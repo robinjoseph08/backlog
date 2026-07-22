@@ -319,15 +319,25 @@ func TestUserFacingUsageUsesBacklogName(t *testing.T) {
 	}
 }
 
-func TestSplitRetryArgumentsAcceptsSingleDashFlags(t *testing.T) {
+func TestSplitRetryArgumentsAcceptsFlagsBeforeIssue(t *testing.T) {
 	t.Parallel()
 
-	issue, flags, err := splitRetryArguments([]string{"-repo-dir", "/tmp/repo", "123"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if issue != "123" || strings.Join(flags, " ") != "-repo-dir /tmp/repo" {
-		t.Fatalf("issue = %q, flags = %q", issue, flags)
+	for _, args := range [][]string{
+		{"-repo-dir", "/tmp/repo", "123"},
+		{"--repo-dir=/tmp/repo", "123"},
+		{"--state-dir=/tmp/state", "123"},
+		{"--git=/tmp/git", "123"},
+	} {
+		issue, flags, err := splitRetryArguments(args)
+		if err != nil {
+			t.Fatalf("split %q: %v", args, err)
+		}
+		if issue != "123" {
+			t.Fatalf("split %q issue = %q, want 123", args, issue)
+		}
+		if len(flags) == 0 {
+			t.Fatalf("split %q dropped flags", args)
+		}
 	}
 }
 

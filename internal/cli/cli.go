@@ -281,8 +281,10 @@ func splitRetryArguments(args []string) (string, []string, error) {
 }
 
 func flagTakesValue(name string) bool {
+	if strings.Contains(name, "=") {
+		return false
+	}
 	name = strings.TrimLeft(name, "-")
-	name, _, _ = strings.Cut(name, "=")
 	return name == "repo-dir" || name == "state-dir" || name == "git"
 }
 
