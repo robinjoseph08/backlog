@@ -1,6 +1,6 @@
-# pi-backlog-runner
+# backlog
 
-`pi-backlog-runner` continuously drains a GitHub issue backlog with isolated Pi AFK workers. It is a deterministic Go scheduler, not a long-running coordinator conversation.
+`backlog` continuously drains a GitHub issue backlog with isolated Pi AFK workers. It is a deterministic Go scheduler, not a long-running coordinator conversation.
 
 Each issue receives its own lease, Git branch, Git worktree, Pi process, named Pi session, context window, and logs. GitHub is always consulted before a run is considered complete.
 
@@ -19,13 +19,13 @@ The runner uses GitHub's versioned issue dependency endpoint. A dependency looku
 ## Build
 
 ```sh
-go build -o pi-backlog-runner ./cmd/pi-backlog-runner
+go build -o backlog ./cmd/backlog
 ```
 
 Or install it on your Go binary path:
 
 ```sh
-go install ./cmd/pi-backlog-runner
+go install ./cmd/backlog
 ```
 
 ## Run
@@ -33,7 +33,7 @@ go install ./cmd/pi-backlog-runner
 From the repository whose backlog should be drained:
 
 ```sh
-pi-backlog-runner run
+backlog run
 ```
 
 Useful options:
@@ -98,14 +98,14 @@ On restart, the runner reconciles persisted leases with process liveness and Git
 Inspect state:
 
 ```sh
-pi-backlog-runner status
-pi-backlog-runner status --json
+backlog status
+backlog status --json
 ```
 
 Allow a failed or `needs-human` issue to be scheduled again:
 
 ```sh
-pi-backlog-runner retry 123
+backlog retry 123
 ```
 
 Retry removes the old lease but deliberately retains the prior worktree for diagnosis. The next attempt receives a new branch and worktree.

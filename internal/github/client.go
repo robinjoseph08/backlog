@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/robinjoseph/pi-backlog-runner/internal/dependencies"
-	"github.com/robinjoseph/pi-backlog-runner/internal/scheduler"
+	"github.com/robinjoseph08/backlog/internal/dependencies"
+	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
 
 type Repository struct {
