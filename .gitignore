@@ -1,0 +1,4 @@
+/pi-backlog-runner
+/coverage.out
+*.test
+.DS_Store
