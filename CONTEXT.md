@@ -29,7 +29,7 @@ A runner shutdown phase that stops creating Leases while allowing every live Wor
 _Avoid_: Pause, cancellation
 
 **Suspended Run**:
-A Run with no live Worker whose durable Pi session, branch, and worktree are retained so a replacement Worker can continue it.
+A Run with no live Worker whose retained continuation state allows a replacement Worker to continue it.
 _Avoid_: Paused Worker, failed Run
 
 **Resume**:
