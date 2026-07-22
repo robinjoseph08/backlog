@@ -37,7 +37,7 @@ Continuation of a Suspended Run by a replacement Worker using the same Run ident
 _Avoid_: Retry, restart
 
 **Reset**:
-Idempotent abandonment of an incomplete Run that cleans its active artifacts, restores issue eligibility, and releases its Lease while preserving history.
+Idempotent abandonment of an incomplete Run that retires its active artifacts, restores the issue as a Candidate, and releases its Lease while preserving history.
 _Avoid_: Retry, cleanup
 
 **Reset Plan**:
