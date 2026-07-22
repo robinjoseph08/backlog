@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/robinjoseph/pi-backlog-runner/internal/scheduler"
+	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
 
 func TestFileStoreRoundTripsStateAtomically(t *testing.T) {

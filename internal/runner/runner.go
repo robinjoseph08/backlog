@@ -11,11 +11,11 @@ import (
 	"syscall"
 	"time"
 
-	ghadapter "github.com/robinjoseph/pi-backlog-runner/internal/github"
-	"github.com/robinjoseph/pi-backlog-runner/internal/scheduler"
-	"github.com/robinjoseph/pi-backlog-runner/internal/state"
-	"github.com/robinjoseph/pi-backlog-runner/internal/worker"
-	"github.com/robinjoseph/pi-backlog-runner/internal/worktree"
+	ghadapter "github.com/robinjoseph08/backlog/internal/github"
+	"github.com/robinjoseph08/backlog/internal/scheduler"
+	"github.com/robinjoseph08/backlog/internal/state"
+	"github.com/robinjoseph08/backlog/internal/worker"
+	"github.com/robinjoseph08/backlog/internal/worktree"
 )
 
 type Config struct {

@@ -10,7 +10,7 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/robinjoseph/pi-backlog-runner/internal/scheduler"
+	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
 
 const CurrentVersion = 1

@@ -1,7 +1,7 @@
 .PHONY: build test test-race vet check
 
 build:
-	go build -o pi-backlog-runner ./cmd/pi-backlog-runner
+	go build -o backlog ./cmd/backlog
 
 test:
 	go test ./...

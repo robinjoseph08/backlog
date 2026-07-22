@@ -6,7 +6,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/robinjoseph/pi-backlog-runner/internal/cli"
+	"github.com/robinjoseph08/backlog/internal/cli"
 )
 
 func main() {

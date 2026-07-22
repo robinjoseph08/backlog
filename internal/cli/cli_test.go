@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/robinjoseph/pi-backlog-runner/internal/scheduler"
-	"github.com/robinjoseph/pi-backlog-runner/internal/state"
+	"github.com/robinjoseph08/backlog/internal/scheduler"
+	"github.com/robinjoseph08/backlog/internal/state"
 )
 
 func TestRunCommandDrainsIssueThroughFakeExecutables(t *testing.T) {
@@ -155,6 +155,41 @@ func TestRepositoryRejectsAlternateStateDirectoryBinding(t *testing.T) {
 	}
 	if err := bindStateDirectory(common, second); err == nil {
 		t.Fatal("alternate state directory binding succeeded")
+	}
+}
+
+func TestRepositoryReadsLegacyStateDirectoryBinding(t *testing.T) {
+	t.Parallel()
+
+	common := t.TempDir()
+	legacy := filepath.Join(t.TempDir(), "legacy-state")
+	if err := os.WriteFile(filepath.Join(common, legacyStateDirectoryBindingFile), []byte(legacy+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := repositoryStateDirectory(common, t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != legacy {
+		t.Fatalf("state directory = %q, want legacy binding %q", got, legacy)
+	}
+}
+
+func TestRepositoryLockConflictsWithLegacyRunner(t *testing.T) {
+	common := t.TempDir()
+	legacy, err := state.AcquireLock(filepath.Join(common, legacyLockFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacy.Release()
+
+	lock, err := acquireRepositoryLock(common)
+	if err == nil {
+		_ = lock.Release()
+		t.Fatal("repository lock succeeded while legacy runner lock was held")
+	}
+	if !strings.Contains(err.Error(), "already active") {
+		t.Fatalf("lock error = %q, want active runner error", err)
 	}
 }
 

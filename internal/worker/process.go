@@ -97,7 +97,7 @@ func (s Supervisor) Start(ctx context.Context, request Request) (*Process, error
 	// The wrapper cannot exec Pi until Release creates the gate. This lets the
 	// runner persist the PID before the worker can claim or modify an issue.
 	const wrapper = `gate=$1; shift; attempts=0; while [ ! -f "$gate" ]; do attempts=$((attempts+1)); if [ "$attempts" -ge 36000 ]; then exit 124; fi; sleep 0.1; done; exec "$@"`
-	wrapperArgs := []string{"-c", wrapper, "pi-backlog-gate", gatePath, executable}
+	wrapperArgs := []string{"-c", wrapper, "backlog-gate", gatePath, executable}
 	wrapperArgs = append(wrapperArgs, piArgs...)
 	command := exec.CommandContext(ctx, "/bin/sh", wrapperArgs...)
 	grace := s.TerminationGrace

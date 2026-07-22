@@ -16,12 +16,12 @@ import (
 	"strings"
 	"time"
 
-	ghadapter "github.com/robinjoseph/pi-backlog-runner/internal/github"
-	"github.com/robinjoseph/pi-backlog-runner/internal/runner"
-	"github.com/robinjoseph/pi-backlog-runner/internal/scheduler"
-	"github.com/robinjoseph/pi-backlog-runner/internal/state"
-	"github.com/robinjoseph/pi-backlog-runner/internal/worker"
-	"github.com/robinjoseph/pi-backlog-runner/internal/worktree"
+	ghadapter "github.com/robinjoseph08/backlog/internal/github"
+	"github.com/robinjoseph08/backlog/internal/runner"
+	"github.com/robinjoseph08/backlog/internal/scheduler"
+	"github.com/robinjoseph08/backlog/internal/state"
+	"github.com/robinjoseph08/backlog/internal/worker"
+	"github.com/robinjoseph08/backlog/internal/worktree"
 )
 
 func Main(ctx context.Context, args []string, stdout, stderr io.Writer) int {
@@ -90,7 +90,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	if err != nil {
 		return err
 	}
-	lock, err := state.AcquireLock(filepath.Join(commonDirectory, "pi-backlog-runner.lock"))
+	lock, err := acquireRepositoryLock(commonDirectory)
 	if err != nil {
 		return err
 	}
@@ -216,7 +216,7 @@ func retryCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if err != nil {
 		return err
 	}
-	lock, err := state.AcquireLock(filepath.Join(commonDirectory, "pi-backlog-runner.lock"))
+	lock, err := acquireRepositoryLock(commonDirectory)
 	if err != nil {
 		return err
 	}
@@ -259,7 +259,7 @@ func retryCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 
 func splitRetryArguments(args []string) (string, []string, error) {
 	if len(args) == 0 {
-		return "", nil, errors.New("usage: pi-backlog-runner retry <issue-number> [flags]")
+		return "", nil, errors.New("usage: backlog retry <issue-number> [flags]")
 	}
 	if !strings.HasPrefix(args[0], "-") {
 		return args[0], args[1:], nil
@@ -350,7 +350,34 @@ func gitCommonDirectory(ctx context.Context, executable, repositoryRoot string) 
 	return filepath.Abs(common)
 }
 
-const stateDirectoryBindingFile = "pi-backlog-runner.state-dir"
+const (
+	lockFile                        = "backlog.lock"
+	legacyLockFile                  = "pi-backlog-runner.lock"
+	stateDirectoryBindingFile       = "backlog.state-dir"
+	legacyStateDirectoryBindingFile = "pi-backlog-runner.state-dir"
+)
+
+type repositoryLock struct {
+	current *state.Lock
+	legacy  *state.Lock
+}
+
+func acquireRepositoryLock(commonDirectory string) (*repositoryLock, error) {
+	legacy, err := state.AcquireLock(filepath.Join(commonDirectory, legacyLockFile))
+	if err != nil {
+		return nil, err
+	}
+	current, err := state.AcquireLock(filepath.Join(commonDirectory, lockFile))
+	if err != nil {
+		_ = legacy.Release()
+		return nil, err
+	}
+	return &repositoryLock{current: current, legacy: legacy}, nil
+}
+
+func (l *repositoryLock) Release() error {
+	return errors.Join(l.current.Release(), l.legacy.Release())
+}
 
 func bindStateDirectory(commonDirectory, stateDirectory string) error {
 	absolute, err := filepath.Abs(stateDirectory)
@@ -372,7 +399,7 @@ func bindStateDirectory(commonDirectory, stateDirectory string) error {
 }
 
 func writeStateDirectoryBinding(commonDirectory, stateDirectory string) error {
-	temporary, err := os.CreateTemp(commonDirectory, ".pi-backlog-runner-state-*.tmp")
+	temporary, err := os.CreateTemp(commonDirectory, ".backlog-state-*.tmp")
 	if err != nil {
 		return err
 	}
@@ -409,7 +436,25 @@ func writeStateDirectoryBinding(commonDirectory, stateDirectory string) error {
 }
 
 func readStateDirectoryBinding(commonDirectory string) (string, bool, error) {
-	data, err := os.ReadFile(filepath.Join(commonDirectory, stateDirectoryBindingFile))
+	current, currentExists, err := readStateDirectoryBindingFile(filepath.Join(commonDirectory, stateDirectoryBindingFile))
+	if err != nil {
+		return "", false, err
+	}
+	legacy, legacyExists, err := readStateDirectoryBindingFile(filepath.Join(commonDirectory, legacyStateDirectoryBindingFile))
+	if err != nil {
+		return "", false, err
+	}
+	if currentExists && legacyExists && current != legacy {
+		return "", false, fmt.Errorf("repository runner state bindings disagree: %s and %s", current, legacy)
+	}
+	if currentExists {
+		return current, true, nil
+	}
+	return legacy, legacyExists, nil
+}
+
+func readStateDirectoryBindingFile(path string) (string, bool, error) {
+	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", false, nil
 	}
@@ -446,7 +491,7 @@ func defaultStateDirectory(repository string) (string, error) {
 		}
 		return '-'
 	}, filepath.Base(absolute))
-	return filepath.Join(cache, "pi-backlog-runner", name+"-"+hex.EncodeToString(digest[:8])), nil
+	return filepath.Join(cache, "backlog", name+"-"+hex.EncodeToString(digest[:8])), nil
 }
 
 func valueOr(value, fallback string) string {
@@ -458,7 +503,7 @@ func valueOr(value, fallback string) string {
 
 func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "Usage:")
-	fmt.Fprintln(writer, "  pi-backlog-runner run [flags]")
-	fmt.Fprintln(writer, "  pi-backlog-runner status [flags]")
-	fmt.Fprintln(writer, "  pi-backlog-runner retry <issue-number> [flags]")
+	fmt.Fprintln(writer, "  backlog run [flags]")
+	fmt.Fprintln(writer, "  backlog status [flags]")
+	fmt.Fprintln(writer, "  backlog retry <issue-number> [flags]")
 }
