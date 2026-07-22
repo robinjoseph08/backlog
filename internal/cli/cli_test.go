@@ -153,6 +153,15 @@ func TestRepositoryRejectsAlternateStateDirectoryBinding(t *testing.T) {
 	if err := bindStateDirectory(common, first); err != nil {
 		t.Fatalf("bind first state directory: %v", err)
 	}
+	for _, name := range []string{legacyStateDirectoryBindingFile, stateDirectoryBindingFile} {
+		bound, ok, err := readStateDirectoryBindingFile(filepath.Join(common, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if !ok || bound != first {
+			t.Fatalf("%s = %q, %t, want %q, true", name, bound, ok, first)
+		}
+	}
 	if err := bindStateDirectory(common, second); err == nil {
 		t.Fatal("alternate state directory binding succeeded")
 	}

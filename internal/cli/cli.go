@@ -386,11 +386,8 @@ func bindStateDirectory(commonDirectory, stateDirectory string) error {
 	}
 	if bound, ok, err := readStateDirectoryBinding(commonDirectory); err != nil {
 		return err
-	} else if ok {
-		if bound != absolute {
-			return fmt.Errorf("repository runner state is already bound to %s; refusing alternate state directory %s", bound, absolute)
-		}
-		return nil
+	} else if ok && bound != absolute {
+		return fmt.Errorf("repository runner state is already bound to %s; refusing alternate state directory %s", bound, absolute)
 	}
 	if err := writeStateDirectoryBinding(commonDirectory, absolute); err != nil {
 		return fmt.Errorf("bind repository runner state directory: %w", err)
@@ -399,6 +396,18 @@ func bindStateDirectory(commonDirectory, stateDirectory string) error {
 }
 
 func writeStateDirectoryBinding(commonDirectory, stateDirectory string) error {
+	// Write the legacy binding first so rolling back to the old executable cannot
+	// split this repository across two state directories. If the second write is
+	// interrupted, the new executable can also recover from the legacy binding.
+	for _, name := range []string{legacyStateDirectoryBindingFile, stateDirectoryBindingFile} {
+		if err := writeStateDirectoryBindingFile(commonDirectory, name, stateDirectory); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeStateDirectoryBindingFile(commonDirectory, name, stateDirectory string) error {
 	temporary, err := os.CreateTemp(commonDirectory, ".backlog-state-*.tmp")
 	if err != nil {
 		return err
@@ -420,8 +429,7 @@ func writeStateDirectoryBinding(commonDirectory, stateDirectory string) error {
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	path := filepath.Join(commonDirectory, stateDirectoryBindingFile)
-	if err := os.Rename(temporaryPath, path); err != nil {
+	if err := os.Rename(temporaryPath, filepath.Join(commonDirectory, name)); err != nil {
 		return err
 	}
 	directory, err := os.Open(commonDirectory)
