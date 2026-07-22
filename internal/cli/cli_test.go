@@ -184,6 +184,63 @@ func TestRepositoryReadsLegacyStateDirectoryBinding(t *testing.T) {
 	}
 }
 
+func TestBindStateDirectoryRepairsSingleBinding(t *testing.T) {
+	for _, existing := range []string{legacyStateDirectoryBindingFile, stateDirectoryBindingFile} {
+		t.Run(existing, func(t *testing.T) {
+			common := t.TempDir()
+			stateDir := filepath.Join(t.TempDir(), "state")
+			if err := os.WriteFile(filepath.Join(common, existing), []byte(stateDir+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := bindStateDirectory(common, stateDir); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{legacyStateDirectoryBindingFile, stateDirectoryBindingFile} {
+				bound, ok, err := readStateDirectoryBindingFile(filepath.Join(common, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !ok || bound != stateDir {
+					t.Fatalf("%s = %q, %t, want %q, true", name, bound, ok, stateDir)
+				}
+			}
+		})
+	}
+}
+
+func TestRepositoryRejectsDisagreeingStateBindings(t *testing.T) {
+	common := t.TempDir()
+	current := filepath.Join(t.TempDir(), "current")
+	legacy := filepath.Join(t.TempDir(), "legacy")
+	if err := os.WriteFile(filepath.Join(common, stateDirectoryBindingFile), []byte(current+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(common, legacyStateDirectoryBindingFile), []byte(legacy+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repositoryStateDirectory(common, t.TempDir(), ""); err == nil || !strings.Contains(err.Error(), "disagree") {
+		t.Fatalf("state resolution error = %v, want disagreement", err)
+	}
+}
+
+func TestStateBindingWritesLegacyFileBeforeCurrentFile(t *testing.T) {
+	common := t.TempDir()
+	stateDir := filepath.Join(t.TempDir(), "state")
+	if err := os.Mkdir(filepath.Join(common, stateDirectoryBindingFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeStateDirectoryBinding(common, stateDir); err == nil {
+		t.Fatal("state binding succeeded with current binding path blocked")
+	}
+	bound, ok, err := readStateDirectoryBindingFile(filepath.Join(common, legacyStateDirectoryBindingFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || bound != stateDir {
+		t.Fatalf("legacy binding = %q, %t, want %q, true", bound, ok, stateDir)
+	}
+}
+
 func TestRepositoryLockConflictsWithLegacyRunner(t *testing.T) {
 	common := t.TempDir()
 	legacy, err := state.AcquireLock(filepath.Join(common, legacyLockFile))
@@ -202,6 +259,25 @@ func TestRepositoryLockConflictsWithLegacyRunner(t *testing.T) {
 	}
 }
 
+func TestRepositoryLockReleasesLegacyLockWhenCurrentLockIsHeld(t *testing.T) {
+	common := t.TempDir()
+	current, err := state.AcquireLock(filepath.Join(common, lockFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer current.Release()
+
+	if lock, err := acquireRepositoryLock(common); err == nil {
+		_ = lock.Release()
+		t.Fatal("repository lock succeeded while current runner lock was held")
+	}
+	legacy, err := state.AcquireLock(filepath.Join(common, legacyLockFile))
+	if err != nil {
+		t.Fatalf("legacy lock remained held after partial acquisition: %v", err)
+	}
+	_ = legacy.Release()
+}
+
 func TestCommandHelpExitsSuccessfully(t *testing.T) {
 	t.Parallel()
 
@@ -211,6 +287,47 @@ func TestCommandHelpExitsSuccessfully(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "max-workers") {
 		t.Fatalf("help = %q, want run flags", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if exit := Main(context.Background(), []string{"retry", "--help"}, &stdout, &stderr); exit != 0 {
+		t.Fatalf("retry help exit = %d, stderr = %q", exit, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "requires an issue number") {
+		t.Fatalf("retry help = %q", stderr.String())
+	}
+}
+
+func TestUserFacingUsageUsesBacklogName(t *testing.T) {
+	t.Parallel()
+
+	var stdout, stderr bytes.Buffer
+	if exit := Main(context.Background(), []string{"help"}, &stdout, &stderr); exit != 0 {
+		t.Fatalf("help exit = %d", exit)
+	}
+	if !strings.Contains(stdout.String(), "backlog run") || strings.Contains(stdout.String(), "pi-backlog-runner") {
+		t.Fatalf("help = %q", stdout.String())
+	}
+
+	stdout.Reset()
+	if exit := Main(context.Background(), []string{"retry"}, &stdout, &stderr); exit != 1 {
+		t.Fatalf("retry exit = %d, want 1", exit)
+	}
+	if !strings.Contains(stderr.String(), "usage: backlog retry") || strings.Contains(stderr.String(), "pi-backlog-runner") {
+		t.Fatalf("retry error = %q", stderr.String())
+	}
+}
+
+func TestSplitRetryArgumentsAcceptsSingleDashFlags(t *testing.T) {
+	t.Parallel()
+
+	issue, flags, err := splitRetryArguments([]string{"-repo-dir", "/tmp/repo", "123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if issue != "123" || strings.Join(flags, " ") != "-repo-dir /tmp/repo" {
+		t.Fatalf("issue = %q, flags = %q", issue, flags)
 	}
 }
 
@@ -228,5 +345,8 @@ func TestDefaultStateDirectoryIsStableAndOutsideRepository(t *testing.T) {
 	}
 	if first != second || strings.HasPrefix(first, repository+string(os.PathSeparator)) {
 		t.Fatalf("state directories = %q, %q for repository %q", first, second, repository)
+	}
+	if namespace := filepath.Base(filepath.Dir(first)); namespace != "backlog" {
+		t.Fatalf("state namespace = %q, want backlog", namespace)
 	}
 }

@@ -37,6 +37,9 @@ echo 'diagnostic' >&2
 	if process.PID() <= 0 {
 		t.Fatalf("pid = %d, want positive", process.PID())
 	}
+	if got := process.command.Args[3]; got != "backlog-gate" {
+		t.Fatalf("wrapper process name = %q, want backlog-gate", got)
+	}
 	if err := process.Release(); err != nil {
 		t.Fatalf("release: %v", err)
 	}

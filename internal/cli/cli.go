@@ -181,15 +181,20 @@ func statusCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 }
 
 func retryCommand(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	issueArg, flagArgs, err := splitRetryArguments(args)
-	if err != nil {
-		return err
-	}
 	flags := flag.NewFlagSet("retry", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	repoDir := flags.String("repo-dir", ".", "Git repository associated with the runner")
 	stateDir := flags.String("state-dir", "", "runner state directory")
 	gitExecutable := flags.String("git", "git", "git executable used to identify the repository root")
+	for _, arg := range args {
+		if arg == "-h" || arg == "--help" {
+			return flags.Parse([]string{arg})
+		}
+	}
+	issueArg, flagArgs, err := splitRetryArguments(args)
+	if err != nil {
+		return err
+	}
 	if err := flags.Parse(flagArgs); err != nil {
 		return err
 	}
@@ -276,7 +281,9 @@ func splitRetryArguments(args []string) (string, []string, error) {
 }
 
 func flagTakesValue(name string) bool {
-	return name == "--repo-dir" || name == "--state-dir" || name == "--git"
+	name = strings.TrimLeft(name, "-")
+	name, _, _ = strings.Cut(name, "=")
+	return name == "repo-dir" || name == "state-dir" || name == "git"
 }
 
 func resolveStateFromFlags(ctx context.Context, repoDir, stateDir, gitExecutable string) (string, error) {
