@@ -394,7 +394,7 @@ func TestRunnerFailsClosedInsteadOfReleasingRecoveredRPCWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := store.LoadValue()
-	if got.Runs[0].Status != scheduler.StatusNeedsHuman || len(got.Leases) != 1 {
+	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID != 1235 || len(got.Leases) != 1 {
 		t.Fatalf("recovered RPC Run/Lease = %#v/%#v", got.Runs[0], got.Leases)
 	}
 	if workers.recoveredReleaseCount() != 0 {

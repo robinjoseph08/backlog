@@ -62,6 +62,19 @@ func TestPlanCountsOnlyActiveRunsAgainstCapacity(t *testing.T) {
 	}
 }
 
+func TestPlanCountsNeedsHumanRunWithRetainedWorkerIdentityAgainstCapacity(t *testing.T) {
+	t.Parallel()
+
+	plan := Plan(Snapshot{
+		Candidates: []Candidate{{Number: 2, CreatedAt: time.Now()}},
+		Runs:       []Run{{Issue: 1, RunID: "run-1", Status: StatusNeedsHuman, PID: 1234}},
+		Leases:     []Lease{{LeaseID: "run-1", Issue: 1, RunID: "run-1"}},
+	}, 1)
+	if len(plan.Starts) != 0 {
+		t.Fatalf("got starts %v, want retained live Worker to consume capacity", issueNumbers(plan.Starts))
+	}
+}
+
 func TestPlanWaitingForMergeLeaseDoesNotConsumeWorkerCapacity(t *testing.T) {
 	t.Parallel()
 

@@ -123,6 +123,41 @@ func TestRetryRemovesOnlyInterventionRequiredLease(t *testing.T) {
 	}
 }
 
+func TestRetryRefusesRunWithRetainedLiveWorkerIdentity(t *testing.T) {
+	t.Parallel()
+
+	stateDir := t.TempDir()
+	repository := filepath.Join(t.TempDir(), "repo")
+	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, output)
+	}
+	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
+	if err := store.Save(state.State{
+		Version: state.CurrentVersion,
+		Runs: []scheduler.Run{{
+			Issue: 43, RunID: "live", Status: scheduler.StatusNeedsHuman, WorkerMode: scheduler.WorkerModePrint,
+			PID: 4321, ProcessIdentity: "identity-4321",
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "live", Issue: 43, RunID: "live"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if exit := Main(context.Background(), []string{"retry", "43", "--repo-dir", repository, "--state-dir", stateDir}, &stdout, &stderr); exit == 0 {
+		t.Fatalf("retry succeeded, stdout = %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "verify process-group exit") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+	got, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Leases) != 1 {
+		t.Fatalf("Leases = %#v, want retained Lease", got.Leases)
+	}
+}
+
 func TestStatusPrintsMachineReadableState(t *testing.T) {
 	t.Parallel()
 

@@ -274,6 +274,9 @@ func retryCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if selected.Status != scheduler.StatusFailed && selected.Status != scheduler.StatusNeedsHuman {
 		return fmt.Errorf("issue #%d is %s; only failed or needs-human runs can be retried", issue, selected.Status)
 	}
+	if selected.PID > 0 {
+		return fmt.Errorf("issue #%d retains live Worker identity pid %d; verify process-group exit before retrying", issue, selected.PID)
+	}
 	current.Leases = append(current.Leases[:leaseIndex], current.Leases[leaseIndex+1:]...)
 	retained := selected.Worktree
 	if err := store.Save(current); err != nil {

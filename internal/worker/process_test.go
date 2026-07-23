@@ -177,6 +177,7 @@ func TestProcessRPCValidationFailsClosed(t *testing.T) {
 		{"duplicate agent end", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n{"type":"agent_start"}\n{"type":"turn_start"}\n{"type":"turn_end"}\n{"type":"agent_end"}\n{"type":"agent_end"}\n`, "invalidly ordered Pi RPC agent_end"},
 		{"unmatched turn end", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n{"type":"agent_start"}\n{"type":"turn_end"}\n`, "invalidly ordered Pi RPC turn_end"},
 		{"unsupported dialog", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n{"type":"agent_start"}\n{"type":"extension_ui_request","id":"ui-1","method":"confirm"}\n`, "unsupported interactive Pi RPC request"},
+		{"duplicate retry attempt", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n{"type":"agent_start"}\n{"type":"turn_start"}\n{"type":"turn_end"}\n{"type":"agent_end"}\n{"type":"auto_retry_start","attempt":1}\n{"type":"auto_retry_start","attempt":1}\n`, "invalidly ordered Pi RPC auto_retry_start"},
 		{"unknown type", `{"type":"surprise"}\n`, "unknown Pi RPC message type"},
 	}
 	for _, test := range tests {
@@ -227,12 +228,19 @@ printf '%s\n' \
   '{"type":"queue_update"}' \
   '{"type":"turn_end"}' \
   '{"type":"agent_end"}' \
-  '{"type":"auto_retry_start"}' \
+  '{"type":"auto_retry_start","attempt":1}' \
   '{"type":"agent_start"}' \
   '{"type":"turn_start"}' \
   '{"type":"message_start"}' \
   '{"type":"message_end"}' \
-  '{"type":"auto_retry_end"}' \
+  '{"type":"turn_end"}' \
+  '{"type":"agent_end"}' \
+  '{"type":"auto_retry_start","attempt":2}' \
+  '{"type":"agent_start"}' \
+  '{"type":"turn_start"}' \
+  '{"type":"message_start"}' \
+  '{"type":"message_end"}' \
+  '{"type":"auto_retry_end","attempt":2}' \
   '{"type":"turn_end"}' \
   '{"type":"agent_end"}' \
   '{"type":"agent_settled"}'

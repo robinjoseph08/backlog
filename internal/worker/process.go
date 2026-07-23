@@ -390,6 +390,7 @@ type rpcWriter struct {
 	messageOpen    bool
 	compactionOpen bool
 	retryOpen      bool
+	retryAttempt   int
 	openTools      map[string]struct{}
 	parseErrors    []error
 	settled        chan struct{}
@@ -469,6 +470,7 @@ func (w *rpcWriter) validate(line []byte) {
 		Command    string          `json:"command"`
 		Method     string          `json:"method"`
 		ToolCallID string          `json:"toolCallId"`
+		Attempt    int             `json:"attempt"`
 		Success    *bool           `json:"success"`
 		Data       json.RawMessage `json:"data"`
 	}
@@ -595,17 +597,19 @@ func (w *rpcWriter) validate(line []byte) {
 		}
 		w.compactionOpen = false
 	case "auto_retry_start":
-		if w.state != rpcBetweenAgentRuns || w.retryOpen || w.compactionOpen {
+		if w.state != rpcBetweenAgentRuns || w.compactionOpen || message.Attempt <= w.retryAttempt {
 			w.invalidOrder(message.Type)
 			return
 		}
 		w.retryOpen = true
+		w.retryAttempt = message.Attempt
 	case "auto_retry_end":
-		if (w.state != rpcBetweenAgentRuns && w.state != rpcAgentRunning) || !w.retryOpen {
+		if (w.state != rpcBetweenAgentRuns && w.state != rpcAgentRunning) || !w.retryOpen || message.Attempt != w.retryAttempt {
 			w.invalidOrder(message.Type)
 			return
 		}
 		w.retryOpen = false
+		w.retryAttempt = 0
 	case "queue_update", "extension_error":
 		if w.state == rpcAwaitingResponse {
 			w.invalidOrder(message.Type)

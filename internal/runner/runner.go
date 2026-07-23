@@ -391,7 +391,7 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 					continue
 				}
 				if run.WorkerMode == scheduler.WorkerModeRPC {
-					r.needsHuman(current, run.Issue, "recovered live RPC Worker cannot restore its prompt and event channels; Worker retained for intervention")
+					r.needsHumanWithLiveWorker(current, run.Issue, "recovered live RPC Worker cannot restore its prompt and event channels; Worker retained for intervention")
 					changed = true
 					continue
 				}
@@ -536,6 +536,15 @@ func (r *Runner) needsHuman(current *state.State, issue int, message string) {
 	run := findActiveRun(current, issue)
 	transitionStatus(&run, scheduler.StatusNeedsHuman)
 	run.PID = 0
+	run.Error = message
+	run.UpdatedAt = r.Now().UTC()
+	replaceRun(current, run)
+	r.logf("issue #%d needs human attention: %s", issue, message)
+}
+
+func (r *Runner) needsHumanWithLiveWorker(current *state.State, issue int, message string) {
+	run := findActiveRun(current, issue)
+	transitionStatus(&run, scheduler.StatusNeedsHuman)
 	run.Error = message
 	run.UpdatedAt = r.Now().UTC()
 	replaceRun(current, run)
