@@ -93,7 +93,9 @@ State and logs live outside the target repository. By default they are stored un
 
 State is written with same-directory temporary files, file sync, atomic rename, and directory sync. A repository-level advisory lock in the Git common directory prevents two local runner instances from scheduling the same backlog, even if they request different state paths. The first run binds the repository to one state directory; later conflicting `--state-dir` values are rejected.
 
-On restart, the runner reconciles persisted leases with process liveness and GitHub pull request and issue state. It compares each recovered PID with its persisted operating-system process start identity, so PID reuse becomes `needs-human` instead of being mistaken for the worker. A live matching worker is never launched twice. A dead worker is verified against GitHub before being classified. Recovered workers older than `--max-worker-age` also become `needs-human`. Uncertainty becomes `needs-human`, never a new launch.
+State keeps historical Runs separate from active Leases. Upgrading version 1 state preserves Run metadata and artifacts, removes the obsolete paused setting, and records legacy print-mode Runs as non-resumable. During migration, incomplete and intervention-required Runs retain their Leases, while verified merged Runs remain as history without active ownership.
+
+On restart, the runner reconciles persisted Leases with process liveness and GitHub pull request and issue state. It compares each recovered PID with its persisted operating-system process start identity, so PID reuse becomes `needs-human` instead of being mistaken for the worker. A live matching worker is never launched twice. A dead worker is verified against GitHub before being classified. Recovered workers older than `--max-worker-age` also become `needs-human`. Uncertainty becomes `needs-human`, never a new launch.
 
 Inspect state:
 
@@ -108,7 +110,7 @@ Allow a failed or `needs-human` issue to be scheduled again:
 backlog retry 123
 ```
 
-Retry removes the old lease but deliberately retains the prior worktree for diagnosis. The next attempt receives a new branch and worktree.
+Retry removes the active Lease but preserves the historical Run and prior worktree for diagnosis. The next attempt receives a new Run identity, branch, and worktree.
 
 ## Shutdown
 

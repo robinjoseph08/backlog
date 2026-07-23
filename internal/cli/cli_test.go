@@ -70,8 +70,8 @@ printf '%s\n' '{"type":"session"}' '{"type":"agent_start"}' '{"type":"agent_sett
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	if len(persisted.Runs) != 1 || persisted.Runs[0].Status != scheduler.StatusMerged {
-		t.Fatalf("state runs = %#v, want merged issue", persisted.Runs)
+	if len(persisted.Runs) != 1 || persisted.Runs[0].Status != scheduler.StatusMerged || len(persisted.Leases) != 0 {
+		t.Fatalf("state Runs/Leases = %#v/%#v, want merged history without an active Lease", persisted.Runs, persisted.Leases)
 	}
 	if _, err := os.Stat(persisted.Runs[0].Worktree); !os.IsNotExist(err) {
 		t.Fatalf("successful worktree still exists, stat error = %v", err)
@@ -92,7 +92,10 @@ func TestRetryRemovesOnlyInterventionRequiredLease(t *testing.T) {
 	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
 	if err := store.Save(state.State{
 		Version: state.CurrentVersion,
-		Runs:    []scheduler.Run{{Issue: 42, RunID: "old", Status: scheduler.StatusFailed, Worktree: "/retained"}},
+		Runs: []scheduler.Run{{
+			Issue: 42, RunID: "old", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, Worktree: "/retained",
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "old", Issue: 42, RunID: "old"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -104,8 +107,8 @@ func TestRetryRemovesOnlyInterventionRequiredLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Runs) != 0 {
-		t.Fatalf("runs = %#v, want lease removed", got.Runs)
+	if len(got.Runs) != 1 || len(got.Leases) != 0 {
+		t.Fatalf("Runs/Leases = %#v/%#v, want history retained and Lease removed", got.Runs, got.Leases)
 	}
 	if !strings.Contains(stdout.String(), "retained") {
 		t.Fatalf("stdout = %q, want retained-worktree notice", stdout.String())
@@ -116,12 +119,16 @@ func TestStatusPrintsMachineReadableState(t *testing.T) {
 	t.Parallel()
 
 	stateDir := t.TempDir()
+	repository := filepath.Join(t.TempDir(), "repo")
+	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, output)
+	}
 	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
 	if err := store.Save(state.State{Version: state.CurrentVersion, Repo: "acme/widgets"}); err != nil {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer
-	if exit := Main(context.Background(), []string{"status", "--state-dir", stateDir, "--json"}, &stdout, &stderr); exit != 0 {
+	if exit := Main(context.Background(), []string{"status", "--repo-dir", repository, "--state-dir", stateDir, "--json"}, &stdout, &stderr); exit != 0 {
 		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
 	}
 	var got state.State

@@ -168,8 +168,8 @@ func statusCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return encoder.Encode(current)
 	}
 	fmt.Fprintf(stdout, "Repository: %s\n", valueOr(current.Repo, "not initialized"))
-	fmt.Fprintf(stdout, "Paused: %t\n", current.Paused)
 	fmt.Fprintf(stdout, "Runs: %d\n", len(current.Runs))
+	fmt.Fprintf(stdout, "Active Leases: %d\n", len(current.Leases))
 	for _, run := range current.Runs {
 		fmt.Fprintf(stdout, "  #%d  %-17s  %s", run.Issue, run.Status, run.Branch)
 		if run.Error != "" {
@@ -234,23 +234,32 @@ func retryCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if err != nil {
 		return err
 	}
-	index := -1
-	var retained string
-	for i, run := range current.Runs {
-		if run.Issue != issue {
+	leaseIndex := -1
+	var selected scheduler.Run
+	for index, lease := range current.Leases {
+		if lease.Issue != issue {
 			continue
 		}
-		if run.Status != scheduler.StatusFailed && run.Status != scheduler.StatusNeedsHuman {
-			return fmt.Errorf("issue #%d is %s; only failed or needs-human runs can be retried", issue, run.Status)
+		leaseIndex = index
+		for _, run := range current.Runs {
+			if run.RunID == lease.RunID && run.Issue == lease.Issue {
+				selected = run
+				break
+			}
 		}
-		index = i
-		retained = run.Worktree
 		break
 	}
-	if index < 0 {
-		return fmt.Errorf("issue #%d has no intervention-required run", issue)
+	if leaseIndex < 0 {
+		return fmt.Errorf("issue #%d has no intervention-required Run with an active Lease", issue)
 	}
-	current.Runs = append(current.Runs[:index], current.Runs[index+1:]...)
+	if selected.RunID == "" {
+		return fmt.Errorf("active Lease for issue #%d has an invalid Run reference", issue)
+	}
+	if selected.Status != scheduler.StatusFailed && selected.Status != scheduler.StatusNeedsHuman {
+		return fmt.Errorf("issue #%d is %s; only failed or needs-human runs can be retried", issue, selected.Status)
+	}
+	current.Leases = append(current.Leases[:leaseIndex], current.Leases[leaseIndex+1:]...)
+	retained := selected.Worktree
 	if err := store.Save(current); err != nil {
 		return err
 	}

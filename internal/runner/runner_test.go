@@ -201,10 +201,11 @@ func TestRunnerDoesNotDuplicatePersistedLiveWorker(t *testing.T) {
 	store := &memoryStore{value: state.State{
 		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
 		Runs: []scheduler.Run{{
-			Issue: 1, RunID: "live", Status: scheduler.StatusRunning, PID: 1234,
+			Issue: 1, RunID: "live", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint, PID: 1234,
 			ProcessIdentity: "identity-1234", Branch: "agent/issue-1-live", Worktree: "/tmp/live",
 			StartedAt: time.Date(2026, 7, 2, 2, 0, 0, 0, time.UTC),
 		}},
+		Leases: []scheduler.Lease{{LeaseID: "live", Issue: 1, RunID: "live"}},
 	}}
 	runner := testRunner(github, workers, store, 1)
 	runner.PIDAlive = func(pid int) bool { return pid == 1234 }
@@ -232,10 +233,11 @@ func TestRunnerDoesNotTrustRecoveredPIDIndefinitely(t *testing.T) {
 	store := &memoryStore{value: state.State{
 		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
 		Runs: []scheduler.Run{{
-			Issue: 1, RunID: "stale", Status: scheduler.StatusRunning, PID: 1234,
+			Issue: 1, RunID: "stale", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint, PID: 1234,
 			ProcessIdentity: "identity-1234", Branch: "agent/issue-1-stale", Worktree: "/tmp/stale",
 			StartedAt: time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
 		}},
+		Leases: []scheduler.Lease{{LeaseID: "stale", Issue: 1, RunID: "stale"}},
 	}}
 	runner := testRunner(github, workers, store, 1)
 	runner.PIDAlive = func(int) bool { return true }
@@ -256,7 +258,8 @@ func TestRunnerReconcilesClaimedRunWithoutLookingUpAnEmptyBranch(t *testing.T) {
 	workers := newFakeWorkers()
 	store := &memoryStore{value: state.State{
 		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
-		Runs: []scheduler.Run{{Issue: 1, RunID: "claimed", Status: scheduler.StatusClaimed}},
+		Runs:   []scheduler.Run{{Issue: 1, RunID: "claimed", Status: scheduler.StatusClaimed, WorkerMode: scheduler.WorkerModePrint}},
+		Leases: []scheduler.Lease{{LeaseID: "claimed", Issue: 1, RunID: "claimed"}},
 	}}
 	runner := testRunner(github, workers, store, 1)
 
@@ -281,9 +284,10 @@ func TestRunnerReconcilesDeadWorkerWithArmedAutoMergeAsWaiting(t *testing.T) {
 	store := &memoryStore{value: state.State{
 		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
 		Runs: []scheduler.Run{{
-			Issue: 3, RunID: "old", Status: scheduler.StatusRunning, PID: 999999,
+			Issue: 3, RunID: "old", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint, PID: 999999,
 			Branch: "agent/issue-3-old", Worktree: "/tmp/old",
 		}},
+		Leases: []scheduler.Lease{{LeaseID: "old", Issue: 3, RunID: "old"}},
 	}}
 	runner := testRunner(github, workers, store, 1)
 	runner.PIDAlive = func(int) bool { return false }
@@ -316,9 +320,10 @@ func TestRunnerReconcilesMergedRunWithoutLaunchingDuplicate(t *testing.T) {
 		Repo:          "acme/widgets",
 		DefaultBranch: "main",
 		Runs: []scheduler.Run{{
-			Issue: 1, RunID: "old", Status: scheduler.StatusRunning, PID: 999999,
+			Issue: 1, RunID: "old", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint, PID: 999999,
 			Branch: "agent/issue-1-old", Worktree: "/tmp/old",
 		}},
+		Leases: []scheduler.Lease{{LeaseID: "old", Issue: 1, RunID: "old"}},
 	}}
 	runner := testRunner(github, workers, store, 1)
 	runner.PIDAlive = func(int) bool { return false }
@@ -331,6 +336,35 @@ func TestRunnerReconcilesMergedRunWithoutLaunchingDuplicate(t *testing.T) {
 	}
 	if got := store.runStatus(1); got != scheduler.StatusMerged {
 		t.Fatalf("issue 1 status = %q, want merged", got)
+	}
+}
+
+func TestRunnerReconcilesOnlyTheLeasedRunWhenIssueHasHistory(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{completions: map[int]ghadapter.CompletionOutcome{1: mergedOutcome(1)}}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs: []scheduler.Run{
+			{Issue: 1, RunID: "historical", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, Error: "keep this diagnostic"},
+			{Issue: 1, RunID: "active", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint, PID: 999999,
+				Branch: "agent/issue-1-active", Worktree: "/tmp/active"},
+		},
+		Leases: []scheduler.Lease{{LeaseID: "active", Issue: 1, RunID: "active"}},
+	}}
+	runner := testRunner(github, workers, store, 1)
+	runner.PIDAlive = func(int) bool { return false }
+
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := store.LoadValue()
+	if len(got.Runs) != 2 || got.Runs[0].Status != scheduler.StatusFailed || got.Runs[0].Error != "keep this diagnostic" {
+		t.Fatalf("historical Run changed: %#v", got.Runs)
+	}
+	if got.Runs[1].Status != scheduler.StatusMerged || len(got.Leases) != 0 {
+		t.Fatalf("active Run/Lease = %#v/%#v, want merged without Lease", got.Runs[1], got.Leases)
 	}
 }
 
@@ -380,8 +414,14 @@ func (s *memoryStore) runStatus(issue int) scheduler.Status {
 	}
 	return ""
 }
+func (s *memoryStore) LoadValue() state.State {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return cloneState(s.value)
+}
 func cloneState(value state.State) state.State {
 	value.Runs = append([]scheduler.Run(nil), value.Runs...)
+	value.Leases = append([]scheduler.Lease(nil), value.Leases...)
 	return value
 }
 

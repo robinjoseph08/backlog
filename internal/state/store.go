@@ -13,9 +13,20 @@ import (
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
 
-const CurrentVersion = 1
+const CurrentVersion = 2
+
+const legacyVersion = 1
 
 type State struct {
+	Version             int               `json:"version"`
+	Repo                string            `json:"repo"`
+	DefaultBranch       string            `json:"defaultBranch"`
+	MaxConcurrentIssues int               `json:"maxConcurrentIssues"`
+	Runs                []scheduler.Run   `json:"runs"`
+	Leases              []scheduler.Lease `json:"leases"`
+}
+
+type legacyState struct {
 	Version             int             `json:"version"`
 	Repo                string          `json:"repo"`
 	DefaultBranch       string          `json:"defaultBranch"`
@@ -36,18 +47,79 @@ func (s FileStore) Load() (State, error) {
 	if err != nil {
 		return State{}, fmt.Errorf("open state: %w", err)
 	}
-	defer file.Close()
 
-	var value State
+	var encoded json.RawMessage
 	decoder := json.NewDecoder(file)
-	if err := decoder.Decode(&value); err != nil {
+	if err := decoder.Decode(&encoded); err != nil {
+		file.Close()
 		return State{}, fmt.Errorf("decode state: %w", err)
 	}
 	if err := ensureEOF(decoder); err != nil {
+		file.Close()
 		return State{}, err
 	}
-	if err := validate(value); err != nil {
+	if err := file.Close(); err != nil {
+		return State{}, fmt.Errorf("close state after reading: %w", err)
+	}
+
+	var header struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(encoded, &header); err != nil {
+		return State{}, fmt.Errorf("decode state version: %w", err)
+	}
+	switch header.Version {
+	case CurrentVersion:
+		var value State
+		if err := json.Unmarshal(encoded, &value); err != nil {
+			return State{}, fmt.Errorf("decode state: %w", err)
+		}
+		if err := validate(value); err != nil {
+			return State{}, err
+		}
+		return value, nil
+	case legacyVersion:
+		var legacy legacyState
+		if err := json.Unmarshal(encoded, &legacy); err != nil {
+			return State{}, fmt.Errorf("decode version 1 state: %w", err)
+		}
+		value, err := migrateV1(legacy)
+		if err != nil {
+			return State{}, err
+		}
+		if err := s.Save(value); err != nil {
+			return State{}, fmt.Errorf("persist version 2 state migration: %w", err)
+		}
+		return value, nil
+	default:
+		return State{}, fmt.Errorf("unsupported state version %d", header.Version)
+	}
+}
+
+func migrateV1(legacy legacyState) (State, error) {
+	if err := validateV1(legacy); err != nil {
 		return State{}, err
+	}
+	value := State{
+		Version:             CurrentVersion,
+		Repo:                legacy.Repo,
+		DefaultBranch:       legacy.DefaultBranch,
+		MaxConcurrentIssues: legacy.MaxConcurrentIssues,
+		Runs:                append([]scheduler.Run(nil), legacy.Runs...),
+	}
+	for index := range value.Runs {
+		run := &value.Runs[index]
+		run.WorkerMode = scheduler.WorkerModePrint
+		if run.Status != scheduler.StatusMerged {
+			value.Leases = append(value.Leases, scheduler.Lease{
+				LeaseID: run.RunID,
+				Issue:   run.Issue,
+				RunID:   run.RunID,
+			})
+		}
+	}
+	if err := validate(value); err != nil {
+		return State{}, fmt.Errorf("migrate version 1 state: %w", err)
 	}
 	return value, nil
 }
@@ -114,32 +186,113 @@ func ensureEOF(decoder *json.Decoder) error {
 	return errors.New("state contains multiple JSON values")
 }
 
-func validate(value State) error {
-	if value.Version != CurrentVersion {
+func validateV1(value legacyState) error {
+	if value.Version != legacyVersion {
 		return fmt.Errorf("unsupported state version %d", value.Version)
 	}
 	issues := make(map[int]struct{}, len(value.Runs))
 	for _, run := range value.Runs {
-		if run.Issue <= 0 {
-			return fmt.Errorf("state contains invalid issue number %d", run.Issue)
-		}
-		if run.RunID == "" {
-			return fmt.Errorf("state contains a run without an id for issue #%d", run.Issue)
-		}
-		if !knownStatus(run.Status) {
-			return fmt.Errorf("state contains unknown status %q for issue #%d", run.Status, run.Issue)
-		}
-		if run.Status == scheduler.StatusRunning {
-			if run.PID <= 0 || run.StartedAt.IsZero() || run.ProcessIdentity == "" {
-				return fmt.Errorf("state contains running issue #%d without durable process identity", run.Issue)
-			}
+		if err := validateRun(run, false); err != nil {
+			return err
 		}
 		if _, exists := issues[run.Issue]; exists {
-			return fmt.Errorf("state contains duplicate lease for issue #%d", run.Issue)
+			return fmt.Errorf("version 1 state contains duplicate lease for issue #%d", run.Issue)
 		}
 		issues[run.Issue] = struct{}{}
 	}
 	return nil
+}
+
+func validate(value State) error {
+	if value.Version != CurrentVersion {
+		return fmt.Errorf("unsupported state version %d", value.Version)
+	}
+	runs := make(map[string]scheduler.Run, len(value.Runs))
+	for _, run := range value.Runs {
+		if err := validateRun(run, true); err != nil {
+			return err
+		}
+		if _, exists := runs[run.RunID]; exists {
+			return fmt.Errorf("state contains duplicate run id %q", run.RunID)
+		}
+		runs[run.RunID] = run
+	}
+
+	leaseIDs := make(map[string]struct{}, len(value.Leases))
+	leasedIssues := make(map[int]struct{}, len(value.Leases))
+	leasedRuns := make(map[string]struct{}, len(value.Leases))
+	for _, lease := range value.Leases {
+		if lease.LeaseID == "" {
+			return errors.New("state contains a Lease without an id")
+		}
+		if lease.Issue <= 0 {
+			return fmt.Errorf("state contains a Lease with invalid issue number %d", lease.Issue)
+		}
+		if lease.RunID == "" {
+			return fmt.Errorf("state contains Lease %q without a Run reference", lease.LeaseID)
+		}
+		if _, exists := leaseIDs[lease.LeaseID]; exists {
+			return fmt.Errorf("state contains duplicate Lease id %q", lease.LeaseID)
+		}
+		leaseIDs[lease.LeaseID] = struct{}{}
+		if _, exists := leasedIssues[lease.Issue]; exists {
+			return fmt.Errorf("state contains multiple active Leases for issue #%d", lease.Issue)
+		}
+		leasedIssues[lease.Issue] = struct{}{}
+		if _, exists := leasedRuns[lease.RunID]; exists {
+			return fmt.Errorf("state contains multiple active Leases for Run %q", lease.RunID)
+		}
+		leasedRuns[lease.RunID] = struct{}{}
+
+		run, exists := runs[lease.RunID]
+		if !exists {
+			return fmt.Errorf("Lease %q references unknown Run %q", lease.LeaseID, lease.RunID)
+		}
+		if run.Issue != lease.Issue {
+			return fmt.Errorf("Lease %q issue #%d does not match Run %q issue #%d", lease.LeaseID, lease.Issue, run.RunID, run.Issue)
+		}
+		if run.Status == scheduler.StatusMerged {
+			return fmt.Errorf("Lease %q references merged Run %q", lease.LeaseID, run.RunID)
+		}
+	}
+	for _, run := range value.Runs {
+		if requiresLease(run.Status) {
+			if _, exists := leasedRuns[run.RunID]; !exists {
+				return fmt.Errorf("active Run %q for issue #%d has no Lease", run.RunID, run.Issue)
+			}
+		}
+	}
+	return nil
+}
+
+func validateRun(run scheduler.Run, requireWorkerMode bool) error {
+	if run.Issue <= 0 {
+		return fmt.Errorf("state contains invalid issue number %d", run.Issue)
+	}
+	if run.RunID == "" {
+		return fmt.Errorf("state contains a Run without an id for issue #%d", run.Issue)
+	}
+	if !knownStatus(run.Status) {
+		return fmt.Errorf("state contains unknown status %q for issue #%d", run.Status, run.Issue)
+	}
+	if requireWorkerMode && run.WorkerMode != scheduler.WorkerModePrint {
+		return fmt.Errorf("state contains Run %q with unknown worker mode %q", run.RunID, run.WorkerMode)
+	}
+	if run.Status == scheduler.StatusRunning {
+		if run.PID <= 0 || run.StartedAt.IsZero() || run.ProcessIdentity == "" {
+			return fmt.Errorf("state contains running issue #%d without durable process identity", run.Issue)
+		}
+	}
+	return nil
+}
+
+func requiresLease(status scheduler.Status) bool {
+	switch status {
+	case scheduler.StatusClaimed, scheduler.StatusWorktreeReady, scheduler.StatusRunning, scheduler.StatusWaitingForMerge:
+		return true
+	default:
+		return false
+	}
 }
 
 func knownStatus(status scheduler.Status) bool {

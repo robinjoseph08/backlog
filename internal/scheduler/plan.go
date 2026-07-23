@@ -17,6 +17,10 @@ const (
 	StatusNeedsHuman      Status = "needs-human"
 )
 
+type WorkerMode string
+
+const WorkerModePrint WorkerMode = "print"
+
 type Blocker struct {
 	Owner  string `json:"owner,omitempty"`
 	Repo   string `json:"repo,omitempty"`
@@ -37,6 +41,7 @@ type Run struct {
 	Issue           int        `json:"issue"`
 	RunID           string     `json:"runId"`
 	Status          Status     `json:"status"`
+	WorkerMode      WorkerMode `json:"workerMode"`
 	PID             int        `json:"pid,omitempty"`
 	ProcessIdentity string     `json:"processIdentity,omitempty"`
 	Branch          string     `json:"branch,omitempty"`
@@ -51,9 +56,16 @@ type Run struct {
 	CompletedAt     *time.Time `json:"completedAt,omitempty"`
 }
 
+type Lease struct {
+	LeaseID string `json:"leaseId"`
+	Issue   int    `json:"issue"`
+	RunID   string `json:"runId"`
+}
+
 type Snapshot struct {
 	Candidates []Candidate
 	Runs       []Run
+	Leases     []Lease
 }
 
 type Schedule struct {
@@ -61,20 +73,28 @@ type Schedule struct {
 }
 
 // Plan selects the oldest eligible candidates that fit in the available worker
-// capacity. Every persisted run retains its issue lease; an explicit retry must
-// remove a failed run before the issue can be selected again.
+// capacity. Active Leases prevent overlapping Runs, and verified merged history
+// prevents a completed issue from being admitted again.
 func Plan(snapshot Snapshot, maxConcurrentIssues int) Schedule {
 	if maxConcurrentIssues <= 0 {
 		return Schedule{}
 	}
 
-	leased := make(map[int]struct{}, len(snapshot.Runs))
-	active := 0
+	runsByID := make(map[string]Run, len(snapshot.Runs))
+	completedIssues := make(map[int]struct{})
 	for _, run := range snapshot.Runs {
-		if isActive(run.Status) {
+		runsByID[run.RunID] = run
+		if run.Status == StatusMerged {
+			completedIssues[run.Issue] = struct{}{}
+		}
+	}
+	leased := make(map[int]struct{}, len(snapshot.Leases))
+	active := 0
+	for _, lease := range snapshot.Leases {
+		if run, exists := runsByID[lease.RunID]; exists && isActive(run.Status) {
 			active++
 		}
-		leased[run.Issue] = struct{}{}
+		leased[lease.Issue] = struct{}{}
 	}
 
 	available := maxConcurrentIssues - active
@@ -88,6 +108,9 @@ func Plan(snapshot Snapshot, maxConcurrentIssues int) Schedule {
 			continue
 		}
 		if _, exists := leased[candidate.Number]; exists {
+			continue
+		}
+		if _, completed := completedIssues[candidate.Number]; completed {
 			continue
 		}
 		eligible = append(eligible, candidate)
