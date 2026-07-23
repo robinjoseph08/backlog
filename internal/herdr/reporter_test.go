@@ -182,6 +182,22 @@ func TestReporterReturnsConnectionFailure(t *testing.T) {
 	}
 }
 
+func TestReporterTimesOutWhenServerDoesNotRespond(t *testing.T) {
+	socketPath, _ := serveOneHerdrResponse(t, func(request socketRequest) string {
+		time.Sleep(200 * time.Millisecond)
+		return fmt.Sprintf(`{"id":%q,"result":{"type":"ok"}}`+"\n", request.ID)
+	})
+	reporter := newReporter(socketPath, "w1:p1", 20*time.Millisecond)
+	started := time.Now()
+	err := reporter.Working("scheduling Runs")
+	if err == nil || !strings.Contains(err.Error(), "read Herdr response") {
+		t.Fatalf("Working error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 150*time.Millisecond {
+		t.Fatalf("Working took %s, want bounded by the socket deadline", elapsed)
+	}
+}
+
 func serveOneHerdrResponse(t *testing.T, response func(socketRequest) string) (string, <-chan error) {
 	t.Helper()
 	socketDir, err := os.MkdirTemp("", "herdr-response-test-")
