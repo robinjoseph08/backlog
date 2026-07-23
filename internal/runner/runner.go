@@ -133,7 +133,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		if len(plan.Starts) > 0 {
 			continue
 		}
-		if activeRunCount(&current) == 0 && !r.Config.Watch {
+		if unfinishedRunCount(&current) == 0 && !r.Config.Watch {
 			return nil
 		}
 
@@ -533,12 +533,11 @@ func removeLease(current *state.State, runID string) {
 	}
 }
 
-func activeRunCount(current *state.State) int {
+func unfinishedRunCount(current *state.State) int {
 	count := 0
 	for _, lease := range current.Leases {
 		run := findRun(current.Runs, lease.RunID)
-		switch run.Status {
-		case scheduler.StatusClaimed, scheduler.StatusWorktreeReady, scheduler.StatusRunning, scheduler.StatusWaitingForMerge:
+		if scheduler.RequiresLease(run.Status) {
 			count++
 		}
 	}

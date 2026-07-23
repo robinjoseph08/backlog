@@ -50,6 +50,31 @@ func TestFileStoreRoundTripsStateAtomically(t *testing.T) {
 	}
 }
 
+func TestFileStorePreviewDoesNotPersistV1Migration(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.json")
+	legacy := `{"version":1,"paused":true,"runs":[{"issue":1,"runId":"failed","status":"failed"}]}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, migrationRequired, err := (FileStore{Path: path}).Preview()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !migrationRequired || got.Version != CurrentVersion || len(got.Runs) != 1 || len(got.Leases) != 1 {
+		t.Fatalf("preview = %#v, migration required = %t", got, migrationRequired)
+	}
+	persisted, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(persisted), `"version":1`) || !strings.Contains(string(persisted), `"paused":true`) {
+		t.Fatalf("preview persisted migration: %s", persisted)
+	}
+}
+
 func TestFileStoreMigratesV1WithoutLosingRunArtifacts(t *testing.T) {
 	t.Parallel()
 

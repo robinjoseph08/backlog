@@ -154,13 +154,28 @@ func statusCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 	if flags.NArg() != 0 {
 		return fmt.Errorf("status takes no positional arguments")
 	}
-	resolved, err := resolveStateFromFlags(ctx, *repoDir, *stateDir, *gitExecutable)
+	resolved, commonDirectory, err := resolveStateFromFlags(ctx, *repoDir, *stateDir, *gitExecutable)
 	if err != nil {
 		return err
 	}
-	current, err := (state.FileStore{Path: filepath.Join(resolved, "state.json")}).Load()
+	store := state.FileStore{Path: filepath.Join(resolved, "state.json")}
+	current, migrationRequired, err := store.Preview()
 	if err != nil {
 		return err
+	}
+	if migrationRequired {
+		lock, err := acquireRepositoryLock(commonDirectory)
+		if err != nil {
+			return fmt.Errorf("migrate state for status: %w", err)
+		}
+		defer lock.Release()
+		if err := bindStateDirectory(commonDirectory, resolved); err != nil {
+			return err
+		}
+		current, err = store.Load()
+		if err != nil {
+			return err
+		}
 	}
 	if *asJSON {
 		encoder := json.NewEncoder(stdout)
@@ -297,20 +312,21 @@ func flagTakesValue(name string) bool {
 	return name == "repo-dir" || name == "state-dir" || name == "git"
 }
 
-func resolveStateFromFlags(ctx context.Context, repoDir, stateDir, gitExecutable string) (string, error) {
+func resolveStateFromFlags(ctx context.Context, repoDir, stateDir, gitExecutable string) (string, string, error) {
 	absoluteRepo, err := filepath.Abs(repoDir)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	root, err := gitRepositoryRoot(ctx, gitExecutable, absoluteRepo)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	common, err := gitCommonDirectory(ctx, gitExecutable, root)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return repositoryStateDirectory(common, root, stateDir)
+	resolved, err := repositoryStateDirectory(common, root, stateDir)
+	return resolved, common, err
 }
 
 func repositoryStateDirectory(commonDirectory, repositoryRoot, override string) (string, error) {

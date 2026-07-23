@@ -140,6 +140,41 @@ func TestStatusPrintsMachineReadableState(t *testing.T) {
 	}
 }
 
+func TestStatusDoesNotMigrateV1WhileRunnerLockIsHeld(t *testing.T) {
+	t.Parallel()
+
+	repository := filepath.Join(t.TempDir(), "repo")
+	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, output)
+	}
+	stateDir := t.TempDir()
+	statePath := filepath.Join(stateDir, "state.json")
+	legacy := `{"version":1,"paused":true,"runs":[{"issue":1,"runId":"failed","status":"failed"}]}`
+	if err := os.WriteFile(statePath, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := state.AcquireLock(filepath.Join(repository, ".git", legacyLockFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+
+	var stdout, stderr bytes.Buffer
+	if exit := Main(context.Background(), []string{"status", "--repo-dir", repository, "--state-dir", stateDir}, &stdout, &stderr); exit != 1 {
+		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "runner already active") {
+		t.Fatalf("stderr = %q, want active runner refusal", stderr.String())
+	}
+	persisted, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(persisted), `"version":1`) || !strings.Contains(string(persisted), `"paused":true`) {
+		t.Fatalf("status migrated state despite active runner: %s", persisted)
+	}
+}
+
 func writeExecutable(t *testing.T, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "fake")

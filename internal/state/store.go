@@ -40,59 +40,73 @@ type FileStore struct {
 }
 
 func (s FileStore) Load() (State, error) {
+	value, _, err := s.load(true)
+	return value, err
+}
+
+// Preview loads and validates state without persisting a required migration.
+// Callers can use the returned flag to acquire their coordination lock before
+// invoking Load to commit the migration.
+func (s FileStore) Preview() (State, bool, error) {
+	return s.load(false)
+}
+
+func (s FileStore) load(persistMigration bool) (State, bool, error) {
 	file, err := os.Open(s.Path)
 	if errors.Is(err, os.ErrNotExist) {
-		return State{Version: CurrentVersion}, nil
+		return State{Version: CurrentVersion}, false, nil
 	}
 	if err != nil {
-		return State{}, fmt.Errorf("open state: %w", err)
+		return State{}, false, fmt.Errorf("open state: %w", err)
 	}
 
 	var encoded json.RawMessage
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(&encoded); err != nil {
 		file.Close()
-		return State{}, fmt.Errorf("decode state: %w", err)
+		return State{}, false, fmt.Errorf("decode state: %w", err)
 	}
 	if err := ensureEOF(decoder); err != nil {
 		file.Close()
-		return State{}, err
+		return State{}, false, err
 	}
 	if err := file.Close(); err != nil {
-		return State{}, fmt.Errorf("close state after reading: %w", err)
+		return State{}, false, fmt.Errorf("close state after reading: %w", err)
 	}
 
 	var header struct {
 		Version int `json:"version"`
 	}
 	if err := json.Unmarshal(encoded, &header); err != nil {
-		return State{}, fmt.Errorf("decode state version: %w", err)
+		return State{}, false, fmt.Errorf("decode state version: %w", err)
 	}
 	switch header.Version {
 	case CurrentVersion:
 		var value State
 		if err := json.Unmarshal(encoded, &value); err != nil {
-			return State{}, fmt.Errorf("decode state: %w", err)
+			return State{}, false, fmt.Errorf("decode state: %w", err)
 		}
 		if err := validate(value); err != nil {
-			return State{}, err
+			return State{}, false, err
 		}
-		return value, nil
+		return value, false, nil
 	case legacyVersion:
 		var legacy legacyState
 		if err := json.Unmarshal(encoded, &legacy); err != nil {
-			return State{}, fmt.Errorf("decode version 1 state: %w", err)
+			return State{}, false, fmt.Errorf("decode version 1 state: %w", err)
 		}
 		value, err := migrateV1(legacy)
 		if err != nil {
-			return State{}, err
+			return State{}, false, err
 		}
-		if err := s.Save(value); err != nil {
-			return State{}, fmt.Errorf("persist version 2 state migration: %w", err)
+		if persistMigration {
+			if err := s.Save(value); err != nil {
+				return State{}, false, fmt.Errorf("persist version 2 state migration: %w", err)
+			}
 		}
-		return value, nil
+		return value, true, nil
 	default:
-		return State{}, fmt.Errorf("unsupported state version %d", header.Version)
+		return State{}, false, fmt.Errorf("unsupported state version %d", header.Version)
 	}
 }
 
@@ -256,7 +270,7 @@ func validate(value State) error {
 		}
 	}
 	for _, run := range value.Runs {
-		if requiresLease(run.Status) {
+		if scheduler.RequiresLease(run.Status) {
 			if _, exists := leasedRuns[run.RunID]; !exists {
 				return fmt.Errorf("active Run %q for issue #%d has no Lease", run.RunID, run.Issue)
 			}
@@ -284,15 +298,6 @@ func validateRun(run scheduler.Run, requireWorkerMode bool) error {
 		}
 	}
 	return nil
-}
-
-func requiresLease(status scheduler.Status) bool {
-	switch status {
-	case scheduler.StatusClaimed, scheduler.StatusWorktreeReady, scheduler.StatusRunning, scheduler.StatusWaitingForMerge:
-		return true
-	default:
-		return false
-	}
 }
 
 func knownStatus(status scheduler.Status) bool {

@@ -89,15 +89,15 @@ func Plan(snapshot Snapshot, maxConcurrentIssues int) Schedule {
 		}
 	}
 	leased := make(map[int]struct{}, len(snapshot.Leases))
-	active := 0
+	workerCount := 0
 	for _, lease := range snapshot.Leases {
-		if run, exists := runsByID[lease.RunID]; exists && isActive(run.Status) {
-			active++
+		if run, exists := runsByID[lease.RunID]; exists && consumesWorkerCapacity(run.Status) {
+			workerCount++
 		}
 		leased[lease.Issue] = struct{}{}
 	}
 
-	available := maxConcurrentIssues - active
+	available := maxConcurrentIssues - workerCount
 	if available <= 0 {
 		return Schedule{}
 	}
@@ -127,7 +127,7 @@ func Plan(snapshot Snapshot, maxConcurrentIssues int) Schedule {
 	return Schedule{Starts: eligible}
 }
 
-func isActive(status Status) bool {
+func consumesWorkerCapacity(status Status) bool {
 	switch status {
 	case StatusClaimed, StatusWorktreeReady, StatusRunning:
 		return true
