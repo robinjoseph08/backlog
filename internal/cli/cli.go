@@ -123,11 +123,6 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 	if flags.NArg() != 0 {
 		return fmt.Errorf("run takes no positional arguments")
 	}
-	herdrReporter := herdr.FromEnvironment()
-	if herdrReporter.Enabled() {
-		_ = herdrReporter.Working("scheduling Runs")
-		defer func() { _ = herdrReporter.Release() }()
-	}
 	absoluteRepo, err := filepath.Abs(*repoDir)
 	if err != nil {
 		return fmt.Errorf("resolve repository directory: %w", err)
@@ -151,6 +146,11 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 	defer lock.Release()
 	if err := bindStateDirectory(commonDirectory, resolvedStateDir); err != nil {
 		return err
+	}
+	herdrReporter := herdr.FromEnvironment()
+	if herdrReporter.Enabled() {
+		_ = herdrReporter.Working("scheduling Runs")
+		defer func() { _ = herdrReporter.Release() }()
 	}
 
 	github := &ghadapter.Client{Executable: *ghExecutable, Dir: repositoryRoot}

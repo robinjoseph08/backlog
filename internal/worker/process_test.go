@@ -19,6 +19,7 @@ func TestWorkersDoNotInheritHerdrPaneEnvironment(t *testing.T) {
 		"HERDR_ENV=1",
 		"HERDR_SOCKET_PATH=/tmp/herdr.sock",
 		"HERDR_PANE_ID=w1:p1",
+		"HERDR_FUTURE_STATE=must-also-be-removed",
 		"BACKLOG_TEST=preserved",
 	}
 

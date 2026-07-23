@@ -56,9 +56,9 @@ Candidate discovery fails closed for admission. If a discovery pass fails, the r
 
 ## Herdr integration
 
-When `backlog run` is launched in a [Herdr](https://herdr.dev/) pane, it automatically reports itself as a custom `backlog` agent over Herdr's inherited local socket. The runner appears as working in Herdr's Agents panel for the lifetime of the command and releases the entry when it exits. The entry represents the aggregate Backlog runner, not each isolated Worker.
+When `backlog run` is launched in a [Herdr](https://herdr.dev/) pane and acquires the repository lock, it reports itself as a custom `backlog` agent over Herdr's inherited local socket. The entry represents the aggregate Backlog runner, not each isolated Worker.
 
-No Herdr integration install or Backlog flag is required. Outside Herdr, the reporter is disabled. Socket failures are ignored so this observational integration cannot affect scheduling or durable state.
+No Herdr integration install or Backlog flag is required. Outside Herdr, the reporter is disabled. Reporting is best effort: Backlog attempts to mark the runner working after setup and release the entry on orderly exit. Socket failures are bounded and ignored, so they cannot change scheduler decisions or durable state.
 
 ## Backlog eligibility
 

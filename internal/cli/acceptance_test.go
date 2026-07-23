@@ -248,6 +248,7 @@ func TestCompiledExecutableRunsAFKThroughDurableRPCSettlement(t *testing.T) {
 	statePath := filepath.Join(stateDir, "state.json")
 	finished := filepath.Join(root, "finished")
 	piAlive := filepath.Join(root, "pi-alive")
+	finishPi := filepath.Join(root, "finish-pi")
 	reconciledAlive := filepath.Join(root, "reconciled-while-pi-alive")
 	piArgs := filepath.Join(root, "pi.args")
 	prompt := filepath.Join(root, "prompt.json")
@@ -286,6 +287,10 @@ if env | grep -q '^HERDR_'; then
   echo 'Pi Worker inherited the foreground Herdr pane environment' >&2
   exit 9
 fi
+if [ "$PWD" != "$(pwd)" ]; then
+  echo 'Pi Worker PWD does not match its worktree' >&2
+  exit 9
+fi
 printf '%s\n' "$*" > `+quote(piArgs)+`
 touch `+quote(piAlive)+`
 grep -q '"status": "running"' `+quote(statePath)+`
@@ -293,6 +298,7 @@ grep -q '"workerMode": "rpc"' `+quote(statePath)+`
 grep -q '"pid": '"$$" `+quote(statePath)+`
 IFS= read -r command
 printf '%s\n' "$command" > `+quote(prompt)+`
+while [ ! -f `+quote(finishPi)+` ]; do sleep 0.01; done
 printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 while IFS= read -r ignored; do :; done
 test -f `+quote(reconciledAlive)+`
@@ -300,27 +306,53 @@ grep -q '"status": "merged"' `+quote(statePath)+`
 rm -f `+quote(piAlive)+`
 `)
 
-	herdrSocket, herdrResult := captureHerdrLifecycle(t)
-	command := exec.Command(binary, "run", "--repo-dir", repository, "--state-dir", stateDir,
-		"--max-workers", "1", "--poll", "5ms", "--gh", gh, "--git", git, "--pi", pi)
-	command.Env = append(os.Environ(),
+	herdrSocket, herdrRequests, herdrDone := captureHerdrLifecycle(t)
+	runArgs := []string{"run", "--repo-dir", repository, "--state-dir", stateDir,
+		"--max-workers", "1", "--poll", "5ms", "--gh", gh, "--git", git, "--pi", pi}
+	herdrEnvironment := append(os.Environ(),
 		"HERDR_ENV=1",
 		"HERDR_SOCKET_PATH="+herdrSocket,
 		"HERDR_PANE_ID=w1:p1",
+		"HERDR_FUTURE_STATE=must-not-reach-worker",
 	)
-	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("compiled RPC run: %v\n%s", err, output)
+	command := exec.Command(binary, runArgs...)
+	command.Env = herdrEnvironment
+	var commandOutput bytes.Buffer
+	command.Stdout = &commandOutput
+	command.Stderr = &commandOutput
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
 	}
-	captured := <-herdrResult
-	if captured.err != nil {
-		t.Fatalf("capture Herdr lifecycle: %v", captured.err)
+	workingRequest := waitForHerdrRequest(t, herdrRequests)
+	if workingRequest.Method != "pane.report_agent" {
+		t.Fatalf("first Herdr lifecycle request = %#v", workingRequest)
 	}
-	if len(captured.requests) != 2 || captured.requests[0].Method != "pane.report_agent" || captured.requests[1].Method != "pane.release_agent" {
-		t.Fatalf("Herdr lifecycle requests = %#v", captured.requests)
-	}
-	working := captured.requests[0].Params
+	working := workingRequest.Params
 	if working.PaneID != "w1:p1" || working.Source != "custom:backlog" || working.Agent != "backlog" || working.State != "working" || working.Message != "scheduling Runs" {
 		t.Fatalf("Herdr working report = %#v", working)
+	}
+	waitForFile(t, piAlive)
+	assertNoHerdrRequest(t, herdrRequests, "runner released its Herdr entry while its Worker was active")
+
+	duplicate := exec.Command(binary, runArgs...)
+	duplicate.Env = herdrEnvironment
+	if output, err := duplicate.CombinedOutput(); err == nil {
+		t.Fatalf("duplicate runner acquired the repository lock, output = %q", output)
+	}
+	assertNoHerdrRequest(t, herdrRequests, "lock-rejected duplicate changed the active runner's Herdr entry")
+
+	if err := os.WriteFile(finishPi, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err != nil {
+		t.Fatalf("compiled RPC run: %v\n%s", err, commandOutput.String())
+	}
+	releaseRequest := waitForHerdrRequest(t, herdrRequests)
+	if releaseRequest.Method != "pane.release_agent" {
+		t.Fatalf("final Herdr lifecycle request = %#v", releaseRequest)
+	}
+	if err := <-herdrDone; err != nil {
+		t.Fatalf("capture Herdr lifecycle: %v", err)
 	}
 	current, err := (state.FileStore{Path: statePath}).Load()
 	if err != nil {
@@ -350,6 +382,16 @@ rm -f `+quote(piAlive)+`
 	}
 	if _, err := os.Stat(piAlive); !os.IsNotExist(err) {
 		t.Fatalf("Pi process did not shut down after persisted reconciliation: %v", err)
+	}
+
+	unavailableSocket := exec.Command(binary, runArgs...)
+	unavailableSocket.Env = append(os.Environ(),
+		"HERDR_ENV=1",
+		"HERDR_SOCKET_PATH="+filepath.Join(root, "missing-herdr.sock"),
+		"HERDR_PANE_ID=w1:p1",
+	)
+	if output, err := unavailableSocket.CombinedOutput(); err != nil {
+		t.Fatalf("Herdr socket failure changed runner outcome: %v\n%s", err, output)
 	}
 }
 
@@ -495,12 +537,7 @@ type capturedHerdrRequest struct {
 	} `json:"params"`
 }
 
-type capturedHerdrLifecycle struct {
-	requests []capturedHerdrRequest
-	err      error
-}
-
-func captureHerdrLifecycle(t *testing.T) (string, <-chan capturedHerdrLifecycle) {
+func captureHerdrLifecycle(t *testing.T) (string, <-chan capturedHerdrRequest, <-chan error) {
 	t.Helper()
 	directory, err := os.MkdirTemp("", "backlog-herdr-test-")
 	if err != nil {
@@ -519,34 +556,61 @@ func captureHerdrLifecycle(t *testing.T) (string, <-chan capturedHerdrLifecycle)
 	}
 	t.Cleanup(func() { listener.Close() })
 
-	result := make(chan capturedHerdrLifecycle, 1)
+	requests := make(chan capturedHerdrRequest, 2)
+	done := make(chan error, 1)
 	go func() {
-		captured := capturedHerdrLifecycle{requests: make([]capturedHerdrRequest, 0, 2)}
-		defer func() { result <- captured }()
+		defer close(requests)
 		for range 2 {
 			connection, err := listener.AcceptUnix()
 			if err != nil {
-				captured.err = err
+				done <- err
 				return
 			}
 			var request capturedHerdrRequest
 			if err := json.NewDecoder(connection).Decode(&request); err != nil {
 				connection.Close()
-				captured.err = err
+				done <- err
 				return
 			}
-			captured.requests = append(captured.requests, request)
+			requests <- request
 			response := fmt.Sprintf(`{"id":%q,"result":{"type":"ok"}}`+"\n", request.ID)
 			if _, err := connection.Write([]byte(response)); err != nil {
 				connection.Close()
-				captured.err = err
+				done <- err
 				return
 			}
 			if err := connection.Close(); err != nil {
-				captured.err = err
+				done <- err
 				return
 			}
 		}
+		done <- nil
 	}()
-	return socketPath, result
+	return socketPath, requests, done
+}
+
+func waitForHerdrRequest(t *testing.T, requests <-chan capturedHerdrRequest) capturedHerdrRequest {
+	t.Helper()
+	select {
+	case request, ok := <-requests:
+		if !ok {
+			t.Fatal("fake Herdr server closed before receiving the expected request")
+		}
+		return request
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Herdr lifecycle request")
+		return capturedHerdrRequest{}
+	}
+}
+
+func assertNoHerdrRequest(t *testing.T, requests <-chan capturedHerdrRequest, message string) {
+	t.Helper()
+	select {
+	case request, ok := <-requests:
+		if !ok {
+			t.Fatal("fake Herdr server closed unexpectedly")
+		}
+		t.Fatalf("%s: %#v", message, request)
+	case <-time.After(100 * time.Millisecond):
+	}
 }
