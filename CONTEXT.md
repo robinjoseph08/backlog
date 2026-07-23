@@ -24,6 +24,26 @@ _Avoid_: Claim, lock
 One isolated attempt to take an eligible candidate through the AFK workflow and verify its GitHub outcome.
 _Avoid_: Task, execution
 
+**Drain**:
+A runner shutdown phase that stops creating Leases while allowing every live Worker to finish before the runner exits.
+_Avoid_: Pause, cancellation
+
+**Suspended Run**:
+A Run with no live Worker whose retained continuation state allows a replacement Worker to continue it.
+_Avoid_: Paused Worker, failed Run
+
+**Resume**:
+Continuation of a Suspended Run by a replacement Worker using the same Run identity and retained artifacts.
+_Avoid_: Retry, restart
+
+**Reset**:
+Idempotent abandonment of an incomplete Run that retires its active artifacts, restores the issue as a Candidate, and releases its Lease while preserving history.
+_Avoid_: Retry, cleanup
+
+**Reset Plan**:
+A read-only, current-state-derived list of mutations required to Reset a Run.
+_Avoid_: Generic cleanup plan
+
 **Worker**:
 The live Pi process belonging to a run.
 _Avoid_: Agent, subagent
