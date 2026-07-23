@@ -373,6 +373,35 @@ func TestRunnerDoesNotDuplicatePersistedLiveWorker(t *testing.T) {
 	}
 }
 
+func TestRunnerFailsClosedInsteadOfReleasingRecoveredRPCWorker(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 2, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs: []scheduler.Run{{
+			Issue: 2, RunID: "rpc-live", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModeRPC, PID: 1235,
+			ProcessIdentity: "identity-1235", Branch: "agent/issue-2-rpc-live", Worktree: "/tmp/rpc-live",
+			SessionID: "backlog-rpc-live", SessionDir: "/state/sessions/rpc-live",
+			StartedAt: time.Date(2026, 7, 2, 2, 0, 0, 0, time.UTC),
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "rpc-live", Issue: 2, RunID: "rpc-live"}},
+	}}
+	runner := testRunner(github, workers, store, 1)
+	runner.PIDAlive = func(pid int) bool { return pid == 1235 }
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusNeedsHuman || len(got.Leases) != 1 {
+		t.Fatalf("recovered RPC Run/Lease = %#v/%#v", got.Runs[0], got.Leases)
+	}
+	if workers.recoveredReleaseCount() != 0 {
+		t.Fatalf("recovered release count = %d, want zero", workers.recoveredReleaseCount())
+	}
+}
+
 func TestRunnerDoesNotTrustRecoveredPIDIndefinitely(t *testing.T) {
 	t.Parallel()
 
@@ -691,14 +720,15 @@ func (p *fakeProcess) Close() worker.Result {
 }
 
 type fakeWorkers struct {
-	mu           sync.Mutex
-	started      []int
-	processes    map[int]*fakeProcess
-	running      int
-	maximum      int
-	releases     int
-	onRelease    func(int)
-	startChanged chan struct{}
+	mu                sync.Mutex
+	started           []int
+	processes         map[int]*fakeProcess
+	running           int
+	maximum           int
+	releases          int
+	recoveredReleases int
+	onRelease         func(int)
+	startChanged      chan struct{}
 }
 
 func newFakeWorkers() *fakeWorkers {
@@ -717,7 +747,12 @@ func (w *fakeWorkers) Start(_ context.Context, request worker.Request) (WorkerPr
 	w.startChanged <- struct{}{}
 	return process, nil
 }
-func (w *fakeWorkers) Release(string) error { return nil }
+func (w *fakeWorkers) Release(string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.recoveredReleases++
+	return nil
+}
 func (w *fakeWorkers) released(issue int) {
 	w.mu.Lock()
 	w.releases++
@@ -795,4 +830,9 @@ func (w *fakeWorkers) releaseCount() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.releases
+}
+func (w *fakeWorkers) recoveredReleaseCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.recoveredReleases
 }

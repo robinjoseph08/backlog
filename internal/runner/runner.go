@@ -390,6 +390,11 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 					changed = true
 					continue
 				}
+				if run.WorkerMode == scheduler.WorkerModeRPC {
+					r.needsHuman(current, run.Issue, "recovered live RPC Worker cannot restore its prompt and event channels; Worker retained for intervention")
+					changed = true
+					continue
+				}
 				if err := r.Workers.Release(run.RunID); err != nil {
 					r.needsHuman(current, run.Issue, fmt.Sprintf("release recovered Pi worker: %v", err))
 					changed = true
