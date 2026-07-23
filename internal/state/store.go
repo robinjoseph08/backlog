@@ -1,12 +1,14 @@
 package state
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -16,6 +18,7 @@ import (
 const CurrentVersion = 2
 
 const legacyVersion = 1
+const sha256HexLength = 64
 
 type State struct {
 	Version             int               `json:"version"`
@@ -300,13 +303,30 @@ func validateRun(run scheduler.Run, requireWorkerMode bool) error {
 			return fmt.Errorf("state contains running issue #%d without durable process identity", run.Issue)
 		}
 	}
+	if run.Continuation != nil {
+		boundary := run.Continuation
+		_, hashErr := hex.DecodeString(boundary.SHA256)
+		if run.WorkerMode != scheduler.WorkerModeRPC || boundary.SessionID != run.SessionID || boundary.Worktree != run.Worktree ||
+			boundary.SessionFile == "" || boundary.LeafID == "" || boundary.EntryCount <= 0 || len(boundary.SHA256) != sha256HexLength || hashErr != nil || boundary.VerifiedAt.IsZero() {
+			return fmt.Errorf("state contains Run %q with an invalid continuation boundary", run.RunID)
+		}
+		relative, err := filepath.Rel(run.SessionDir, boundary.SessionFile)
+		if err != nil || relative == "." || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("state contains Run %q with a continuation file outside its session directory", run.RunID)
+		}
+	}
+	if run.Status == scheduler.StatusSuspended {
+		if run.PID != 0 || run.ProcessIdentity != "" || run.Continuation == nil {
+			return fmt.Errorf("state contains suspended issue #%d without a verified stopped continuation", run.Issue)
+		}
+	}
 	return nil
 }
 
 func knownStatus(status scheduler.Status) bool {
 	switch status {
 	case scheduler.StatusClaimed, scheduler.StatusWorktreeReady, scheduler.StatusRunning,
-		scheduler.StatusWaitingForMerge, scheduler.StatusMerged, scheduler.StatusFailed, scheduler.StatusNeedsHuman:
+		scheduler.StatusWaitingForMerge, scheduler.StatusSuspended, scheduler.StatusMerged, scheduler.StatusFailed, scheduler.StatusNeedsHuman:
 		return true
 	default:
 		return false

@@ -19,7 +19,7 @@ import (
 	"github.com/robinjoseph08/backlog/internal/state"
 )
 
-func TestCompiledExecutableDrainsOnSIGINTWithoutAdmittingAnotherLease(t *testing.T) {
+func TestCompiledExecutableSuspendsOnSecondSIGINTWithoutAdmittingAnotherLease(t *testing.T) {
 	root := t.TempDir()
 	repository := filepath.Join(root, "repo")
 	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
@@ -30,7 +30,6 @@ func TestCompiledExecutableDrainsOnSIGINTWithoutAdmittingAnotherLease(t *testing
 	stateDir := filepath.Join(root, "state")
 	statePath := filepath.Join(stateDir, "state.json")
 	workerStarted := filepath.Join(root, "worker-started")
-	finishWorker := filepath.Join(root, "finish-worker")
 	gh := writeExecutable(t, `#!/bin/sh
 set -eu
 case "$*" in
@@ -48,9 +47,9 @@ case "$*" in
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/32/dependencies/blocked_by?per_page=100 --paginate --slurp")
     printf '%s\n' '[[]]' ;;
   "pr list --repo acme/widgets --state all --head agent/issue-31-"*" --json number,url,state,mergedAt,autoMergeRequest,isDraft")
-    printf '%s\n' '[{"number":31,"url":"https://example.test/pull/31","state":"MERGED","mergedAt":"2026-07-23T00:00:00Z"}]' ;;
+    printf '%s\n' '[]' ;;
   "issue view 31 --repo acme/widgets --json state,title,url")
-    printf '%s\n' '{"state":"CLOSED","title":"First","url":"https://example.test/issues/31"}' ;;
+    printf '%s\n' '{"state":"OPEN","title":"First","url":"https://example.test/issues/31"}' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
 `)
@@ -64,10 +63,27 @@ exit 0
 `)
 	pi := writeExecutable(t, `#!/bin/sh
 set -eu
+session_dir= session_id=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --session-dir) session_dir=$2; shift 2 ;;
+    --session-id) session_id=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+worktree=$(pwd)
+IFS= read -r prompt
 touch `+quote(workerStarted)+`
-while [ ! -f `+quote(finishWorker)+` ]; do sleep 0.01; done
-IFS= read -r command
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
+IFS= read -r abort
+session_file="$session_dir/session.jsonl"
+printf '{"type":"session","version":3,"id":"%s","cwd":"%s"}\n' "$session_id" "$worktree" > "$session_file"
+printf '%s\n' '{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"work"}}' >> "$session_file"
+printf '%s\n' '{"id":"backlog-suspend-abort","type":"response","command":"abort","success":true}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+IFS= read -r state
+printf '{"id":"backlog-suspend-state","type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":"%s","sessionId":"%s"}}\n' "$session_file" "$session_id"
+IFS= read -r entries
+printf '%s\n' '{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"work"}}],"leafId":"leaf"}}'
 while IFS= read -r ignored; do :; done
 `)
 
@@ -121,11 +137,13 @@ while IFS= read -r ignored; do :; done
 			break
 		}
 	}
-	if err := os.WriteFile(finishWorker, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
 	if err := command.Wait(); err != nil {
-		t.Fatalf("compiled Drain run: %v, stderr = %q", err, stderr.String())
+		var exitError *exec.ExitError
+		if !errors.As(err, &exitError) || exitError.ExitCode() != 130 {
+			t.Fatalf("compiled second-SIGINT run: %v, stderr = %q", err, stderr.String())
+		}
+	} else {
+		t.Fatal("compiled second-SIGINT run exited zero, want 130")
 	}
 	for line := range lines {
 		outputLines = append(outputLines, line)
@@ -134,16 +152,17 @@ while IFS= read -r ignored; do :; done
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(current.Runs) != 1 || current.Runs[0].Issue != 31 || current.Runs[0].Status != scheduler.StatusMerged || len(current.Leases) != 0 {
-		t.Fatalf("persisted state after Drain = %#v", current)
+	if len(current.Runs) != 1 || current.Runs[0].Issue != 31 || current.Runs[0].Status != scheduler.StatusSuspended ||
+		current.Runs[0].PID != 0 || current.Runs[0].Continuation == nil || len(current.Leases) != 1 {
+		t.Fatalf("persisted state after second SIGINT = %#v", current)
 	}
 	output := strings.Join(outputLines, "\n")
-	if !strings.Contains(output, "Drain complete: 0 Workers remaining; exiting successfully") {
-		t.Fatalf("Drain output = %q", output)
+	if !strings.Contains(output, "Suspension complete: 0 Workers remaining") {
+		t.Fatalf("suspension output = %q", output)
 	}
 }
 
-func TestCompiledExecutableRetainsImmediateSIGTERMShutdown(t *testing.T) {
+func TestCompiledExecutableSuspendsDirectlyOnSIGTERM(t *testing.T) {
 	root := t.TempDir()
 	repository := filepath.Join(root, "repo")
 	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
@@ -165,6 +184,10 @@ case "$*" in
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/33/comments?per_page=100 --paginate --slurp"|\
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/33/dependencies/blocked_by?per_page=100 --paginate --slurp")
     printf '%s\n' '[[]]' ;;
+  "pr list --repo acme/widgets --state all --head agent/issue-33-"*" --json number,url,state,mergedAt,autoMergeRequest,isDraft")
+    printf '%s\n' '[]' ;;
+  "issue view 33 --repo acme/widgets --json state,title,url")
+    printf '%s\n' '{"state":"OPEN","title":"Terminate","url":"https://example.test/issues/33"}' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
 `)
@@ -177,10 +200,28 @@ exit 0
 `)
 	pi := writeExecutable(t, `#!/bin/sh
 set -eu
-IFS= read -r command
+session_dir= session_id=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --session-dir) session_dir=$2; shift 2 ;;
+    --session-id) session_id=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+worktree=$(pwd)
+IFS= read -r prompt
 printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
 touch `+quote(workerStarted)+`
-while :; do sleep 1; done
+IFS= read -r abort
+session_file="$session_dir/session.jsonl"
+printf '{"type":"session","version":3,"id":"%s","cwd":"%s"}\n' "$session_id" "$worktree" > "$session_file"
+printf '%s\n' '{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"work"}}' >> "$session_file"
+printf '%s\n' '{"id":"backlog-suspend-abort","type":"response","command":"abort","success":true}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+IFS= read -r state
+printf '{"id":"backlog-suspend-state","type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":"%s","sessionId":"%s"}}\n' "$session_file" "$session_id"
+IFS= read -r entries
+printf '%s\n' '{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"work"}}],"leafId":"leaf"}}'
+while IFS= read -r ignored; do :; done
 `)
 
 	command := exec.Command(binary, "run", "--repo-dir", repository, "--state-dir", stateDir,
@@ -197,15 +238,18 @@ while :; do sleep 1; done
 	}
 	if err := command.Wait(); err != nil {
 		var exitError *exec.ExitError
-		if !errors.As(err, &exitError) {
+		if !errors.As(err, &exitError) || exitError.ExitCode() != 143 {
 			t.Fatalf("compiled SIGTERM run: %v, output = %q", err, output.String())
 		}
+	} else {
+		t.Fatal("compiled SIGTERM run exited zero, want 143")
 	}
 	current, err := (state.FileStore{Path: statePath}).Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(current.Runs) != 1 || current.Runs[0].Status != scheduler.StatusFailed || len(current.Leases) != 1 {
+	if len(current.Runs) != 1 || current.Runs[0].Status != scheduler.StatusSuspended || current.Runs[0].Continuation == nil ||
+		current.Runs[0].PID != 0 || len(current.Leases) != 1 {
 		t.Fatalf("persisted state after SIGTERM = %#v", current)
 	}
 	if strings.Contains(output.String(), "Drain:") {

@@ -370,6 +370,47 @@ func TestFileStorePersistsRPCSessionIdentityAndRequiresItsStorage(t *testing.T) 
 	}
 }
 
+func TestFileStorePersistsOnlyVerifiedStoppedSuspension(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store := FileStore{Path: filepath.Join(root, "state.json")}
+	verifiedAt := time.Date(2026, 7, 23, 1, 2, 3, 0, time.UTC)
+	run := scheduler.Run{
+		Issue: 8, RunID: "run-8", Status: scheduler.StatusSuspended, WorkerMode: scheduler.WorkerModeRPC,
+		Branch: "agent/issue-8-run-8", Worktree: filepath.Join(root, "worktree"),
+		SessionID: "backlog-run-8", SessionDir: filepath.Join(root, "sessions", "run-8"),
+		Continuation: &scheduler.ContinuationBoundary{
+			SessionID: "backlog-run-8", SessionFile: filepath.Join(root, "sessions", "run-8", "session.jsonl"),
+			Worktree: filepath.Join(root, "worktree"), LeafID: "leaf", EntryCount: 3, SHA256: strings.Repeat("a", 64), VerifiedAt: verifiedAt,
+		},
+	}
+	value := State{Version: CurrentVersion, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: "run-8", Issue: 8, RunID: "run-8"}}}
+	if err := store.Save(value); err != nil {
+		t.Fatalf("save suspended Run: %v", err)
+	}
+	got, err := store.Load()
+	if err != nil || got.Runs[0].Continuation == nil || got.Runs[0].Continuation.LeafID != "leaf" || len(got.Leases) != 1 {
+		t.Fatalf("loaded suspension = %#v, err = %v", got, err)
+	}
+
+	invalid := value
+	invalid.Runs = append([]scheduler.Run(nil), value.Runs...)
+	invalid.Runs[0].PID = 1234
+	invalid.Runs[0].ProcessIdentity = "identity"
+	if err := store.Save(invalid); err == nil || !strings.Contains(err.Error(), "verified stopped continuation") {
+		t.Fatalf("live suspended Run error = %v", err)
+	}
+	invalid = value
+	invalid.Runs = append([]scheduler.Run(nil), value.Runs...)
+	boundary := *invalid.Runs[0].Continuation
+	boundary.SessionFile = filepath.Join(root, "outside.jsonl")
+	invalid.Runs[0].Continuation = &boundary
+	if err := store.Save(invalid); err == nil || !strings.Contains(err.Error(), "outside its session directory") {
+		t.Fatalf("outside continuation path error = %v", err)
+	}
+}
+
 func TestFileStoreRejectsRunningLeaseWithoutStartIdentity(t *testing.T) {
 	t.Parallel()
 

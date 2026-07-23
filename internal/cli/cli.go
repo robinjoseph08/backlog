@@ -60,6 +60,10 @@ func MainWithSignals(ctx context.Context, args []string, stdout, stderr io.Write
 		return 0
 	}
 	if err != nil {
+		var signalExit *runner.SignalExit
+		if errors.As(err, &signalExit) {
+			return signalExit.Code
+		}
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
 	}

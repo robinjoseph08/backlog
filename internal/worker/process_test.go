@@ -2,6 +2,9 @@ package worker
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -449,6 +452,270 @@ wait "$child"
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("descendant pid %d survived process-group escalation; leader exit code %d", childPID, result.ExitCode)
+}
+
+func TestProcessSuspendVerifiesAndSyncsContinuationBoundary(t *testing.T) {
+	root := t.TempDir()
+	worktree := filepath.Join(root, "worktree")
+	sessionDir := filepath.Join(root, "sessions")
+	sessionFile := filepath.Join(sessionDir, "session.jsonl")
+	started := filepath.Join(root, "started")
+	if err := os.MkdirAll(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	header := `{"type":"session","version":3,"id":"backlog-run-50","timestamp":"2026-07-23T00:00:00Z","cwd":` + strconv.Quote(worktree) + `}`
+	entries := []string{
+		`{"type":"message","id":"user","parentId":null,"timestamp":"2026-07-23T00:00:01Z","message":{"role":"user","content":"work"}}`,
+		`{"type":"message","id":"assistant","parentId":"user","timestamp":"2026-07-23T00:00:02Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"tool-1","name":"bash","arguments":{}}],"stopReason":"toolUse"}}`,
+		`{"type":"message","id":"result","parentId":"assistant","timestamp":"2026-07-23T00:00:03Z","message":{"role":"toolResult","toolCallId":"tool-1","toolName":"bash","content":[{"type":"text","text":"done"}],"isError":false}}`,
+	}
+	entriesJSON := "[" + strings.Join(entries, ",") + "]"
+	pi := fakePi(t, `
+IFS= read -r prompt
+touch `+shellQuote(started)+`
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"tool_execution_start","toolCallId":"tool-1"}'
+IFS= read -r abort
+printf '%s\n' `+shellQuote(header)+` `+shellQuote(entries[0])+` `+shellQuote(entries[1])+` `+shellQuote(entries[2])+` > `+shellQuote(sessionFile)+`
+printf '%s\n' '{"id":"backlog-suspend-abort","type":"response","command":"abort","success":true}' '{"type":"tool_execution_end","toolCallId":"tool-1"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+IFS= read -r state
+printf '%s\n' '{"id":"backlog-suspend-state","type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":`+strings.ReplaceAll(strconv.Quote(sessionFile), `'`, `\'`)+`,"sessionId":"backlog-run-50"}}'
+IFS= read -r get_entries
+printf '%s\n' '{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":`+entriesJSON+`,"leafId":"result"}}'
+while IFS= read -r ignored; do :; done
+`)
+	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(
+		context.Background(), request(50, "run-50", worktree, sessionDir),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatal(err)
+	}
+	waitForPath(t, started)
+	boundary, err := process.Suspend(context.Background(), ContinuationRequest{
+		SessionID: "backlog-run-50", SessionDir: sessionDir, Worktree: worktree,
+	})
+	if err != nil {
+		t.Fatalf("suspend: %v", err)
+	}
+	expectedHash := sha256.Sum256([]byte(header + "\n" + strings.Join(entries, "\n") + "\n"))
+	if boundary.SessionFile != sessionFile || boundary.LeafID != "result" || boundary.EntryCount != 3 || boundary.SHA256 != hex.EncodeToString(expectedHash[:]) {
+		t.Fatalf("boundary = %#v", boundary)
+	}
+	if result := process.CloseContext(context.Background(), nil); !result.GroupExited || result.Err != nil {
+		t.Fatalf("close = %#v", result)
+	}
+}
+
+func TestProcessSuspendRequiresCorrelatedAbortResponseAndCompleteToolTail(t *testing.T) {
+	tests := []struct {
+		name      string
+		abortLine string
+		want      string
+	}{
+		{name: "mismatched abort response", abortLine: `{"id":"wrong","type":"response","command":"abort","success":true}`, want: "unexpected or mismatched"},
+		{name: "rejected correlated abort", abortLine: `{"id":"backlog-suspend-abort","type":"response","command":"abort","success":false,"error":"not active"}`, want: "not active"},
+		{name: "missing tool result", abortLine: `{"id":"backlog-suspend-abort","type":"response","command":"abort","success":true}`, want: "without durable results"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			worktree := filepath.Join(root, "worktree")
+			sessionDir := filepath.Join(root, "sessions")
+			sessionFile := filepath.Join(sessionDir, "session.jsonl")
+			started := filepath.Join(root, "started")
+			if err := os.MkdirAll(worktree, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			header := `{"type":"session","version":3,"id":"backlog-run-51","cwd":` + strconv.Quote(worktree) + `}`
+			entry := `{"type":"message","id":"assistant","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"tool-1"}]}}`
+			pi := fakePi(t, `
+IFS= read -r prompt
+touch `+shellQuote(started)+`
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
+IFS= read -r abort
+printf '%s\n' `+shellQuote(header)+` `+shellQuote(entry)+` > `+shellQuote(sessionFile)+`
+printf '%s\n' `+shellQuote(test.abortLine)+` '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+IFS= read -r state
+printf '%s\n' '{"id":"backlog-suspend-state","type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":`+strings.ReplaceAll(strconv.Quote(sessionFile), `'`, `\'`)+`,"sessionId":"backlog-run-51"}}'
+IFS= read -r entries
+printf '%s\n' '{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[`+entry+`],"leafId":"assistant"}}'
+while IFS= read -r ignored; do :; done
+`)
+			process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(
+				context.Background(), request(51, "run-51", worktree, sessionDir),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := process.Release(); err != nil {
+				t.Fatal(err)
+			}
+			waitForPath(t, started)
+			ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+			_, suspendErr := process.Suspend(ctx, ContinuationRequest{SessionID: "backlog-run-51", SessionDir: sessionDir, Worktree: worktree})
+			cancel()
+			if suspendErr == nil || !strings.Contains(suspendErr.Error(), test.want) {
+				t.Fatalf("suspend error = %v, want %q", suspendErr, test.want)
+			}
+			_ = process.Abort()
+			_ = process.Close()
+		})
+	}
+}
+
+func TestProcessSuspendRejectsIncompleteIdleStateAndWrongSession(t *testing.T) {
+	tests := []struct {
+		name        string
+		stateData   func(string) string
+		settleEvent string
+		want        string
+	}{
+		{name: "missing streaming field", stateData: func(path string) string {
+			return `{"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(path) + `,"sessionId":"backlog-run-52"}`
+		}, settleEvent: `{"type":"agent_settled"}`, want: "omitted required idle fields"},
+		{name: "null compaction field", stateData: func(path string) string {
+			return `{"isStreaming":false,"isCompacting":null,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(path) + `,"sessionId":"backlog-run-52"}`
+		}, settleEvent: `{"type":"agent_settled"}`, want: "omitted required idle fields"},
+		{name: "streaming", stateData: func(path string) string {
+			return `{"isStreaming":true,"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(path) + `,"sessionId":"backlog-run-52"}`
+		}, settleEvent: `{"type":"agent_settled"}`, want: "not idle"},
+		{name: "compacting", stateData: func(path string) string {
+			return `{"isStreaming":false,"isCompacting":true,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(path) + `,"sessionId":"backlog-run-52"}`
+		}, settleEvent: `{"type":"agent_settled"}`, want: "not idle"},
+		{name: "pending messages", stateData: func(path string) string {
+			return `{"isStreaming":false,"isCompacting":false,"pendingMessageCount":1,"sessionFile":` + strconv.Quote(path) + `,"sessionId":"backlog-run-52"}`
+		}, settleEvent: `{"type":"agent_settled"}`, want: "not idle"},
+		{name: "wrong session", stateData: func(path string) string {
+			return `{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(path) + `,"sessionId":"another-session"}`
+		}, settleEvent: `{"type":"agent_settled"}`, want: "does not match"},
+		{name: "missing settlement", stateData: func(path string) string {
+			return `{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(path) + `,"sessionId":"backlog-run-52"}`
+		}, want: "deadline exceeded"},
+		{name: "open tool activity", stateData: func(path string) string {
+			return `{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(path) + `,"sessionId":"backlog-run-52"}`
+		}, settleEvent: `{"type":"tool_execution_start","toolCallId":"open"}` + "\n" + `{"type":"agent_settled"}`, want: "tool_execution_start"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			worktree := filepath.Join(root, "worktree")
+			sessionDir := filepath.Join(root, "sessions")
+			sessionFile := filepath.Join(sessionDir, "session.jsonl")
+			started := filepath.Join(root, "started")
+			if err := os.MkdirAll(worktree, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			header := `{"type":"session","id":"backlog-run-52","cwd":` + strconv.Quote(worktree) + `}`
+			entry := `{"type":"message","id":"user","parentId":null,"message":{"role":"user","content":"work"}}`
+			stateResponse := `{"id":"backlog-suspend-state","type":"response","command":"get_state","success":true,"data":` + test.stateData(sessionFile) + `}`
+			settleCommands := ""
+			for _, event := range strings.Split(test.settleEvent, "\n") {
+				if event != "" {
+					settleCommands += "printf '%s\\n' " + shellQuote(event) + "\n"
+				}
+			}
+			pi := fakePi(t, `
+IFS= read -r prompt
+touch `+shellQuote(started)+`
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
+IFS= read -r abort
+printf '%s\n' `+shellQuote(header)+` `+shellQuote(entry)+` > `+shellQuote(sessionFile)+`
+printf '%s\n' '{"id":"backlog-suspend-abort","type":"response","command":"abort","success":true}' '{"type":"turn_end"}' '{"type":"agent_end"}'
+`+settleCommands+`
+IFS= read -r state
+printf '%s\n' `+shellQuote(stateResponse)+`
+IFS= read -r entries
+printf '%s\n' '{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[`+entry+`],"leafId":"user"}}'
+while IFS= read -r ignored; do :; done
+`)
+			process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(context.Background(), request(52, "run-52", worktree, sessionDir))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := process.Release(); err != nil {
+				t.Fatal(err)
+			}
+			waitForPath(t, started)
+			ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+			_, suspendErr := process.Suspend(ctx, ContinuationRequest{SessionID: "backlog-run-52", SessionDir: sessionDir, Worktree: worktree})
+			cancel()
+			if suspendErr == nil || !strings.Contains(suspendErr.Error(), test.want) {
+				t.Fatalf("suspend error = %v, want %q", suspendErr, test.want)
+			}
+			_ = process.Abort()
+			_ = process.Close()
+		})
+	}
+}
+
+func TestVerifySessionBoundaryRejectsPathIdentityAndEntryMismatches(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "sessions")
+	outsideDir := filepath.Join(root, "outside")
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outsideDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(outsideDir, "session.jsonl")
+	if err := os.WriteFile(outside, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifySessionPath(sessionDir, outside); err == nil || !strings.Contains(err.Error(), "outside") {
+		t.Fatalf("outside path error = %v", err)
+	}
+	link := filepath.Join(sessionDir, "linked.jsonl")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifySessionPath(sessionDir, link); err == nil || !strings.Contains(err.Error(), "resolved") {
+		t.Fatalf("symlink path error = %v", err)
+	}
+
+	worktree := filepath.Join(root, "worktree")
+	sessionFile := filepath.Join(sessionDir, "session.jsonl")
+	header := `{"type":"session","id":"session-1","cwd":` + strconv.Quote(worktree) + `}`
+	diskEntry := `{"type":"message","id":"leaf","parentId":null,"value":9007199254740992,"message":{"role":"user"}}`
+	if err := os.WriteFile(sessionFile, []byte(header+"\n"+diskEntry+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	expected := ContinuationRequest{SessionID: "session-1", SessionDir: sessionDir, Worktree: worktree}
+	syncCalls := []string{}
+	syncFile := func(file *os.File) error {
+		syncCalls = append(syncCalls, file.Name())
+		return nil
+	}
+	if _, err := verifyAndSyncSession(sessionFile, expected, []json.RawMessage{json.RawMessage(diskEntry)}, "leaf", syncFile); err != nil {
+		t.Fatalf("valid boundary: %v", err)
+	}
+	if len(syncCalls) != 2 || syncCalls[0] != sessionFile || syncCalls[1] != sessionDir {
+		t.Fatalf("sync calls = %v, want file then directory", syncCalls)
+	}
+	if _, err := verifyAndSyncSession(sessionFile, expected, []json.RawMessage{json.RawMessage(strings.Replace(diskEntry, "9007199254740992", "9007199254740993", 1))}, "leaf", syncFile); err == nil || !strings.Contains(err.Error(), "not synchronized") {
+		t.Fatalf("large-number mismatch error = %v", err)
+	}
+	duplicate := strings.Replace(diskEntry, `"value":9007199254740992`, `"value":9007199254740992,"value":9007199254740992`, 1)
+	if _, err := verifyAndSyncSession(sessionFile, expected, []json.RawMessage{json.RawMessage(duplicate)}, "leaf", syncFile); err == nil || !strings.Contains(err.Error(), "duplicate key") {
+		t.Fatalf("duplicate-key error = %v", err)
+	}
+	syncFailure := errors.New("sync failed")
+	if _, err := verifyAndSyncSession(sessionFile, expected, []json.RawMessage{json.RawMessage(diskEntry)}, "leaf", func(*os.File) error { return syncFailure }); !errors.Is(err, syncFailure) {
+		t.Fatalf("sync failure = %v", err)
+	}
+}
+
+func waitForPath(t *testing.T, path string) {
+	t.Helper()
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("path %s was not created", path)
 }
 
 func TestProcessExplicitlyRejectsProjectTrustWhenApprovalIsDisabled(t *testing.T) {
