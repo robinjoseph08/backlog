@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -25,6 +26,7 @@ type Config struct {
 	PollInterval        time.Duration
 	MaxWorkerAge        time.Duration
 	Watch               bool
+	SessionsDir         string
 }
 
 type GitHub interface {
@@ -49,6 +51,7 @@ type WorkerProcess interface {
 	Release() error
 	Abort() error
 	Wait() worker.Result
+	Close() worker.Result
 }
 
 type Workers interface {
@@ -139,10 +142,34 @@ func (r *Runner) Run(ctx context.Context) error {
 
 		select {
 		case completion := <-completions:
-			delete(localWorkers, completion.issue)
+			process := localWorkers[completion.issue]
+			if process == nil {
+				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after an unknown worker completion; worktree retained")
+				return errors.Join(fmt.Errorf("worker completed for unowned issue #%d", completion.issue), shutdownErr)
+			}
+			if !completion.result.Settled {
+				if completion.result.StreamErr == nil {
+					completion.result.StreamErr = errors.New("Pi RPC worker ended without agent_settled")
+					completion.result.Err = errors.Join(completion.result.Err, completion.result.StreamErr)
+				}
+				if err := process.Abort(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+					completion.result.Err = errors.Join(completion.result.Err, fmt.Errorf("stop invalid Pi RPC worker: %w", err))
+				}
+			}
 			if err := r.handleWorkerCompletion(ctx, &current, completion); err != nil {
+				_ = process.Abort()
+				_ = process.Close()
+				delete(localWorkers, completion.issue)
 				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after a completion error; worktree retained")
 				return errors.Join(err, shutdownErr)
+			}
+			// Reconciliation and its durable state write happen while the idle RPC
+			// process is still alive. EOF is sent only after that write succeeds.
+			closed := process.Close()
+			delete(localWorkers, completion.issue)
+			if closed.Err != nil && completion.result.Settled {
+				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after an RPC shutdown error; worktree retained")
+				return errors.Join(fmt.Errorf("close issue #%d Pi RPC worker: %w", completion.issue, closed.Err), shutdownErr)
 			}
 		case <-poll.C:
 			if err := r.reconcile(ctx, &current, localWorkers); err != nil {
@@ -156,7 +183,7 @@ func (r *Runner) Run(ctx context.Context) error {
 }
 
 func (r *Runner) validate() error {
-	if r.Config.Repo == "" || r.Config.DefaultBranch == "" {
+	if r.Config.Repo == "" || r.Config.DefaultBranch == "" || r.Config.SessionsDir == "" {
 		return errors.New("runner repository configuration is incomplete")
 	}
 	if r.Config.MaxConcurrentIssues <= 0 {
@@ -206,8 +233,9 @@ func (r *Runner) start(ctx context.Context, workerCtx context.Context, current *
 	now := r.Now().UTC()
 	runID := r.NewRunID(candidate.Number)
 	run := scheduler.Run{
-		Issue: candidate.Number, RunID: runID, Status: scheduler.StatusClaimed, WorkerMode: scheduler.WorkerModePrint,
-		SessionName: fmt.Sprintf("afk #%d", candidate.Number), StartedAt: now, UpdatedAt: now,
+		Issue: candidate.Number, RunID: runID, Status: scheduler.StatusClaimed, WorkerMode: scheduler.WorkerModeRPC,
+		SessionName: fmt.Sprintf("afk #%d", candidate.Number), SessionID: "backlog-" + runID,
+		SessionDir: filepath.Join(r.Config.SessionsDir, runID), StartedAt: now, UpdatedAt: now,
 	}
 	current.Runs = append(current.Runs, run)
 	current.Leases = append(current.Leases, scheduler.Lease{LeaseID: runID, Issue: candidate.Number, RunID: runID})
@@ -243,6 +271,7 @@ func (r *Runner) start(ctx context.Context, workerCtx context.Context, current *
 
 	process, err := r.Workers.Start(workerCtx, worker.Request{
 		Issue: candidate.Number, RunID: runID, Worktree: assignment.Path, SessionName: run.SessionName,
+		SessionID: run.SessionID, SessionDir: run.SessionDir,
 	})
 	if err != nil {
 		r.failRun(current, candidate.Number, fmt.Sprintf("start Pi worker: %v", err))
@@ -251,7 +280,7 @@ func (r *Runner) start(ctx context.Context, workerCtx context.Context, current *
 	identity, err := r.PIDIdentity(process.PID())
 	if err != nil {
 		_ = process.Abort()
-		_ = process.Wait()
+		_ = process.Close()
 		r.failRun(current, candidate.Number, fmt.Sprintf("record Pi worker identity: %v", err))
 		return nil, r.saveAfterFailure(*current, candidate.Number)
 	}
@@ -263,7 +292,7 @@ func (r *Runner) start(ctx context.Context, workerCtx context.Context, current *
 	replaceRun(current, run)
 	if err := r.Store.Save(*current); err != nil {
 		_ = process.Abort()
-		_ = process.Wait()
+		_ = process.Close()
 		r.failRun(current, candidate.Number, fmt.Sprintf("persist worker identity before release: %v", err))
 		persistErr := r.Store.Save(*current)
 		return nil, errors.Join(
@@ -273,7 +302,7 @@ func (r *Runner) start(ctx context.Context, workerCtx context.Context, current *
 	}
 	if err := process.Release(); err != nil {
 		_ = process.Abort()
-		_ = process.Wait()
+		_ = process.Close()
 		r.failRun(current, candidate.Number, fmt.Sprintf("release Pi worker: %v", err))
 		return nil, r.saveAfterFailure(*current, candidate.Number)
 	}
@@ -291,7 +320,7 @@ func (r *Runner) handleWorkerCompletion(ctx context.Context, current *state.Stat
 		r.needsHuman(current, run.Issue, fmt.Sprintf("verify worker outcome: %v", err))
 	} else {
 		if completion.result.StreamErr != nil && outcome.Merged && outcome.IssueClosed {
-			r.needsHuman(current, run.Issue, fmt.Sprintf("GitHub completion verified but Pi event stream was invalid; worktree retained: %v", completion.result.StreamErr))
+			r.needsHuman(current, run.Issue, fmt.Sprintf("GitHub completion verified but Pi RPC stream was invalid; worktree retained: %v", completion.result.StreamErr))
 			updated := findActiveRun(current, run.Issue)
 			updated.PullRequest = outcome.PullRequest
 			replaceRun(current, updated)
@@ -472,6 +501,12 @@ func (r *Runner) shutdownOwned(
 	}
 	for range issues {
 		completion := <-completions
+		if process := local[completion.issue]; process != nil {
+			closed := process.Close()
+			if closed.Err != nil && !errors.Is(closed.Err, context.Canceled) {
+				shutdownErrors = append(shutdownErrors, fmt.Errorf("close issue #%d worker: %w", completion.issue, closed.Err))
+			}
+		}
 		delete(local, completion.issue)
 	}
 	for _, issue := range issues {

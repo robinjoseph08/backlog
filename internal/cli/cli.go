@@ -119,6 +119,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		Config: runner.Config{
 			Repo: repository.Slug, DefaultBranch: repository.DefaultBranch,
 			MaxConcurrentIssues: *maxWorkers, PollInterval: *poll, MaxWorkerAge: *maxWorkerAge, Watch: *watch,
+			SessionsDir: filepath.Join(resolvedStateDir, "sessions"),
 		},
 		GitHub:    github,
 		Store:     state.FileStore{Path: filepath.Join(resolvedStateDir, "state.json")},

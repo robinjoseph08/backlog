@@ -65,7 +65,7 @@ func TestRunnerRetainsMergedWorkWhenPiEventStreamIsMalformed(t *testing.T) {
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 9)
 	github.setCompletion(9, mergedOutcome(9))
-	streamErr := errors.New("malformed Pi JSON on line 2")
+	streamErr := errors.New("malformed Pi RPC JSON on line 2")
 	workers.complete(9, worker.Result{ExitCode: 0, StreamErr: streamErr, Err: streamErr})
 	if err := <-done; err != nil {
 		t.Fatalf("run: %v", err)
@@ -370,7 +370,7 @@ func TestRunnerReconcilesOnlyTheLeasedRunWhenIssueHasHistory(t *testing.T) {
 
 func testRunner(github *fakeGitHub, workers *fakeWorkers, store *memoryStore, max int) *Runner {
 	return &Runner{
-		Config:      Config{Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: max, PollInterval: 5 * time.Millisecond},
+		Config:      Config{Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: max, PollInterval: 5 * time.Millisecond, SessionsDir: "/tmp/backlog-sessions"},
 		GitHub:      github,
 		Store:       store,
 		Worktrees:   &fakeWorktrees{},
@@ -513,9 +513,11 @@ func (p *fakeProcess) Abort() error {
 	return nil
 }
 func (p *fakeProcess) Wait() worker.Result {
-	result := <-p.done
+	return <-p.done
+}
+func (p *fakeProcess) Close() worker.Result {
 	p.owner.finished(p.issue)
-	return result
+	return worker.Result{}
 }
 
 type fakeWorkers struct {
@@ -548,6 +550,9 @@ func (w *fakeWorkers) complete(issue int, result worker.Result) {
 	w.mu.Lock()
 	process := w.processes[issue]
 	w.mu.Unlock()
+	if result.Err == nil && result.StreamErr == nil {
+		result.Settled = true
+	}
 	process.done <- result
 }
 func (w *fakeWorkers) finished(int) {

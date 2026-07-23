@@ -19,7 +19,10 @@ const (
 
 type WorkerMode string
 
-const WorkerModePrint WorkerMode = "print"
+const (
+	WorkerModePrint WorkerMode = "print"
+	WorkerModeRPC   WorkerMode = "rpc"
+)
 
 type Blocker struct {
 	Owner  string `json:"owner,omitempty"`
@@ -47,6 +50,8 @@ type Run struct {
 	Branch          string     `json:"branch,omitempty"`
 	Worktree        string     `json:"worktree,omitempty"`
 	SessionName     string     `json:"sessionName,omitempty"`
+	SessionID       string     `json:"sessionId,omitempty"`
+	SessionDir      string     `json:"sessionDir,omitempty"`
 	LogPath         string     `json:"logPath,omitempty"`
 	StderrPath      string     `json:"stderrPath,omitempty"`
 	PullRequest     string     `json:"pullRequest,omitempty"`

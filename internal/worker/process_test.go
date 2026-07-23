@@ -12,24 +12,47 @@ import (
 	"time"
 )
 
-func TestProcessStartsNamedPersistentAFKSessionInWorktree(t *testing.T) {
+func TestProcessRejectsIncompleteRPCSessionAndUncreatableStorage(t *testing.T) {
+	t.Parallel()
+
+	supervisor := Supervisor{Executable: "/does/not/matter", LogsDir: t.TempDir()}
+	if _, err := supervisor.Start(context.Background(), Request{Issue: 5}); err == nil || !strings.Contains(err.Error(), "incomplete") {
+		t.Fatalf("incomplete request error = %v", err)
+	}
+	root := t.TempDir()
+	blocked := filepath.Join(root, "blocked")
+	if err := os.WriteFile(blocked, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	req := request(5, "run-5", root, filepath.Join(blocked, "run-5"))
+	if _, err := supervisor.Start(context.Background(), req); err == nil || !strings.Contains(err.Error(), "create Pi session directory") {
+		t.Fatalf("session storage error = %v", err)
+	}
+}
+
+func TestProcessStartsDeterministicPersistentRPCSessionInWorktree(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
 	argsPath := filepath.Join(root, "args")
 	cwdPath := filepath.Join(root, "cwd")
+	inputPath := filepath.Join(root, "input")
 	pi := fakePi(t, `
 printf '%s\n' "$*" > `+shellQuote(argsPath)+`
 pwd > `+shellQuote(cwdPath)+`
-printf '%s\n' '{"type":"session"}' '{"type":"agent_start"}' '{"type":"agent_settled"}'
+IFS= read -r command
+printf '%s\n' "$command" > `+shellQuote(inputPath)+`
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+while IFS= read -r ignored; do :; done
 echo 'diagnostic' >&2
 `)
 	worktree := filepath.Join(root, "worktree")
+	sessionDir := filepath.Join(root, "sessions", "run-42")
 	if err := os.Mkdir(worktree, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs"), Approve: true}).Start(
-		context.Background(), Request{Issue: 42, RunID: "run-42", Worktree: worktree, SessionName: "afk #42"},
+		context.Background(), request(42, "run-42", worktree, sessionDir),
 	)
 	if err != nil {
 		t.Fatalf("start: %v", err)
@@ -43,19 +66,33 @@ echo 'diagnostic' >&2
 	if err := process.Release(); err != nil {
 		t.Fatalf("release: %v", err)
 	}
-	result := process.Wait()
+	settled := process.Wait()
+	if settled.Err != nil || !settled.Settled {
+		t.Fatalf("wait = %#v", settled)
+	}
+	if _, err := os.Stat(filepath.Join(root, "args")); err != nil {
+		t.Fatalf("Pi was not alive at settlement: %v", err)
+	}
+	result := process.Close()
 	if result.Err != nil || result.ExitCode != 0 {
-		t.Fatalf("wait = %#v", result)
+		t.Fatalf("close = %#v", result)
 	}
 
 	args, _ := os.ReadFile(argsPath)
-	wantArgs := `--mode json -p --approve --name afk #42 /skill:afk 42`
+	wantArgs := `--mode rpc --approve --name afk #42 --session-dir ` + sessionDir + ` --session-id backlog-run-42`
 	if strings.TrimSpace(string(args)) != wantArgs {
 		t.Fatalf("args = %q, want %q", strings.TrimSpace(string(args)), wantArgs)
+	}
+	input, _ := os.ReadFile(inputPath)
+	if strings.TrimSpace(string(input)) != `{"id":"backlog-afk-prompt","type":"prompt","message":"/skill:afk 42"}` {
+		t.Fatalf("RPC input = %q", input)
 	}
 	cwd, _ := os.ReadFile(cwdPath)
 	if strings.TrimSpace(string(cwd)) != worktree {
 		t.Fatalf("cwd = %q, want %q", strings.TrimSpace(string(cwd)), worktree)
+	}
+	if info, err := os.Stat(sessionDir); err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("session directory mode = %v, err = %v", info.Mode().Perm(), err)
 	}
 	stdout, err := os.ReadFile(result.LogPath)
 	if err != nil || !strings.Contains(string(stdout), `"agent_settled"`) {
@@ -67,17 +104,21 @@ echo 'diagnostic' >&2
 	}
 }
 
-func TestProcessCannotRunPiUntilReleased(t *testing.T) {
+func TestProcessCannotSubmitPromptUntilReleased(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
 	marker := filepath.Join(root, "started")
+	input := filepath.Join(root, "input")
 	pi := fakePi(t, `
 printf started > `+shellQuote(marker)+`
-printf '%s\n' '{"type":"session"}' '{"type":"agent_settled"}'
+IFS= read -r command
+printf '%s' "$command" > `+shellQuote(input)+`
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+while IFS= read -r ignored; do :; done
 `)
 	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(
-		context.Background(), Request{Issue: 5, RunID: "run-5", Worktree: root, SessionName: "afk #5"},
+		context.Background(), request(5, "run-5", root, filepath.Join(root, "sessions", "run-5")),
 	)
 	if err != nil {
 		t.Fatalf("start: %v", err)
@@ -86,14 +127,119 @@ printf '%s\n' '{"type":"session"}' '{"type":"agent_settled"}'
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("Pi ran before durable release, stat error = %v", err)
 	}
+	if _, err := os.Stat(input); !os.IsNotExist(err) {
+		t.Fatalf("prompt was submitted before release, stat error = %v", err)
+	}
 	if err := process.Release(); err != nil {
 		t.Fatalf("release: %v", err)
 	}
-	if result := process.Wait(); result.Err != nil {
-		t.Fatalf("wait: %v", result.Err)
+	if result := process.Wait(); result.Err != nil || !result.Settled {
+		t.Fatalf("wait: %#v", result)
 	}
-	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("Pi did not run after release: %v", err)
+	if result := process.Close(); result.Err != nil {
+		t.Fatalf("close: %v", result.Err)
+	}
+	if _, err := os.Stat(input); err != nil {
+		t.Fatalf("prompt was not submitted after release: %v", err)
+	}
+}
+
+func TestProcessRPCValidationFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		output string
+		want   string
+	}{
+		{"malformed", "not-json\\n", "malformed Pi RPC JSON"},
+		{"truncated", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}`, "truncated Pi RPC JSON"},
+		{"duplicate response", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n`, "duplicated Pi RPC prompt response"},
+		{"mismatched response", `{"id":"wrong","type":"response","command":"prompt","success":true}\n`, "mismatched Pi RPC response"},
+		{"invalid order", `{"type":"agent_settled"}\n`, "invalidly ordered Pi RPC agent_settled"},
+		{"unknown type", `{"type":"surprise"}\n`, "unknown Pi RPC message type"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			pi := fakePi(t, `
+IFS= read -r command
+printf '`+test.output+`'
+`)
+			process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(
+				context.Background(), request(7, "run-7", root, filepath.Join(root, "sessions", "run-7")),
+			)
+			if err != nil {
+				t.Fatalf("start: %v", err)
+			}
+			if err := process.Release(); err != nil {
+				t.Fatalf("release: %v", err)
+			}
+			result := process.Wait()
+			if result.Err == nil || !strings.Contains(result.Err.Error(), test.want) {
+				t.Fatalf("wait error = %v, want containing %q", result.Err, test.want)
+			}
+			_ = process.Abort()
+			_ = process.Close()
+		})
+	}
+}
+
+func TestProcessAcceptsOnlyLFAsRecordBoundary(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	pi := fakePi(t, `
+IFS= read -r command
+printf '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true,"data":"line separator"}\r\n'
+printf '%s\n' '{"type":"agent_start"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+while IFS= read -r ignored; do :; done
+`)
+	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(
+		context.Background(), request(10, "run-10", root, filepath.Join(root, "sessions", "run-10")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if result := process.Wait(); result.Err != nil || !result.Settled {
+		t.Fatalf("strict LF parser rejected Unicode separator or CRLF: %#v", result)
+	}
+	if result := process.Close(); result.Err != nil {
+		t.Fatal(result.Err)
+	}
+}
+
+func TestCloseWaitsForTheWorkerProcessGroupToExit(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	childDone := filepath.Join(root, "child-done")
+	pi := fakePi(t, `
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+while IFS= read -r ignored; do :; done
+(sleep 0.08; touch `+shellQuote(childDone)+`) </dev/null >/dev/null 2>&1 &
+`)
+	process, err := (Supervisor{
+		Executable: pi, LogsDir: filepath.Join(root, "logs"), TerminationGrace: time.Second,
+	}).Start(context.Background(), request(12, "run-12", root, filepath.Join(root, "sessions", "run-12")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if result := process.Wait(); result.Err != nil || !result.Settled {
+		t.Fatalf("wait = %#v", result)
+	}
+	if result := process.Close(); result.Err != nil {
+		t.Fatalf("close = %#v", result)
+	}
+	if _, err := os.Stat(childDone); err != nil {
+		t.Fatalf("Close returned before a process-group child exited: %v", err)
 	}
 }
 
@@ -103,6 +249,7 @@ func TestAbortEscalatesForWorkerIgnoringTermination(t *testing.T) {
 	root := t.TempDir()
 	childPIDPath := filepath.Join(root, "child.pid")
 	pi := fakePi(t, `
+IFS= read -r command
 sh -c 'trap "" TERM; while :; do sleep 1; done' &
 child=$!
 printf '%s\n' "$child" > `+shellQuote(childPIDPath)+`
@@ -111,7 +258,7 @@ wait "$child"
 `)
 	process, err := (Supervisor{
 		Executable: pi, LogsDir: filepath.Join(root, "logs"), TerminationGrace: 30 * time.Millisecond,
-	}).Start(context.Background(), Request{Issue: 6, RunID: "run-6", Worktree: root, SessionName: "afk #6"})
+	}).Start(context.Background(), request(6, "run-6", root, filepath.Join(root, "sessions", "run-6")))
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -130,7 +277,7 @@ wait "$child"
 	if err := process.Abort(); err != nil {
 		t.Fatalf("abort: %v", err)
 	}
-	result := process.Wait()
+	result := process.Close()
 	if time.Since(started) > time.Second {
 		t.Fatalf("abort took %s, want bounded escalation", time.Since(started))
 	}
@@ -154,10 +301,12 @@ func TestProcessExplicitlyRejectsProjectTrustWhenApprovalIsDisabled(t *testing.T
 	argsPath := filepath.Join(root, "args")
 	pi := fakePi(t, `
 printf '%s\n' "$*" > `+shellQuote(argsPath)+`
-printf '%s\n' '{"type":"session"}' '{"type":"agent_settled"}'
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+while IFS= read -r ignored; do :; done
 `)
 	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs"), Approve: false}).Start(
-		context.Background(), Request{Issue: 8, RunID: "run-8", Worktree: root, SessionName: "afk #8"},
+		context.Background(), request(8, "run-8", root, filepath.Join(root, "sessions", "run-8")),
 	)
 	if err != nil {
 		t.Fatalf("start: %v", err)
@@ -168,31 +317,19 @@ printf '%s\n' '{"type":"session"}' '{"type":"agent_settled"}'
 	if result := process.Wait(); result.Err != nil {
 		t.Fatalf("wait: %v", result.Err)
 	}
+	if result := process.Close(); result.Err != nil {
+		t.Fatalf("close: %v", result.Err)
+	}
 	args, _ := os.ReadFile(argsPath)
 	if !strings.Contains(string(args), "--no-approve") || strings.Contains(string(args), " --approve") {
 		t.Fatalf("args = %q, want --no-approve only", strings.TrimSpace(string(args)))
 	}
 }
 
-func TestProcessFailsSafelyOnMalformedJSONOutput(t *testing.T) {
-	t.Parallel()
-
-	pi := fakePi(t, `
-printf '%s\n' '{"type":"agent_start"}' 'not-json'
-`)
-	worktree := t.TempDir()
-	process, err := (Supervisor{Executable: pi, LogsDir: t.TempDir()}).Start(
-		context.Background(), Request{Issue: 7, RunID: "run-7", Worktree: worktree, SessionName: "afk #7"},
-	)
-	if err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	if err := process.Release(); err != nil {
-		t.Fatalf("release: %v", err)
-	}
-	result := process.Wait()
-	if result.Err == nil || !strings.Contains(result.Err.Error(), "malformed Pi JSON") {
-		t.Fatalf("wait error = %v, want malformed JSON failure", result.Err)
+func request(issue int, runID, worktree, sessionDir string) Request {
+	return Request{
+		Issue: issue, RunID: runID, Worktree: worktree, SessionName: "afk #" + strconv.Itoa(issue),
+		SessionID: "backlog-" + runID, SessionDir: sessionDir,
 	}
 }
 

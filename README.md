@@ -75,15 +75,11 @@ AFK repeats its own blocker check inside the worker as a final safety check.
 
 ## Worker behavior
 
-For issue `#123`, the runner invokes Pi in the issue worktree using the equivalent of:
+For issue `#123`, the runner starts Pi in RPC mode in the issue worktree using a deterministic session ID derived from the Run ID and a dedicated session directory under Backlog state. A start gate prevents Pi from opening the session or receiving the AFK prompt until the Worker PID and process-start identity are durable.
 
-```sh
-pi --mode json -p --approve --name "afk #123" "/skill:afk 123"
-```
+Backlog submits `/skill:afk 123` as a correlated RPC `prompt` command. Standard output uses strict LF-delimited JSONL and is saved separately from standard error. Malformed or truncated records, mismatched or duplicate responses, and invalid lifecycle ordering fail closed and preserve the worktree.
 
-Standard output is validated as JSONL and saved separately from standard error. A malformed event stream fails the run safely and preserves its worktree.
-
-A zero Pi exit code is not completion. The runner looks up the pull request by the run's unique branch and verifies that it merged and that the issue closed. If Pi exits cleanly while an open PR has auto-merge armed, the run waits and reconciles it periodically. Other open-PR outcomes require human attention.
+`agent_settled`, not process exit, triggers completion handling. While the idle Pi RPC process is still alive, the runner looks up the pull request by the Run's unique branch, verifies the issue state, and persists the reconciled Run. It then closes RPC input, waits for orderly process-group exit, and releases Worker capacity. An armed open pull request becomes `waiting-for-merge`; other unverified outcomes require human attention.
 
 Only verified merged runs have their worktrees and local branches removed. Failed and ambiguous runs are retained.
 
@@ -93,7 +89,7 @@ State and logs live outside the target repository. By default they are stored un
 
 State is written with same-directory temporary files, file sync, atomic rename, and directory sync. A repository-level advisory lock in the Git common directory prevents two local runner instances from scheduling the same backlog, even if they request different state paths. The first runner start, or a status command that migrates version 1 state, binds the repository to one state directory; later conflicting `--state-dir` values are rejected.
 
-State keeps historical Runs separate from active Leases. Upgrading version 1 state preserves Run metadata and artifacts, removes the obsolete paused setting, and records legacy print-mode Runs as non-resumable. During migration, incomplete and intervention-required Runs retain their Leases, while verified merged Runs remain as history without active ownership.
+State keeps historical Runs separate from active Leases. New Runs persist their RPC session identity and dedicated session storage before launch. Upgrading version 1 state preserves Run metadata and artifacts, removes the obsolete paused setting, and records legacy print-mode Runs as non-resumable. During migration, incomplete and intervention-required Runs retain their Leases, while verified merged Runs remain as history without active ownership.
 
 On restart, the runner reconciles persisted Leases with process liveness and GitHub pull request and issue state. It compares each recovered PID with its persisted operating-system process start identity, so PID reuse becomes `needs-human` instead of being mistaken for the worker. A live matching worker is never launched twice. A dead worker is verified against GitHub before being classified. Recovered workers older than `--max-worker-age` also become `needs-human`. Uncertainty becomes `needs-human`, never a new launch.
 
