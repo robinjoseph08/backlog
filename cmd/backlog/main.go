@@ -10,7 +10,11 @@ import (
 )
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	os.Exit(cli.Main(ctx, os.Args[1:], os.Stdout, os.Stderr))
+	ctx, stopTermination := signal.NotifyContext(context.Background(), syscall.SIGTERM)
+	interrupts := make(chan os.Signal, 16)
+	signal.Notify(interrupts, os.Interrupt)
+	exitCode := cli.MainWithSignals(ctx, os.Args[1:], os.Stdout, os.Stderr, interrupts)
+	signal.Stop(interrupts)
+	stopTermination()
+	os.Exit(exitCode)
 }
