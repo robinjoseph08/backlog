@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -116,7 +117,14 @@ func TestFileStoreMigratesV1WithoutLosingRunArtifacts(t *testing.T) {
     }
   ]
 }`
-	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+	var source legacyState
+	if err := json.Unmarshal([]byte(legacy), &source); err != nil {
+		t.Fatal(err)
+	}
+	for index := range source.Runs {
+		source.Runs[index].WorkerMode = scheduler.WorkerModePrint
+	}
+	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -130,15 +138,8 @@ func TestFileStoreMigratesV1WithoutLosingRunArtifacts(t *testing.T) {
 	if len(got.Runs) != 2 || len(got.Leases) != 1 {
 		t.Fatalf("migrated Runs/Leases = %d/%d, want 2/1", len(got.Runs), len(got.Leases))
 	}
-	failed := got.Runs[0]
-	if failed.WorkerMode != scheduler.WorkerModePrint || failed.PID != 4321 || failed.ProcessIdentity != "4321:identity" ||
-		failed.Branch != "agent/issue-42-legacy" || failed.Worktree != "/tmp/legacy-worktree" || failed.SessionName != "afk #42" ||
-		failed.LogPath != "/tmp/legacy.jsonl" || failed.StderrPath != "/tmp/legacy.stderr.log" ||
-		failed.PullRequest != "https://example.test/pull/42" || failed.Error != "diagnostic detail" || failed.StartedAt.IsZero() || failed.UpdatedAt.IsZero() {
-		t.Fatalf("migrated failed Run lost fields: %#v", failed)
-	}
-	if got.Runs[1].WorkerMode != scheduler.WorkerModePrint || got.Runs[1].CompletedAt == nil {
-		t.Fatalf("migrated merged Run = %#v", got.Runs[1])
+	if !reflect.DeepEqual(got.Runs, source.Runs) {
+		t.Fatalf("migrated Runs = %#v, want every source artifact preserved in %#v", got.Runs, source.Runs)
 	}
 	if lease := got.Leases[0]; lease.LeaseID != "legacy-failed" || lease.Issue != 42 || lease.RunID != "legacy-failed" {
 		t.Fatalf("migrated Lease = %#v", lease)
@@ -157,6 +158,13 @@ func TestFileStoreMigratesV1WithoutLosingRunArtifacts(t *testing.T) {
 	}
 	if _, exists := persisted["paused"]; exists {
 		t.Fatalf("obsolete paused field survived migration: %s", encoded)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("migrated state permissions = %v, want shared atomic Save permissions 0600", info.Mode().Perm())
 	}
 	if leftovers, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".state-*.tmp")); err != nil || len(leftovers) != 0 {
 		t.Fatalf("migration temporary files = %v, err = %v", leftovers, err)
@@ -256,6 +264,20 @@ func TestFileStoreRejectsInvalidRunAndLeaseReferences(t *testing.T) {
 			value: State{Version: CurrentVersion, Runs: []scheduler.Run{printRun(1, "run", scheduler.StatusFailed)},
 				Leases: []scheduler.Lease{{LeaseID: "lease", Issue: 2, RunID: "run"}}},
 			want: "does not match",
+		},
+		{
+			name:  "duplicate Run id",
+			value: State{Version: CurrentVersion, Runs: []scheduler.Run{printRun(1, "duplicate", scheduler.StatusFailed), printRun(2, "duplicate", scheduler.StatusFailed)}},
+			want:  "duplicate run id",
+		},
+		{
+			name: "duplicate Lease id",
+			value: State{Version: CurrentVersion, Runs: []scheduler.Run{
+				printRun(1, "first", scheduler.StatusFailed), printRun(2, "second", scheduler.StatusFailed),
+			}, Leases: []scheduler.Lease{
+				{LeaseID: "duplicate", Issue: 1, RunID: "first"}, {LeaseID: "duplicate", Issue: 2, RunID: "second"},
+			}},
+			want: "duplicate Lease id",
 		},
 		{
 			name: "multiple Leases for issue",

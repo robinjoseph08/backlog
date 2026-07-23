@@ -441,7 +441,17 @@ func (g *fakeGitHub) Completion(_ context.Context, _ string, issue int, branch s
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.completionBranches = append(g.completionBranches, branch)
-	return g.completions[issue], nil
+	outcome := g.completions[issue]
+	if outcome.Merged && outcome.IssueClosed {
+		remaining := g.candidates[:0]
+		for _, candidate := range g.candidates {
+			if candidate.Number != issue {
+				remaining = append(remaining, candidate)
+			}
+		}
+		g.candidates = remaining
+	}
+	return outcome, nil
 }
 func (g *fakeGitHub) setCompletion(issue int, outcome ghadapter.CompletionOutcome) {
 	g.mu.Lock()

@@ -20,6 +20,7 @@ func TestRunCommandDrainsIssueThroughFakeExecutables(t *testing.T) {
 	root := t.TempDir()
 	repository := filepath.Join(root, "repo")
 	stateDir := filepath.Join(root, "state")
+	closedMarker := filepath.Join(root, "issue-42-closed")
 	if err := os.Mkdir(repository, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +30,11 @@ case "$*" in
   "repo view --json nameWithOwner,defaultBranchRef")
     printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
   "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
-    printf '%s\n' '[{"number":42,"title":"Build it","createdAt":"2026-01-01T00:00:00Z","url":"https://github.com/acme/widgets/issues/42"}]' ;;
+    if test -f `+quote(closedMarker)+`; then
+      printf '%s\n' '[]'
+    else
+      printf '%s\n' '[{"number":42,"title":"Build it","createdAt":"2026-01-01T00:00:00Z","url":"https://github.com/acme/widgets/issues/42"}]'
+    fi ;;
   "issue view 42 --repo acme/widgets --json number,title,body,state,url,createdAt")
     printf '%s\n' '{"number":42,"title":"Build it","body":"","state":"OPEN","url":"https://github.com/acme/widgets/issues/42","createdAt":"2026-01-01T00:00:00Z"}' ;;
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/42/comments?per_page=100 --paginate --slurp")
@@ -39,6 +44,7 @@ case "$*" in
   "pr list --repo acme/widgets --state all --head agent/issue-42-"*" --json number,url,state,mergedAt,autoMergeRequest,isDraft")
     printf '%s\n' '[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"MERGED","mergedAt":"2026-01-02T00:00:00Z"}]' ;;
   "issue view 42 --repo acme/widgets --json state,title,url")
+    touch `+quote(closedMarker)+`
     printf '%s\n' '{"state":"CLOSED","title":"Build it","url":"https://github.com/acme/widgets/issues/42"}' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac

@@ -75,14 +75,14 @@ func TestPlanWaitingForMergeLeaseDoesNotConsumeWorkerCapacity(t *testing.T) {
 	}
 }
 
-func TestPlanAllowsNewRunAfterHistoricalLeaseIsReleased(t *testing.T) {
+func TestPlanAllowsNewRunWhenOnlyHistoricalRunsRemain(t *testing.T) {
 	t.Parallel()
 
 	plan := Plan(Snapshot{
 		Candidates: []Candidate{{Number: 10, CreatedAt: time.Now()}},
 		Runs: []Run{
-			{Issue: 10, RunID: "failed-1", Status: StatusFailed},
-			{Issue: 10, RunID: "failed-2", Status: StatusFailed},
+			{Issue: 10, RunID: "merged", Status: StatusMerged},
+			{Issue: 10, RunID: "failed", Status: StatusFailed},
 		},
 	}, 1)
 

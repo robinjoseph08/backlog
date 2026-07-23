@@ -73,20 +73,16 @@ type Schedule struct {
 }
 
 // Plan selects the oldest eligible candidates that fit in the available worker
-// capacity. Active Leases prevent overlapping Runs, and verified merged history
-// prevents a completed issue from being admitted again.
+// capacity. Active Leases prevent overlapping Runs, while historical Runs do
+// not prevent a reopened Candidate from being admitted again.
 func Plan(snapshot Snapshot, maxConcurrentIssues int) Schedule {
 	if maxConcurrentIssues <= 0 {
 		return Schedule{}
 	}
 
 	runsByID := make(map[string]Run, len(snapshot.Runs))
-	completedIssues := make(map[int]struct{})
 	for _, run := range snapshot.Runs {
 		runsByID[run.RunID] = run
-		if run.Status == StatusMerged {
-			completedIssues[run.Issue] = struct{}{}
-		}
 	}
 	leased := make(map[int]struct{}, len(snapshot.Leases))
 	workerCount := 0
@@ -108,9 +104,6 @@ func Plan(snapshot Snapshot, maxConcurrentIssues int) Schedule {
 			continue
 		}
 		if _, exists := leased[candidate.Number]; exists {
-			continue
-		}
-		if _, completed := completedIssues[candidate.Number]; completed {
 			continue
 		}
 		eligible = append(eligible, candidate)

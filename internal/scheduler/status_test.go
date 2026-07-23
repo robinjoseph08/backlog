@@ -2,6 +2,28 @@ package scheduler
 
 import "testing"
 
+func TestRequiresLeaseCoversEveryStatus(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		status Status
+		want   bool
+	}{
+		{StatusClaimed, true},
+		{StatusWorktreeReady, true},
+		{StatusRunning, true},
+		{StatusWaitingForMerge, true},
+		{StatusMerged, false},
+		{StatusFailed, false},
+		{StatusNeedsHuman, false},
+	}
+	for _, test := range tests {
+		if got := RequiresLease(test.status); got != test.want {
+			t.Errorf("RequiresLease(%q) = %t, want %t", test.status, got, test.want)
+		}
+	}
+}
+
 func TestRunStateTransitionsAreExplicit(t *testing.T) {
 	t.Parallel()
 
