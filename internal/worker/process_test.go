@@ -12,6 +12,23 @@ import (
 	"time"
 )
 
+func TestWorkersDoNotInheritHerdrPaneEnvironment(t *testing.T) {
+	environment := []string{
+		"PATH=/usr/bin",
+		"PWD=/old/directory",
+		"HERDR_ENV=1",
+		"HERDR_SOCKET_PATH=/tmp/herdr.sock",
+		"HERDR_PANE_ID=w1:p1",
+		"HERDR_FUTURE_STATE=must-also-be-removed",
+		"BACKLOG_TEST=preserved",
+	}
+
+	filtered := workerEnvironment(environment, "/worktree")
+	if got := strings.Join(filtered, "\n"); got != "PATH=/usr/bin\nBACKLOG_TEST=preserved\nPWD=/worktree" {
+		t.Fatalf("filtered environment = %q", got)
+	}
+}
+
 func TestProcessRejectsIncompleteRPCSessionAndUncreatableStorage(t *testing.T) {
 	t.Parallel()
 

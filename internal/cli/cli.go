@@ -17,6 +17,7 @@ import (
 	"time"
 
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
+	"github.com/robinjoseph08/backlog/internal/herdr"
 	"github.com/robinjoseph08/backlog/internal/runner"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
@@ -145,6 +146,11 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 	defer lock.Release()
 	if err := bindStateDirectory(commonDirectory, resolvedStateDir); err != nil {
 		return err
+	}
+	herdrReporter := herdr.FromEnvironment()
+	if herdrReporter.Enabled() {
+		_ = herdrReporter.Working("scheduling Runs")
+		defer func() { _ = herdrReporter.Release() }()
 	}
 
 	github := &ghadapter.Client{Executable: *ghExecutable, Dir: repositoryRoot}
