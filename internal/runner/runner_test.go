@@ -75,6 +75,32 @@ func TestRunnerRetainsMergedWorkWhenPiEventStreamIsMalformed(t *testing.T) {
 	}
 }
 
+func TestRunnerStopsInvalidWorkerBeforeGitHubReconciliation(t *testing.T) {
+	t.Parallel()
+
+	workers := newFakeWorkers()
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 6, CreatedAt: time.Now()}}}
+	github.completionCheck = func(int) error {
+		if workers.runningCount() != 0 {
+			return errors.New("GitHub reconciled while invalid Worker was alive")
+		}
+		return nil
+	}
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 6)
+	streamErr := errors.New("malformed Pi RPC JSON")
+	workers.complete(6, worker.Result{ExitCode: -1, StreamErr: streamErr, Err: streamErr})
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := store.runStatus(6); got != scheduler.StatusFailed {
+		t.Fatalf("issue 6 status = %q, want failed after stopped-Worker reconciliation", got)
+	}
+}
+
 func TestRunnerFailsClosedWhenGitHubReconciliationFails(t *testing.T) {
 	t.Parallel()
 
@@ -559,6 +585,7 @@ type fakeGitHub struct {
 	candidates         []scheduler.Candidate
 	completions        map[int]ghadapter.CompletionOutcome
 	completionErrs     map[int]error
+	completionCheck    func(int) error
 	completionBranches []string
 }
 
@@ -571,6 +598,11 @@ func (g *fakeGitHub) Completion(_ context.Context, _ string, issue int, branch s
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.completionBranches = append(g.completionBranches, branch)
+	if g.completionCheck != nil {
+		if err := g.completionCheck(issue); err != nil {
+			return ghadapter.CompletionOutcome{}, err
+		}
+	}
 	if err := g.completionErrs[issue]; err != nil {
 		return ghadapter.CompletionOutcome{}, err
 	}
@@ -635,6 +667,7 @@ type fakeProcess struct {
 	owner       *fakeWorkers
 	done        chan worker.Result
 	closeResult worker.Result
+	closeOnce   sync.Once
 }
 
 func (p *fakeProcess) PID() int { return 1000 + p.issue }
@@ -653,7 +686,7 @@ func (p *fakeProcess) Wait() worker.Result {
 	return <-p.done
 }
 func (p *fakeProcess) Close() worker.Result {
-	p.owner.finished(p.issue)
+	p.closeOnce.Do(func() { p.owner.finished(p.issue) })
 	return p.closeResult
 }
 

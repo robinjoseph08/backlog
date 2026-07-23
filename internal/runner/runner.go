@@ -147,6 +147,8 @@ func (r *Runner) Run(ctx context.Context) error {
 				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after an unknown worker completion; worktree retained")
 				return errors.Join(fmt.Errorf("worker completed for unowned issue #%d", completion.issue), shutdownErr)
 			}
+			closedBeforeReconciliation := false
+			var closed worker.Result
 			if !completion.result.Settled {
 				if completion.result.StreamErr == nil {
 					completion.result.StreamErr = errors.New("Pi RPC worker ended without agent_settled")
@@ -155,6 +157,10 @@ func (r *Runner) Run(ctx context.Context) error {
 				if err := process.Abort(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 					completion.result.Err = errors.Join(completion.result.Err, fmt.Errorf("stop invalid Pi RPC worker: %w", err))
 				}
+				closed = process.Close()
+				closedBeforeReconciliation = true
+				completion.result.ExitCode = closed.ExitCode
+				completion.result.Err = errors.Join(completion.result.Err, closed.Err)
 			}
 			runID := findActiveRun(&current, completion.issue).RunID
 			if err := r.handleWorkerCompletion(ctx, &current, completion); err != nil {
@@ -170,7 +176,9 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 			// Reconciliation and its durable state write happen while the idle RPC
 			// process is still alive. EOF is sent only after that write succeeds.
-			closed := process.Close()
+			if !closedBeforeReconciliation {
+				closed = process.Close()
+			}
 			delete(localWorkers, completion.issue)
 			if err := r.finalizeSettledWorker(ctx, &current, runID, closed.Err, completion.result.Settled); err != nil {
 				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after an RPC finalization error; worktree retained")
