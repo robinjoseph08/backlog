@@ -154,13 +154,28 @@ func statusCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 	if flags.NArg() != 0 {
 		return fmt.Errorf("status takes no positional arguments")
 	}
-	resolved, err := resolveStateFromFlags(ctx, *repoDir, *stateDir, *gitExecutable)
+	resolved, commonDirectory, err := resolveStateFromFlags(ctx, *repoDir, *stateDir, *gitExecutable)
 	if err != nil {
 		return err
 	}
-	current, err := (state.FileStore{Path: filepath.Join(resolved, "state.json")}).Load()
+	store := state.FileStore{Path: filepath.Join(resolved, "state.json")}
+	current, migrationRequired, err := store.Preview()
 	if err != nil {
 		return err
+	}
+	if migrationRequired {
+		lock, err := acquireRepositoryLock(commonDirectory)
+		if err != nil {
+			return fmt.Errorf("migrate state for status: %w", err)
+		}
+		defer lock.Release()
+		if err := bindStateDirectory(commonDirectory, resolved); err != nil {
+			return err
+		}
+		current, err = store.Load()
+		if err != nil {
+			return err
+		}
 	}
 	if *asJSON {
 		encoder := json.NewEncoder(stdout)
@@ -168,8 +183,8 @@ func statusCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return encoder.Encode(current)
 	}
 	fmt.Fprintf(stdout, "Repository: %s\n", valueOr(current.Repo, "not initialized"))
-	fmt.Fprintf(stdout, "Paused: %t\n", current.Paused)
 	fmt.Fprintf(stdout, "Runs: %d\n", len(current.Runs))
+	fmt.Fprintf(stdout, "Active Leases: %d\n", len(current.Leases))
 	for _, run := range current.Runs {
 		fmt.Fprintf(stdout, "  #%d  %-17s  %s", run.Issue, run.Status, run.Branch)
 		if run.Error != "" {
@@ -234,23 +249,32 @@ func retryCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if err != nil {
 		return err
 	}
-	index := -1
-	var retained string
-	for i, run := range current.Runs {
-		if run.Issue != issue {
+	leaseIndex := -1
+	var selected scheduler.Run
+	for index, lease := range current.Leases {
+		if lease.Issue != issue {
 			continue
 		}
-		if run.Status != scheduler.StatusFailed && run.Status != scheduler.StatusNeedsHuman {
-			return fmt.Errorf("issue #%d is %s; only failed or needs-human runs can be retried", issue, run.Status)
+		leaseIndex = index
+		for _, run := range current.Runs {
+			if run.RunID == lease.RunID && run.Issue == lease.Issue {
+				selected = run
+				break
+			}
 		}
-		index = i
-		retained = run.Worktree
 		break
 	}
-	if index < 0 {
-		return fmt.Errorf("issue #%d has no intervention-required run", issue)
+	if leaseIndex < 0 {
+		return fmt.Errorf("issue #%d has no intervention-required Run with an active Lease", issue)
 	}
-	current.Runs = append(current.Runs[:index], current.Runs[index+1:]...)
+	if selected.RunID == "" {
+		return fmt.Errorf("active Lease for issue #%d has an invalid Run reference", issue)
+	}
+	if selected.Status != scheduler.StatusFailed && selected.Status != scheduler.StatusNeedsHuman {
+		return fmt.Errorf("issue #%d is %s; only failed or needs-human runs can be retried", issue, selected.Status)
+	}
+	current.Leases = append(current.Leases[:leaseIndex], current.Leases[leaseIndex+1:]...)
+	retained := selected.Worktree
 	if err := store.Save(current); err != nil {
 		return err
 	}
@@ -288,20 +312,21 @@ func flagTakesValue(name string) bool {
 	return name == "repo-dir" || name == "state-dir" || name == "git"
 }
 
-func resolveStateFromFlags(ctx context.Context, repoDir, stateDir, gitExecutable string) (string, error) {
+func resolveStateFromFlags(ctx context.Context, repoDir, stateDir, gitExecutable string) (string, string, error) {
 	absoluteRepo, err := filepath.Abs(repoDir)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	root, err := gitRepositoryRoot(ctx, gitExecutable, absoluteRepo)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	common, err := gitCommonDirectory(ctx, gitExecutable, root)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return repositoryStateDirectory(common, root, stateDir)
+	resolved, err := repositoryStateDirectory(common, root, stateDir)
+	return resolved, common, err
 }
 
 func repositoryStateDirectory(commonDirectory, repositoryRoot, override string) (string, error) {

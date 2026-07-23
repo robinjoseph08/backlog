@@ -1,8 +1,19 @@
 package scheduler
 
+// RequiresLease reports whether a Run status represents unfinished work that
+// must retain active ownership of its issue.
+func RequiresLease(status Status) bool {
+	switch status {
+	case StatusClaimed, StatusWorktreeReady, StatusRunning, StatusWaitingForMerge:
+		return true
+	default:
+		return false
+	}
+}
+
 // CanTransition defines every persisted run-state transition. Failed,
-// needs-human, and merged runs are terminal; retry removes the old lease and
-// creates a new claimed run rather than mutating a terminal run.
+// needs-human, and merged Runs are terminal. Retry releases an active Lease,
+// and any later scheduler admission creates a new Run.
 func CanTransition(from, to Status) bool {
 	if from == to {
 		return from == StatusWaitingForMerge

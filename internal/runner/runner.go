@@ -114,7 +114,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 			return errors.Join(fmt.Errorf("reconcile GitHub backlog: %w", err), shutdownErr)
 		}
-		plan := scheduler.Plan(scheduler.Snapshot{Candidates: candidates, Runs: current.Runs}, r.Config.MaxConcurrentIssues)
+		plan := scheduler.Plan(scheduler.Snapshot{Candidates: candidates, Runs: current.Runs, Leases: current.Leases}, r.Config.MaxConcurrentIssues)
 		for _, candidate := range plan.Starts {
 			process, err := r.start(ctx, runCtx, &current, candidate)
 			if err != nil {
@@ -133,7 +133,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		if len(plan.Starts) > 0 {
 			continue
 		}
-		if activeRunCount(current.Runs) == 0 && !r.Config.Watch {
+		if unfinishedRunCount(&current) == 0 && !r.Config.Watch {
 			return nil
 		}
 
@@ -206,10 +206,11 @@ func (r *Runner) start(ctx context.Context, workerCtx context.Context, current *
 	now := r.Now().UTC()
 	runID := r.NewRunID(candidate.Number)
 	run := scheduler.Run{
-		Issue: candidate.Number, RunID: runID, Status: scheduler.StatusClaimed,
+		Issue: candidate.Number, RunID: runID, Status: scheduler.StatusClaimed, WorkerMode: scheduler.WorkerModePrint,
 		SessionName: fmt.Sprintf("afk #%d", candidate.Number), StartedAt: now, UpdatedAt: now,
 	}
 	current.Runs = append(current.Runs, run)
+	current.Leases = append(current.Leases, scheduler.Lease{LeaseID: runID, Issue: candidate.Number, RunID: runID})
 	if err := r.Store.Save(*current); err != nil {
 		return nil, fmt.Errorf("persist lease for issue #%d: %w", candidate.Number, err)
 	}
@@ -220,7 +221,7 @@ func (r *Runner) start(ctx context.Context, workerCtx context.Context, current *
 		r.failRun(current, candidate.Number, fmt.Sprintf("plan worktree: %v", err))
 		return nil, r.saveAfterFailure(*current, candidate.Number)
 	}
-	run = findRun(current.Runs, candidate.Number)
+	run = findActiveRun(current, candidate.Number)
 	run.Worktree = assignment.Path
 	run.Branch = assignment.Branch
 	run.UpdatedAt = r.Now().UTC()
@@ -232,7 +233,7 @@ func (r *Runner) start(ctx context.Context, workerCtx context.Context, current *
 		r.failRun(current, candidate.Number, fmt.Sprintf("prepare worktree: %v", err))
 		return nil, r.saveAfterFailure(*current, candidate.Number)
 	}
-	run = findRun(current.Runs, candidate.Number)
+	run = findActiveRun(current, candidate.Number)
 	transitionStatus(&run, scheduler.StatusWorktreeReady)
 	run.UpdatedAt = r.Now().UTC()
 	replaceRun(current, run)
@@ -254,7 +255,7 @@ func (r *Runner) start(ctx context.Context, workerCtx context.Context, current *
 		r.failRun(current, candidate.Number, fmt.Sprintf("record Pi worker identity: %v", err))
 		return nil, r.saveAfterFailure(*current, candidate.Number)
 	}
-	run = findRun(current.Runs, candidate.Number)
+	run = findActiveRun(current, candidate.Number)
 	transitionStatus(&run, scheduler.StatusRunning)
 	run.PID = process.PID()
 	run.ProcessIdentity = identity
@@ -281,7 +282,7 @@ func (r *Runner) start(ctx context.Context, workerCtx context.Context, current *
 }
 
 func (r *Runner) handleWorkerCompletion(ctx context.Context, current *state.State, completion workerCompletion) error {
-	run := findRun(current.Runs, completion.issue)
+	run := findActiveRun(current, completion.issue)
 	if run.Issue == 0 {
 		return fmt.Errorf("worker completed for unleased issue #%d", completion.issue)
 	}
@@ -291,19 +292,19 @@ func (r *Runner) handleWorkerCompletion(ctx context.Context, current *state.Stat
 	} else {
 		if completion.result.StreamErr != nil && outcome.Merged && outcome.IssueClosed {
 			r.needsHuman(current, run.Issue, fmt.Sprintf("GitHub completion verified but Pi event stream was invalid; worktree retained: %v", completion.result.StreamErr))
-			updated := findRun(current.Runs, run.Issue)
+			updated := findActiveRun(current, run.Issue)
 			updated.PullRequest = outcome.PullRequest
 			replaceRun(current, updated)
 		} else {
 			r.applyOutcome(ctx, current, run, outcome, completion.result.ExitCode == 0 && completion.result.Err == nil)
 		}
-		if updated := findRun(current.Runs, run.Issue); updated.Status == scheduler.StatusFailed && completion.result.Err != nil {
+		if updated := findActiveRun(current, run.Issue); updated.Status == scheduler.StatusFailed && completion.result.Err != nil {
 			updated.Error = completion.result.Err.Error()
 			updated.UpdatedAt = r.Now().UTC()
 			replaceRun(current, updated)
 		}
 	}
-	resultRun := findRun(current.Runs, run.Issue)
+	resultRun := findRun(current.Runs, run.RunID)
 	if resultRun.LogPath == "" {
 		resultRun.LogPath = completion.result.LogPath
 	}
@@ -319,7 +320,11 @@ func (r *Runner) handleWorkerCompletion(ctx context.Context, current *state.Stat
 
 func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[int]WorkerProcess) error {
 	changed := false
-	for _, run := range append([]scheduler.Run(nil), current.Runs...) {
+	for _, lease := range append([]scheduler.Lease(nil), current.Leases...) {
+		run := findRun(current.Runs, lease.RunID)
+		if run.Issue == 0 || run.Issue != lease.Issue {
+			return fmt.Errorf("active Lease %q has an invalid Run reference", lease.LeaseID)
+		}
 		if _, isOwned := owned[run.Issue]; isOwned {
 			continue
 		}
@@ -401,6 +406,7 @@ func (r *Runner) applyOutcome(ctx context.Context, current *state.State, run sch
 		run.CompletedAt = &now
 		run.PID = 0
 		run.Error = ""
+		removeLease(current, run.RunID)
 		r.logf("verified merged completion for issue #%d", run.Issue)
 	case outcome.Merged && !outcome.IssueClosed:
 		transitionStatus(&run, scheduler.StatusNeedsHuman)
@@ -422,7 +428,7 @@ func (r *Runner) applyOutcome(ctx context.Context, current *state.State, run sch
 }
 
 func (r *Runner) failRun(current *state.State, issue int, message string) {
-	run := findRun(current.Runs, issue)
+	run := findActiveRun(current, issue)
 	transitionStatus(&run, scheduler.StatusFailed)
 	run.PID = 0
 	run.Error = message
@@ -432,7 +438,7 @@ func (r *Runner) failRun(current *state.State, issue int, message string) {
 }
 
 func (r *Runner) needsHuman(current *state.State, issue int, message string) {
-	run := findRun(current.Runs, issue)
+	run := findActiveRun(current, issue)
 	transitionStatus(&run, scheduler.StatusNeedsHuman)
 	run.PID = 0
 	run.Error = message
@@ -491,10 +497,19 @@ func transitionStatus(run *scheduler.Run, next scheduler.Status) {
 	run.Status = next
 }
 
-func findRun(runs []scheduler.Run, issue int) scheduler.Run {
+func findRun(runs []scheduler.Run, runID string) scheduler.Run {
 	for _, run := range runs {
-		if run.Issue == issue {
+		if run.RunID == runID {
 			return run
+		}
+	}
+	return scheduler.Run{}
+}
+
+func findActiveRun(current *state.State, issue int) scheduler.Run {
+	for _, lease := range current.Leases {
+		if lease.Issue == issue {
+			return findRun(current.Runs, lease.RunID)
 		}
 	}
 	return scheduler.Run{}
@@ -502,18 +517,27 @@ func findRun(runs []scheduler.Run, issue int) scheduler.Run {
 
 func replaceRun(current *state.State, replacement scheduler.Run) {
 	for index := range current.Runs {
-		if current.Runs[index].Issue == replacement.Issue {
+		if current.Runs[index].RunID == replacement.RunID {
 			current.Runs[index] = replacement
 			return
 		}
 	}
 }
 
-func activeRunCount(runs []scheduler.Run) int {
+func removeLease(current *state.State, runID string) {
+	for index := range current.Leases {
+		if current.Leases[index].RunID == runID {
+			current.Leases = append(current.Leases[:index], current.Leases[index+1:]...)
+			return
+		}
+	}
+}
+
+func unfinishedRunCount(current *state.State) int {
 	count := 0
-	for _, run := range runs {
-		switch run.Status {
-		case scheduler.StatusClaimed, scheduler.StatusWorktreeReady, scheduler.StatusRunning, scheduler.StatusWaitingForMerge:
+	for _, lease := range current.Leases {
+		run := findRun(current.Runs, lease.RunID)
+		if scheduler.RequiresLease(run.Status) {
 			count++
 		}
 	}

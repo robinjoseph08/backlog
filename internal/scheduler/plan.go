@@ -17,6 +17,10 @@ const (
 	StatusNeedsHuman      Status = "needs-human"
 )
 
+type WorkerMode string
+
+const WorkerModePrint WorkerMode = "print"
+
 type Blocker struct {
 	Owner  string `json:"owner,omitempty"`
 	Repo   string `json:"repo,omitempty"`
@@ -37,6 +41,7 @@ type Run struct {
 	Issue           int        `json:"issue"`
 	RunID           string     `json:"runId"`
 	Status          Status     `json:"status"`
+	WorkerMode      WorkerMode `json:"workerMode"`
 	PID             int        `json:"pid,omitempty"`
 	ProcessIdentity string     `json:"processIdentity,omitempty"`
 	Branch          string     `json:"branch,omitempty"`
@@ -51,9 +56,16 @@ type Run struct {
 	CompletedAt     *time.Time `json:"completedAt,omitempty"`
 }
 
+type Lease struct {
+	LeaseID string `json:"leaseId"`
+	Issue   int    `json:"issue"`
+	RunID   string `json:"runId"`
+}
+
 type Snapshot struct {
 	Candidates []Candidate
 	Runs       []Run
+	Leases     []Lease
 }
 
 type Schedule struct {
@@ -61,23 +73,27 @@ type Schedule struct {
 }
 
 // Plan selects the oldest eligible candidates that fit in the available worker
-// capacity. Every persisted run retains its issue lease; an explicit retry must
-// remove a failed run before the issue can be selected again.
+// capacity. Active Leases prevent overlapping Runs, while historical Runs do
+// not prevent a reopened Candidate from being admitted again.
 func Plan(snapshot Snapshot, maxConcurrentIssues int) Schedule {
 	if maxConcurrentIssues <= 0 {
 		return Schedule{}
 	}
 
-	leased := make(map[int]struct{}, len(snapshot.Runs))
-	active := 0
+	runsByID := make(map[string]Run, len(snapshot.Runs))
 	for _, run := range snapshot.Runs {
-		if isActive(run.Status) {
-			active++
+		runsByID[run.RunID] = run
+	}
+	leased := make(map[int]struct{}, len(snapshot.Leases))
+	workerCount := 0
+	for _, lease := range snapshot.Leases {
+		if run, exists := runsByID[lease.RunID]; exists && consumesWorkerCapacity(run.Status) {
+			workerCount++
 		}
-		leased[run.Issue] = struct{}{}
+		leased[lease.Issue] = struct{}{}
 	}
 
-	available := maxConcurrentIssues - active
+	available := maxConcurrentIssues - workerCount
 	if available <= 0 {
 		return Schedule{}
 	}
@@ -104,7 +120,7 @@ func Plan(snapshot Snapshot, maxConcurrentIssues int) Schedule {
 	return Schedule{Starts: eligible}
 }
 
-func isActive(status Status) bool {
+func consumesWorkerCapacity(status Status) bool {
 	switch status {
 	case StatusClaimed, StatusWorktreeReady, StatusRunning:
 		return true

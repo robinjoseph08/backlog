@@ -20,6 +20,7 @@ func TestRunCommandDrainsIssueThroughFakeExecutables(t *testing.T) {
 	root := t.TempDir()
 	repository := filepath.Join(root, "repo")
 	stateDir := filepath.Join(root, "state")
+	closedMarker := filepath.Join(root, "issue-42-closed")
 	if err := os.Mkdir(repository, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +30,11 @@ case "$*" in
   "repo view --json nameWithOwner,defaultBranchRef")
     printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
   "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
-    printf '%s\n' '[{"number":42,"title":"Build it","createdAt":"2026-01-01T00:00:00Z","url":"https://github.com/acme/widgets/issues/42"}]' ;;
+    if test -f `+quote(closedMarker)+`; then
+      printf '%s\n' '[]'
+    else
+      printf '%s\n' '[{"number":42,"title":"Build it","createdAt":"2026-01-01T00:00:00Z","url":"https://github.com/acme/widgets/issues/42"}]'
+    fi ;;
   "issue view 42 --repo acme/widgets --json number,title,body,state,url,createdAt")
     printf '%s\n' '{"number":42,"title":"Build it","body":"","state":"OPEN","url":"https://github.com/acme/widgets/issues/42","createdAt":"2026-01-01T00:00:00Z"}' ;;
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/42/comments?per_page=100 --paginate --slurp")
@@ -39,6 +44,7 @@ case "$*" in
   "pr list --repo acme/widgets --state all --head agent/issue-42-"*" --json number,url,state,mergedAt,autoMergeRequest,isDraft")
     printf '%s\n' '[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"MERGED","mergedAt":"2026-01-02T00:00:00Z"}]' ;;
   "issue view 42 --repo acme/widgets --json state,title,url")
+    touch `+quote(closedMarker)+`
     printf '%s\n' '{"state":"CLOSED","title":"Build it","url":"https://github.com/acme/widgets/issues/42"}' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
@@ -70,8 +76,8 @@ printf '%s\n' '{"type":"session"}' '{"type":"agent_start"}' '{"type":"agent_sett
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	if len(persisted.Runs) != 1 || persisted.Runs[0].Status != scheduler.StatusMerged {
-		t.Fatalf("state runs = %#v, want merged issue", persisted.Runs)
+	if len(persisted.Runs) != 1 || persisted.Runs[0].Status != scheduler.StatusMerged || len(persisted.Leases) != 0 {
+		t.Fatalf("state Runs/Leases = %#v/%#v, want merged history without an active Lease", persisted.Runs, persisted.Leases)
 	}
 	if _, err := os.Stat(persisted.Runs[0].Worktree); !os.IsNotExist(err) {
 		t.Fatalf("successful worktree still exists, stat error = %v", err)
@@ -92,7 +98,10 @@ func TestRetryRemovesOnlyInterventionRequiredLease(t *testing.T) {
 	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
 	if err := store.Save(state.State{
 		Version: state.CurrentVersion,
-		Runs:    []scheduler.Run{{Issue: 42, RunID: "old", Status: scheduler.StatusFailed, Worktree: "/retained"}},
+		Runs: []scheduler.Run{{
+			Issue: 42, RunID: "old", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, Worktree: "/retained",
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "old", Issue: 42, RunID: "old"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -104,8 +113,8 @@ func TestRetryRemovesOnlyInterventionRequiredLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Runs) != 0 {
-		t.Fatalf("runs = %#v, want lease removed", got.Runs)
+	if len(got.Runs) != 1 || len(got.Leases) != 0 {
+		t.Fatalf("Runs/Leases = %#v/%#v, want history retained and Lease removed", got.Runs, got.Leases)
 	}
 	if !strings.Contains(stdout.String(), "retained") {
 		t.Fatalf("stdout = %q, want retained-worktree notice", stdout.String())
@@ -116,12 +125,16 @@ func TestStatusPrintsMachineReadableState(t *testing.T) {
 	t.Parallel()
 
 	stateDir := t.TempDir()
+	repository := filepath.Join(t.TempDir(), "repo")
+	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, output)
+	}
 	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
 	if err := store.Save(state.State{Version: state.CurrentVersion, Repo: "acme/widgets"}); err != nil {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer
-	if exit := Main(context.Background(), []string{"status", "--state-dir", stateDir, "--json"}, &stdout, &stderr); exit != 0 {
+	if exit := Main(context.Background(), []string{"status", "--repo-dir", repository, "--state-dir", stateDir, "--json"}, &stdout, &stderr); exit != 0 {
 		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
 	}
 	var got state.State
@@ -130,6 +143,41 @@ func TestStatusPrintsMachineReadableState(t *testing.T) {
 	}
 	if got.Repo != "acme/widgets" {
 		t.Fatalf("repo = %q", got.Repo)
+	}
+}
+
+func TestStatusDoesNotMigrateV1WhileRunnerLockIsHeld(t *testing.T) {
+	t.Parallel()
+
+	repository := filepath.Join(t.TempDir(), "repo")
+	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, output)
+	}
+	stateDir := t.TempDir()
+	statePath := filepath.Join(stateDir, "state.json")
+	legacy := `{"version":1,"paused":true,"runs":[{"issue":1,"runId":"failed","status":"failed"}]}`
+	if err := os.WriteFile(statePath, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := state.AcquireLock(filepath.Join(repository, ".git", legacyLockFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+
+	var stdout, stderr bytes.Buffer
+	if exit := Main(context.Background(), []string{"status", "--repo-dir", repository, "--state-dir", stateDir}, &stdout, &stderr); exit != 1 {
+		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "runner already active") {
+		t.Fatalf("stderr = %q, want active runner refusal", stderr.String())
+	}
+	persisted, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(persisted), `"version":1`) || !strings.Contains(string(persisted), `"paused":true`) {
+		t.Fatalf("status migrated state despite active runner: %s", persisted)
 	}
 }
 
