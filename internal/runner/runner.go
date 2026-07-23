@@ -30,6 +30,8 @@ type Config struct {
 }
 
 type GitHub interface {
+	// Candidates returns a complete admission snapshot. When err is non-nil,
+	// callers must not create Leases from any returned candidates.
 	Candidates(context.Context, string) ([]scheduler.Candidate, error)
 	Completion(context.Context, string, int, string) (ghadapter.CompletionOutcome, error)
 }
@@ -103,41 +105,62 @@ func (r *Runner) Run(ctx context.Context) error {
 	localWorkers := make(map[int]WorkerProcess)
 	poll := time.NewTicker(r.Config.PollInterval)
 	defer poll.Stop()
+	var candidateRetryTimer *time.Timer
+	var candidateRetry <-chan time.Time
+	var candidateErr error
+	defer func() {
+		if candidateRetryTimer != nil {
+			candidateRetryTimer.Stop()
+		}
+	}()
 
 	for {
 		if ctx.Err() != nil {
 			return r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped; worker was terminated and its worktree was retained")
 		}
 
-		candidates, err := r.GitHub.Candidates(ctx, r.Config.Repo)
-		if err != nil {
-			shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after a backlog reconciliation error; worktree retained")
-			if ctx.Err() != nil {
-				return shutdownErr
-			}
-			return errors.Join(fmt.Errorf("reconcile GitHub backlog: %w", err), shutdownErr)
-		}
-		plan := scheduler.Plan(scheduler.Snapshot{Candidates: candidates, Runs: current.Runs, Leases: current.Leases}, r.Config.MaxConcurrentIssues)
-		for _, candidate := range plan.Starts {
-			process, err := r.start(ctx, runCtx, &current, candidate)
+		if candidateRetry == nil {
+			candidates, err := r.GitHub.Candidates(ctx, r.Config.Repo)
 			if err != nil {
-				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after a worker launch error; worktree retained")
-				return errors.Join(err, shutdownErr)
-			}
-			if process == nil {
-				continue
-			}
-			localWorkers[candidate.Number] = process
-			go func(issue int, process WorkerProcess) {
-				completions <- workerCompletion{issue: issue, result: process.Wait()}
-			}(candidate.Number, process)
-		}
+				if ctx.Err() != nil {
+					continue
+				}
+				candidateErr = fmt.Errorf("reconcile GitHub backlog: %w", err)
+				if unfinishedRunCount(&current) == 0 && !r.Config.Watch {
+					return candidateErr
+				}
+				r.logf("candidate discovery failed; retrying in %s: %v", r.Config.PollInterval, err)
+				if candidateRetryTimer == nil {
+					candidateRetryTimer = time.NewTimer(r.Config.PollInterval)
+				} else {
+					candidateRetryTimer.Reset(r.Config.PollInterval)
+				}
+				candidateRetry = candidateRetryTimer.C
+			} else {
+				candidateErr = nil
+				plan := scheduler.Plan(scheduler.Snapshot{Candidates: candidates, Runs: current.Runs, Leases: current.Leases}, r.Config.MaxConcurrentIssues)
+				for _, candidate := range plan.Starts {
+					process, err := r.start(ctx, runCtx, &current, candidate)
+					if err != nil {
+						shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after a worker launch error; worktree retained")
+						return errors.Join(err, shutdownErr)
+					}
+					if process == nil {
+						continue
+					}
+					localWorkers[candidate.Number] = process
+					go func(issue int, process WorkerProcess) {
+						completions <- workerCompletion{issue: issue, result: process.Wait()}
+					}(candidate.Number, process)
+				}
 
-		if len(plan.Starts) > 0 {
-			continue
-		}
-		if unfinishedRunCount(&current) == 0 && !r.Config.Watch {
-			return nil
+				if len(plan.Starts) > 0 {
+					continue
+				}
+				if unfinishedRunCount(&current) == 0 && !r.Config.Watch {
+					return nil
+				}
+			}
 		}
 
 		select {
@@ -184,6 +207,11 @@ func (r *Runner) Run(ctx context.Context) error {
 				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after an RPC finalization error; worktree retained")
 				return errors.Join(err, shutdownErr)
 			}
+			if candidateErr != nil && unfinishedRunCount(&current) == 0 && !r.Config.Watch {
+				return candidateErr
+			}
+		case <-candidateRetry:
+			candidateRetry = nil
 		case <-poll.C:
 			if err := r.reconcile(ctx, &current, localWorkers); err != nil {
 				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after a reconciliation error; worktree retained")
