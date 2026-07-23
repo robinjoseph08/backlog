@@ -262,17 +262,20 @@ func (p *Process) Suspend(ctx context.Context, expected ContinuationRequest) (Co
 		return Continuation{}, fmt.Errorf("get Pi RPC state: %s", stateResponse.Error)
 	}
 	var rpcState struct {
-		IsStreaming         bool   `json:"isStreaming"`
-		IsCompacting        bool   `json:"isCompacting"`
+		IsStreaming         *bool  `json:"isStreaming"`
+		IsCompacting        *bool  `json:"isCompacting"`
 		SessionFile         string `json:"sessionFile"`
 		SessionID           string `json:"sessionId"`
-		PendingMessageCount int    `json:"pendingMessageCount"`
+		PendingMessageCount *int   `json:"pendingMessageCount"`
 	}
 	if err := json.Unmarshal(stateResponse.Data, &rpcState); err != nil {
 		return Continuation{}, fmt.Errorf("decode Pi RPC state: %w", err)
 	}
-	if rpcState.IsStreaming || rpcState.IsCompacting || rpcState.PendingMessageCount != 0 {
-		return Continuation{}, fmt.Errorf("Pi RPC state is not idle (streaming=%t compacting=%t pendingMessages=%d)", rpcState.IsStreaming, rpcState.IsCompacting, rpcState.PendingMessageCount)
+	if rpcState.IsStreaming == nil || rpcState.IsCompacting == nil || rpcState.PendingMessageCount == nil {
+		return Continuation{}, errors.New("Pi RPC state omitted required idle fields")
+	}
+	if *rpcState.IsStreaming || *rpcState.IsCompacting || *rpcState.PendingMessageCount != 0 {
+		return Continuation{}, fmt.Errorf("Pi RPC state is not idle (streaming=%t compacting=%t pendingMessages=%d)", *rpcState.IsStreaming, *rpcState.IsCompacting, *rpcState.PendingMessageCount)
 	}
 	if rpcState.SessionID != expected.SessionID {
 		return Continuation{}, fmt.Errorf("Pi RPC session id %q does not match %q", rpcState.SessionID, expected.SessionID)
@@ -295,7 +298,7 @@ func (p *Process) Suspend(ctx context.Context, expected ContinuationRequest) (Co
 	if err := json.Unmarshal(entriesResponse.Data, &rpcEntries); err != nil {
 		return Continuation{}, fmt.Errorf("decode Pi session entries: %w", err)
 	}
-	sha, err := verifyAndSyncSession(rpcState.SessionFile, expected, rpcEntries.Entries, rpcEntries.LeafID)
+	sha, err := verifyAndSyncSession(rpcState.SessionFile, expected, rpcEntries.Entries, rpcEntries.LeafID, func(file *os.File) error { return file.Sync() })
 	if err != nil {
 		return Continuation{}, err
 	}
@@ -511,7 +514,7 @@ func verifySessionPath(sessionDir, sessionFile string) error {
 	return nil
 }
 
-func verifyAndSyncSession(path string, expected ContinuationRequest, rpcEntries []json.RawMessage, leafID string) (string, error) {
+func verifyAndSyncSession(path string, expected ContinuationRequest, rpcEntries []json.RawMessage, leafID string, syncFile func(*os.File) error) (string, error) {
 	if leafID == "" || len(rpcEntries) == 0 {
 		return "", errors.New("Pi session has no durable continuation leaf")
 	}
@@ -549,11 +552,12 @@ func verifyAndSyncSession(path string, expected ContinuationRequest, rpcEntries 
 		return "", fmt.Errorf("Pi session header identity/path %q/%q does not match %q/%q", header.ID, header.CWD, expected.SessionID, expected.Worktree)
 	}
 	for index := range rpcEntries {
-		var diskValue, rpcValue any
-		if err := json.Unmarshal(records[index+1], &diskValue); err != nil {
+		diskValue, err := decodeExactJSON(records[index+1])
+		if err != nil {
 			return "", fmt.Errorf("decode Pi session file entry %d: %w", index+1, err)
 		}
-		if err := json.Unmarshal(rpcEntries[index], &rpcValue); err != nil {
+		rpcValue, err := decodeExactJSON(rpcEntries[index])
+		if err != nil {
 			return "", fmt.Errorf("decode Pi RPC session entry %d: %w", index+1, err)
 		}
 		if !reflect.DeepEqual(diskValue, rpcValue) {
@@ -563,14 +567,14 @@ func verifyAndSyncSession(path string, expected ContinuationRequest, rpcEntries 
 	if err := verifyContinuationLeaf(rpcEntries, leafID); err != nil {
 		return "", err
 	}
-	if err := file.Sync(); err != nil {
+	if err := syncFile(file); err != nil {
 		return "", fmt.Errorf("sync Pi session file: %w", err)
 	}
 	directory, err := os.Open(filepath.Dir(path))
 	if err != nil {
 		return "", fmt.Errorf("open Pi session directory: %w", err)
 	}
-	if err := directory.Sync(); err != nil {
+	if err := syncFile(directory); err != nil {
 		directory.Close()
 		return "", fmt.Errorf("sync Pi session directory: %w", err)
 	}
@@ -578,6 +582,73 @@ func verifyAndSyncSession(path string, expected ContinuationRequest, rpcEntries 
 		return "", fmt.Errorf("close Pi session directory: %w", err)
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func decodeExactJSON(raw []byte) (any, error) {
+	if err := rejectDuplicateJSONKeys(json.NewDecoder(bytes.NewReader(raw))); err != nil {
+		return nil, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, errors.New("multiple JSON values")
+		}
+		return nil, err
+	}
+	return value, nil
+}
+
+func rejectDuplicateJSONKeys(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, composite := token.(json.Delim)
+	if !composite {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		keys := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return errors.New("JSON object key is not a string")
+			}
+			if _, duplicate := keys[key]; duplicate {
+				return fmt.Errorf("JSON object contains duplicate key %q", key)
+			}
+			keys[key] = struct{}{}
+			if err := rejectDuplicateJSONKeys(decoder); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for decoder.More() {
+			if err := rejectDuplicateJSONKeys(decoder); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("unexpected JSON delimiter %q", delimiter)
+	}
+	closing, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if closing != json.Delim(map[json.Delim]json.Delim{'{': '}', '[': ']'}[delimiter]) {
+		return errors.New("JSON composite has mismatched delimiter")
+	}
+	return nil
 }
 
 func verifyContinuationLeaf(entries []json.RawMessage, leafID string) error {

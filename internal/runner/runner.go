@@ -1043,6 +1043,14 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 	for completed := 0; completed < workerCount; completed++ {
 		closed := <-closeResults
 		run := findRun(current.Runs, runIDs[closed.issue])
+		if closed.result.GroupExited && closed.result.Err != nil {
+			clean = false
+			reason := fmt.Sprintf("close RPC Worker after continuation verification: %v", closed.result.Err)
+			if previous := failureReasons[closed.issue]; previous != "" {
+				reason = previous + "; " + reason
+			}
+			failureReasons[closed.issue] = reason
+		}
 		if !closed.result.GroupExited {
 			clean = false
 			message := "Worker process-group exit was not verified before the suspension deadline"
@@ -1080,7 +1088,9 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 			}
 			replaceRun(current, run)
 		}
-		delete(local, closed.issue)
+		if closed.result.GroupExited {
+			delete(local, closed.issue)
+		}
 		if err := r.Store.Save(*current); err != nil {
 			clean = false
 			persistenceErrors = append(persistenceErrors, fmt.Errorf("persist suspended issue #%d: %w", closed.issue, err))
@@ -1098,6 +1108,9 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 		return errors.Join(persistenceErrors...)
 	}
 	if !clean {
+		if len(local) != 0 {
+			return fmt.Errorf("suspension could not verify or stop %s; one or more Runs require human verification", workerSummary(len(local)))
+		}
 		return errors.New("suspension stopped all Workers but one or more Runs require human verification")
 	}
 	r.logf("Suspension complete: 0 Workers remaining")
