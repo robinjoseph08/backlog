@@ -156,6 +156,7 @@ func (r *Runner) Run(ctx context.Context) error {
 					completion.result.Err = errors.Join(completion.result.Err, fmt.Errorf("stop invalid Pi RPC worker: %w", err))
 				}
 			}
+			runID := findActiveRun(&current, completion.issue).RunID
 			if err := r.handleWorkerCompletion(ctx, &current, completion); err != nil {
 				_ = process.Abort()
 				_ = process.Close()
@@ -167,9 +168,9 @@ func (r *Runner) Run(ctx context.Context) error {
 			// process is still alive. EOF is sent only after that write succeeds.
 			closed := process.Close()
 			delete(localWorkers, completion.issue)
-			if closed.Err != nil && completion.result.Settled {
-				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after an RPC shutdown error; worktree retained")
-				return errors.Join(fmt.Errorf("close issue #%d Pi RPC worker: %w", completion.issue, closed.Err), shutdownErr)
+			if err := r.finalizeSettledWorker(ctx, &current, runID, closed.Err, completion.result.Settled); err != nil {
+				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after an RPC finalization error; worktree retained")
+				return errors.Join(err, shutdownErr)
 			}
 		case <-poll.C:
 			if err := r.reconcile(ctx, &current, localWorkers); err != nil {
@@ -325,7 +326,7 @@ func (r *Runner) handleWorkerCompletion(ctx context.Context, current *state.Stat
 			updated.PullRequest = outcome.PullRequest
 			replaceRun(current, updated)
 		} else {
-			r.applyOutcome(ctx, current, run, outcome, completion.result.ExitCode == 0 && completion.result.Err == nil)
+			r.applyOutcome(ctx, current, run, outcome, completion.result.ExitCode == 0 && completion.result.Err == nil, false)
 		}
 		if updated := findActiveRun(current, run.Issue); updated.Status == scheduler.StatusFailed && completion.result.Err != nil {
 			updated.Error = completion.result.Err.Error()
@@ -406,7 +407,7 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 			continue
 		}
 		allowWaiting := run.Status == scheduler.StatusWaitingForMerge || run.Status == scheduler.StatusRunning
-		r.applyOutcome(ctx, current, run, outcome, allowWaiting)
+		r.applyOutcome(ctx, current, run, outcome, allowWaiting, true)
 		changed = true
 	}
 	if changed {
@@ -417,17 +418,19 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 	return nil
 }
 
-func (r *Runner) applyOutcome(ctx context.Context, current *state.State, run scheduler.Run, outcome ghadapter.CompletionOutcome, allowWaiting bool) {
+func (r *Runner) applyOutcome(ctx context.Context, current *state.State, run scheduler.Run, outcome ghadapter.CompletionOutcome, allowWaiting, cleanupMerged bool) {
 	run.PullRequest = outcome.PullRequest
 	run.UpdatedAt = r.Now().UTC()
 	switch {
 	case outcome.Merged && outcome.IssueClosed:
-		assignment := worktree.Assignment{Path: run.Worktree, Branch: run.Branch}
-		if assignment.Path != "" && assignment.Branch != "" {
-			if err := r.Worktrees.Cleanup(ctx, assignment); err != nil {
-				transitionStatus(&run, scheduler.StatusNeedsHuman)
-				run.Error = fmt.Sprintf("completion verified but worktree cleanup failed: %v", err)
-				break
+		if cleanupMerged {
+			assignment := worktree.Assignment{Path: run.Worktree, Branch: run.Branch}
+			if assignment.Path != "" && assignment.Branch != "" {
+				if err := r.Worktrees.Cleanup(ctx, assignment); err != nil {
+					transitionStatus(&run, scheduler.StatusNeedsHuman)
+					run.Error = fmt.Sprintf("completion verified but worktree cleanup failed: %v", err)
+					break
+				}
 			}
 		}
 		now := r.Now().UTC()
@@ -454,6 +457,52 @@ func (r *Runner) applyOutcome(ctx context.Context, current *state.State, run sch
 		run.Error = "worker stopped without creating a pull request"
 	}
 	replaceRun(current, run)
+}
+
+func (r *Runner) finalizeSettledWorker(ctx context.Context, current *state.State, runID string, closeErr error, settled bool) error {
+	if !settled {
+		return nil
+	}
+	run := findRun(current.Runs, runID)
+	if run.RunID == "" {
+		return fmt.Errorf("finalize unknown Run %q", runID)
+	}
+	if closeErr != nil {
+		if run.Status == scheduler.StatusMerged || run.Status == scheduler.StatusWaitingForMerge {
+			r.retainProvisionalCompletion(current, &run, fmt.Sprintf("Pi RPC stream or process-group shutdown failed after settlement: %v", closeErr))
+			if err := r.Store.Save(*current); err != nil {
+				return fmt.Errorf("persist fail-closed RPC shutdown for issue #%d: %w", run.Issue, err)
+			}
+		}
+		return nil
+	}
+	if run.Status != scheduler.StatusMerged {
+		return nil
+	}
+	assignment := worktree.Assignment{Path: run.Worktree, Branch: run.Branch}
+	if assignment.Path == "" || assignment.Branch == "" {
+		return nil
+	}
+	if err := r.Worktrees.Cleanup(ctx, assignment); err != nil {
+		r.retainProvisionalCompletion(current, &run, fmt.Sprintf("completion verified but worktree cleanup failed: %v", err))
+		if saveErr := r.Store.Save(*current); saveErr != nil {
+			return errors.Join(fmt.Errorf("cleanup issue #%d worktree: %w", run.Issue, err), fmt.Errorf("persist retained completion: %w", saveErr))
+		}
+	}
+	return nil
+}
+
+func (r *Runner) retainProvisionalCompletion(current *state.State, run *scheduler.Run, message string) {
+	run.Status = scheduler.StatusNeedsHuman
+	run.CompletedAt = nil
+	run.PID = 0
+	run.Error = message
+	run.UpdatedAt = r.Now().UTC()
+	replaceRun(current, *run)
+	if findActiveRun(current, run.Issue).RunID == "" {
+		current.Leases = append(current.Leases, scheduler.Lease{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID})
+	}
+	r.logf("issue #%d needs human attention: %s", run.Issue, message)
 }
 
 func (r *Runner) failRun(current *state.State, issue int, message string) {

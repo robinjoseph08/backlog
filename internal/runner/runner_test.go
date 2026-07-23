@@ -75,6 +75,38 @@ func TestRunnerRetainsMergedWorkWhenPiEventStreamIsMalformed(t *testing.T) {
 	}
 }
 
+func TestRunnerFailsClosedWhenRPCOutputBreaksAfterSettlement(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 10, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+	worktrees := runner.Worktrees.(*fakeWorktrees)
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 10)
+	github.setCompletion(10, mergedOutcome(10))
+	workers.setCloseResult(10, worker.Result{Err: errors.New("message followed agent_settled")})
+	workers.complete(10, worker.Result{ExitCode: 0})
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got := store.runStatus(10); got != scheduler.StatusNeedsHuman {
+		t.Fatalf("issue 10 status = %q, want needs-human", got)
+	}
+	if worktrees.cleanupCount() != 0 {
+		t.Fatalf("cleanup count = %d, want worktree retained", worktrees.cleanupCount())
+	}
+	got, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Leases) != 1 || got.Leases[0].Issue != 10 {
+		t.Fatalf("Leases = %#v, want issue 10 retained", got.Leases)
+	}
+}
+
 func TestRunnerRetainsFailedWorktree(t *testing.T) {
 	t.Parallel()
 
@@ -498,9 +530,10 @@ func (w *fakeWorktrees) cleanupCount() int {
 }
 
 type fakeProcess struct {
-	issue int
-	owner *fakeWorkers
-	done  chan worker.Result
+	issue       int
+	owner       *fakeWorkers
+	done        chan worker.Result
+	closeResult worker.Result
 }
 
 func (p *fakeProcess) PID() int       { return 1000 + p.issue }
@@ -517,7 +550,7 @@ func (p *fakeProcess) Wait() worker.Result {
 }
 func (p *fakeProcess) Close() worker.Result {
 	p.owner.finished(p.issue)
-	return worker.Result{}
+	return p.closeResult
 }
 
 type fakeWorkers struct {
@@ -554,6 +587,11 @@ func (w *fakeWorkers) complete(issue int, result worker.Result) {
 		result.Settled = true
 	}
 	process.done <- result
+}
+func (w *fakeWorkers) setCloseResult(issue int, result worker.Result) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.processes[issue].closeResult = result
 }
 func (w *fakeWorkers) finished(int) {
 	w.mu.Lock()

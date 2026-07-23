@@ -157,6 +157,9 @@ func TestProcessRPCValidationFailsClosed(t *testing.T) {
 		{"duplicate response", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n`, "duplicated Pi RPC prompt response"},
 		{"mismatched response", `{"id":"wrong","type":"response","command":"prompt","success":true}\n`, "mismatched Pi RPC response"},
 		{"invalid order", `{"type":"agent_settled"}\n`, "invalidly ordered Pi RPC agent_settled"},
+		{"duplicate agent end", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n{"type":"agent_start"}\n{"type":"agent_end"}\n{"type":"agent_end"}\n`, "invalidly ordered Pi RPC agent_end"},
+		{"unmatched turn end", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n{"type":"agent_start"}\n{"type":"turn_end"}\n`, "invalidly ordered Pi RPC turn_end"},
+		{"unsupported dialog", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n{"type":"agent_start"}\n{"type":"extension_ui_request","id":"ui-1","method":"confirm"}\n`, "unsupported interactive Pi RPC request"},
 		{"unknown type", `{"type":"surprise"}\n`, "unknown Pi RPC message type"},
 	}
 	for _, test := range tests {
@@ -182,6 +185,41 @@ printf '`+test.output+`'
 			_ = process.Abort()
 			_ = process.Close()
 		})
+	}
+}
+
+func TestProcessAcceptsRetriesAndFireAndForgetExtensionUI(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	pi := fakePi(t, `
+IFS= read -r command
+printf '%s\n' \
+  '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' \
+  '{"type":"extension_ui_request","id":"ui-1","method":"setTitle"}' \
+  '{"type":"agent_start"}' \
+  '{"type":"agent_end"}' \
+  '{"type":"auto_retry_start"}' \
+  '{"type":"auto_retry_end"}' \
+  '{"type":"agent_start"}' \
+  '{"type":"agent_end"}' \
+  '{"type":"agent_settled"}'
+while IFS= read -r ignored; do :; done
+`)
+	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(
+		context.Background(), request(11, "run-11", root, filepath.Join(root, "sessions", "run-11")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if result := process.Wait(); result.Err != nil || !result.Settled {
+		t.Fatalf("valid retry stream = %#v", result)
+	}
+	if result := process.Close(); result.Err != nil {
+		t.Fatal(result.Err)
 	}
 }
 

@@ -331,26 +331,42 @@ func beginProcessGroupTermination(command *exec.Cmd, grace time.Duration, done c
 	return nil
 }
 
+type rpcAgentState uint8
+
+const (
+	rpcAwaitingResponse rpcAgentState = iota
+	rpcAwaitingAgentStart
+	rpcAgentRunning
+	rpcBetweenAgentRuns
+	rpcAgentSettled
+)
+
 type rpcWriter struct {
-	mu          sync.Mutex
-	destination io.Writer
-	buffer      []byte
-	lineNumber  int
-	issue       int
-	commandID   string
-	sawResponse bool
-	sawStart    bool
-	sawEnd      bool
-	sawSettled  bool
-	parseErrors []error
-	settled     chan struct{}
-	failed      chan struct{}
-	settledOnce sync.Once
-	failedOnce  sync.Once
+	mu             sync.Mutex
+	destination    io.Writer
+	buffer         []byte
+	lineNumber     int
+	issue          int
+	commandID      string
+	state          rpcAgentState
+	turnOpen       bool
+	messageOpen    bool
+	compactionOpen bool
+	retryOpen      bool
+	openTools      map[string]struct{}
+	parseErrors    []error
+	settled        chan struct{}
+	failed         chan struct{}
+	settledOnce    sync.Once
+	failedOnce     sync.Once
 }
 
 func newRPCWriter(destination io.Writer, commandID string, issue int) *rpcWriter {
-	return &rpcWriter{destination: destination, commandID: commandID, issue: issue, settled: make(chan struct{}), failed: make(chan struct{})}
+	return &rpcWriter{
+		destination: destination, commandID: commandID, issue: issue,
+		state: rpcAwaitingResponse, openTools: make(map[string]struct{}),
+		settled: make(chan struct{}), failed: make(chan struct{}),
+	}
 }
 
 func (w *rpcWriter) Write(data []byte) (int, error) {
@@ -383,10 +399,10 @@ func (w *rpcWriter) Finish() error {
 		w.addError(fmt.Errorf("truncated Pi RPC JSON record after line %d", w.lineNumber))
 		w.buffer = nil
 	}
-	if !w.sawResponse {
+	if w.state == rpcAwaitingResponse {
 		w.addError(errors.New("Pi RPC stream omitted the correlated prompt response"))
 	}
-	if !w.sawSettled {
+	if w.state != rpcAgentSettled {
 		w.addError(errors.New("Pi RPC stream ended before agent_settled"))
 	}
 	return errors.Join(w.parseErrors...)
@@ -401,7 +417,7 @@ func (w *rpcWriter) Err() error {
 func (w *rpcWriter) Settled() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.sawSettled
+	return w.state == rpcAgentSettled
 }
 
 func (w *rpcWriter) validate(line []byte) {
@@ -411,23 +427,25 @@ func (w *rpcWriter) validate(line []byte) {
 		return
 	}
 	var message struct {
-		Type    string          `json:"type"`
-		ID      string          `json:"id"`
-		Command string          `json:"command"`
-		Success *bool           `json:"success"`
-		Data    json.RawMessage `json:"data"`
+		Type       string          `json:"type"`
+		ID         string          `json:"id"`
+		Command    string          `json:"command"`
+		Method     string          `json:"method"`
+		ToolCallID string          `json:"toolCallId"`
+		Success    *bool           `json:"success"`
+		Data       json.RawMessage `json:"data"`
 	}
 	if !json.Valid(line) || json.Unmarshal(line, &message) != nil || message.Type == "" {
 		w.addError(fmt.Errorf("malformed Pi RPC JSON on line %d", w.lineNumber))
 		return
 	}
-	if w.sawSettled {
+	if w.state == rpcAgentSettled {
 		w.addError(fmt.Errorf("Pi RPC message %q followed agent_settled on line %d", message.Type, w.lineNumber))
 		return
 	}
 	if message.Type == "response" {
-		if w.sawResponse {
-			w.addError(fmt.Errorf("duplicated Pi RPC prompt response on line %d", w.lineNumber))
+		if w.state != rpcAwaitingResponse {
+			w.addError(fmt.Errorf("duplicated Pi RPC prompt response or invalid response order on line %d", w.lineNumber))
 			return
 		}
 		if message.ID != w.commandID || message.Command != "prompt" {
@@ -438,7 +456,11 @@ func (w *rpcWriter) validate(line []byte) {
 			w.addError(fmt.Errorf("Pi RPC prompt was rejected on line %d", w.lineNumber))
 			return
 		}
-		w.sawResponse = true
+		w.state = rpcAwaitingAgentStart
+		return
+	}
+	if message.Type == "extension_ui_request" {
+		w.validateExtensionUIRequest(message.ID, message.Method)
 		return
 	}
 	if message.ID != "" {
@@ -447,35 +469,130 @@ func (w *rpcWriter) validate(line []byte) {
 	}
 	switch message.Type {
 	case "agent_start":
-		if w.sawStart {
-			w.addError(fmt.Errorf("duplicated Pi RPC agent_start on line %d", w.lineNumber))
+		if (w.state != rpcAwaitingAgentStart && w.state != rpcBetweenAgentRuns) || w.compactionOpen || w.retryOpen {
+			w.invalidOrder(message.Type)
 			return
 		}
-		w.sawStart = true
+		w.state = rpcAgentRunning
 	case "agent_end":
-		if !w.sawStart || !w.sawResponse {
-			w.addError(fmt.Errorf("invalidly ordered Pi RPC agent_end on line %d", w.lineNumber))
+		if w.state != rpcAgentRunning || w.turnOpen || w.messageOpen || len(w.openTools) != 0 {
+			w.invalidOrder(message.Type)
 			return
 		}
-		w.sawEnd = true
+		w.state = rpcBetweenAgentRuns
 	case "agent_settled":
-		if !w.sawStart || !w.sawEnd || !w.sawResponse {
-			w.addError(fmt.Errorf("invalidly ordered Pi RPC agent_settled on line %d", w.lineNumber))
+		if w.state != rpcBetweenAgentRuns || w.compactionOpen || w.retryOpen {
+			w.invalidOrder(message.Type)
 			return
 		}
-		w.sawSettled = true
+		w.state = rpcAgentSettled
 		w.settledOnce.Do(func() { close(w.settled) })
-	case "turn_start", "turn_end", "message_start", "message_update", "message_end",
-		"tool_execution_start", "tool_execution_update", "tool_execution_end", "queue_update",
-		"compaction_start", "compaction_end", "auto_retry_start", "auto_retry_end", "extension_error":
-		if !w.sawStart {
-			w.addError(fmt.Errorf("invalidly ordered Pi RPC event %q on line %d", message.Type, w.lineNumber))
+	case "turn_start":
+		if w.state != rpcAgentRunning || w.turnOpen {
+			w.invalidOrder(message.Type)
+			return
 		}
-	case "extension_ui_request":
-		w.addError(fmt.Errorf("unsupported interactive Pi RPC request on line %d", w.lineNumber))
+		w.turnOpen = true
+	case "turn_end":
+		if w.state != rpcAgentRunning || !w.turnOpen || w.messageOpen || len(w.openTools) != 0 {
+			w.invalidOrder(message.Type)
+			return
+		}
+		w.turnOpen = false
+	case "message_start":
+		if w.state != rpcAgentRunning || w.messageOpen {
+			w.invalidOrder(message.Type)
+			return
+		}
+		w.messageOpen = true
+	case "message_update":
+		if w.state != rpcAgentRunning || !w.messageOpen {
+			w.invalidOrder(message.Type)
+		}
+	case "message_end":
+		if w.state != rpcAgentRunning || !w.messageOpen {
+			w.invalidOrder(message.Type)
+			return
+		}
+		w.messageOpen = false
+	case "tool_execution_start":
+		if w.state != rpcAgentRunning || message.ToolCallID == "" {
+			w.invalidOrder(message.Type)
+			return
+		}
+		if _, exists := w.openTools[message.ToolCallID]; exists {
+			w.addError(fmt.Errorf("duplicated Pi RPC tool_execution_start on line %d", w.lineNumber))
+			return
+		}
+		w.openTools[message.ToolCallID] = struct{}{}
+	case "tool_execution_update":
+		if w.state != rpcAgentRunning || message.ToolCallID == "" {
+			w.invalidOrder(message.Type)
+			return
+		}
+		if _, exists := w.openTools[message.ToolCallID]; !exists {
+			w.invalidOrder(message.Type)
+		}
+	case "tool_execution_end":
+		if w.state != rpcAgentRunning || message.ToolCallID == "" {
+			w.invalidOrder(message.Type)
+			return
+		}
+		if _, exists := w.openTools[message.ToolCallID]; !exists {
+			w.invalidOrder(message.Type)
+			return
+		}
+		delete(w.openTools, message.ToolCallID)
+	case "compaction_start":
+		if w.state != rpcBetweenAgentRuns || w.compactionOpen || w.retryOpen {
+			w.invalidOrder(message.Type)
+			return
+		}
+		w.compactionOpen = true
+	case "compaction_end":
+		if w.state != rpcBetweenAgentRuns || !w.compactionOpen {
+			w.invalidOrder(message.Type)
+			return
+		}
+		w.compactionOpen = false
+	case "auto_retry_start":
+		if w.state != rpcBetweenAgentRuns || w.retryOpen || w.compactionOpen {
+			w.invalidOrder(message.Type)
+			return
+		}
+		w.retryOpen = true
+	case "auto_retry_end":
+		if w.state != rpcBetweenAgentRuns || !w.retryOpen {
+			w.invalidOrder(message.Type)
+			return
+		}
+		w.retryOpen = false
+	case "queue_update", "extension_error":
+		if w.state == rpcAwaitingResponse {
+			w.invalidOrder(message.Type)
+		}
 	default:
 		w.addError(fmt.Errorf("unknown Pi RPC message type %q on line %d", message.Type, w.lineNumber))
 	}
+}
+
+func (w *rpcWriter) validateExtensionUIRequest(id, method string) {
+	if w.state == rpcAwaitingResponse || id == "" {
+		w.invalidOrder("extension_ui_request")
+		return
+	}
+	switch method {
+	case "notify", "setStatus", "setWidget", "setTitle", "set_editor_text":
+		return
+	case "select", "confirm", "input", "editor":
+		w.addError(fmt.Errorf("unsupported interactive Pi RPC request %q on line %d", method, w.lineNumber))
+	default:
+		w.addError(fmt.Errorf("unknown Pi RPC extension UI method %q on line %d", method, w.lineNumber))
+	}
+}
+
+func (w *rpcWriter) invalidOrder(messageType string) {
+	w.addError(fmt.Errorf("invalidly ordered Pi RPC %s on line %d", messageType, w.lineNumber))
 }
 
 func (w *rpcWriter) addError(err error) {
