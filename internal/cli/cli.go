@@ -25,6 +25,12 @@ import (
 )
 
 func Main(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	return MainWithSignals(ctx, args, stdout, stderr, nil)
+}
+
+// MainWithSignals runs the CLI while preserving each delivered interrupt for
+// the runner lifecycle instead of reducing all interrupts to one cancellation.
+func MainWithSignals(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan os.Signal) int {
 	if len(args) == 0 {
 		printUsage(stderr)
 		return 2
@@ -32,7 +38,7 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	var err error
 	switch args[0] {
 	case "run":
-		err = runCommand(ctx, args[1:], stdout, stderr)
+		err = runCommand(ctx, args[1:], stdout, stderr, signals)
 	case "status":
 		err = statusCommand(ctx, args[1:], stdout, stderr)
 	case "retry":
@@ -55,7 +61,7 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan os.Signal) error {
 	flags := flag.NewFlagSet("run", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	repoDir := flags.String("repo-dir", ".", "Git repository to drain")
@@ -126,6 +132,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		Worktrees: worktrees,
 		Workers:   workerAdapter{supervisor: supervisor},
 		Output:    stdout,
+		Signals:   signals,
 	}
 	return backlogRunner.Run(ctx)
 }

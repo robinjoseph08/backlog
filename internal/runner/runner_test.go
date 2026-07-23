@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -241,6 +242,27 @@ func TestRunnerPersistsWorkerIdentityBeforeRelease(t *testing.T) {
 	}
 }
 
+func TestRunnerDoesNotCommitInMemoryLeaseWhenAdmissionSaveFails(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 15, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 2}
+	runner := testRunner(github, workers, store, 1)
+
+	err := runner.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "persist lease for issue #15") {
+		t.Fatalf("run error = %v, want Lease persistence failure", err)
+	}
+	got := store.LoadValue()
+	if len(got.Runs) != 0 || len(got.Leases) != 0 {
+		t.Fatalf("state after failed admission = %#v, want no Run or Lease", got)
+	}
+	if workers.wasStarted(15) {
+		t.Fatal("Worker started after Lease persistence failed")
+	}
+}
+
 func TestRunnerStopsGatedWorkerWhenPIDPersistenceFails(t *testing.T) {
 	t.Parallel()
 
@@ -282,6 +304,95 @@ func TestRunnerNeverStartsBlockedCandidate(t *testing.T) {
 	if workers.wasStarted(1) {
 		t.Fatal("blocked issue #1 was started")
 	}
+}
+
+func TestRunnerNeverPersistsLeaseAfterDrainIsAccepted(t *testing.T) {
+	t.Parallel()
+
+	candidateLookupStarted := make(chan struct{})
+	github := &fakeGitHub{candidatesFunc: func(ctx context.Context) ([]scheduler.Candidate, error) {
+		close(candidateLookupStarted)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	signals := make(chan os.Signal, 2)
+	output := newSynchronizedOutput()
+	runner := testRunner(github, workers, store, 1)
+	runner.Config.Watch = true
+	runner.Signals = signals
+	runner.Output = output
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	<-candidateLookupStarted
+	signals <- os.Interrupt
+	output.waitFor(t, "Drain: admission stopped; 0 Workers remaining; next SIGINT will request suspension")
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := store.LoadValue()
+	if len(got.Leases) != 0 || len(got.Runs) != 0 {
+		t.Fatalf("state after Drain = %#v, want no admitted Run or Lease", got)
+	}
+	if len(workers.startedSnapshot()) != 0 {
+		t.Fatalf("started Workers = %v, want none", workers.startedSnapshot())
+	}
+}
+
+func TestRunnerFinishesLeaseCommittedBeforeDrainAndObservesRepeatedSignals(t *testing.T) {
+	t.Parallel()
+
+	var candidateCtx context.Context
+	candidateReturned := make(chan struct{})
+	github := &fakeGitHub{
+		candidates: []scheduler.Candidate{{Number: 14, CreatedAt: time.Now()}},
+		candidatesFunc: func(ctx context.Context) ([]scheduler.Candidate, error) {
+			candidateCtx = ctx
+			close(candidateReturned)
+			return []scheduler.Candidate{{Number: 14, CreatedAt: time.Now()}}, nil
+		},
+	}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	prepareStarted := make(chan struct{})
+	finishPrepare := make(chan struct{})
+	signals := make(chan os.Signal, 2)
+	output := newSynchronizedOutput()
+	runner := testRunner(github, workers, store, 1)
+	runner.Signals = signals
+	runner.Output = output
+	runner.Worktrees = &blockingWorktrees{prepareStarted: prepareStarted, finishPrepare: finishPrepare}
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	<-candidateReturned
+	<-prepareStarted
+	if got := store.LoadValue(); len(got.Leases) != 1 || got.Leases[0].Issue != 14 {
+		t.Fatalf("state before Drain = %#v, want committed Lease for issue 14", got)
+	}
+	signals <- os.Interrupt
+	select {
+	case <-candidateCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Drain was not accepted while the committed Run was preparing")
+	}
+	signals <- os.Interrupt
+	close(finishPrepare)
+	workers.waitForStarts(t, 14)
+	output.waitFor(t, "Drain: admission stopped; 1 Worker remaining; next SIGINT will request suspension")
+	output.waitFor(t, "Drain: additional interrupt observed; 1 Worker remaining; next SIGINT will request suspension")
+	github.setCompletion(14, mergedOutcome(14))
+	workers.complete(14, worker.Result{ExitCode: 0})
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := store.LoadValue()
+	if len(got.Runs) != 1 || got.Runs[0].Status != scheduler.StatusMerged || len(got.Leases) != 0 {
+		t.Fatalf("state after drained Worker settlement = %#v", got)
+	}
+	output.waitFor(t, "Drain complete: 0 Workers remaining; exiting successfully")
 }
 
 func TestRunnerWaitsForOwnedWorkerBeforePersistingShutdown(t *testing.T) {
@@ -858,15 +969,15 @@ type fakeGitHub struct {
 	candidateResults   []candidateResult
 	candidateCallTimes []time.Time
 	candidateChanged   chan struct{}
+	candidatesFunc     func(context.Context) ([]scheduler.Candidate, error)
 	completions        map[int]ghadapter.CompletionOutcome
 	completionErrs     map[int]error
 	completionCheck    func(int) error
 	completionBranches []string
 }
 
-func (g *fakeGitHub) Candidates(context.Context, string) ([]scheduler.Candidate, error) {
+func (g *fakeGitHub) Candidates(ctx context.Context, _ string) ([]scheduler.Candidate, error) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	call := len(g.candidateCallTimes)
 	g.candidateCallTimes = append(g.candidateCallTimes, time.Now())
 	if g.candidateChanged != nil {
@@ -875,6 +986,12 @@ func (g *fakeGitHub) Candidates(context.Context, string) ([]scheduler.Candidate,
 		default:
 		}
 	}
+	custom := g.candidatesFunc
+	if custom != nil {
+		g.mu.Unlock()
+		return custom(ctx)
+	}
+	defer g.mu.Unlock()
 	if call < len(g.candidateResults) {
 		result := g.candidateResults[call]
 		return append([]scheduler.Candidate(nil), result.candidates...), result.err
@@ -949,6 +1066,22 @@ func mergedOutcome(issue int) ghadapter.CompletionOutcome {
 type fakeWorktrees struct {
 	mu      sync.Mutex
 	cleaned []worktree.Assignment
+}
+
+type blockingWorktrees struct {
+	fakeWorktrees
+	prepareStarted chan struct{}
+	finishPrepare  chan struct{}
+}
+
+func (w *blockingWorktrees) Prepare(ctx context.Context, _ worktree.Assignment) error {
+	close(w.prepareStarted)
+	select {
+	case <-w.finishPrepare:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (*fakeWorktrees) Plan(issue int, runID string) (worktree.Assignment, error) {
@@ -1126,4 +1259,43 @@ func (w *fakeWorkers) recoveredReleaseCount() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.recoveredReleases
+}
+
+type synchronizedOutput struct {
+	mu      sync.Mutex
+	content strings.Builder
+	changed chan struct{}
+}
+
+func newSynchronizedOutput() *synchronizedOutput {
+	return &synchronizedOutput{changed: make(chan struct{}, 20)}
+}
+
+func (w *synchronizedOutput) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	written, err := w.content.Write(data)
+	select {
+	case w.changed <- struct{}{}:
+	default:
+	}
+	return written, err
+}
+
+func (w *synchronizedOutput) waitFor(t *testing.T, text string) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		w.mu.Lock()
+		found := strings.Contains(w.content.String(), text)
+		w.mu.Unlock()
+		if found {
+			return
+		}
+		select {
+		case <-w.changed:
+		case <-deadline:
+			t.Fatalf("output did not contain %q", text)
+		}
+	}
 }

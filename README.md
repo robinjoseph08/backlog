@@ -112,7 +112,9 @@ Retry removes the active Lease but preserves the historical Run and prior worktr
 
 ## Shutdown
 
-`SIGINT` and `SIGTERM` stop scheduling and cancel workers started by the current runner. Pi process groups receive `SIGTERM`, followed by `SIGKILL` after a grace period if needed. Their runs are persisted as failed and their worktrees are retained. Persisted live workers discovered from an earlier runner are not killed because the new process does not own them.
+The first `SIGINT` enters Drain. Backlog atomically stops admitting new Leases, allows every already leased Worker to settle and reconcile, reports the stage and remaining Worker count, and exits successfully when no owned Workers remain. A Lease committed just before Drain may still finish worktree preparation and Worker launch. Additional `SIGINT` requests are reported while Drain continues; clean suspension is implemented by the next lifecycle stage.
+
+`SIGTERM` and non-signal context cancellation retain the immediate shutdown behavior: they stop scheduling and cancel workers started by the current runner. Pi process groups receive `SIGTERM`, followed by `SIGKILL` after a grace period if needed. Their runs are persisted as failed and their worktrees are retained. Persisted live workers discovered from an earlier runner are not killed because the new process does not own them.
 
 ## Validation
 

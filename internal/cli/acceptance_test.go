@@ -1,16 +1,147 @@
 package cli
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 )
+
+func TestCompiledExecutableDrainsOnSIGINTWithoutAdmittingAnotherLease(t *testing.T) {
+	root := t.TempDir()
+	repository := filepath.Join(root, "repo")
+	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, output)
+	}
+	binary := filepath.Join(root, "backlog")
+	build := exec.Command("go", "build", "-o", binary, "./cmd/backlog")
+	build.Dir = filepath.Clean(filepath.Join("..", ".."))
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build compiled Drain executable: %v\n%s", err, output)
+	}
+
+	stateDir := filepath.Join(root, "state")
+	statePath := filepath.Join(stateDir, "state.json")
+	workerStarted := filepath.Join(root, "worker-started")
+	finishWorker := filepath.Join(root, "finish-worker")
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef")
+    printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
+    printf '%s\n' '[{"number":31,"title":"First","createdAt":"2026-01-01T00:00:00Z","url":"https://example.test/issues/31"},{"number":32,"title":"Later","createdAt":"2026-01-02T00:00:00Z","url":"https://example.test/issues/32"}]' ;;
+  "issue view 31 --repo acme/widgets --json number,title,body,state,url,createdAt")
+    printf '%s\n' '{"number":31,"title":"First","body":"","state":"OPEN","url":"https://example.test/issues/31","createdAt":"2026-01-01T00:00:00Z"}' ;;
+  "issue view 32 --repo acme/widgets --json number,title,body,state,url,createdAt")
+    printf '%s\n' '{"number":32,"title":"Later","body":"","state":"OPEN","url":"https://example.test/issues/32","createdAt":"2026-01-02T00:00:00Z"}' ;;
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/31/comments?per_page=100 --paginate --slurp"|\
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/31/dependencies/blocked_by?per_page=100 --paginate --slurp"|\
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/32/comments?per_page=100 --paginate --slurp"|\
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/32/dependencies/blocked_by?per_page=100 --paginate --slurp")
+    printf '%s\n' '[[]]' ;;
+  "pr list --repo acme/widgets --state all --head agent/issue-31-"*" --json number,url,state,mergedAt,autoMergeRequest,isDraft")
+    printf '%s\n' '[{"number":31,"url":"https://example.test/pull/31","state":"MERGED","mergedAt":"2026-07-23T00:00:00Z"}]' ;;
+  "issue view 31 --repo acme/widgets --json state,title,url")
+    printf '%s\n' '{"state":"CLOSED","title":"First","url":"https://example.test/issues/31"}' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	git := writeExecutable(t, `#!/bin/sh
+set -eu
+if [ "$3" = "rev-parse" ] && [ "$4" = "--show-toplevel" ]; then printf '%s\n' `+quote(repository)+`; exit 0; fi
+if [ "$3" = "rev-parse" ] && [ "$4" = "--git-common-dir" ]; then printf '%s\n' `+quote(filepath.Join(repository, ".git"))+`; exit 0; fi
+if [ "$3" = "worktree" ] && [ "$4" = "add" ]; then mkdir -p "$7"; exit 0; fi
+if [ "$3" = "worktree" ] && [ "$4" = "remove" ]; then rm -rf "$6"; exit 0; fi
+exit 0
+`)
+	pi := writeExecutable(t, `#!/bin/sh
+set -eu
+touch `+quote(workerStarted)+`
+while [ ! -f `+quote(finishWorker)+` ]; do sleep 0.01; done
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+while IFS= read -r ignored; do :; done
+`)
+
+	command := exec.Command(binary, "run", "--repo-dir", repository, "--state-dir", stateDir,
+		"--max-workers", "1", "--poll", "5ms", "--gh", gh, "--git", git, "--pi", pi)
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	lines := make(chan string, 100)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+		close(lines)
+	}()
+	waitForFile(t, workerStarted)
+	if current, err := (state.FileStore{Path: statePath}).Load(); err != nil || len(current.Leases) != 1 || current.Leases[0].Issue != 31 {
+		t.Fatalf("state before SIGINT = %#v, err = %v", current, err)
+	}
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		t.Fatalf("send SIGINT: %v", err)
+	}
+	var outputLines []string
+	for {
+		line, ok := <-lines
+		if !ok {
+			t.Fatalf("process exited before reporting Drain, output = %q, stderr = %q", outputLines, stderr.String())
+		}
+		outputLines = append(outputLines, line)
+		if strings.Contains(line, "Drain: admission stopped; 1 Worker remaining; next SIGINT will request suspension") {
+			break
+		}
+	}
+	if err := os.WriteFile(finishWorker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err != nil {
+		t.Fatalf("compiled Drain run: %v, stderr = %q", err, stderr.String())
+	}
+	for line := range lines {
+		outputLines = append(outputLines, line)
+	}
+	current, err := (state.FileStore{Path: statePath}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.Runs) != 1 || current.Runs[0].Issue != 31 || current.Runs[0].Status != scheduler.StatusMerged || len(current.Leases) != 0 {
+		t.Fatalf("persisted state after Drain = %#v", current)
+	}
+	output := strings.Join(outputLines, "\n")
+	if !strings.Contains(output, "Drain complete: 0 Workers remaining; exiting successfully") {
+		t.Fatalf("Drain output = %q", output)
+	}
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("file %s was not created", path)
+}
 
 func TestCompiledExecutableRunsAFKThroughDurableRPCSettlement(t *testing.T) {
 	root := t.TempDir()

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -68,6 +69,7 @@ type Runner struct {
 	Worktrees Worktrees
 	Workers   Workers
 	Output    io.Writer
+	Signals   <-chan os.Signal
 
 	Now         func() time.Time
 	NewRunID    func(issue int) string
@@ -80,12 +82,51 @@ type workerCompletion struct {
 	result worker.Result
 }
 
+// admissionGate serializes the in-memory Drain transition with the complete
+// durable Lease write. Once stop returns, no later commit can call Store.Save.
+type admissionGate struct {
+	mu       sync.Mutex
+	draining bool
+}
+
+func (g *admissionGate) commit(save func() error) (bool, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.draining {
+		return false, nil
+	}
+	return true, save()
+}
+
+func (g *admissionGate) stop() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	first := !g.draining
+	g.draining = true
+	return first
+}
+
+func (g *admissionGate) stopped() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.draining
+}
+
+type signalEvent struct {
+	signal     os.Signal
+	firstDrain bool
+}
+
 func (r *Runner) Run(ctx context.Context) error {
 	if err := r.validate(); err != nil {
 		return err
 	}
-	runCtx, cancelWorkers := context.WithCancel(ctx)
-	defer cancelWorkers()
+	workerCtx, cancelWorkers := context.WithCancel(context.Background())
+	stopWorkerCancellation := context.AfterFunc(ctx, cancelWorkers)
+	defer func() {
+		stopWorkerCancellation()
+		cancelWorkers()
+	}()
 
 	current, err := r.Store.Load()
 	if err != nil {
@@ -114,14 +155,36 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}()
 
+	admissionCtx, cancelAdmission := context.WithCancel(ctx)
+	defer cancelAdmission()
+	admission := &admissionGate{}
+	signalCtx, stopSignals := context.WithCancel(context.Background())
+	defer stopSignals()
+	signalEvents := r.observeSignals(signalCtx, admission, cancelAdmission)
+	draining := false
+
 	for {
+		select {
+		case event := <-signalEvents:
+			draining = r.handleSignal(event, len(localWorkers)) || draining
+		default:
+		}
 		if ctx.Err() != nil {
 			return r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped; worker was terminated and its worktree was retained")
 		}
 
-		if candidateRetry == nil {
-			candidates, err := r.GitHub.Candidates(ctx, r.Config.Repo)
+		if !draining && candidateRetry == nil {
+			candidates, err := r.GitHub.Candidates(admissionCtx, r.Config.Repo)
 			if err != nil {
+				if admissionCtx.Err() != nil && ctx.Err() == nil {
+					select {
+					case event := <-signalEvents:
+						draining = r.handleSignal(event, len(localWorkers))
+						continue
+					case <-ctx.Done():
+						continue
+					}
+				}
 				if ctx.Err() != nil {
 					continue
 				}
@@ -139,8 +202,9 @@ func (r *Runner) Run(ctx context.Context) error {
 			} else {
 				candidateErr = nil
 				plan := scheduler.Plan(scheduler.Snapshot{Candidates: candidates, Runs: current.Runs, Leases: current.Leases}, r.Config.MaxConcurrentIssues)
+				startedWorker := false
 				for _, candidate := range plan.Starts {
-					process, err := r.start(ctx, runCtx, &current, candidate)
+					process, err := r.start(workerCtx, admission, &current, candidate)
 					if err != nil {
 						shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after a worker launch error; worktree retained")
 						return errors.Join(err, shutdownErr)
@@ -149,21 +213,32 @@ func (r *Runner) Run(ctx context.Context) error {
 						continue
 					}
 					localWorkers[candidate.Number] = process
+					startedWorker = true
 					go func(issue int, process WorkerProcess) {
 						completions <- workerCompletion{issue: issue, result: process.Wait()}
 					}(candidate.Number, process)
 				}
 
-				if len(plan.Starts) > 0 {
+				if startedWorker {
 					continue
 				}
 				if unfinishedRunCount(&current) == 0 && !r.Config.Watch {
+					if admission.stopped() {
+						event := <-signalEvents
+						draining = r.handleSignal(event, len(localWorkers)) || draining
+						continue
+					}
 					return nil
 				}
 			}
+		} else if draining && len(localWorkers) == 0 {
+			r.logf("Drain complete: 0 Workers remaining; exiting successfully")
+			return nil
 		}
 
 		select {
+		case event := <-signalEvents:
+			draining = r.handleSignal(event, len(localWorkers)) || draining
 		case completion := <-completions:
 			process := localWorkers[completion.issue]
 			if process == nil {
@@ -203,18 +278,32 @@ func (r *Runner) Run(ctx context.Context) error {
 				closed = process.Close()
 			}
 			delete(localWorkers, completion.issue)
+			if draining && len(localWorkers) > 0 {
+				r.logf("Drain: %s remaining; next SIGINT will request suspension", workerSummary(len(localWorkers)))
+			}
 			if err := r.finalizeSettledWorker(ctx, &current, runID, closed.Err, completion.result.Settled); err != nil {
 				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after an RPC finalization error; worktree retained")
 				return errors.Join(err, shutdownErr)
 			}
-			if candidateErr != nil && unfinishedRunCount(&current) == 0 && !r.Config.Watch {
+			if !draining && candidateErr != nil && unfinishedRunCount(&current) == 0 && !r.Config.Watch {
 				return candidateErr
 			}
 		case <-candidateRetry:
 			candidateRetry = nil
 		case <-poll.C:
-			if err := r.reconcile(ctx, &current, localWorkers); err != nil {
+			if draining {
+				continue
+			}
+			if err := r.reconcile(admissionCtx, &current, localWorkers); err != nil {
+				if admissionCtx.Err() != nil && ctx.Err() == nil {
+					event := <-signalEvents
+					draining = r.handleSignal(event, len(localWorkers)) || draining
+					continue
+				}
 				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after a reconciliation error; worktree retained")
+				if ctx.Err() != nil {
+					return shutdownErr
+				}
 				return errors.Join(err, shutdownErr)
 			}
 			if candidateErr != nil && unfinishedRunCount(&current) == 0 && !r.Config.Watch {
@@ -224,6 +313,51 @@ func (r *Runner) Run(ctx context.Context) error {
 			continue
 		}
 	}
+}
+
+func (r *Runner) observeSignals(ctx context.Context, admission *admissionGate, cancelAdmission context.CancelFunc) <-chan signalEvent {
+	if r.Signals == nil {
+		return nil
+	}
+	events := make(chan signalEvent, 16)
+	go func() {
+		for {
+			select {
+			case signal, ok := <-r.Signals:
+				if !ok {
+					return
+				}
+				first := admission.stop()
+				if first {
+					cancelAdmission()
+				}
+				select {
+				case events <- signalEvent{signal: signal, firstDrain: first}:
+				case <-ctx.Done():
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return events
+}
+
+func (r *Runner) handleSignal(event signalEvent, workers int) bool {
+	if event.firstDrain {
+		r.logf("Drain: admission stopped; %s remaining; next SIGINT will request suspension", workerSummary(workers))
+		return true
+	}
+	r.logf("Drain: additional %s observed; %s remaining; next SIGINT will request suspension", event.signal, workerSummary(workers))
+	return false
+}
+
+func workerSummary(count int) string {
+	if count == 1 {
+		return "1 Worker"
+	}
+	return fmt.Sprintf("%d Workers", count)
 }
 
 func (r *Runner) validate() error {
@@ -273,7 +407,7 @@ func (r *Runner) initializeState(current *state.State) error {
 	return nil
 }
 
-func (r *Runner) start(ctx context.Context, workerCtx context.Context, current *state.State, candidate scheduler.Candidate) (WorkerProcess, error) {
+func (r *Runner) start(workerCtx context.Context, admission *admissionGate, current *state.State, candidate scheduler.Candidate) (WorkerProcess, error) {
 	now := r.Now().UTC()
 	runID := r.NewRunID(candidate.Number)
 	run := scheduler.Run{
@@ -281,10 +415,21 @@ func (r *Runner) start(ctx context.Context, workerCtx context.Context, current *
 		SessionName: fmt.Sprintf("afk #%d", candidate.Number), SessionID: "backlog-" + runID,
 		SessionDir: filepath.Join(r.Config.SessionsDir, runID), StartedAt: now, UpdatedAt: now,
 	}
-	current.Runs = append(current.Runs, run)
-	current.Leases = append(current.Leases, scheduler.Lease{LeaseID: runID, Issue: candidate.Number, RunID: runID})
-	if err := r.Store.Save(*current); err != nil {
+	admitted, err := admission.commit(func() error {
+		next := *current
+		next.Runs = append(append([]scheduler.Run(nil), current.Runs...), run)
+		next.Leases = append(append([]scheduler.Lease(nil), current.Leases...), scheduler.Lease{LeaseID: runID, Issue: candidate.Number, RunID: runID})
+		if err := r.Store.Save(next); err != nil {
+			return err
+		}
+		*current = next
+		return nil
+	})
+	if err != nil {
 		return nil, fmt.Errorf("persist lease for issue #%d: %w", candidate.Number, err)
+	}
+	if !admitted {
+		return nil, nil
 	}
 	r.logf("claimed issue #%d as %s", candidate.Number, runID)
 
@@ -301,7 +446,7 @@ func (r *Runner) start(ctx context.Context, workerCtx context.Context, current *
 	if err := r.Store.Save(*current); err != nil {
 		return nil, fmt.Errorf("persist planned worktree for issue #%d: %w", candidate.Number, err)
 	}
-	if err := r.Worktrees.Prepare(ctx, assignment); err != nil {
+	if err := r.Worktrees.Prepare(workerCtx, assignment); err != nil {
 		r.failRun(current, candidate.Number, fmt.Sprintf("prepare worktree: %v", err))
 		return nil, r.saveAfterFailure(*current, candidate.Number)
 	}
