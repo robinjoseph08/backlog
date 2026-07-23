@@ -217,6 +217,9 @@ func (r *Runner) Run(ctx context.Context) error {
 				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after a reconciliation error; worktree retained")
 				return errors.Join(err, shutdownErr)
 			}
+			if candidateErr != nil && unfinishedRunCount(&current) == 0 && !r.Config.Watch {
+				return candidateErr
+			}
 		case <-ctx.Done():
 			continue
 		}

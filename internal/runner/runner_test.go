@@ -368,6 +368,41 @@ func TestRunnerKeepsActiveWorkerRunningThroughCandidateDiscoveryFailure(t *testi
 	}
 }
 
+func TestRunnerReturnsCandidateDiscoveryErrorAfterWaitingRunReconciles(t *testing.T) {
+	t.Parallel()
+
+	transientErr := errors.New("candidate discovery unavailable")
+	github := &fakeGitHub{
+		candidateResults: []candidateResult{{err: transientErr}},
+		candidateChanged: make(chan struct{}, 2),
+		completions: map[int]ghadapter.CompletionOutcome{
+			4: {PRFound: true, PullRequest: "https://example.test/pr/4", AutoMergeArmed: true},
+		},
+	}
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs: []scheduler.Run{{
+			Issue: 4, RunID: "waiting", Status: scheduler.StatusWaitingForMerge, WorkerMode: scheduler.WorkerModeRPC,
+			Branch: "agent/issue-4-waiting", Worktree: "/tmp/waiting",
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "waiting", Issue: 4, RunID: "waiting"}},
+	}}
+	runner := testRunner(github, newFakeWorkers(), store, 1)
+	runner.Config.PollInterval = 50 * time.Millisecond
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	github.waitForCandidateCalls(t, 1)
+	github.setCompletion(4, mergedOutcome(4))
+
+	if err := <-done; err == nil || !strings.Contains(err.Error(), transientErr.Error()) {
+		t.Fatalf("run error = %v, want candidate discovery error after waiting Run reconciliation", err)
+	}
+	if got := store.runStatus(4); got != scheduler.StatusMerged {
+		t.Fatalf("issue 4 status = %q, want merged", got)
+	}
+}
+
 func TestRunnerRetriesCandidateDiscoveryAfterPollIntervalAndResumesAdmission(t *testing.T) {
 	t.Parallel()
 
@@ -402,9 +437,7 @@ func TestRunnerRetriesCandidateDiscoveryAfterPollIntervalAndResumesAdmission(t *
 
 	workers.complete(4, worker.Result{ExitCode: 1, Err: errors.New("failed")})
 	workers.complete(5, worker.Result{ExitCode: 1, Err: errors.New("failed")})
-	for deadline := time.Now().Add(time.Second); workers.runningCount() != 0 && time.Now().Before(deadline); {
-		time.Sleep(time.Millisecond)
-	}
+	workers.waitForNoRunningWorkers(t)
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("run: %v", err)
@@ -431,9 +464,7 @@ func TestRunnerWatchRetriesCandidateDiscoveryWithoutActiveRun(t *testing.T) {
 
 	workers.waitForStarts(t, 7)
 	workers.complete(7, worker.Result{ExitCode: 1, Err: errors.New("failed")})
-	for deadline := time.Now().Add(time.Second); workers.runningCount() != 0 && time.Now().Before(deadline); {
-		time.Sleep(time.Millisecond)
-	}
+	workers.waitForNoRunningWorkers(t)
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("run: %v", err)
@@ -1010,6 +1041,16 @@ func (w *fakeWorkers) waitForStarts(t *testing.T, issues ...int) {
 		case <-deadline:
 			t.Fatalf("started %v, want %v", w.startedSnapshot(), issues)
 		}
+	}
+}
+func (w *fakeWorkers) waitForNoRunningWorkers(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for w.runningCount() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := w.runningCount(); got != 0 {
+		t.Fatalf("running Workers = %d, want zero", got)
 	}
 }
 func (w *fakeWorkers) wasStarted(issue int) bool {
