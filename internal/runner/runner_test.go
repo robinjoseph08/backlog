@@ -418,6 +418,41 @@ func TestRunnerAcceptsIdleDrainWhileInitialReconciliationIsBlocked(t *testing.T)
 	output.waitFor(t, "Drain complete: 0 Workers remaining; exiting successfully")
 }
 
+func TestRunnerDoesNotMisclassifyMergedRunWhenDrainCancelsCleanup(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{completions: map[int]ghadapter.CompletionOutcome{21: mergedOutcome(21)}}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion,
+		Runs: []scheduler.Run{{
+			Issue: 21, RunID: "run-21", Status: scheduler.StatusWaitingForMerge,
+			Branch: "agent/issue-21-run-21", Worktree: "/tmp/run-21",
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "run-21", Issue: 21, RunID: "run-21"}},
+	}}
+	cleanupStarted := make(chan struct{})
+	signals := make(chan os.Signal, 1)
+	output := newSynchronizedOutput()
+	runner := testRunner(github, workers, store, 1)
+	runner.Worktrees = &blockingCleanupWorktrees{cleanupStarted: cleanupStarted}
+	runner.Signals = signals
+	runner.Output = output
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	<-cleanupStarted
+	signals <- os.Interrupt
+	output.waitFor(t, "Drain: admission stopped; 0 Workers remaining; next SIGINT will be recorded as a suspension request")
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := store.LoadValue()
+	if len(got.Runs) != 1 || got.Runs[0].Status != scheduler.StatusWaitingForMerge || len(got.Leases) != 1 {
+		t.Fatalf("state after canceled completion cleanup = %#v", got)
+	}
+}
+
 func TestRunnerAcceptsIdleDrainWhilePeriodicReconciliationIsBlocked(t *testing.T) {
 	t.Parallel()
 
@@ -549,6 +584,46 @@ func TestRunnerFinishesLeaseCommittedBeforeDrainAndObservesRepeatedSignals(t *te
 		t.Fatalf("state after drained Worker settlement = %#v", got)
 	}
 	output.waitFor(t, "Drain complete: 0 Workers remaining; exiting successfully")
+}
+
+func TestRunnerReportsDrainWhileSettledWorkerReconciliationIsBlocked(t *testing.T) {
+	t.Parallel()
+
+	completionStarted := make(chan struct{})
+	finishCompletion := make(chan struct{})
+	github := &fakeGitHub{
+		candidates: []scheduler.Candidate{{Number: 22, CreatedAt: time.Now()}},
+		completionFunc: func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
+			close(completionStarted)
+			<-finishCompletion
+			return mergedOutcome(22), nil
+		},
+	}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	signals := make(chan os.Signal, 2)
+	output := newSynchronizedOutput()
+	runner := testRunner(github, workers, store, 1)
+	runner.Signals = signals
+	runner.Output = output
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 22)
+	workers.complete(22, worker.Result{ExitCode: 0})
+	<-completionStarted
+	signals <- os.Interrupt
+	output.waitFor(t, "Drain: admission stopped; 1 Worker remaining; next SIGINT will be recorded as a suspension request")
+	signals <- os.Interrupt
+	output.waitFor(t, "Drain: additional interrupt recorded as a suspension request; 1 Worker remaining")
+	close(finishCompletion)
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := store.LoadValue()
+	if len(got.Runs) != 1 || got.Runs[0].Status != scheduler.StatusMerged || len(got.Leases) != 0 {
+		t.Fatalf("state after blocked reconciliation Drain = %#v", got)
+	}
 }
 
 func TestRunnerDrainsEveryOwnedWorkerAndReportsProgress(t *testing.T) {
@@ -1274,6 +1349,17 @@ type blockingWorktrees struct {
 	fakeWorktrees
 	prepareStarted chan struct{}
 	finishPrepare  chan struct{}
+}
+
+type blockingCleanupWorktrees struct {
+	fakeWorktrees
+	cleanupStarted chan struct{}
+}
+
+func (w *blockingCleanupWorktrees) Cleanup(ctx context.Context, _ worktree.Assignment) error {
+	close(w.cleanupStarted)
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func (w *blockingWorktrees) Prepare(ctx context.Context, _ worktree.Assignment) error {

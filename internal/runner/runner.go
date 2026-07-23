@@ -279,7 +279,9 @@ func (r *Runner) Run(ctx context.Context) error {
 				completion.result.Err = errors.Join(completion.result.Err, closed.Err)
 			}
 			runID := findActiveRun(&current, completion.issue).RunID
-			if err := r.handleWorkerCompletion(ctx, &current, completion); err != nil {
+			startedDraining, err := r.handleWorkerCompletionWhileObservingSignals(ctx, &current, completion, signalEvents, len(localWorkers))
+			draining = startedDraining || draining
+			if err != nil {
 				_ = process.Abort()
 				_ = process.Close()
 				delete(localWorkers, completion.issue)
@@ -550,6 +552,20 @@ func (r *Runner) start(workerCtx context.Context, admission *admissionGate, curr
 	return process, nil
 }
 
+func (r *Runner) handleWorkerCompletionWhileObservingSignals(ctx context.Context, current *state.State, completion workerCompletion, signalEvents <-chan signalEvent, workers int) (bool, error) {
+	result := make(chan error, 1)
+	go func() { result <- r.handleWorkerCompletion(ctx, current, completion) }()
+	draining := false
+	for {
+		select {
+		case err := <-result:
+			return draining, err
+		case event := <-signalEvents:
+			draining = r.handleSignal(event, workers) || draining
+		}
+	}
+}
+
 func (r *Runner) handleWorkerCompletion(ctx context.Context, current *state.State, completion workerCompletion) error {
 	run := findActiveRun(current, completion.issue)
 	if run.Issue == 0 {
@@ -565,7 +581,9 @@ func (r *Runner) handleWorkerCompletion(ctx context.Context, current *state.Stat
 			updated.PullRequest = outcome.PullRequest
 			replaceRun(current, updated)
 		} else {
-			r.applyOutcome(ctx, current, run, outcome, completion.result.ExitCode == 0 && completion.result.Err == nil, false)
+			if err := r.applyOutcome(ctx, current, run, outcome, completion.result.ExitCode == 0 && completion.result.Err == nil, false); err != nil {
+				return err
+			}
 		}
 		if updated := findActiveRun(current, run.Issue); updated.Status == scheduler.StatusFailed && completion.result.Err != nil {
 			updated.Error = completion.result.Err.Error()
@@ -654,7 +672,9 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 			continue
 		}
 		allowWaiting := run.Status == scheduler.StatusWaitingForMerge || run.Status == scheduler.StatusRunning
-		r.applyOutcome(ctx, current, run, outcome, allowWaiting, true)
+		if err := r.applyOutcome(ctx, current, run, outcome, allowWaiting, true); err != nil {
+			return err
+		}
 		changed = true
 	}
 	if changed {
@@ -665,7 +685,7 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 	return nil
 }
 
-func (r *Runner) applyOutcome(ctx context.Context, current *state.State, run scheduler.Run, outcome ghadapter.CompletionOutcome, allowWaiting, cleanupMerged bool) {
+func (r *Runner) applyOutcome(ctx context.Context, current *state.State, run scheduler.Run, outcome ghadapter.CompletionOutcome, allowWaiting, cleanupMerged bool) error {
 	run.PullRequest = outcome.PullRequest
 	run.UpdatedAt = r.Now().UTC()
 	switch {
@@ -674,6 +694,9 @@ func (r *Runner) applyOutcome(ctx context.Context, current *state.State, run sch
 			assignment := worktree.Assignment{Path: run.Worktree, Branch: run.Branch}
 			if assignment.Path != "" && assignment.Branch != "" {
 				if err := r.Worktrees.Cleanup(ctx, assignment); err != nil {
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
 					transitionStatus(&run, scheduler.StatusNeedsHuman)
 					run.Error = fmt.Sprintf("completion verified but worktree cleanup failed: %v", err)
 					break
@@ -704,6 +727,7 @@ func (r *Runner) applyOutcome(ctx context.Context, current *state.State, run sch
 		run.Error = "worker stopped without creating a pull request"
 	}
 	replaceRun(current, run)
+	return nil
 }
 
 func (r *Runner) finalizeSettledWorker(ctx context.Context, current *state.State, runID string, closeErr error, settled bool) error {
