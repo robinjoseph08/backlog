@@ -747,7 +747,7 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 			continue
 		}
 		allowWaiting := run.Status == scheduler.StatusWaitingForMerge || run.Status == scheduler.StatusRunning || run.Status == scheduler.StatusSuspended
-		if run.Status == scheduler.StatusSuspended && !(outcome.Merged && outcome.IssueClosed) && !(outcome.PRFound && outcome.AutoMergeArmed) {
+		if run.Status == scheduler.StatusSuspended && !outcome.Merged && !(outcome.PRFound && outcome.AutoMergeArmed) {
 			continue
 		}
 		if err := r.applyOutcome(ctx, current, run, outcome, allowWaiting, true); err != nil {
@@ -985,7 +985,6 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 		if result.err != nil {
 			clean = false
 			failureReasons[result.issue] = fmt.Sprintf("establish verified continuation boundary: %v", result.err)
-			_ = process.Abort()
 			closeProcess(result.issue, process)
 			continue
 		}
@@ -1011,7 +1010,6 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 			failureReasons[result.issue] = fmt.Sprintf("persist continuation marker: %v", err)
 			run.Continuation = nil
 			replaceRun(current, run)
-			_ = process.Abort()
 			closeProcess(result.issue, process)
 			continue
 		}
@@ -1033,7 +1031,7 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 		if result.err != nil {
 			clean = false
 			failureReasons[result.issue] = fmt.Sprintf("reconcile GitHub before suspension: %v", result.err)
-		} else if (result.outcome.Merged && result.outcome.IssueClosed) || (result.outcome.PRFound && result.outcome.AutoMergeArmed) {
+		} else if result.outcome.Merged || (result.outcome.PRFound && result.outcome.AutoMergeArmed) {
 			verifiedOutcomes[result.issue] = result.outcome
 		}
 		closeProcess(result.issue, local[result.issue])

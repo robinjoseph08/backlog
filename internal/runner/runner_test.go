@@ -1145,6 +1145,32 @@ func TestRunnerReconcilesSuspendedRunWithArmedAutoMergeAsWaiting(t *testing.T) {
 	}
 }
 
+func TestRunnerReconcilesSuspendedMergedOpenIssueAsNeedsHuman(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{completions: map[int]ghadapter.CompletionOutcome{
+		25: {PRFound: true, PullRequest: "https://example.test/pr/25", Merged: true, IssueClosed: false},
+	}}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs: []scheduler.Run{{
+			Issue: 25, RunID: "suspended-open", Status: scheduler.StatusSuspended, WorkerMode: scheduler.WorkerModeRPC,
+			Branch: "agent/issue-25-suspended", Worktree: "/tmp/suspended-25", SessionID: "session-25", SessionDir: "/tmp/sessions/25",
+			Continuation: &scheduler.ContinuationBoundary{SessionID: "session-25", SessionFile: "/tmp/sessions/25/session.jsonl", Worktree: "/tmp/suspended-25", LeafID: "leaf", EntryCount: 1, SHA256: strings.Repeat("a", 64), VerifiedAt: time.Now()},
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "suspended-open", Issue: 25, RunID: "suspended-open"}},
+	}}
+	runner := testRunner(github, workers, store, 1)
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusNeedsHuman || !strings.Contains(got.Runs[0].Error, "issue remains open") || len(got.Leases) != 1 {
+		t.Fatalf("reconciled merged-open suspended Run = %#v", got)
+	}
+}
+
 func TestRunnerReconcilesMergedRunWithoutLaunchingDuplicate(t *testing.T) {
 	t.Parallel()
 
@@ -1449,6 +1475,45 @@ func TestRunnerTreatsCloseErrorAsFailedSuspensionAfterVerifiedExit(t *testing.T)
 	}
 }
 
+func TestRunnerDoesNotAbortBeforeIdentityAuthorizedCloseAfterBoundaryFailure(t *testing.T) {
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 52, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	workers.authorizeClose = true
+	workers.suspendFunc = func(context.Context, int, worker.ContinuationRequest) (worker.Continuation, error) {
+		return worker.Continuation{}, errors.New("boundary verification failed")
+	}
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	signals := make(chan os.Signal, 1)
+	runner := testRunner(github, workers, store, 1)
+	var identityMu sync.Mutex
+	identityChecks := 0
+	runner.PIDIdentity = func(pid int) (string, error) {
+		identityMu.Lock()
+		defer identityMu.Unlock()
+		identityChecks++
+		if identityChecks >= 3 {
+			return "reused-process", nil
+		}
+		return fmt.Sprintf("identity-%d", pid), nil
+	}
+	runner.Signals = signals
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 52)
+	signals <- syscall.SIGTERM
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "could not verify or stop") {
+		t.Fatalf("run: %v, want failed-closed identity mismatch", err)
+	}
+	if got := workers.abortedCount(); got != 0 {
+		t.Fatalf("Abort called %d times before identity-authorized close", got)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID == 0 || len(got.Leases) != 1 {
+		t.Fatalf("Run after boundary failure identity mismatch = %#v", got)
+	}
+}
+
 func TestRunnerGitHubReconciliationErrorPreventsCleanSuspension(t *testing.T) {
 	github := &fakeGitHub{
 		candidates: []scheduler.Candidate{{Number: 50, CreatedAt: time.Now()}},
@@ -1472,6 +1537,32 @@ func TestRunnerGitHubReconciliationErrorPreventsCleanSuspension(t *testing.T) {
 	got := store.LoadValue()
 	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID != 0 || got.Runs[0].Continuation == nil || !strings.Contains(got.Runs[0].Error, "GitHub unavailable") || len(got.Leases) != 1 {
 		t.Fatalf("Run after GitHub reconciliation error = %#v", got)
+	}
+}
+
+func TestRunnerMergedOpenIssueWinsOverSuspension(t *testing.T) {
+	github := &fakeGitHub{
+		candidates: []scheduler.Candidate{{Number: 51, CreatedAt: time.Now()}},
+		completions: map[int]ghadapter.CompletionOutcome{51: {
+			PRFound: true, PullRequest: "https://example.test/51", Merged: true, IssueClosed: false,
+		}},
+	}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	signals := make(chan os.Signal, 1)
+	runner := testRunner(github, workers, store, 1)
+	runner.Signals = signals
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 51)
+	signals <- syscall.SIGTERM
+	if err := <-done; !isSignalExit(err, 143) {
+		t.Fatalf("run: %v, want signal exit 143", err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID != 0 || !strings.Contains(got.Runs[0].Error, "issue remains open") || len(got.Leases) != 1 {
+		t.Fatalf("merged-open outcome after suspension = %#v", got)
 	}
 }
 
@@ -1783,6 +1874,7 @@ func (p *fakeProcess) Release() error {
 	return nil
 }
 func (p *fakeProcess) Abort() error {
+	p.owner.recordAbort()
 	select {
 	case p.done <- worker.Result{ExitCode: -1, Err: context.Canceled}:
 	default:
@@ -1845,6 +1937,7 @@ type fakeWorkers struct {
 	onRelease         func(int)
 	onCloseContext    func(int) error
 	authorizeClose    bool
+	abortCount        int
 	suspendFunc       func(context.Context, int, worker.ContinuationRequest) (worker.Continuation, error)
 	startChanged      chan struct{}
 }
@@ -1870,6 +1963,16 @@ func (w *fakeWorkers) Release(string) error {
 	defer w.mu.Unlock()
 	w.recoveredReleases++
 	return nil
+}
+func (w *fakeWorkers) recordAbort() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.abortCount++
+}
+func (w *fakeWorkers) abortedCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.abortCount
 }
 func (w *fakeWorkers) released(issue int) {
 	w.mu.Lock()
