@@ -127,6 +127,13 @@ func (r *Runner) Run(ctx context.Context) error {
 		stopWorkerCancellation()
 		cancelWorkers()
 	}()
+	admissionCtx, cancelAdmission := context.WithCancel(ctx)
+	defer cancelAdmission()
+	admission := &admissionGate{}
+	signalCtx, stopSignals := context.WithCancel(context.Background())
+	defer stopSignals()
+	signalEvents := r.observeSignals(signalCtx, admission, cancelAdmission)
+	draining := false
 
 	current, err := r.Store.Load()
 	if err != nil {
@@ -138,8 +145,19 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := r.Store.Save(current); err != nil {
 		return fmt.Errorf("initialize runner state: %w", err)
 	}
-	if err := r.reconcile(ctx, &current, nil); err != nil {
-		return err
+	if admission.stopped() {
+		event := <-signalEvents
+		draining = r.handleSignal(event, 0)
+	} else if err := r.reconcile(admissionCtx, &current, nil); err != nil {
+		switch {
+		case admissionCtx.Err() != nil && ctx.Err() == nil:
+			event := <-signalEvents
+			draining = r.handleSignal(event, 0)
+		case ctx.Err() != nil:
+			return nil
+		default:
+			return err
+		}
 	}
 
 	completions := make(chan workerCompletion, r.Config.MaxConcurrentIssues)
@@ -154,14 +172,6 @@ func (r *Runner) Run(ctx context.Context) error {
 			candidateRetryTimer.Stop()
 		}
 	}()
-
-	admissionCtx, cancelAdmission := context.WithCancel(ctx)
-	defer cancelAdmission()
-	admission := &admissionGate{}
-	signalCtx, stopSignals := context.WithCancel(context.Background())
-	defer stopSignals()
-	signalEvents := r.observeSignals(signalCtx, admission, cancelAdmission)
-	draining := false
 
 	for {
 		select {
@@ -595,6 +605,9 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 
 		outcome, err := r.GitHub.Completion(ctx, r.Config.Repo, run.Issue, run.Branch)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			r.needsHuman(current, run.Issue, fmt.Sprintf("reconcile GitHub outcome: %v", err))
 			changed = true
 			continue

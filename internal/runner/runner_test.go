@@ -306,6 +306,93 @@ func TestRunnerNeverStartsBlockedCandidate(t *testing.T) {
 	}
 }
 
+func TestAdmissionGateSerializesDrainAcceptanceWithLeasePersistence(t *testing.T) {
+	t.Parallel()
+
+	gate := &admissionGate{}
+	saveStarted := make(chan struct{})
+	finishSave := make(chan struct{})
+	commitDone := make(chan bool, 1)
+	go func() {
+		admitted, err := gate.commit(func() error {
+			close(saveStarted)
+			<-finishSave
+			return nil
+		})
+		if err != nil {
+			panic(err)
+		}
+		commitDone <- admitted
+	}()
+	<-saveStarted
+
+	stopDone := make(chan bool, 1)
+	go func() { stopDone <- gate.stop() }()
+	select {
+	case <-stopDone:
+		t.Fatal("Drain was accepted before the in-progress Lease persistence finished")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(finishSave)
+	if admitted := <-commitDone; !admitted {
+		t.Fatal("Lease persistence that preceded Drain acceptance was rejected")
+	}
+	if firstDrain := <-stopDone; !firstDrain {
+		t.Fatal("first Drain transition was not accepted")
+	}
+
+	savedAfterDrain := false
+	admitted, err := gate.commit(func() error {
+		savedAfterDrain = true
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if admitted || savedAfterDrain {
+		t.Fatal("Lease persisted after Drain was accepted")
+	}
+}
+
+func TestRunnerAcceptsIdleDrainWhileInitialReconciliationIsBlocked(t *testing.T) {
+	t.Parallel()
+
+	reconciliationStarted := make(chan struct{})
+	github := &fakeGitHub{completionFunc: func(ctx context.Context, _ int, _ string) (ghadapter.CompletionOutcome, error) {
+		close(reconciliationStarted)
+		<-ctx.Done()
+		return ghadapter.CompletionOutcome{}, ctx.Err()
+	}}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion,
+		Runs: []scheduler.Run{{
+			Issue: 16, RunID: "run-16", Status: scheduler.StatusWaitingForMerge,
+			Branch: "agent/issue-16-run-16", Worktree: "/tmp/run-16",
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "run-16", Issue: 16, RunID: "run-16"}},
+	}}
+	signals := make(chan os.Signal, 1)
+	output := newSynchronizedOutput()
+	runner := testRunner(github, workers, store, 1)
+	runner.Signals = signals
+	runner.Output = output
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	<-reconciliationStarted
+	signals <- os.Interrupt
+	output.waitFor(t, "Drain: admission stopped; 0 Workers remaining; next SIGINT will request suspension")
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := store.LoadValue()
+	if len(got.Runs) != 1 || got.Runs[0].Status != scheduler.StatusWaitingForMerge || len(got.Leases) != 1 {
+		t.Fatalf("state after idle Drain = %#v, want waiting Run and Lease unchanged", got)
+	}
+	output.waitFor(t, "Drain complete: 0 Workers remaining; exiting successfully")
+}
+
 func TestRunnerNeverPersistsLeaseAfterDrainIsAccepted(t *testing.T) {
 	t.Parallel()
 
@@ -971,6 +1058,7 @@ type fakeGitHub struct {
 	candidateChanged   chan struct{}
 	candidatesFunc     func(context.Context) ([]scheduler.Candidate, error)
 	completions        map[int]ghadapter.CompletionOutcome
+	completionFunc     func(context.Context, int, string) (ghadapter.CompletionOutcome, error)
 	completionErrs     map[int]error
 	completionCheck    func(int) error
 	completionBranches []string
@@ -998,8 +1086,13 @@ func (g *fakeGitHub) Candidates(ctx context.Context, _ string) ([]scheduler.Cand
 	}
 	return append([]scheduler.Candidate(nil), g.candidates...), nil
 }
-func (g *fakeGitHub) Completion(_ context.Context, _ string, issue int, branch string) (ghadapter.CompletionOutcome, error) {
+func (g *fakeGitHub) Completion(ctx context.Context, _ string, issue int, branch string) (ghadapter.CompletionOutcome, error) {
 	g.mu.Lock()
+	custom := g.completionFunc
+	if custom != nil {
+		g.mu.Unlock()
+		return custom(ctx, issue, branch)
+	}
 	defer g.mu.Unlock()
 	g.completionBranches = append(g.completionBranches, branch)
 	if g.completionCheck != nil {
