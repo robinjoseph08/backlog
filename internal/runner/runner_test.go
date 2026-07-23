@@ -373,7 +373,7 @@ func TestRunnerReturnsCandidateDiscoveryErrorAfterWaitingRunReconciles(t *testin
 
 	transientErr := errors.New("candidate discovery unavailable")
 	github := &fakeGitHub{
-		candidateResults: []candidateResult{{err: transientErr}},
+		candidateResults: []candidateResult{{err: transientErr}, {err: transientErr}},
 		candidateChanged: make(chan struct{}, 2),
 		completions: map[int]ghadapter.CompletionOutcome{
 			4: {PRFound: true, PullRequest: "https://example.test/pr/4", AutoMergeArmed: true},
@@ -406,14 +406,15 @@ func TestRunnerReturnsCandidateDiscoveryErrorAfterWaitingRunReconciles(t *testin
 func TestRunnerRetriesCandidateDiscoveryAfterPollIntervalAndResumesAdmission(t *testing.T) {
 	t.Parallel()
 
-	pollInterval := 40 * time.Millisecond
+	pollInterval := 80 * time.Millisecond
 	github := &fakeGitHub{
 		candidateResults: []candidateResult{
 			{candidates: []scheduler.Candidate{{Number: 4, CreatedAt: time.Now()}}},
 			{candidates: []scheduler.Candidate{{Number: 5, CreatedAt: time.Now()}}, err: errors.New("candidate discovery unavailable")},
+			{candidates: []scheduler.Candidate{{Number: 6, CreatedAt: time.Now()}}, err: errors.New("candidate discovery still unavailable")},
 			{candidates: []scheduler.Candidate{{Number: 4, CreatedAt: time.Now()}, {Number: 5, CreatedAt: time.Now()}}},
 		},
-		candidateChanged: make(chan struct{}, 6),
+		candidateChanged: make(chan struct{}, 8),
 	}
 	workers := newFakeWorkers()
 	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
@@ -425,14 +426,28 @@ func TestRunnerRetriesCandidateDiscoveryAfterPollIntervalAndResumesAdmission(t *
 	go func() { done <- runner.Run(ctx) }()
 
 	workers.waitForStarts(t, 4)
+	github.waitForCandidateCalls(t, 2)
+	assertOnlyIssueFourIsLeased(t, workers, store)
+
 	github.waitForCandidateCalls(t, 3)
+	assertOnlyIssueFourIsLeased(t, workers, store)
+
+	github.waitForCandidateCalls(t, 4)
 	workers.waitForStarts(t, 5)
 	calls := github.candidateCallSnapshot()
-	if elapsed := calls[2].Sub(calls[1]); elapsed < pollInterval {
-		t.Fatalf("candidate discovery retried after %s, want no sooner than %s", elapsed, pollInterval)
+	for i := 2; i < 4; i++ {
+		if elapsed := calls[i].Sub(calls[i-1]); elapsed < pollInterval {
+			t.Fatalf("candidate discovery retry %d happened after %s, want no sooner than %s", i-1, elapsed, pollInterval)
+		}
 	}
 	if got := workers.startCount(4); got != 1 {
 		t.Fatalf("issue #4 start count = %d, want 1", got)
+	}
+	if got := store.runStatus(4); got != scheduler.StatusRunning {
+		t.Fatalf("issue 4 status = %q, want running after discovery retries", got)
+	}
+	if workers.wasStarted(6) {
+		t.Fatal("issue #6 was started from a failed candidate discovery pass")
 	}
 
 	workers.complete(4, worker.Result{ExitCode: 1, Err: errors.New("failed")})
@@ -447,6 +462,7 @@ func TestRunnerRetriesCandidateDiscoveryAfterPollIntervalAndResumesAdmission(t *
 func TestRunnerWatchRetriesCandidateDiscoveryWithoutActiveRun(t *testing.T) {
 	t.Parallel()
 
+	pollInterval := 40 * time.Millisecond
 	github := &fakeGitHub{
 		candidateResults: []candidateResult{
 			{err: errors.New("GitHub unavailable")},
@@ -457,12 +473,17 @@ func TestRunnerWatchRetriesCandidateDiscoveryWithoutActiveRun(t *testing.T) {
 	workers := newFakeWorkers()
 	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
 	runner := testRunner(github, workers, store, 1)
+	runner.Config.PollInterval = pollInterval
 	runner.Config.Watch = true
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(ctx) }()
 
 	workers.waitForStarts(t, 7)
+	calls := github.candidateCallSnapshot()
+	if elapsed := calls[1].Sub(calls[0]); elapsed < pollInterval {
+		t.Fatalf("idle candidate discovery retried after %s, want no sooner than %s", elapsed, pollInterval)
+	}
 	workers.complete(7, worker.Result{ExitCode: 1, Err: errors.New("failed")})
 	workers.waitForNoRunningWorkers(t)
 	cancel()
@@ -717,6 +738,20 @@ func TestRunnerReconcilesOnlyTheLeasedRunWhenIssueHasHistory(t *testing.T) {
 	}
 	if got.Runs[1].Status != scheduler.StatusMerged || len(got.Leases) != 0 {
 		t.Fatalf("active Run/Lease = %#v/%#v, want merged without Lease", got.Runs[1], got.Leases)
+	}
+}
+
+func assertOnlyIssueFourIsLeased(t *testing.T, workers *fakeWorkers, store *memoryStore) {
+	t.Helper()
+	if got := store.runStatus(4); got != scheduler.StatusRunning {
+		t.Fatalf("issue 4 status = %q, want running during discovery failure", got)
+	}
+	if workers.wasStarted(5) || workers.wasStarted(6) {
+		t.Fatalf("Workers started from failed snapshots: %v", workers.startedSnapshot())
+	}
+	leases := store.LoadValue().Leases
+	if len(leases) != 1 || leases[0].Issue != 4 || leases[0].RunID != "run-4" {
+		t.Fatalf("Leases = %#v, want only issue #4 Run run-4", leases)
 	}
 }
 

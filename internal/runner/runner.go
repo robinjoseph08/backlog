@@ -129,7 +129,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				if unfinishedRunCount(&current) == 0 && !r.Config.Watch {
 					return candidateErr
 				}
-				r.logf("candidate discovery failed; retrying in %s: %v", r.Config.PollInterval, err)
+				r.logf("candidate discovery failed; admission paused; retry due in %s if supervision continues: %v", r.Config.PollInterval, err)
 				if candidateRetryTimer == nil {
 					candidateRetryTimer = time.NewTimer(r.Config.PollInterval)
 				} else {
