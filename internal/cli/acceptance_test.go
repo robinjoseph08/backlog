@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -280,6 +282,10 @@ exit 0
 `)
 	pi := writeExecutable(t, `#!/bin/sh
 set -eu
+if env | grep -q '^HERDR_'; then
+  echo 'Pi Worker inherited the foreground Herdr pane environment' >&2
+  exit 9
+fi
 printf '%s\n' "$*" > `+quote(piArgs)+`
 touch `+quote(piAlive)+`
 grep -q '"status": "running"' `+quote(statePath)+`
@@ -294,10 +300,27 @@ grep -q '"status": "merged"' `+quote(statePath)+`
 rm -f `+quote(piAlive)+`
 `)
 
+	herdrSocket, herdrResult := captureHerdrLifecycle(t)
 	command := exec.Command(binary, "run", "--repo-dir", repository, "--state-dir", stateDir,
 		"--max-workers", "1", "--poll", "5ms", "--gh", gh, "--git", git, "--pi", pi)
+	command.Env = append(os.Environ(),
+		"HERDR_ENV=1",
+		"HERDR_SOCKET_PATH="+herdrSocket,
+		"HERDR_PANE_ID=w1:p1",
+	)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("compiled RPC run: %v\n%s", err, output)
+	}
+	captured := <-herdrResult
+	if captured.err != nil {
+		t.Fatalf("capture Herdr lifecycle: %v", captured.err)
+	}
+	if len(captured.requests) != 2 || captured.requests[0].Method != "pane.report_agent" || captured.requests[1].Method != "pane.release_agent" {
+		t.Fatalf("Herdr lifecycle requests = %#v", captured.requests)
+	}
+	working := captured.requests[0].Params
+	if working.PaneID != "w1:p1" || working.Source != "custom:backlog" || working.Agent != "backlog" || working.State != "working" || working.Message != "scheduling Runs" {
+		t.Fatalf("Herdr working report = %#v", working)
 	}
 	current, err := (state.FileStore{Path: statePath}).Load()
 	if err != nil {
@@ -457,4 +480,73 @@ esac
 		reconciled.LogPath != "/retained/legacy.jsonl" || reconciled.StderrPath != "/retained/legacy.stderr.log" || reconciled.PullRequest != "https://example.test/pull/42" {
 		t.Fatalf("startup reconciliation lost migrated artifacts: %#v", reconciled)
 	}
+}
+
+type capturedHerdrRequest struct {
+	ID     string `json:"id"`
+	Method string `json:"method"`
+	Params struct {
+		PaneID  string `json:"pane_id"`
+		Source  string `json:"source"`
+		Agent   string `json:"agent"`
+		State   string `json:"state"`
+		Message string `json:"message"`
+		Seq     uint64 `json:"seq"`
+	} `json:"params"`
+}
+
+type capturedHerdrLifecycle struct {
+	requests []capturedHerdrRequest
+	err      error
+}
+
+func captureHerdrLifecycle(t *testing.T) (string, <-chan capturedHerdrLifecycle) {
+	t.Helper()
+	directory, err := os.MkdirTemp("", "backlog-herdr-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(directory) })
+
+	socketPath := filepath.Join(directory, "herdr.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := listener.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		listener.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+
+	result := make(chan capturedHerdrLifecycle, 1)
+	go func() {
+		captured := capturedHerdrLifecycle{requests: make([]capturedHerdrRequest, 0, 2)}
+		defer func() { result <- captured }()
+		for range 2 {
+			connection, err := listener.AcceptUnix()
+			if err != nil {
+				captured.err = err
+				return
+			}
+			var request capturedHerdrRequest
+			if err := json.NewDecoder(connection).Decode(&request); err != nil {
+				connection.Close()
+				captured.err = err
+				return
+			}
+			captured.requests = append(captured.requests, request)
+			response := fmt.Sprintf(`{"id":%q,"result":{"type":"ok"}}`+"\n", request.ID)
+			if _, err := connection.Write([]byte(response)); err != nil {
+				connection.Close()
+				captured.err = err
+				return
+			}
+			if err := connection.Close(); err != nil {
+				captured.err = err
+				return
+			}
+		}
+	}()
+	return socketPath, result
 }

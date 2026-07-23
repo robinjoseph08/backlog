@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -122,6 +123,9 @@ func (s Supervisor) Start(ctx context.Context, request Request) (*Process, error
 	wrapperArgs := []string{"-c", wrapper, "backlog-gate", gatePath, executable}
 	wrapperArgs = append(wrapperArgs, piArgs...)
 	command := exec.CommandContext(ctx, "/bin/sh", wrapperArgs...)
+	// Workers are headless subprocesses, not Herdr panes. Do not let them
+	// report against or control the foreground runner's inherited pane.
+	command.Env = workerEnvironment(os.Environ(), request.Worktree)
 	stdin, err := command.StdinPipe()
 	if err != nil {
 		stdoutLog.Close()
@@ -163,6 +167,17 @@ func (s Supervisor) Start(ctx context.Context, request Request) (*Process, error
 	}
 	go process.reap()
 	return process, nil
+}
+
+func workerEnvironment(environment []string, worktree string) []string {
+	filtered := make([]string, 0, len(environment)+1)
+	for _, variable := range environment {
+		if strings.HasPrefix(variable, "HERDR_") || strings.HasPrefix(variable, "PWD=") {
+			continue
+		}
+		filtered = append(filtered, variable)
+	}
+	return append(filtered, "PWD="+worktree)
 }
 
 func (s Supervisor) Release(runID string) error {

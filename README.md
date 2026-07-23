@@ -54,6 +54,12 @@ The foreground runner exits when there are no active workers and no currently el
 
 Candidate discovery fails closed for admission. If a discovery pass fails, the runner creates no Leases from that pass, continues supervising existing Workers, and schedules the next retry after `--poll`. With `--watch`, it also retries while no Run is active. Without `--watch`, it reports the discovery error once no unfinished leased Run remains, even if that happens before the scheduled retry.
 
+## Herdr integration
+
+When `backlog run` is launched in a [Herdr](https://herdr.dev/) pane, it automatically reports itself as a custom `backlog` agent over Herdr's inherited local socket. The runner appears as working in Herdr's Agents panel for the lifetime of the command and releases the entry when it exits. The entry represents the aggregate Backlog runner, not each isolated Worker.
+
+No Herdr integration install or Backlog flag is required. Outside Herdr, the reporter is disabled. Socket failures are ignored so this observational integration cannot affect scheduling or durable state.
+
 ## Backlog eligibility
 
 A candidate must be an open issue labeled `ready-for-agent`. Candidates are considered oldest first.

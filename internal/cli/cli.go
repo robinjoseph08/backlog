@@ -17,6 +17,7 @@ import (
 	"time"
 
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
+	"github.com/robinjoseph08/backlog/internal/herdr"
 	"github.com/robinjoseph08/backlog/internal/runner"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
@@ -121,6 +122,11 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 	}
 	if flags.NArg() != 0 {
 		return fmt.Errorf("run takes no positional arguments")
+	}
+	herdrReporter := herdr.FromEnvironment()
+	if herdrReporter.Enabled() {
+		_ = herdrReporter.Working("scheduling Runs")
+		defer func() { _ = herdrReporter.Release() }()
 	}
 	absoluteRepo, err := filepath.Abs(*repoDir)
 	if err != nil {
