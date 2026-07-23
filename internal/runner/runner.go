@@ -967,8 +967,9 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 	}
 
 	closeResults := make(chan suspensionCloseResult, workerCount)
+	githubResults := make(chan suspensionGitHubResult, workerCount)
 	failureReasons := make(map[int]string)
-	readyToReconcile := make([]int, 0, workerCount)
+	reconciliationCount := 0
 	clean := !r.suspensionFailed.Load()
 	closeProcess := func(issue int, process WorkerProcess) {
 		go func() {
@@ -1014,19 +1015,16 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 			continue
 		}
 
-		readyToReconcile = append(readyToReconcile, result.issue)
+		reconciliationCount++
+		go func(issue int, run scheduler.Run, process WorkerProcess) {
+			outcome, err := r.GitHub.Completion(ctx, r.Config.Repo, run.Issue, run.Branch)
+			closeProcess(issue, process)
+			githubResults <- suspensionGitHubResult{issue: issue, outcome: outcome, err: err}
+		}(result.issue, run, process)
 	}
 
-	githubResults := make(chan suspensionGitHubResult, len(readyToReconcile))
-	for _, issue := range readyToReconcile {
-		run := findRun(current.Runs, runIDs[issue])
-		go func(issue int, run scheduler.Run) {
-			outcome, err := r.GitHub.Completion(ctx, r.Config.Repo, run.Issue, run.Branch)
-			githubResults <- suspensionGitHubResult{issue: issue, outcome: outcome, err: err}
-		}(issue, run)
-	}
-	verifiedOutcomes := make(map[int]ghadapter.CompletionOutcome, len(readyToReconcile))
-	for range readyToReconcile {
+	verifiedOutcomes := make(map[int]ghadapter.CompletionOutcome, reconciliationCount)
+	for completed := 0; completed < reconciliationCount; completed++ {
 		result := <-githubResults
 		if result.err != nil {
 			clean = false
@@ -1034,7 +1032,6 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 		} else if result.outcome.Merged || (result.outcome.PRFound && result.outcome.AutoMergeArmed) {
 			verifiedOutcomes[result.issue] = result.outcome
 		}
-		closeProcess(result.issue, local[result.issue])
 	}
 
 	var persistenceErrors []error

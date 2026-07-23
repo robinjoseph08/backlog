@@ -1359,6 +1359,57 @@ func TestRunnerSuspendsDirectlyOnSIGTERMAndUsesOneDeadline(t *testing.T) {
 	}
 }
 
+func TestRunnerPipelinesHealthyWorkerWhileAnotherBoundaryTimesOut(t *testing.T) {
+	github := &fakeGitHub{
+		candidates: []scheduler.Candidate{
+			{Number: 53, CreatedAt: time.Now()}, {Number: 54, CreatedAt: time.Now().Add(time.Second)},
+		},
+		completionFunc: func(ctx context.Context, _ int, _ string) (ghadapter.CompletionOutcome, error) {
+			select {
+			case <-ctx.Done():
+				return ghadapter.CompletionOutcome{}, ctx.Err()
+			default:
+				return ghadapter.CompletionOutcome{}, nil
+			}
+		},
+	}
+	workers := newFakeWorkers()
+	workers.suspendFunc = func(ctx context.Context, issue int, request worker.ContinuationRequest) (worker.Continuation, error) {
+		if issue == 53 {
+			<-ctx.Done()
+			return worker.Continuation{}, ctx.Err()
+		}
+		return worker.Continuation{
+			SessionID: request.SessionID, SessionFile: request.SessionDir + "/session.jsonl", Worktree: request.Worktree,
+			LeafID: "leaf", EntryCount: 1, SHA256: "hash",
+		}, nil
+	}
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	signals := make(chan os.Signal, 1)
+	runner := testRunner(github, workers, store, 2)
+	runner.Config.SuspensionTimeout = 40 * time.Millisecond
+	runner.Signals = signals
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 53, 54)
+	signals <- syscall.SIGTERM
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "require human") {
+		t.Fatalf("run: %v, want one failed-closed suspension", err)
+	}
+	got := store.LoadValue()
+	statuses := map[int]scheduler.Status{}
+	for _, run := range got.Runs {
+		statuses[run.Issue] = run.Status
+	}
+	if statuses[53] != scheduler.StatusNeedsHuman || statuses[54] != scheduler.StatusSuspended {
+		t.Fatalf("mixed-speed suspension statuses = %v, want needs-human/suspended", statuses)
+	}
+	if len(got.Leases) != 2 {
+		t.Fatalf("Leases = %#v, want both retained", got.Leases)
+	}
+}
+
 func TestRunnerGitHubCompletionWinsOverSuspension(t *testing.T) {
 	github := &fakeGitHub{
 		candidates:  []scheduler.Candidate{{Number: 45, CreatedAt: time.Now()}},
