@@ -12,6 +12,7 @@ const (
 	StatusWorktreeReady   Status = "worktree-ready"
 	StatusRunning         Status = "running"
 	StatusWaitingForMerge Status = "waiting-for-merge"
+	StatusSuspended       Status = "suspended"
 	StatusMerged          Status = "merged"
 	StatusFailed          Status = "failed"
 	StatusNeedsHuman      Status = "needs-human"
@@ -40,25 +41,36 @@ type Candidate struct {
 	Blockers  []Blocker
 }
 
+type ContinuationBoundary struct {
+	SessionID   string    `json:"sessionId"`
+	SessionFile string    `json:"sessionFile"`
+	Worktree    string    `json:"worktree"`
+	LeafID      string    `json:"leafId"`
+	EntryCount  int       `json:"entryCount"`
+	SHA256      string    `json:"sha256"`
+	VerifiedAt  time.Time `json:"verifiedAt"`
+}
+
 type Run struct {
-	Issue           int        `json:"issue"`
-	RunID           string     `json:"runId"`
-	Status          Status     `json:"status"`
-	WorkerMode      WorkerMode `json:"workerMode"`
-	PID             int        `json:"pid,omitempty"`
-	ProcessIdentity string     `json:"processIdentity,omitempty"`
-	Branch          string     `json:"branch,omitempty"`
-	Worktree        string     `json:"worktree,omitempty"`
-	SessionName     string     `json:"sessionName,omitempty"`
-	SessionID       string     `json:"sessionId,omitempty"`
-	SessionDir      string     `json:"sessionDir,omitempty"`
-	LogPath         string     `json:"logPath,omitempty"`
-	StderrPath      string     `json:"stderrPath,omitempty"`
-	PullRequest     string     `json:"pullRequest,omitempty"`
-	Error           string     `json:"error,omitempty"`
-	StartedAt       time.Time  `json:"startedAt"`
-	UpdatedAt       time.Time  `json:"updatedAt"`
-	CompletedAt     *time.Time `json:"completedAt,omitempty"`
+	Issue           int                   `json:"issue"`
+	RunID           string                `json:"runId"`
+	Status          Status                `json:"status"`
+	WorkerMode      WorkerMode            `json:"workerMode"`
+	PID             int                   `json:"pid,omitempty"`
+	ProcessIdentity string                `json:"processIdentity,omitempty"`
+	Branch          string                `json:"branch,omitempty"`
+	Worktree        string                `json:"worktree,omitempty"`
+	SessionName     string                `json:"sessionName,omitempty"`
+	SessionID       string                `json:"sessionId,omitempty"`
+	SessionDir      string                `json:"sessionDir,omitempty"`
+	Continuation    *ContinuationBoundary `json:"continuation,omitempty"`
+	LogPath         string                `json:"logPath,omitempty"`
+	StderrPath      string                `json:"stderrPath,omitempty"`
+	PullRequest     string                `json:"pullRequest,omitempty"`
+	Error           string                `json:"error,omitempty"`
+	StartedAt       time.Time             `json:"startedAt"`
+	UpdatedAt       time.Time             `json:"updatedAt"`
+	CompletedAt     *time.Time            `json:"completedAt,omitempty"`
 }
 
 type Lease struct {
@@ -127,7 +139,7 @@ func Plan(snapshot Snapshot, maxConcurrentIssues int) Schedule {
 
 func consumesWorkerCapacity(run Run) bool {
 	switch run.Status {
-	case StatusClaimed, StatusWorktreeReady, StatusRunning:
+	case StatusClaimed, StatusWorktreeReady, StatusRunning, StatusSuspended:
 		return true
 	case StatusNeedsHuman:
 		return run.PID > 0

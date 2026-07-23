@@ -4,7 +4,7 @@ package scheduler
 // must retain active ownership of its issue.
 func RequiresLease(status Status) bool {
 	switch status {
-	case StatusClaimed, StatusWorktreeReady, StatusRunning, StatusWaitingForMerge:
+	case StatusClaimed, StatusWorktreeReady, StatusRunning, StatusWaitingForMerge, StatusSuspended:
 		return true
 	default:
 		return false
@@ -24,7 +24,9 @@ func CanTransition(from, to Status) bool {
 	case StatusWorktreeReady:
 		return to == StatusRunning || to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman
 	case StatusRunning:
-		return to == StatusWaitingForMerge || to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman
+		return to == StatusWaitingForMerge || to == StatusSuspended || to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman
+	case StatusSuspended:
+		return to == StatusRunning || to == StatusMerged || to == StatusNeedsHuman
 	case StatusWaitingForMerge:
 		return to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman
 	default:

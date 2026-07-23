@@ -13,6 +13,7 @@ func TestRequiresLeaseCoversEveryStatus(t *testing.T) {
 		{StatusWorktreeReady, true},
 		{StatusRunning, true},
 		{StatusWaitingForMerge, true},
+		{StatusSuspended, true},
 		{StatusMerged, false},
 		{StatusFailed, false},
 		{StatusNeedsHuman, false},
@@ -33,12 +34,16 @@ func TestRunStateTransitionsAreExplicit(t *testing.T) {
 		{StatusClaimed, StatusMerged},
 		{StatusWorktreeReady, StatusRunning},
 		{StatusRunning, StatusWaitingForMerge},
+		{StatusRunning, StatusSuspended},
 		{StatusRunning, StatusMerged},
 		{StatusRunning, StatusFailed},
 		{StatusRunning, StatusNeedsHuman},
 		{StatusWaitingForMerge, StatusWaitingForMerge},
 		{StatusWaitingForMerge, StatusMerged},
 		{StatusWaitingForMerge, StatusNeedsHuman},
+		{StatusSuspended, StatusRunning},
+		{StatusSuspended, StatusMerged},
+		{StatusSuspended, StatusNeedsHuman},
 	}
 	for _, transition := range allowed {
 		if !CanTransition(transition[0], transition[1]) {

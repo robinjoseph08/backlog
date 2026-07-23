@@ -75,6 +75,19 @@ func TestPlanCountsNeedsHumanRunWithRetainedWorkerIdentityAgainstCapacity(t *tes
 	}
 }
 
+func TestPlanCountsSuspendedRunAgainstCapacityBeforeResume(t *testing.T) {
+	t.Parallel()
+
+	plan := Plan(Snapshot{
+		Candidates: []Candidate{{Number: 2, CreatedAt: time.Now()}},
+		Runs:       []Run{{Issue: 1, RunID: "run-1", Status: StatusSuspended}},
+		Leases:     []Lease{{LeaseID: "run-1", Issue: 1, RunID: "run-1"}},
+	}, 1)
+	if len(plan.Starts) != 0 {
+		t.Fatalf("got starts %v, want suspended Run to consume capacity before Resume", issueNumbers(plan.Starts))
+	}
+}
+
 func TestPlanWaitingForMergeLeaseDoesNotConsumeWorkerCapacity(t *testing.T) {
 	t.Parallel()
 
