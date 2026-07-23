@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -311,6 +312,201 @@ func TestRunnerWaitsForOwnedWorkerBeforePersistingShutdown(t *testing.T) {
 	}
 }
 
+func TestRunnerKeepsActiveWorkerRunningThroughCandidateDiscoveryFailure(t *testing.T) {
+	t.Parallel()
+
+	transientErr := errors.New("native blockers: TLS handshake timeout")
+	github := &fakeGitHub{
+		candidateResults: []candidateResult{
+			{candidates: []scheduler.Candidate{{Number: 4, CreatedAt: time.Now()}}},
+			{candidates: []scheduler.Candidate{{Number: 12, CreatedAt: time.Now()}}, err: transientErr},
+		},
+		candidateChanged: make(chan struct{}, 4),
+	}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 2)
+	runner.Config.PollInterval = 200 * time.Millisecond
+	output := newDiagnosticWriter(transientErr.Error())
+	runner.Output = output
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 4)
+	github.waitForCandidateCalls(t, 2)
+
+	select {
+	case <-output.seen:
+	case err := <-done:
+		t.Fatalf("runner stopped after transient candidate discovery error: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not report the transient candidate discovery error")
+	}
+	if got := workers.runningCount(); got != 1 {
+		t.Fatalf("running Workers = %d, want 1", got)
+	}
+	if got := store.runStatus(4); got != scheduler.StatusRunning {
+		t.Fatalf("issue 4 status = %q, want running", got)
+	}
+	if workers.wasStarted(12) {
+		t.Fatal("issue #12 was started from a failed candidate discovery pass")
+	}
+	if got := len(store.LoadValue().Leases); got != 1 {
+		t.Fatalf("Lease count = %d, want 1", got)
+	}
+
+	github.setCompletion(4, mergedOutcome(4))
+	workers.complete(4, worker.Result{ExitCode: 0})
+	if err := <-done; err == nil || !strings.Contains(err.Error(), transientErr.Error()) {
+		t.Fatalf("run error = %v, want useful candidate discovery error after Worker completion", err)
+	}
+	if got := store.runStatus(4); got != scheduler.StatusMerged {
+		t.Fatalf("issue 4 status = %q, want merged", got)
+	}
+	if !strings.Contains(output.String(), transientErr.Error()) {
+		t.Fatalf("runner output = %q, want candidate discovery diagnostic", output.String())
+	}
+}
+
+func TestRunnerReturnsCandidateDiscoveryErrorAfterWaitingRunReconciles(t *testing.T) {
+	t.Parallel()
+
+	transientErr := errors.New("candidate discovery unavailable")
+	github := &fakeGitHub{
+		candidateResults: []candidateResult{{err: transientErr}, {err: transientErr}},
+		candidateChanged: make(chan struct{}, 2),
+		completions: map[int]ghadapter.CompletionOutcome{
+			4: {PRFound: true, PullRequest: "https://example.test/pr/4", AutoMergeArmed: true},
+		},
+	}
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs: []scheduler.Run{{
+			Issue: 4, RunID: "waiting", Status: scheduler.StatusWaitingForMerge, WorkerMode: scheduler.WorkerModeRPC,
+			Branch: "agent/issue-4-waiting", Worktree: "/tmp/waiting",
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "waiting", Issue: 4, RunID: "waiting"}},
+	}}
+	runner := testRunner(github, newFakeWorkers(), store, 1)
+	runner.Config.PollInterval = 50 * time.Millisecond
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	github.waitForCandidateCalls(t, 1)
+	github.setCompletion(4, mergedOutcome(4))
+
+	if err := <-done; err == nil || !strings.Contains(err.Error(), transientErr.Error()) {
+		t.Fatalf("run error = %v, want candidate discovery error after waiting Run reconciliation", err)
+	}
+	if got := store.runStatus(4); got != scheduler.StatusMerged {
+		t.Fatalf("issue 4 status = %q, want merged", got)
+	}
+}
+
+func TestRunnerRetriesCandidateDiscoveryAfterPollIntervalAndResumesAdmission(t *testing.T) {
+	t.Parallel()
+
+	pollInterval := 80 * time.Millisecond
+	github := &fakeGitHub{
+		candidateResults: []candidateResult{
+			{candidates: []scheduler.Candidate{{Number: 4, CreatedAt: time.Now()}}},
+			{candidates: []scheduler.Candidate{{Number: 5, CreatedAt: time.Now()}}, err: errors.New("candidate discovery unavailable")},
+			{candidates: []scheduler.Candidate{{Number: 6, CreatedAt: time.Now()}}, err: errors.New("candidate discovery still unavailable")},
+			{candidates: []scheduler.Candidate{{Number: 4, CreatedAt: time.Now()}, {Number: 5, CreatedAt: time.Now()}}},
+		},
+		candidateChanged: make(chan struct{}, 8),
+	}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 2)
+	runner.Config.PollInterval = pollInterval
+	runner.Config.Watch = true
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+
+	workers.waitForStarts(t, 4)
+	github.waitForCandidateCalls(t, 2)
+	assertOnlyIssueFourIsLeased(t, workers, store)
+
+	github.waitForCandidateCalls(t, 3)
+	assertOnlyIssueFourIsLeased(t, workers, store)
+
+	github.waitForCandidateCalls(t, 4)
+	workers.waitForStarts(t, 5)
+	calls := github.candidateCallSnapshot()
+	for i := 2; i < 4; i++ {
+		if elapsed := calls[i].Sub(calls[i-1]); elapsed < pollInterval {
+			t.Fatalf("candidate discovery retry %d happened after %s, want no sooner than %s", i-1, elapsed, pollInterval)
+		}
+	}
+	if got := workers.startCount(4); got != 1 {
+		t.Fatalf("issue #4 start count = %d, want 1", got)
+	}
+	if got := store.runStatus(4); got != scheduler.StatusRunning {
+		t.Fatalf("issue 4 status = %q, want running after discovery retries", got)
+	}
+	if workers.wasStarted(6) {
+		t.Fatal("issue #6 was started from a failed candidate discovery pass")
+	}
+
+	workers.complete(4, worker.Result{ExitCode: 1, Err: errors.New("failed")})
+	workers.complete(5, worker.Result{ExitCode: 1, Err: errors.New("failed")})
+	workers.waitForNoRunningWorkers(t)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+}
+
+func TestRunnerWatchRetriesCandidateDiscoveryWithoutActiveRun(t *testing.T) {
+	t.Parallel()
+
+	pollInterval := 40 * time.Millisecond
+	github := &fakeGitHub{
+		candidateResults: []candidateResult{
+			{err: errors.New("GitHub unavailable")},
+			{candidates: []scheduler.Candidate{{Number: 7, CreatedAt: time.Now()}}},
+		},
+		candidateChanged: make(chan struct{}, 4),
+	}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+	runner.Config.PollInterval = pollInterval
+	runner.Config.Watch = true
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+
+	workers.waitForStarts(t, 7)
+	calls := github.candidateCallSnapshot()
+	if elapsed := calls[1].Sub(calls[0]); elapsed < pollInterval {
+		t.Fatalf("idle candidate discovery retried after %s, want no sooner than %s", elapsed, pollInterval)
+	}
+	workers.complete(7, worker.Result{ExitCode: 1, Err: errors.New("failed")})
+	workers.waitForNoRunningWorkers(t)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+}
+
+func TestRunnerReturnsCandidateDiscoveryErrorWithoutWatchOrUnfinishedRun(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{
+		candidateResults: []candidateResult{{err: errors.New("native blockers: TLS handshake timeout")}},
+		candidateChanged: make(chan struct{}, 1),
+	}
+	runner := testRunner(github, newFakeWorkers(), &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+
+	err := runner.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "reconcile GitHub backlog: native blockers: TLS handshake timeout") {
+		t.Fatalf("run error = %v, want candidate discovery failure", err)
+	}
+}
+
 func TestRunnerSchedulesDependentAfterBlockerCloses(t *testing.T) {
 	t.Parallel()
 
@@ -545,6 +741,48 @@ func TestRunnerReconcilesOnlyTheLeasedRunWhenIssueHasHistory(t *testing.T) {
 	}
 }
 
+func assertOnlyIssueFourIsLeased(t *testing.T, workers *fakeWorkers, store *memoryStore) {
+	t.Helper()
+	if got := store.runStatus(4); got != scheduler.StatusRunning {
+		t.Fatalf("issue 4 status = %q, want running during discovery failure", got)
+	}
+	if workers.wasStarted(5) || workers.wasStarted(6) {
+		t.Fatalf("Workers started from failed snapshots: %v", workers.startedSnapshot())
+	}
+	leases := store.LoadValue().Leases
+	if len(leases) != 1 || leases[0].Issue != 4 || leases[0].RunID != "run-4" {
+		t.Fatalf("Leases = %#v, want only issue #4 Run run-4", leases)
+	}
+}
+
+type diagnosticWriter struct {
+	mu    sync.Mutex
+	text  bytes.Buffer
+	match string
+	seen  chan struct{}
+	once  sync.Once
+}
+
+func newDiagnosticWriter(match string) *diagnosticWriter {
+	return &diagnosticWriter{match: match, seen: make(chan struct{})}
+}
+
+func (w *diagnosticWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.text.Write(p)
+	if strings.Contains(w.text.String(), w.match) {
+		w.once.Do(func() { close(w.seen) })
+	}
+	return n, err
+}
+
+func (w *diagnosticWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.text.String()
+}
+
 func testRunner(github *fakeGitHub, workers *fakeWorkers, store *memoryStore, max int) *Runner {
 	return &Runner{
 		Config:      Config{Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: max, PollInterval: 5 * time.Millisecond, SessionsDir: "/tmp/backlog-sessions"},
@@ -609,9 +847,17 @@ func cloneState(value state.State) state.State {
 	return value
 }
 
+type candidateResult struct {
+	candidates []scheduler.Candidate
+	err        error
+}
+
 type fakeGitHub struct {
 	mu                 sync.Mutex
 	candidates         []scheduler.Candidate
+	candidateResults   []candidateResult
+	candidateCallTimes []time.Time
+	candidateChanged   chan struct{}
 	completions        map[int]ghadapter.CompletionOutcome
 	completionErrs     map[int]error
 	completionCheck    func(int) error
@@ -621,6 +867,18 @@ type fakeGitHub struct {
 func (g *fakeGitHub) Candidates(context.Context, string) ([]scheduler.Candidate, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	call := len(g.candidateCallTimes)
+	g.candidateCallTimes = append(g.candidateCallTimes, time.Now())
+	if g.candidateChanged != nil {
+		select {
+		case g.candidateChanged <- struct{}{}:
+		default:
+		}
+	}
+	if call < len(g.candidateResults) {
+		result := g.candidateResults[call]
+		return append([]scheduler.Candidate(nil), result.candidates...), result.err
+	}
 	return append([]scheduler.Candidate(nil), g.candidates...), nil
 }
 func (g *fakeGitHub) Completion(_ context.Context, _ string, issue int, branch string) (ghadapter.CompletionOutcome, error) {
@@ -664,6 +922,25 @@ func (g *fakeGitHub) completionBranchSnapshot() []string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return append([]string(nil), g.completionBranches...)
+}
+func (g *fakeGitHub) waitForCandidateCalls(t *testing.T, count int) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		if len(g.candidateCallSnapshot()) >= count {
+			return
+		}
+		select {
+		case <-g.candidateChanged:
+		case <-deadline:
+			t.Fatalf("candidate calls = %d, want at least %d", len(g.candidateCallSnapshot()), count)
+		}
+	}
+}
+func (g *fakeGitHub) candidateCallSnapshot() []time.Time {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]time.Time(nil), g.candidateCallTimes...)
 }
 func mergedOutcome(issue int) ghadapter.CompletionOutcome {
 	return ghadapter.CompletionOutcome{PRFound: true, PullRequest: fmt.Sprintf("https://example.test/pr/%d", issue), Merged: true, IssueClosed: true}
@@ -801,15 +1078,29 @@ func (w *fakeWorkers) waitForStarts(t *testing.T, issues ...int) {
 		}
 	}
 }
+func (w *fakeWorkers) waitForNoRunningWorkers(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for w.runningCount() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := w.runningCount(); got != 0 {
+		t.Fatalf("running Workers = %d, want zero", got)
+	}
+}
 func (w *fakeWorkers) wasStarted(issue int) bool {
+	return w.startCount(issue) > 0
+}
+func (w *fakeWorkers) startCount(issue int) int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	count := 0
 	for _, started := range w.started {
 		if started == issue {
-			return true
+			count++
 		}
 	}
-	return false
+	return count
 }
 func (w *fakeWorkers) startedSnapshot() []int {
 	w.mu.Lock()

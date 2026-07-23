@@ -52,6 +52,8 @@ The concurrency limit counts top-level issues. Each AFK worker may itself launch
 
 The foreground runner exits when there are no active workers and no currently eligible candidates. Blocked candidates do not keep it alive unless `--watch` is set.
 
+Candidate discovery fails closed for admission. If a discovery pass fails, the runner creates no Leases from that pass, continues supervising existing Workers, and schedules the next retry after `--poll`. With `--watch`, it also retries while no Run is active. Without `--watch`, it reports the discovery error once no unfinished leased Run remains, even if that happens before the scheduled retry.
+
 ## Backlog eligibility
 
 A candidate must be an open issue labeled `ready-for-agent`. Candidates are considered oldest first.
