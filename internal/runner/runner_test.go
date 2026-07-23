@@ -354,6 +354,31 @@ func TestAdmissionGateSerializesDrainAcceptanceWithLeasePersistence(t *testing.T
 	}
 }
 
+func TestRunnerStartRejectsLeaseAfterDrainIsAccepted(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+	gate := &admissionGate{}
+	if first := gate.stop(); !first {
+		t.Fatal("first Drain transition was not accepted")
+	}
+	current := store.LoadValue()
+	admissionResult := make(chan bool, 1)
+	process, err := runner.start(context.Background(), gate, &current, scheduler.Candidate{Number: 17}, admissionResult)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if admitted := <-admissionResult; admitted {
+		t.Fatal("production start path admitted a Lease after Drain")
+	}
+	if process != nil || len(current.Runs) != 0 || len(current.Leases) != 0 || len(store.LoadValue().Runs) != 0 {
+		t.Fatalf("state after rejected start = process %#v, memory %#v, store %#v", process, current, store.LoadValue())
+	}
+}
+
 func TestRunnerAcceptsIdleDrainWhileInitialReconciliationIsBlocked(t *testing.T) {
 	t.Parallel()
 
@@ -382,7 +407,7 @@ func TestRunnerAcceptsIdleDrainWhileInitialReconciliationIsBlocked(t *testing.T)
 	go func() { done <- runner.Run(context.Background()) }()
 	<-reconciliationStarted
 	signals <- os.Interrupt
-	output.waitFor(t, "Drain: admission stopped; 0 Workers remaining; next SIGINT will request suspension")
+	output.waitFor(t, "Drain: admission stopped; 0 Workers remaining; next SIGINT will be recorded as a suspension request")
 	if err := <-done; err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -391,6 +416,50 @@ func TestRunnerAcceptsIdleDrainWhileInitialReconciliationIsBlocked(t *testing.T)
 		t.Fatalf("state after idle Drain = %#v, want waiting Run and Lease unchanged", got)
 	}
 	output.waitFor(t, "Drain complete: 0 Workers remaining; exiting successfully")
+}
+
+func TestRunnerAcceptsIdleDrainWhilePeriodicReconciliationIsBlocked(t *testing.T) {
+	t.Parallel()
+
+	reconciliationStarted := make(chan struct{})
+	completionCalls := 0
+	github := &fakeGitHub{completionFunc: func(ctx context.Context, _ int, _ string) (ghadapter.CompletionOutcome, error) {
+		completionCalls++
+		if completionCalls == 1 {
+			return ghadapter.CompletionOutcome{PRFound: true, AutoMergeArmed: true}, nil
+		}
+		close(reconciliationStarted)
+		<-ctx.Done()
+		return ghadapter.CompletionOutcome{}, ctx.Err()
+	}}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion,
+		Runs: []scheduler.Run{{
+			Issue: 20, RunID: "run-20", Status: scheduler.StatusWaitingForMerge,
+			Branch: "agent/issue-20-run-20", Worktree: "/tmp/run-20",
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "run-20", Issue: 20, RunID: "run-20"}},
+	}}
+	signals := make(chan os.Signal, 1)
+	output := newSynchronizedOutput()
+	runner := testRunner(github, workers, store, 1)
+	runner.Config.Watch = true
+	runner.Signals = signals
+	runner.Output = output
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	<-reconciliationStarted
+	signals <- os.Interrupt
+	output.waitFor(t, "Drain: admission stopped; 0 Workers remaining; next SIGINT will be recorded as a suspension request")
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := store.LoadValue()
+	if len(got.Runs) != 1 || got.Runs[0].Status != scheduler.StatusWaitingForMerge || len(got.Leases) != 1 {
+		t.Fatalf("state after periodic reconciliation Drain = %#v", got)
+	}
 }
 
 func TestRunnerNeverPersistsLeaseAfterDrainIsAccepted(t *testing.T) {
@@ -415,7 +484,7 @@ func TestRunnerNeverPersistsLeaseAfterDrainIsAccepted(t *testing.T) {
 	go func() { done <- runner.Run(context.Background()) }()
 	<-candidateLookupStarted
 	signals <- os.Interrupt
-	output.waitFor(t, "Drain: admission stopped; 0 Workers remaining; next SIGINT will request suspension")
+	output.waitFor(t, "Drain: admission stopped; 0 Workers remaining; next SIGINT will be recorded as a suspension request")
 	if err := <-done; err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -468,8 +537,8 @@ func TestRunnerFinishesLeaseCommittedBeforeDrainAndObservesRepeatedSignals(t *te
 	signals <- os.Interrupt
 	close(finishPrepare)
 	workers.waitForStarts(t, 14)
-	output.waitFor(t, "Drain: admission stopped; 1 Worker remaining; next SIGINT will request suspension")
-	output.waitFor(t, "Drain: additional interrupt observed; 1 Worker remaining; next SIGINT will request suspension")
+	output.waitFor(t, "Drain: admission stopped; 1 Worker remaining; next SIGINT will be recorded as a suspension request")
+	output.waitFor(t, "Drain: additional interrupt recorded as a suspension request; 1 Worker remaining")
 	github.setCompletion(14, mergedOutcome(14))
 	workers.complete(14, worker.Result{ExitCode: 0})
 	if err := <-done; err != nil {
@@ -478,6 +547,46 @@ func TestRunnerFinishesLeaseCommittedBeforeDrainAndObservesRepeatedSignals(t *te
 	got := store.LoadValue()
 	if len(got.Runs) != 1 || got.Runs[0].Status != scheduler.StatusMerged || len(got.Leases) != 0 {
 		t.Fatalf("state after drained Worker settlement = %#v", got)
+	}
+	output.waitFor(t, "Drain complete: 0 Workers remaining; exiting successfully")
+}
+
+func TestRunnerDrainsEveryOwnedWorkerAndReportsProgress(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{candidates: []scheduler.Candidate{
+		{Number: 18, CreatedAt: time.Now()},
+		{Number: 19, CreatedAt: time.Now().Add(time.Second)},
+	}}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	signals := make(chan os.Signal, 1)
+	output := newSynchronizedOutput()
+	runner := testRunner(github, workers, store, 2)
+	runner.Signals = signals
+	runner.Output = output
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 18, 19)
+	signals <- os.Interrupt
+	output.waitFor(t, "Drain: admission stopped; 2 Workers remaining; next SIGINT will be recorded as a suspension request")
+	github.setCompletion(18, mergedOutcome(18))
+	workers.complete(18, worker.Result{ExitCode: 0})
+	output.waitFor(t, "Drain: 1 Worker remaining; next SIGINT will be recorded as a suspension request")
+	select {
+	case err := <-done:
+		t.Fatalf("runner exited before every Worker settled: %v", err)
+	default:
+	}
+	github.setCompletion(19, mergedOutcome(19))
+	workers.complete(19, worker.Result{ExitCode: 0})
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := store.LoadValue()
+	if len(got.Runs) != 2 || got.Runs[0].Status != scheduler.StatusMerged || got.Runs[1].Status != scheduler.StatusMerged || len(got.Leases) != 0 {
+		t.Fatalf("state after draining two Workers = %#v", got)
 	}
 	output.waitFor(t, "Drain complete: 0 Workers remaining; exiting successfully")
 }

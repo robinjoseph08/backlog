@@ -40,9 +40,13 @@ func MainWithSignals(ctx context.Context, args []string, stdout, stderr io.Write
 	case "run":
 		err = runCommand(ctx, args[1:], stdout, stderr, signals)
 	case "status":
-		err = statusCommand(ctx, args[1:], stdout, stderr)
+		commandCtx, stop := cancelContextOnSignal(ctx, signals)
+		defer stop()
+		err = statusCommand(commandCtx, args[1:], stdout, stderr)
 	case "retry":
-		err = retryCommand(ctx, args[1:], stdout, stderr)
+		commandCtx, stop := cancelContextOnSignal(ctx, signals)
+		defer stop()
+		err = retryCommand(commandCtx, args[1:], stdout, stderr)
 	case "help", "--help", "-h":
 		printUsage(stdout)
 		return 0
@@ -62,6 +66,44 @@ func MainWithSignals(ctx context.Context, args []string, stdout, stderr io.Write
 }
 
 func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan os.Signal) error {
+	setupCtx := ctx
+	runnerSignals := signals
+	var cancelSetup context.CancelFunc
+	var setupDone, relayDone chan struct{}
+	if signals != nil {
+		setupCtx, cancelSetup = context.WithCancel(ctx)
+		forwarded := make(chan os.Signal, 16)
+		runnerSignals = forwarded
+		setupDone = make(chan struct{})
+		relayDone = make(chan struct{})
+		go func() {
+			for {
+				select {
+				case signal, ok := <-signals:
+					if !ok {
+						return
+					}
+					select {
+					case forwarded <- signal:
+					case <-relayDone:
+						return
+					}
+					select {
+					case <-setupDone:
+					default:
+						cancelSetup()
+					}
+				case <-relayDone:
+					return
+				}
+			}
+		}()
+		defer func() {
+			close(relayDone)
+			cancelSetup()
+		}()
+	}
+
 	flags := flag.NewFlagSet("run", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	repoDir := flags.String("repo-dir", ".", "Git repository to drain")
@@ -84,11 +126,11 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 	if err != nil {
 		return fmt.Errorf("resolve repository directory: %w", err)
 	}
-	repositoryRoot, err := gitRepositoryRoot(ctx, *gitExecutable, absoluteRepo)
+	repositoryRoot, err := gitRepositoryRoot(setupCtx, *gitExecutable, absoluteRepo)
 	if err != nil {
 		return err
 	}
-	commonDirectory, err := gitCommonDirectory(ctx, *gitExecutable, repositoryRoot)
+	commonDirectory, err := gitCommonDirectory(setupCtx, *gitExecutable, repositoryRoot)
 	if err != nil {
 		return err
 	}
@@ -106,7 +148,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 	}
 
 	github := &ghadapter.Client{Executable: *ghExecutable, Dir: repositoryRoot}
-	repository, err := github.Repository(ctx)
+	repository, err := github.Repository(setupCtx)
 	if err != nil {
 		return err
 	}
@@ -132,9 +174,34 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 		Worktrees: worktrees,
 		Workers:   workerAdapter{supervisor: supervisor},
 		Output:    stdout,
-		Signals:   signals,
+		Signals:   runnerSignals,
+	}
+	if setupDone != nil {
+		close(setupDone)
 	}
 	return backlogRunner.Run(ctx)
+}
+
+func cancelContextOnSignal(ctx context.Context, signals <-chan os.Signal) (context.Context, func()) {
+	if signals == nil {
+		return ctx, func() {}
+	}
+	commandCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case _, ok := <-signals:
+			if ok {
+				cancel()
+			}
+		case <-ctx.Done():
+		case <-done:
+		}
+	}()
+	return commandCtx, func() {
+		close(done)
+		cancel()
+	}
 }
 
 type workerAdapter struct {

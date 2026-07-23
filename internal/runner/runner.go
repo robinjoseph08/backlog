@@ -82,6 +82,11 @@ type workerCompletion struct {
 	result worker.Result
 }
 
+type workerStart struct {
+	process WorkerProcess
+	err     error
+}
+
 // admissionGate serializes the in-memory Drain transition with the complete
 // durable Lease write. Once stop returns, no later commit can call Store.Save.
 type admissionGate struct {
@@ -214,19 +219,22 @@ func (r *Runner) Run(ctx context.Context) error {
 				plan := scheduler.Plan(scheduler.Snapshot{Candidates: candidates, Runs: current.Runs, Leases: current.Leases}, r.Config.MaxConcurrentIssues)
 				startedWorker := false
 				for _, candidate := range plan.Starts {
-					process, err := r.start(workerCtx, admission, &current, candidate)
+					process, startedDraining, err := r.startWhileObservingSignals(workerCtx, admission, &current, candidate, signalEvents, len(localWorkers))
+					draining = startedDraining || draining
 					if err != nil {
 						shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after a worker launch error; worktree retained")
 						return errors.Join(err, shutdownErr)
 					}
-					if process == nil {
-						continue
+					if process != nil {
+						localWorkers[candidate.Number] = process
+						startedWorker = true
+						go func(issue int, process WorkerProcess) {
+							completions <- workerCompletion{issue: issue, result: process.Wait()}
+						}(candidate.Number, process)
 					}
-					localWorkers[candidate.Number] = process
-					startedWorker = true
-					go func(issue int, process WorkerProcess) {
-						completions <- workerCompletion{issue: issue, result: process.Wait()}
-					}(candidate.Number, process)
+					if draining {
+						break
+					}
 				}
 
 				if startedWorker {
@@ -289,7 +297,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 			delete(localWorkers, completion.issue)
 			if draining && len(localWorkers) > 0 {
-				r.logf("Drain: %s remaining; next SIGINT will request suspension", workerSummary(len(localWorkers)))
+				r.logf("Drain: %s remaining; next SIGINT will be recorded as a suspension request", workerSummary(len(localWorkers)))
 			}
 			if err := r.finalizeSettledWorker(ctx, &current, runID, closed.Err, completion.result.Settled); err != nil {
 				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after an RPC finalization error; worktree retained")
@@ -356,11 +364,42 @@ func (r *Runner) observeSignals(ctx context.Context, admission *admissionGate, c
 
 func (r *Runner) handleSignal(event signalEvent, workers int) bool {
 	if event.firstDrain {
-		r.logf("Drain: admission stopped; %s remaining; next SIGINT will request suspension", workerSummary(workers))
+		r.logf("Drain: admission stopped; %s remaining; next SIGINT will be recorded as a suspension request", workerSummary(workers))
 		return true
 	}
-	r.logf("Drain: additional %s observed; %s remaining; next SIGINT will request suspension", event.signal, workerSummary(workers))
+	r.logf("Drain: additional %s recorded as a suspension request; %s remaining", event.signal, workerSummary(workers))
 	return false
+}
+
+func (r *Runner) startWhileObservingSignals(workerCtx context.Context, admission *admissionGate, current *state.State, candidate scheduler.Candidate, signalEvents <-chan signalEvent, workers int) (WorkerProcess, bool, error) {
+	admissionResult := make(chan bool, 1)
+	result := make(chan workerStart, 1)
+	go func() {
+		process, err := r.start(workerCtx, admission, current, candidate, admissionResult)
+		result <- workerStart{process: process, err: err}
+	}()
+
+	draining := false
+	admitted := false
+	admissionKnown := false
+	for {
+		select {
+		case admitted = <-admissionResult:
+			admissionKnown = true
+		case event := <-signalEvents:
+			if !admissionKnown {
+				admitted = <-admissionResult
+				admissionKnown = true
+			}
+			starting := 0
+			if admitted {
+				starting = 1
+			}
+			draining = r.handleSignal(event, workers+starting) || draining
+		case started := <-result:
+			return started.process, draining, started.err
+		}
+	}
 }
 
 func workerSummary(count int) string {
@@ -417,7 +456,7 @@ func (r *Runner) initializeState(current *state.State) error {
 	return nil
 }
 
-func (r *Runner) start(workerCtx context.Context, admission *admissionGate, current *state.State, candidate scheduler.Candidate) (WorkerProcess, error) {
+func (r *Runner) start(workerCtx context.Context, admission *admissionGate, current *state.State, candidate scheduler.Candidate, admissionResult chan<- bool) (WorkerProcess, error) {
 	now := r.Now().UTC()
 	runID := r.NewRunID(candidate.Number)
 	run := scheduler.Run{
@@ -436,8 +475,10 @@ func (r *Runner) start(workerCtx context.Context, admission *admissionGate, curr
 		return nil
 	})
 	if err != nil {
+		admissionResult <- false
 		return nil, fmt.Errorf("persist lease for issue #%d: %w", candidate.Number, err)
 	}
+	admissionResult <- admitted
 	if !admitted {
 		return nil, nil
 	}

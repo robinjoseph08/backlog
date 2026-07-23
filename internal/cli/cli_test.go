@@ -9,10 +9,41 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 )
+
+func TestMainWithSignalsCancelsCommandsDuringRepositorySetup(t *testing.T) {
+	for _, command := range []string{"run", "status"} {
+		t.Run(command, func(t *testing.T) {
+			root := t.TempDir()
+			started := filepath.Join(root, "git-started")
+			git := writeExecutable(t, `#!/bin/sh
+set -eu
+touch `+quote(started)+`
+exec sleep 30
+`)
+			signals := make(chan os.Signal, 1)
+			done := make(chan int, 1)
+			var stdout, stderr bytes.Buffer
+			go func() {
+				done <- MainWithSignals(context.Background(), []string{command, "--git", git}, &stdout, &stderr, signals)
+			}()
+			waitForFile(t, started)
+			signals <- os.Interrupt
+			select {
+			case exitCode := <-done:
+				if exitCode != 1 {
+					t.Fatalf("exit = %d, stderr = %q", exitCode, stderr.String())
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("%s did not stop after SIGINT during setup", command)
+			}
+		})
+	}
+}
 
 func TestRunCommandDrainsIssueThroughFakeExecutables(t *testing.T) {
 	t.Parallel()
