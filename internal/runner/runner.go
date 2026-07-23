@@ -161,8 +161,12 @@ func (r *Runner) Run(ctx context.Context) error {
 				_ = process.Abort()
 				_ = process.Close()
 				delete(localWorkers, completion.issue)
+				persisted, reloadErr := r.Store.Load()
+				if reloadErr == nil {
+					current = persisted
+				}
 				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after a completion error; worktree retained")
-				return errors.Join(err, shutdownErr)
+				return errors.Join(err, reloadErr, shutdownErr)
 			}
 			// Reconciliation and its durable state write happen while the idle RPC
 			// process is still alive. EOF is sent only after that write succeeds.

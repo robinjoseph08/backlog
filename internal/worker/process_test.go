@@ -42,7 +42,7 @@ printf '%s\n' "$*" > `+shellQuote(argsPath)+`
 pwd > `+shellQuote(cwdPath)+`
 IFS= read -r command
 printf '%s\n' "$command" > `+shellQuote(inputPath)+`
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 while IFS= read -r ignored; do :; done
 echo 'diagnostic' >&2
 `)
@@ -114,7 +114,7 @@ func TestProcessCannotSubmitPromptUntilReleased(t *testing.T) {
 printf started > `+shellQuote(marker)+`
 IFS= read -r command
 printf '%s' "$command" > `+shellQuote(input)+`
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 while IFS= read -r ignored; do :; done
 `)
 	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(
@@ -144,6 +144,20 @@ while IFS= read -r ignored; do :; done
 	}
 }
 
+func TestReleaseCreatesStartGateBeforeWritingPrompt(t *testing.T) {
+	t.Parallel()
+
+	gatePath := filepath.Join(t.TempDir(), "run.start")
+	input := &gateCheckingWriteCloser{t: t, gatePath: gatePath}
+	process := &Process{gatePath: gatePath, stdin: input, events: &rpcWriter{issue: 5}}
+	if err := process.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if !input.wrote {
+		t.Fatal("AFK prompt was not written")
+	}
+}
+
 func TestProcessRPCValidationFailsClosed(t *testing.T) {
 	t.Parallel()
 
@@ -156,8 +170,11 @@ func TestProcessRPCValidationFailsClosed(t *testing.T) {
 		{"truncated", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}`, "truncated Pi RPC JSON"},
 		{"duplicate response", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n`, "duplicated Pi RPC prompt response"},
 		{"mismatched response", `{"id":"wrong","type":"response","command":"prompt","success":true}\n`, "mismatched Pi RPC response"},
+		{"wrong response command", `{"id":"backlog-afk-prompt","type":"response","command":"abort","success":true}\n`, "mismatched Pi RPC response"},
+		{"missing response success", `{"id":"backlog-afk-prompt","type":"response","command":"prompt"}\n`, "Pi RPC prompt was rejected"},
+		{"rejected response", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":false}\n`, "Pi RPC prompt was rejected"},
 		{"invalid order", `{"type":"agent_settled"}\n`, "invalidly ordered Pi RPC agent_settled"},
-		{"duplicate agent end", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n{"type":"agent_start"}\n{"type":"agent_end"}\n{"type":"agent_end"}\n`, "invalidly ordered Pi RPC agent_end"},
+		{"duplicate agent end", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n{"type":"agent_start"}\n{"type":"turn_start"}\n{"type":"turn_end"}\n{"type":"agent_end"}\n{"type":"agent_end"}\n`, "invalidly ordered Pi RPC agent_end"},
 		{"unmatched turn end", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n{"type":"agent_start"}\n{"type":"turn_end"}\n`, "invalidly ordered Pi RPC turn_end"},
 		{"unsupported dialog", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n{"type":"agent_start"}\n{"type":"extension_ui_request","id":"ui-1","method":"confirm"}\n`, "unsupported interactive Pi RPC request"},
 		{"unknown type", `{"type":"surprise"}\n`, "unknown Pi RPC message type"},
@@ -198,10 +215,25 @@ printf '%s\n' \
   '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' \
   '{"type":"extension_ui_request","id":"ui-1","method":"setTitle"}' \
   '{"type":"agent_start"}' \
+  '{"type":"turn_start"}' \
+  '{"type":"message_start"}' \
+  '{"type":"message_update"}' \
+  '{"type":"message_end"}' \
+  '{"type":"tool_execution_start","toolCallId":"tool-1"}' \
+  '{"type":"tool_execution_start","toolCallId":"tool-2"}' \
+  '{"type":"tool_execution_update","toolCallId":"tool-2"}' \
+  '{"type":"tool_execution_end","toolCallId":"tool-1"}' \
+  '{"type":"tool_execution_end","toolCallId":"tool-2"}' \
+  '{"type":"queue_update"}' \
+  '{"type":"turn_end"}' \
   '{"type":"agent_end"}' \
   '{"type":"auto_retry_start"}' \
-  '{"type":"auto_retry_end"}' \
   '{"type":"agent_start"}' \
+  '{"type":"turn_start"}' \
+  '{"type":"message_start"}' \
+  '{"type":"message_end"}' \
+  '{"type":"auto_retry_end"}' \
+  '{"type":"turn_end"}' \
   '{"type":"agent_end"}' \
   '{"type":"agent_settled"}'
 while IFS= read -r ignored; do :; done
@@ -223,6 +255,33 @@ while IFS= read -r ignored; do :; done
 	}
 }
 
+func TestCloseReportsProtocolFailureAfterSettlement(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	pi := fakePi(t, `
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+sleep 0.05
+printf '%s\n' '{"type":"surprise"}'
+`)
+	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(
+		context.Background(), request(13, "run-13", root, filepath.Join(root, "sessions", "run-13")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if result := process.Wait(); result.Err != nil || !result.Settled {
+		t.Fatalf("wait = %#v", result)
+	}
+	if result := process.Close(); result.Err == nil || !strings.Contains(result.Err.Error(), "followed agent_settled") {
+		t.Fatalf("close error = %v, want post-settlement protocol failure", result.Err)
+	}
+}
+
 func TestProcessAcceptsOnlyLFAsRecordBoundary(t *testing.T) {
 	t.Parallel()
 
@@ -230,7 +289,7 @@ func TestProcessAcceptsOnlyLFAsRecordBoundary(t *testing.T) {
 	pi := fakePi(t, `
 IFS= read -r command
 printf '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true,"data":"line separator"}\r\n'
-printf '%s\n' '{"type":"agent_start"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 while IFS= read -r ignored; do :; done
 `)
 	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(
@@ -257,7 +316,7 @@ func TestCloseWaitsForTheWorkerProcessGroupToExit(t *testing.T) {
 	childDone := filepath.Join(root, "child-done")
 	pi := fakePi(t, `
 IFS= read -r command
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 while IFS= read -r ignored; do :; done
 (sleep 0.08; touch `+shellQuote(childDone)+`) </dev/null >/dev/null 2>&1 &
 `)
@@ -278,6 +337,41 @@ while IFS= read -r ignored; do :; done
 	}
 	if _, err := os.Stat(childDone); err != nil {
 		t.Fatalf("Close returned before a process-group child exited: %v", err)
+	}
+}
+
+func TestCloseEscalatesWhenWorkerIgnoresInputClosure(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	pi := fakePi(t, `
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+trap '' TERM
+while :; do sleep 1; done
+`)
+	process, err := (Supervisor{
+		Executable: pi, LogsDir: filepath.Join(root, "logs"), TerminationGrace: 30 * time.Millisecond,
+	}).Start(context.Background(), request(14, "run-14", root, filepath.Join(root, "sessions", "run-14")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if result := process.Wait(); result.Err != nil || !result.Settled {
+		t.Fatalf("wait = %#v", result)
+	}
+	started := time.Now()
+	result := process.Close()
+	if time.Since(started) > time.Second {
+		t.Fatalf("Close took %s, want bounded escalation", time.Since(started))
+	}
+	if result.Err == nil || !strings.Contains(result.Err.Error(), "did not exit after input closed") {
+		t.Fatalf("close error = %v, want graceful-exit timeout", result.Err)
+	}
+	if err := syscall.Kill(-process.PID(), syscall.Signal(0)); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("Worker process group survived Close escalation: %v", err)
 	}
 }
 
@@ -340,7 +434,7 @@ func TestProcessExplicitlyRejectsProjectTrustWhenApprovalIsDisabled(t *testing.T
 	pi := fakePi(t, `
 printf '%s\n' "$*" > `+shellQuote(argsPath)+`
 IFS= read -r command
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 while IFS= read -r ignored; do :; done
 `)
 	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs"), Approve: false}).Start(
@@ -363,6 +457,23 @@ while IFS= read -r ignored; do :; done
 		t.Fatalf("args = %q, want --no-approve only", strings.TrimSpace(string(args)))
 	}
 }
+
+type gateCheckingWriteCloser struct {
+	t        *testing.T
+	gatePath string
+	wrote    bool
+}
+
+func (w *gateCheckingWriteCloser) Write(data []byte) (int, error) {
+	w.t.Helper()
+	if _, err := os.Stat(w.gatePath); err != nil {
+		w.t.Fatalf("prompt written before start gate existed: %v", err)
+	}
+	w.wrote = true
+	return len(data), nil
+}
+
+func (*gateCheckingWriteCloser) Close() error { return nil }
 
 func request(issue int, runID, worktree, sessionDir string) Request {
 	return Request{

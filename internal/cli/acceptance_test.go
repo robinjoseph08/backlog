@@ -70,7 +70,7 @@ grep -q '"workerMode": "rpc"' `+quote(statePath)+`
 grep -q '"pid": '"$$" `+quote(statePath)+`
 IFS= read -r command
 printf '%s\n' "$command" > `+quote(prompt)+`
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 while IFS= read -r ignored; do :; done
 test -f `+quote(reconciledAlive)+`
 grep -q '"status": "merged"' `+quote(statePath)+`

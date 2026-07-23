@@ -222,14 +222,25 @@ func (p *Process) Wait() Result {
 	}
 }
 
-// Close closes RPC input and waits for the entire Worker process group leader
-// to exit. Callers persist the reconciled Run before invoking Close.
+// Close closes RPC input and waits for the Worker process and its entire
+// process group to exit. Callers persist the reconciled Run before invoking Close.
 func (p *Process) Close() Result {
 	p.closeInputOnce.Do(func() { p.closeInputErr = p.stdin.Close() })
-	<-p.exitDone
+	var gracefulErr error
+	grace := time.NewTimer(p.processGroupGrace)
+	defer grace.Stop()
+	select {
+	case <-p.exitDone:
+	case <-grace.C:
+		gracefulErr = errors.New("Pi RPC process did not exit after input closed")
+		if err := p.terminate(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			gracefulErr = errors.Join(gracefulErr, fmt.Errorf("terminate Pi RPC process group: %w", err))
+		}
+		<-p.exitDone
+	}
 	result := p.exitResult()
 	groupErr := waitForProcessGroupExit(p.PID(), p.processGroupGrace)
-	result.Err = errors.Join(result.Err, p.closeInputErr, groupErr)
+	result.Err = errors.Join(result.Err, p.closeInputErr, gracefulErr, groupErr)
 	return result
 }
 
@@ -277,20 +288,45 @@ func waitForProcessGroupExit(pid int, grace time.Duration) error {
 	if pid <= 0 {
 		return nil
 	}
+	exited, err := waitForProcessGroup(pid, grace)
+	if err != nil || exited {
+		return err
+	}
+	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("terminate surviving Worker process group: %w", err)
+	}
+	exited, err = waitForProcessGroup(pid, grace)
+	if err != nil || exited {
+		return err
+	}
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("kill surviving Worker process group: %w", err)
+	}
+	exited, err = waitForProcessGroup(pid, grace)
+	if err != nil {
+		return err
+	}
+	if !exited {
+		return fmt.Errorf("Worker process group %d survived shutdown escalation", pid)
+	}
+	return nil
+}
+
+func waitForProcessGroup(pid int, grace time.Duration) (bool, error) {
 	deadline := time.NewTimer(grace)
 	defer deadline.Stop()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		if err := syscall.Kill(-pid, syscall.Signal(0)); errors.Is(err, syscall.ESRCH) {
-			return nil
+			return true, nil
 		} else if err != nil && !errors.Is(err, syscall.EPERM) {
-			return fmt.Errorf("verify Worker process-group exit: %w", err)
+			return false, fmt.Errorf("verify Worker process-group exit: %w", err)
 		}
 		select {
 		case <-ticker.C:
 		case <-deadline.C:
-			return fmt.Errorf("Worker process group %d remained alive after process exit", pid)
+			return false, nil
 		}
 	}
 }
@@ -350,6 +386,7 @@ type rpcWriter struct {
 	commandID      string
 	state          rpcAgentState
 	turnOpen       bool
+	completedTurns int
 	messageOpen    bool
 	compactionOpen bool
 	retryOpen      bool
@@ -469,13 +506,14 @@ func (w *rpcWriter) validate(line []byte) {
 	}
 	switch message.Type {
 	case "agent_start":
-		if (w.state != rpcAwaitingAgentStart && w.state != rpcBetweenAgentRuns) || w.compactionOpen || w.retryOpen {
+		if (w.state != rpcAwaitingAgentStart && w.state != rpcBetweenAgentRuns) || w.compactionOpen {
 			w.invalidOrder(message.Type)
 			return
 		}
 		w.state = rpcAgentRunning
+		w.completedTurns = 0
 	case "agent_end":
-		if w.state != rpcAgentRunning || w.turnOpen || w.messageOpen || len(w.openTools) != 0 {
+		if w.state != rpcAgentRunning || w.completedTurns == 0 || w.turnOpen || w.messageOpen || len(w.openTools) != 0 {
 			w.invalidOrder(message.Type)
 			return
 		}
@@ -499,24 +537,25 @@ func (w *rpcWriter) validate(line []byte) {
 			return
 		}
 		w.turnOpen = false
+		w.completedTurns++
 	case "message_start":
-		if w.state != rpcAgentRunning || w.messageOpen {
+		if w.state != rpcAgentRunning || !w.turnOpen || w.messageOpen {
 			w.invalidOrder(message.Type)
 			return
 		}
 		w.messageOpen = true
 	case "message_update":
-		if w.state != rpcAgentRunning || !w.messageOpen {
+		if w.state != rpcAgentRunning || !w.turnOpen || !w.messageOpen {
 			w.invalidOrder(message.Type)
 		}
 	case "message_end":
-		if w.state != rpcAgentRunning || !w.messageOpen {
+		if w.state != rpcAgentRunning || !w.turnOpen || !w.messageOpen {
 			w.invalidOrder(message.Type)
 			return
 		}
 		w.messageOpen = false
 	case "tool_execution_start":
-		if w.state != rpcAgentRunning || message.ToolCallID == "" {
+		if w.state != rpcAgentRunning || !w.turnOpen || message.ToolCallID == "" {
 			w.invalidOrder(message.Type)
 			return
 		}
@@ -526,7 +565,7 @@ func (w *rpcWriter) validate(line []byte) {
 		}
 		w.openTools[message.ToolCallID] = struct{}{}
 	case "tool_execution_update":
-		if w.state != rpcAgentRunning || message.ToolCallID == "" {
+		if w.state != rpcAgentRunning || !w.turnOpen || message.ToolCallID == "" {
 			w.invalidOrder(message.Type)
 			return
 		}
@@ -534,7 +573,7 @@ func (w *rpcWriter) validate(line []byte) {
 			w.invalidOrder(message.Type)
 		}
 	case "tool_execution_end":
-		if w.state != rpcAgentRunning || message.ToolCallID == "" {
+		if w.state != rpcAgentRunning || !w.turnOpen || message.ToolCallID == "" {
 			w.invalidOrder(message.Type)
 			return
 		}
@@ -562,7 +601,7 @@ func (w *rpcWriter) validate(line []byte) {
 		}
 		w.retryOpen = true
 	case "auto_retry_end":
-		if w.state != rpcBetweenAgentRuns || !w.retryOpen {
+		if (w.state != rpcBetweenAgentRuns && w.state != rpcAgentRunning) || !w.retryOpen {
 			w.invalidOrder(message.Type)
 			return
 		}

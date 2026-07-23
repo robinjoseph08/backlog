@@ -10,7 +10,7 @@ Each issue receives its own lease, Git branch, Git worktree, Pi process, named P
 - Go 1.23 or newer to build
 - `git`
 - GitHub CLI `gh`, authenticated for the target repository
-- Pi with the global `afk` skill available
+- Pi 0.80.4 or newer with the global `afk` skill available
 - A Git remote named `origin`
 - GitHub API access with Issues read permission
 
@@ -79,7 +79,7 @@ For issue `#123`, the runner starts Pi in RPC mode in the issue worktree using a
 
 Backlog submits `/skill:afk 123` as a correlated RPC `prompt` command. Standard output uses strict LF-delimited JSONL and is saved separately from standard error. Malformed or truncated records, mismatched or duplicate responses, and invalid lifecycle ordering fail closed and preserve the worktree.
 
-`agent_settled`, not process exit, triggers completion handling. While the idle Pi RPC process is still alive, the runner looks up the pull request by the Run's unique branch, verifies the issue state, and persists the reconciled Run. It then closes RPC input, waits for orderly process-group exit, and releases Worker capacity. An armed open pull request becomes `waiting-for-merge`; other unverified outcomes require human attention.
+`agent_settled` is the normal completion trigger. An unexpected process exit triggers fail-closed reconciliation instead. While the idle Pi RPC process is still alive, the runner looks up the pull request by the Run's unique branch, verifies the issue state, and persists the reconciled Run. It then closes RPC input, escalates if orderly shutdown exceeds its grace period, confirms process-group exit, and releases Worker capacity. An armed open pull request becomes `waiting-for-merge`; other unverified outcomes require human attention.
 
 Only verified merged runs have their worktrees and local branches removed. Failed and ambiguous runs are retained.
 

@@ -61,7 +61,7 @@ if [ "$3" = "worktree" ] && [ "$4" = "remove" ]; then rm -rf "$6"; fi
 	pi := writeExecutable(t, `#!/bin/sh
 set -eu
 IFS= read -r command
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 while IFS= read -r ignored; do :; done
 `)
 
