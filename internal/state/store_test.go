@@ -301,7 +301,7 @@ func TestFileStoreRejectsInvalidRunAndLeaseReferences(t *testing.T) {
 		},
 		{
 			name:  "unknown worker mode",
-			value: State{Version: CurrentVersion, Runs: []scheduler.Run{{Issue: 1, RunID: "run", Status: scheduler.StatusFailed, WorkerMode: "rpc"}}},
+			value: State{Version: CurrentVersion, Runs: []scheduler.Run{{Issue: 1, RunID: "run", Status: scheduler.StatusFailed, WorkerMode: "future"}}},
 			want:  "unknown worker mode",
 		},
 	}
@@ -338,6 +338,35 @@ func TestFileStoreRejectsMalformedState(t *testing.T) {
 	_, err := (FileStore{Path: path}).Load()
 	if err == nil {
 		t.Fatal("load succeeded, want malformed-state error")
+	}
+}
+
+func TestFileStorePersistsRPCSessionIdentityAndRequiresItsStorage(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.json")
+	store := FileStore{Path: path}
+	value := State{
+		Version: CurrentVersion,
+		Runs: []scheduler.Run{{
+			Issue: 5, RunID: "run-5", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModeRPC,
+			SessionID: "backlog-run-5", SessionDir: "/state/sessions/run-5",
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "run-5", Issue: 5, RunID: "run-5"}},
+	}
+	if err := store.Save(value); err != nil {
+		t.Fatalf("save RPC Run: %v", err)
+	}
+	got, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Runs[0].SessionID != value.Runs[0].SessionID || got.Runs[0].SessionDir != value.Runs[0].SessionDir {
+		t.Fatalf("RPC session metadata = %#v", got.Runs[0])
+	}
+	value.Runs[0].SessionDir = ""
+	if err := store.Save(value); err == nil || !strings.Contains(err.Error(), "without durable session identity and storage") {
+		t.Fatalf("missing session storage error = %v", err)
 	}
 }
 

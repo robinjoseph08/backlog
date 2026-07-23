@@ -289,8 +289,11 @@ func validateRun(run scheduler.Run, requireWorkerMode bool) error {
 	if !knownStatus(run.Status) {
 		return fmt.Errorf("state contains unknown status %q for issue #%d", run.Status, run.Issue)
 	}
-	if requireWorkerMode && run.WorkerMode != scheduler.WorkerModePrint {
+	if requireWorkerMode && run.WorkerMode != scheduler.WorkerModePrint && run.WorkerMode != scheduler.WorkerModeRPC {
 		return fmt.Errorf("state contains Run %q with unknown worker mode %q", run.RunID, run.WorkerMode)
+	}
+	if run.WorkerMode == scheduler.WorkerModeRPC && (run.SessionID == "" || run.SessionDir == "") {
+		return fmt.Errorf("state contains RPC Run %q without durable session identity and storage", run.RunID)
 	}
 	if run.Status == scheduler.StatusRunning {
 		if run.PID <= 0 || run.StartedAt.IsZero() || run.ProcessIdentity == "" {

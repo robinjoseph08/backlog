@@ -19,7 +19,10 @@ const (
 
 type WorkerMode string
 
-const WorkerModePrint WorkerMode = "print"
+const (
+	WorkerModePrint WorkerMode = "print"
+	WorkerModeRPC   WorkerMode = "rpc"
+)
 
 type Blocker struct {
 	Owner  string `json:"owner,omitempty"`
@@ -47,6 +50,8 @@ type Run struct {
 	Branch          string     `json:"branch,omitempty"`
 	Worktree        string     `json:"worktree,omitempty"`
 	SessionName     string     `json:"sessionName,omitempty"`
+	SessionID       string     `json:"sessionId,omitempty"`
+	SessionDir      string     `json:"sessionDir,omitempty"`
 	LogPath         string     `json:"logPath,omitempty"`
 	StderrPath      string     `json:"stderrPath,omitempty"`
 	PullRequest     string     `json:"pullRequest,omitempty"`
@@ -87,7 +92,7 @@ func Plan(snapshot Snapshot, maxConcurrentIssues int) Schedule {
 	leased := make(map[int]struct{}, len(snapshot.Leases))
 	workerCount := 0
 	for _, lease := range snapshot.Leases {
-		if run, exists := runsByID[lease.RunID]; exists && consumesWorkerCapacity(run.Status) {
+		if run, exists := runsByID[lease.RunID]; exists && consumesWorkerCapacity(run) {
 			workerCount++
 		}
 		leased[lease.Issue] = struct{}{}
@@ -120,10 +125,12 @@ func Plan(snapshot Snapshot, maxConcurrentIssues int) Schedule {
 	return Schedule{Starts: eligible}
 }
 
-func consumesWorkerCapacity(status Status) bool {
-	switch status {
+func consumesWorkerCapacity(run Run) bool {
+	switch run.Status {
 	case StatusClaimed, StatusWorktreeReady, StatusRunning:
 		return true
+	case StatusNeedsHuman:
+		return run.PID > 0
 	default:
 		return false
 	}

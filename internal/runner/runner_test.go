@@ -65,13 +65,126 @@ func TestRunnerRetainsMergedWorkWhenPiEventStreamIsMalformed(t *testing.T) {
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 9)
 	github.setCompletion(9, mergedOutcome(9))
-	streamErr := errors.New("malformed Pi JSON on line 2")
+	streamErr := errors.New("malformed Pi RPC JSON on line 2")
 	workers.complete(9, worker.Result{ExitCode: 0, StreamErr: streamErr, Err: streamErr})
 	if err := <-done; err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if got := store.runStatus(9); got != scheduler.StatusNeedsHuman {
 		t.Fatalf("issue 9 status = %q, want needs-human", got)
+	}
+}
+
+func TestRunnerStopsInvalidWorkerBeforeGitHubReconciliation(t *testing.T) {
+	t.Parallel()
+
+	workers := newFakeWorkers()
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 6, CreatedAt: time.Now()}}}
+	github.completionCheck = func(int) error {
+		if workers.runningCount() != 0 {
+			return errors.New("GitHub reconciled while invalid Worker was alive")
+		}
+		return nil
+	}
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 6)
+	streamErr := errors.New("malformed Pi RPC JSON")
+	workers.complete(6, worker.Result{ExitCode: -1, StreamErr: streamErr, Err: streamErr})
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := store.runStatus(6); got != scheduler.StatusFailed {
+		t.Fatalf("issue 6 status = %q, want failed after stopped-Worker reconciliation", got)
+	}
+}
+
+func TestRunnerFailsClosedWhenGitHubReconciliationFails(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{
+		candidates:     []scheduler.Candidate{{Number: 8, CreatedAt: time.Now()}},
+		completionErrs: map[int]error{8: errors.New("GitHub unavailable")},
+	}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+	worktrees := runner.Worktrees.(*fakeWorktrees)
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 8)
+	workers.complete(8, worker.Result{ExitCode: 0})
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got := store.runStatus(8); got != scheduler.StatusNeedsHuman {
+		t.Fatalf("issue 8 status = %q, want needs-human", got)
+	}
+	if worktrees.cleanupCount() != 0 {
+		t.Fatalf("cleanup count = %d, want worktree retained", worktrees.cleanupCount())
+	}
+}
+
+func TestRunnerClosesWorkerAndRetainsLeaseWhenCompletionSaveFails(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 12, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+	worktrees := runner.Worktrees.(*fakeWorktrees)
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 12)
+	github.setCompletion(12, mergedOutcome(12))
+	store.failNext()
+	workers.complete(12, worker.Result{ExitCode: 0})
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "persist completion") {
+		t.Fatalf("run error = %v, want completion persistence failure", err)
+	}
+	if workers.runningCount() != 0 {
+		t.Fatalf("running workers = %d, want Worker closed", workers.runningCount())
+	}
+	if worktrees.cleanupCount() != 0 {
+		t.Fatalf("cleanup count = %d, want worktree retained", worktrees.cleanupCount())
+	}
+	got := store.LoadValue()
+	if len(got.Leases) != 1 || got.Runs[0].Status != scheduler.StatusRunning {
+		t.Fatalf("state after failed completion save = %#v", got)
+	}
+}
+
+func TestRunnerFailsClosedWhenRPCOutputBreaksAfterSettlement(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 10, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+	worktrees := runner.Worktrees.(*fakeWorktrees)
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 10)
+	github.setCompletion(10, mergedOutcome(10))
+	workers.setCloseResult(10, worker.Result{Err: errors.New("message followed agent_settled")})
+	workers.complete(10, worker.Result{ExitCode: 0})
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got := store.runStatus(10); got != scheduler.StatusNeedsHuman {
+		t.Fatalf("issue 10 status = %q, want needs-human", got)
+	}
+	if worktrees.cleanupCount() != 0 {
+		t.Fatalf("cleanup count = %d, want worktree retained", worktrees.cleanupCount())
+	}
+	got, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Leases) != 1 || got.Leases[0].Issue != 10 {
+		t.Fatalf("Leases = %#v, want issue 10 retained", got.Leases)
 	}
 }
 
@@ -95,6 +208,38 @@ func TestRunnerRetainsFailedWorktree(t *testing.T) {
 	}
 }
 
+func TestRunnerPersistsWorkerIdentityBeforeRelease(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 7, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	released := make(chan error, 1)
+	workers.onRelease = func(issue int) {
+		current, err := store.Load()
+		if err != nil {
+			released <- err
+			return
+		}
+		run := findActiveRun(&current, issue)
+		if run.Status != scheduler.StatusRunning || run.PID != 1000+issue || run.ProcessIdentity == "" {
+			released <- fmt.Errorf("Run at release = %#v", run)
+			return
+		}
+		released <- nil
+	}
+	runner := testRunner(github, workers, store, 1)
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	if err := <-released; err != nil {
+		t.Fatal(err)
+	}
+	workers.complete(7, worker.Result{ExitCode: 1, Err: errors.New("failed")})
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRunnerStopsGatedWorkerWhenPIDPersistenceFails(t *testing.T) {
 	t.Parallel()
 
@@ -109,6 +254,9 @@ func TestRunnerStopsGatedWorkerWhenPIDPersistenceFails(t *testing.T) {
 	}
 	if workers.runningCount() != 0 {
 		t.Fatalf("running workers = %d, want gated worker stopped", workers.runningCount())
+	}
+	if workers.releaseCount() != 0 {
+		t.Fatalf("release count = %d, want gated worker unreleased", workers.releaseCount())
 	}
 }
 
@@ -222,6 +370,35 @@ func TestRunnerDoesNotDuplicatePersistedLiveWorker(t *testing.T) {
 	}
 	if got := store.runStatus(1); got != scheduler.StatusRunning {
 		t.Fatalf("live orphan status = %q, want running", got)
+	}
+}
+
+func TestRunnerFailsClosedInsteadOfReleasingRecoveredRPCWorker(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 2, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs: []scheduler.Run{{
+			Issue: 2, RunID: "rpc-live", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModeRPC, PID: 1235,
+			ProcessIdentity: "identity-1235", Branch: "agent/issue-2-rpc-live", Worktree: "/tmp/rpc-live",
+			SessionID: "backlog-rpc-live", SessionDir: "/state/sessions/rpc-live",
+			StartedAt: time.Date(2026, 7, 2, 2, 0, 0, 0, time.UTC),
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "rpc-live", Issue: 2, RunID: "rpc-live"}},
+	}}
+	runner := testRunner(github, workers, store, 1)
+	runner.PIDAlive = func(pid int) bool { return pid == 1235 }
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID != 1235 || len(got.Leases) != 1 {
+		t.Fatalf("recovered RPC Run/Lease = %#v/%#v", got.Runs[0], got.Leases)
+	}
+	if workers.recoveredReleaseCount() != 0 {
+		t.Fatalf("recovered release count = %d, want zero", workers.recoveredReleaseCount())
 	}
 }
 
@@ -370,7 +547,7 @@ func TestRunnerReconcilesOnlyTheLeasedRunWhenIssueHasHistory(t *testing.T) {
 
 func testRunner(github *fakeGitHub, workers *fakeWorkers, store *memoryStore, max int) *Runner {
 	return &Runner{
-		Config:      Config{Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: max, PollInterval: 5 * time.Millisecond},
+		Config:      Config{Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: max, PollInterval: 5 * time.Millisecond, SessionsDir: "/tmp/backlog-sessions"},
 		GitHub:      github,
 		Store:       store,
 		Worktrees:   &fakeWorktrees{},
@@ -383,10 +560,11 @@ func testRunner(github *fakeGitHub, workers *fakeWorkers, store *memoryStore, ma
 }
 
 type memoryStore struct {
-	mu         sync.Mutex
-	value      state.State
-	saveCount  int
-	failAtSave int
+	mu           sync.Mutex
+	value        state.State
+	saveCount    int
+	failAtSave   int
+	failNextSave bool
 }
 
 func (s *memoryStore) Load() (state.State, error) {
@@ -398,11 +576,17 @@ func (s *memoryStore) Save(value state.State) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.saveCount++
-	if s.failAtSave > 0 && s.saveCount == s.failAtSave {
+	if s.failNextSave || s.failAtSave > 0 && s.saveCount == s.failAtSave {
+		s.failNextSave = false
 		return errors.New("injected state save failure")
 	}
 	s.value = cloneState(value)
 	return nil
+}
+func (s *memoryStore) failNext() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failNextSave = true
 }
 func (s *memoryStore) runStatus(issue int) scheduler.Status {
 	s.mu.Lock()
@@ -429,6 +613,8 @@ type fakeGitHub struct {
 	mu                 sync.Mutex
 	candidates         []scheduler.Candidate
 	completions        map[int]ghadapter.CompletionOutcome
+	completionErrs     map[int]error
+	completionCheck    func(int) error
 	completionBranches []string
 }
 
@@ -441,6 +627,14 @@ func (g *fakeGitHub) Completion(_ context.Context, _ string, issue int, branch s
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.completionBranches = append(g.completionBranches, branch)
+	if g.completionCheck != nil {
+		if err := g.completionCheck(issue); err != nil {
+			return ghadapter.CompletionOutcome{}, err
+		}
+	}
+	if err := g.completionErrs[issue]; err != nil {
+		return ghadapter.CompletionOutcome{}, err
+	}
 	outcome := g.completions[issue]
 	if outcome.Merged && outcome.IssueClosed {
 		remaining := g.candidates[:0]
@@ -498,13 +692,18 @@ func (w *fakeWorktrees) cleanupCount() int {
 }
 
 type fakeProcess struct {
-	issue int
-	owner *fakeWorkers
-	done  chan worker.Result
+	issue       int
+	owner       *fakeWorkers
+	done        chan worker.Result
+	closeResult worker.Result
+	closeOnce   sync.Once
 }
 
-func (p *fakeProcess) PID() int       { return 1000 + p.issue }
-func (p *fakeProcess) Release() error { return nil }
+func (p *fakeProcess) PID() int { return 1000 + p.issue }
+func (p *fakeProcess) Release() error {
+	p.owner.released(p.issue)
+	return nil
+}
 func (p *fakeProcess) Abort() error {
 	select {
 	case p.done <- worker.Result{ExitCode: -1, Err: context.Canceled}:
@@ -513,18 +712,23 @@ func (p *fakeProcess) Abort() error {
 	return nil
 }
 func (p *fakeProcess) Wait() worker.Result {
-	result := <-p.done
-	p.owner.finished(p.issue)
-	return result
+	return <-p.done
+}
+func (p *fakeProcess) Close() worker.Result {
+	p.closeOnce.Do(func() { p.owner.finished(p.issue) })
+	return p.closeResult
 }
 
 type fakeWorkers struct {
-	mu           sync.Mutex
-	started      []int
-	processes    map[int]*fakeProcess
-	running      int
-	maximum      int
-	startChanged chan struct{}
+	mu                sync.Mutex
+	started           []int
+	processes         map[int]*fakeProcess
+	running           int
+	maximum           int
+	releases          int
+	recoveredReleases int
+	onRelease         func(int)
+	startChanged      chan struct{}
 }
 
 func newFakeWorkers() *fakeWorkers {
@@ -543,12 +747,34 @@ func (w *fakeWorkers) Start(_ context.Context, request worker.Request) (WorkerPr
 	w.startChanged <- struct{}{}
 	return process, nil
 }
-func (w *fakeWorkers) Release(string) error { return nil }
+func (w *fakeWorkers) Release(string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.recoveredReleases++
+	return nil
+}
+func (w *fakeWorkers) released(issue int) {
+	w.mu.Lock()
+	w.releases++
+	onRelease := w.onRelease
+	w.mu.Unlock()
+	if onRelease != nil {
+		onRelease(issue)
+	}
+}
 func (w *fakeWorkers) complete(issue int, result worker.Result) {
 	w.mu.Lock()
 	process := w.processes[issue]
 	w.mu.Unlock()
+	if result.Err == nil && result.StreamErr == nil {
+		result.Settled = true
+	}
 	process.done <- result
+}
+func (w *fakeWorkers) setCloseResult(issue int, result worker.Result) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.processes[issue].closeResult = result
 }
 func (w *fakeWorkers) finished(int) {
 	w.mu.Lock()
@@ -599,4 +825,14 @@ func (w *fakeWorkers) runningCount() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.running
+}
+func (w *fakeWorkers) releaseCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.releases
+}
+func (w *fakeWorkers) recoveredReleaseCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.recoveredReleases
 }
