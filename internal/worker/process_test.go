@@ -482,7 +482,7 @@ while IFS= read -r ignored; do :; done
 	if boundary.SessionFile != sessionFile || boundary.LeafID != "result" || boundary.EntryCount != 3 || len(boundary.SHA256) != 64 {
 		t.Fatalf("boundary = %#v", boundary)
 	}
-	if result := process.CloseContext(context.Background()); !result.GroupExited || result.Err != nil {
+	if result := process.CloseContext(context.Background(), nil); !result.GroupExited || result.Err != nil {
 		t.Fatalf("close = %#v", result)
 	}
 }

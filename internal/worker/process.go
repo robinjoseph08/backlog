@@ -236,7 +236,7 @@ func (p *Process) Suspend(ctx context.Context, expected ContinuationRequest) (Co
 	if expected.SessionID == "" || expected.SessionDir == "" || expected.Worktree == "" {
 		return Continuation{}, errors.New("continuation request is incomplete")
 	}
-	abort, err := p.rpcCommand(ctx, "backlog-suspend-abort", "abort", nil)
+	abort, err := p.rpcCommand(ctx, "backlog-suspend-abort", "abort")
 	if err != nil {
 		return Continuation{}, fmt.Errorf("abort Pi agent: %w", err)
 	}
@@ -254,7 +254,7 @@ func (p *Process) Suspend(ctx context.Context, expected ContinuationRequest) (Co
 		return Continuation{}, err
 	}
 
-	stateResponse, err := p.rpcCommand(ctx, "backlog-suspend-state", "get_state", nil)
+	stateResponse, err := p.rpcCommand(ctx, "backlog-suspend-state", "get_state")
 	if err != nil {
 		return Continuation{}, fmt.Errorf("get Pi RPC state: %w", err)
 	}
@@ -281,7 +281,7 @@ func (p *Process) Suspend(ctx context.Context, expected ContinuationRequest) (Co
 		return Continuation{}, err
 	}
 
-	entriesResponse, err := p.rpcCommand(ctx, "backlog-suspend-entries", "get_entries", nil)
+	entriesResponse, err := p.rpcCommand(ctx, "backlog-suspend-entries", "get_entries")
 	if err != nil {
 		return Continuation{}, fmt.Errorf("get Pi session entries: %w", err)
 	}
@@ -315,14 +315,12 @@ type rpcResponse struct {
 	Data    json.RawMessage `json:"data"`
 }
 
-func (p *Process) rpcCommand(ctx context.Context, id, command string, fields map[string]any) (rpcResponse, error) {
+func (p *Process) rpcCommand(ctx context.Context, id, command string) (rpcResponse, error) {
 	response := p.events.ExpectResponse(id, command)
-	message := make(map[string]any, len(fields)+2)
-	message["id"] = id
-	message["type"] = command
-	for key, value := range fields {
-		message[key] = value
-	}
+	message := struct {
+		ID   string `json:"id"`
+		Type string `json:"type"`
+	}{ID: id, Type: command}
 	encoded, err := json.Marshal(message)
 	if err == nil {
 		encoded = append(encoded, '\n')
@@ -392,8 +390,10 @@ func (p *Process) Close() Result {
 	return result
 }
 
-// CloseContext closes RPC input and proves process-group exit within ctx.
-func (p *Process) CloseContext(ctx context.Context) Result {
+// CloseContext closes RPC input and proves process-group exit within ctx. If
+// the deadline expires, authorizeKill must revalidate the durable process
+// identity immediately before CloseContext force stops the process group.
+func (p *Process) CloseContext(ctx context.Context, authorizeKill func() error) Result {
 	p.closeInputOnce.Do(func() {
 		p.stdinMu.Lock()
 		p.closeInputErr = p.stdin.Close()
@@ -402,7 +402,21 @@ func (p *Process) CloseContext(ctx context.Context) Result {
 	select {
 	case <-p.exitDone:
 	case <-ctx.Done():
-		_ = p.Kill()
+		if authorizeKill == nil {
+			result := p.exitResult()
+			result.Err = errors.Join(result.Err, p.closeInputErr, ctx.Err(), errors.New("Worker process-group exit was not verified; force stop was not authorized"))
+			return result
+		}
+		if err := authorizeKill(); err != nil {
+			result := p.exitResult()
+			result.Err = errors.Join(result.Err, p.closeInputErr, ctx.Err(), fmt.Errorf("authorize Worker force stop: %w", err))
+			return result
+		}
+		if err := p.kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			result := p.exitResult()
+			result.Err = errors.Join(result.Err, p.closeInputErr, ctx.Err(), fmt.Errorf("force stop Worker process group: %w", err))
+			return result
+		}
 		select {
 		case <-p.exitDone:
 		default:
@@ -421,7 +435,7 @@ func (p *Process) CloseContext(ctx context.Context) Result {
 	return result
 }
 
-func (p *Process) Kill() error {
+func (p *Process) kill() error {
 	if p.PID() <= 0 {
 		return os.ErrProcessDone
 	}

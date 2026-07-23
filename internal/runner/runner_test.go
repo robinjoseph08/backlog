@@ -368,7 +368,7 @@ func TestRunnerStartRejectsLeaseAfterDrainIsAccepted(t *testing.T) {
 	}
 	current := store.LoadValue()
 	admissionResult := make(chan bool, 1)
-	process, err := runner.start(context.Background(), gate, &current, scheduler.Candidate{Number: 17}, admissionResult)
+	process, err := runner.start(context.Background(), context.Background(), gate, &current, scheduler.Candidate{Number: 17}, admissionResult)
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -570,10 +570,10 @@ func TestRunnerFinishesLeaseCommittedBeforeDrainAndObservesRepeatedSignals(t *te
 	case <-time.After(time.Second):
 		t.Fatal("Drain was not accepted while the committed Run was preparing")
 	}
-	signals <- os.Interrupt
 	close(finishPrepare)
 	workers.waitForStarts(t, 14)
 	output.waitFor(t, "Drain: admission stopped; 1 Worker remaining; next SIGINT will be recorded as a suspension request")
+	signals <- os.Interrupt
 	output.waitFor(t, "Drain: additional interrupt recorded as a suspension request; 1 Worker remaining")
 	github.setCompletion(14, mergedOutcome(14))
 	workers.complete(14, worker.Result{ExitCode: 0})
@@ -1181,6 +1181,34 @@ func TestRunnerDoesNotPersistBoundaryAfterMarkerWriteFails(t *testing.T) {
 	}
 }
 
+func TestRunnerSuspensionRequestBoundsCommittedWorkerPreparation(t *testing.T) {
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 47, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	prepareStarted := make(chan struct{})
+	signals := make(chan os.Signal, 1)
+	runner := testRunner(github, workers, store, 1)
+	runner.Config.SuspensionTimeout = 40 * time.Millisecond
+	runner.Signals = signals
+	runner.Worktrees = &blockingWorktrees{prepareStarted: prepareStarted, finishPrepare: make(chan struct{})}
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	<-prepareStarted
+	started := time.Now()
+	signals <- syscall.SIGTERM
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "continuation boundary") {
+		t.Fatalf("run: %v, want failed-closed interrupted preparation", err)
+	}
+	if elapsed := time.Since(started); elapsed > 120*time.Millisecond {
+		t.Fatalf("suspension request did not bound Worker preparation: %s", elapsed)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID != 0 || len(got.Leases) != 1 {
+		t.Fatalf("Run after interrupted preparation = %#v", got)
+	}
+}
+
 func TestRunnerSuspendsDirectlyOnSIGTERMAndUsesOneDeadline(t *testing.T) {
 	github := &fakeGitHub{candidates: []scheduler.Candidate{
 		{Number: 41, CreatedAt: time.Now()}, {Number: 42, CreatedAt: time.Now().Add(time.Second)},
@@ -1224,6 +1252,14 @@ func TestRunnerGitHubCompletionWinsOverSuspension(t *testing.T) {
 	}
 	workers := newFakeWorkers()
 	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	workers.onCloseContext = func(issue int) error {
+		persisted := store.LoadValue()
+		run := findActiveRun(&persisted, issue)
+		if run.Status != scheduler.StatusRunning || run.PID == 0 || run.Continuation == nil || len(persisted.Leases) != 1 {
+			return fmt.Errorf("GitHub outcome was persisted before process-group exit: %#v", persisted)
+		}
+		return nil
+	}
 	signals := make(chan os.Signal, 1)
 	runner := testRunner(github, workers, store, 1)
 	runner.Signals = signals
@@ -1264,6 +1300,39 @@ func TestRunnerRetainsPIDAndLeaseWhenSuspensionCannotVerifyProcessGroupExit(t *t
 	got := store.LoadValue()
 	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID == 0 || got.Runs[0].ProcessIdentity == "" || len(got.Leases) != 1 {
 		t.Fatalf("unverified process-group exit = %#v", got)
+	}
+}
+
+func TestRunnerRechecksWorkerIdentityImmediatelyBeforeTimeoutForceStop(t *testing.T) {
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 48, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	workers.authorizeClose = true
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	signals := make(chan os.Signal, 1)
+	runner := testRunner(github, workers, store, 1)
+	var identityMu sync.Mutex
+	identityChecks := 0
+	runner.PIDIdentity = func(pid int) (string, error) {
+		identityMu.Lock()
+		defer identityMu.Unlock()
+		identityChecks++
+		if identityChecks >= 3 {
+			return "reused-process", nil
+		}
+		return fmt.Sprintf("identity-%d", pid), nil
+	}
+	runner.Signals = signals
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 48)
+	signals <- syscall.SIGTERM
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "require human") {
+		t.Fatalf("run: %v, want failed-closed identity mismatch", err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID == 0 || len(got.Leases) != 1 {
+		t.Fatalf("Run after force-stop identity mismatch = %#v", got)
 	}
 }
 
@@ -1604,11 +1673,18 @@ func (p *fakeProcess) Close() worker.Result {
 	p.closeOnce.Do(func() { p.owner.finished(p.issue) })
 	return p.closeResult
 }
-func (p *fakeProcess) CloseContext(context.Context) worker.Result {
+func (p *fakeProcess) CloseContext(_ context.Context, authorizeKill func() error) worker.Result {
 	p.owner.mu.Lock()
 	onClose := p.owner.onCloseContext
+	authorizeClose := p.owner.authorizeClose
 	p.owner.mu.Unlock()
 	result := p.Close()
+	if authorizeClose {
+		if err := authorizeKill(); err != nil {
+			result.Err = err
+			return result
+		}
+	}
 	if onClose != nil {
 		if err := onClose(p.issue); err != nil {
 			result.Err = err
@@ -1618,7 +1694,6 @@ func (p *fakeProcess) CloseContext(context.Context) worker.Result {
 	result.GroupExited = true
 	return result
 }
-func (p *fakeProcess) Kill() error { return p.Abort() }
 
 type fakeWorkers struct {
 	mu                sync.Mutex
@@ -1630,6 +1705,7 @@ type fakeWorkers struct {
 	recoveredReleases int
 	onRelease         func(int)
 	onCloseContext    func(int) error
+	authorizeClose    bool
 	suspendFunc       func(context.Context, int, worker.ContinuationRequest) (worker.Continuation, error)
 	startChanged      chan struct{}
 }
