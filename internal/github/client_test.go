@@ -2,7 +2,9 @@ package github
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -148,6 +150,55 @@ esac`)
 	_, err := client.Candidates(context.Background(), "acme/widgets")
 	if err == nil || !strings.Contains(err.Error(), "native blockers") {
 		t.Fatalf("got error %v, want native blocker lookup failure", err)
+	}
+}
+
+func TestClientReadsIssueStateAndLabelsForResume(t *testing.T) {
+	t.Parallel()
+
+	gh := fakeGH(t, `
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"},{"name":"spec"}]}' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+	got, err := (Client{Executable: gh}).IssueState(context.Background(), "acme/widgets", 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Open || len(got.Labels) != 2 || got.Labels[0] != "in-progress" || got.Labels[1] != "spec" {
+		t.Fatalf("issue state = %#v", got)
+	}
+}
+
+func TestClientIssueInspectionRefusesAmbiguousManagedLabels(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		labels string
+		want   string
+	}{
+		{name: "duplicate", labels: `[{"name":"in-progress"},{"name":"in-progress"}]`, want: "duplicate label"},
+		{name: "case alias", labels: `[{"name":"IN-PROGRESS"}]`, want: "non-canonical managed label"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			gh := fakeGH(t, `
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":`+test.labels+`}' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+			got, err := (Client{Executable: gh}).IssueState(context.Background(), "acme/widgets", 42)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+			if got.Open || got.Labels != nil {
+				t.Fatalf("issue state = %#v, want fail-closed empty metadata", got)
+			}
+		})
 	}
 }
 
@@ -429,10 +480,10 @@ func TestClientVerifiesCompletionFromPullRequestAndIssue(t *testing.T) {
 
 	gh := fakeGH(t, `
 case "$*" in
-  "pr list --repo acme/widgets --state all --head agent/issue-42-run --json number,url,state,mergedAt,autoMergeRequest,isDraft")
-    printf '%s\n' '[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"MERGED","mergedAt":"2026-01-03T00:00:00Z"}]' ;;
-  "issue view 42 --repo acme/widgets --json state,title,url")
-    printf '%s\n' '{"state":"CLOSED","title":"done","url":"https://github.com/acme/widgets/issues/42"}' ;;
+  "pr list --repo acme/widgets --state all --head agent/issue-42-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+    printf '%s\n' '[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"MERGED","mergedAt":"2026-01-03T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-42-run","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+  "issue view 42 --repo acme/widgets --json number,state,title,url")
+    printf '%s\n' '{"number":42,"state":"CLOSED","title":"done","url":"https://github.com/acme/widgets/issues/42"}' ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
 esac`)
 	client := Client{Executable: gh}
@@ -451,10 +502,10 @@ func TestClientRecognizesArmedAutoMergeAsUnderstoodWait(t *testing.T) {
 
 	gh := fakeGH(t, `
 case "$*" in
-  "pr list --repo acme/widgets --state all --head agent/issue-7-run --json number,url,state,mergedAt,autoMergeRequest,isDraft")
-    printf '%s\n' '[{"number":101,"url":"https://github.com/acme/widgets/pull/101","state":"OPEN","mergedAt":null,"autoMergeRequest":{"mergeMethod":"SQUASH"},"isDraft":false}]' ;;
-  "issue view 7 --repo acme/widgets --json state,title,url")
-    printf '%s\n' '{"state":"OPEN","title":"waiting","url":"https://github.com/acme/widgets/issues/7"}' ;;
+  "pr list --repo acme/widgets --state all --head agent/issue-7-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+    printf '%s\n' '[{"number":101,"url":"https://github.com/acme/widgets/pull/101","state":"OPEN","mergedAt":null,"autoMergeRequest":{"mergeMethod":"SQUASH"},"isDraft":false,"headRefName":"agent/issue-7-run","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+  "issue view 7 --repo acme/widgets --json number,state,title,url")
+    printf '%s\n' '{"number":7,"state":"OPEN","title":"waiting","url":"https://github.com/acme/widgets/issues/7"}' ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
 esac`)
 
@@ -467,16 +518,213 @@ esac`)
 	}
 }
 
+func TestClientIssueInspectionRefusesMismatchedIdentity(t *testing.T) {
+	t.Parallel()
+
+	gh := fakeGH(t, `
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    printf '%s\n' '{"number":41,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"}]}' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+
+	got, err := (Client{Executable: gh}).IssueState(context.Background(), "acme/widgets", 42)
+	if err == nil || !strings.Contains(err.Error(), "mismatched") {
+		t.Fatalf("error = %v, want mismatched issue refusal", err)
+	}
+	if got.Open || got.Labels != nil {
+		t.Fatalf("issue state = %#v, want fail-closed empty metadata", got)
+	}
+}
+
+func TestClientIssueInspectionRefusesUnicodeRepositoryAlias(t *testing.T) {
+	t.Parallel()
+
+	gh := fakeGH(t, `
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgetſ/issues/42","state":"OPEN","labels":[{"name":"in-progress"}]}' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+
+	got, err := (Client{Executable: gh}).IssueState(context.Background(), "acme/widgets", 42)
+	if err == nil || !strings.Contains(err.Error(), "mismatched") {
+		t.Fatalf("error = %v, want Unicode repository alias refusal", err)
+	}
+	if got.Open || got.Labels != nil {
+		t.Fatalf("issue state = %#v, want fail-closed empty metadata", got)
+	}
+}
+
+func TestClientIssueInspectionRefusesDuplicateIdentityFields(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		response string
+	}{
+		{name: "number", response: `{"number":41,"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"}]}`},
+		{name: "number case alias", response: `{"number":41,"Number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"}]}`},
+		{name: "lone number case alias", response: `{"Number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"}]}`},
+		{name: "URL", response: `{"number":42,"url":"https://github.com/acme/widgets/issues/41","url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"}]}`},
+		{name: "state", response: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","state":"OPEN","labels":[{"name":"in-progress"}]}`},
+		{name: "Unicode state alias", response: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","\u017Ftate":"OPEN","labels":[{"name":"in-progress"}]}`},
+		{name: "lone Unicode state alias", response: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","\u017Ftate":"OPEN","labels":[{"name":"in-progress"}]}`},
+		{name: "nested label case alias", response: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"ready-for-human","Name":"in-progress"}]}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			gh := fakeGH(t, `
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    printf '%s\n' '`+test.response+`' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+
+			got, err := (Client{Executable: gh}).IssueState(context.Background(), "acme/widgets", 42)
+			if err == nil || !strings.Contains(err.Error(), "JSON field") {
+				t.Fatalf("error = %v, want ambiguous identity refusal", err)
+			}
+			if got.Open || got.Labels != nil {
+				t.Fatalf("issue state = %#v, want fail-closed empty metadata", got)
+			}
+		})
+	}
+}
+
+func TestClientCompletionRefusesMismatchedIssueIdentity(t *testing.T) {
+	t.Parallel()
+
+	gh := fakeGH(t, `
+case "$*" in
+  "pr list --repo acme/widgets --state all --head agent/issue-42-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+    printf '%s\n' '[]' ;;
+  "issue view 42 --repo acme/widgets --json number,state,title,url")
+    printf '%s\n' '{"number":41,"state":"OPEN","title":"wrong issue","url":"https://github.com/acme/widgets/issues/42"}' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+
+	got, err := (Client{Executable: gh}).Completion(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
+	if err == nil || !strings.Contains(err.Error(), "mismatched") {
+		t.Fatalf("error = %v, want mismatched issue refusal", err)
+	}
+	if got != (CompletionOutcome{}) {
+		t.Fatalf("completion = %#v, want fail-closed empty outcome", got)
+	}
+}
+
+func TestClientCompletionRefusesDuplicateIssueIdentityFields(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		response string
+	}{
+		{name: "number", response: `{"number":41,"number":42,"state":"OPEN","url":"https://github.com/acme/widgets/issues/42"}`},
+		{name: "number case alias", response: `{"number":41,"Number":42,"state":"OPEN","url":"https://github.com/acme/widgets/issues/42"}`},
+		{name: "lone number case alias", response: `{"Number":42,"state":"OPEN","url":"https://github.com/acme/widgets/issues/42"}`},
+		{name: "URL", response: `{"number":42,"state":"OPEN","url":"https://github.com/acme/widgets/issues/41","url":"https://github.com/acme/widgets/issues/42"}`},
+		{name: "state", response: `{"number":42,"state":"CLOSED","state":"OPEN","url":"https://github.com/acme/widgets/issues/42"}`},
+		{name: "Unicode state alias", response: `{"number":42,"state":"CLOSED","\u017Ftate":"OPEN","url":"https://github.com/acme/widgets/issues/42"}`},
+		{name: "lone Unicode state alias", response: `{"number":42,"\u017Ftate":"OPEN","url":"https://github.com/acme/widgets/issues/42"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			gh := fakeGH(t, `
+case "$*" in
+  "pr list --repo acme/widgets --state all --head agent/issue-42-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+    printf '%s\n' '[]' ;;
+  "issue view 42 --repo acme/widgets --json number,state,title,url")
+    printf '%s\n' '`+test.response+`' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+
+			got, err := (Client{Executable: gh}).Completion(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
+			if err == nil || !strings.Contains(err.Error(), "JSON field") {
+				t.Fatalf("error = %v, want ambiguous identity refusal", err)
+			}
+			if got != (CompletionOutcome{}) {
+				t.Fatalf("completion = %#v, want fail-closed empty outcome", got)
+			}
+		})
+	}
+}
+
+func TestClientCompletionRefusesCaseVariantPullRequestIdentity(t *testing.T) {
+	t.Parallel()
+
+	gh := fakeGH(t, `
+case "$*" in
+  "pr list --repo acme/widgets --state all --head agent/issue-9-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+    printf '%s\n' '[{"number":109,"url":"https://github.com/acme/widgets/pull/109","state":"MERGED","mergedAt":"2026-01-03T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-9-run","headRepositoryOwner":{"login":"other","Login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+
+	got, err := (Client{Executable: gh}).Completion(context.Background(), "acme/widgets", 9, "agent/issue-9-run")
+	if err == nil || !strings.Contains(err.Error(), "duplicate JSON field") {
+		t.Fatalf("error = %v, want case-variant pull request identity refusal", err)
+	}
+	if got != (CompletionOutcome{}) {
+		t.Fatalf("completion = %#v, want fail-closed empty outcome", got)
+	}
+}
+
+func TestClientCompletionRefusesSameBranchFromFork(t *testing.T) {
+	t.Parallel()
+
+	gh := fakeGH(t, `
+case "$*" in
+  "pr list --repo acme/widgets --state all --head agent/issue-9-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+    printf '%s\n' '[{"number":109,"url":"https://github.com/acme/widgets/pull/109","state":"MERGED","mergedAt":"2026-01-03T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-9-run","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/fork"}}]' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+
+	_, err := (Client{Executable: gh}).Completion(context.Background(), "acme/widgets", 9, "agent/issue-9-run")
+	if err == nil || !strings.Contains(err.Error(), "mismatched") {
+		t.Fatalf("error = %v, want mismatched pull request refusal", err)
+	}
+}
+
+func TestMain(m *testing.M) {
+	if filepath.Base(os.Args[0]) == "gh" {
+		os.Exit(runFakeGH())
+	}
+	os.Exit(m.Run())
+}
+
+func runFakeGH() int {
+	scriptPath := filepath.Join(filepath.Dir(os.Args[0]), "gh-script")
+	args := append([]string{scriptPath}, os.Args[1:]...)
+	cmd := exec.Command("/bin/sh", args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return exitErr.ExitCode()
+		}
+		_, _ = fmt.Fprintln(os.Stderr, err)
+		return 127
+	}
+	return 0
+}
+
 func fakeGH(t *testing.T, body string) string {
 	t.Helper()
 	dir := t.TempDir()
-	path := filepath.Join(dir, "gh")
-	stagedPath := filepath.Join(dir, ".gh-staged")
+	scriptPath := filepath.Join(dir, "gh-script")
 	script := "#!/bin/sh\nset -eu\n" + body + "\n"
-	if err := os.WriteFile(stagedPath, []byte(script), 0o700); err != nil {
+	if err := os.WriteFile(scriptPath, []byte(script), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(stagedPath, path); err != nil {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "gh")
+	if err := os.Symlink(executable, path); err != nil {
 		t.Fatal(err)
 	}
 	return path

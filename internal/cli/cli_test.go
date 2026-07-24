@@ -72,11 +72,12 @@ case "$*" in
     printf '%s\n' '[[]]' ;;
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/42/dependencies/blocked_by?per_page=100 --paginate --slurp")
     printf '%s\n' '[[]]' ;;
-  "pr list --repo acme/widgets --state all --head agent/issue-42-"*" --json number,url,state,mergedAt,autoMergeRequest,isDraft")
-    printf '%s\n' '[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"MERGED","mergedAt":"2026-01-02T00:00:00Z"}]' ;;
-  "issue view 42 --repo acme/widgets --json state,title,url")
+  "pr list --repo acme/widgets --state all --head agent/issue-42-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+    head=$8
+    printf '[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"MERGED","mergedAt":"2026-01-02T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"%s","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]\n' "$head" ;;
+  "issue view 42 --repo acme/widgets --json number,state,title,url")
     touch `+quote(closedMarker)+`
-    printf '%s\n' '{"state":"CLOSED","title":"Build it","url":"https://github.com/acme/widgets/issues/42"}' ;;
+    printf '%s\n' '{"number":42,"state":"CLOSED","title":"Build it","url":"https://github.com/acme/widgets/issues/42"}' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
 `)

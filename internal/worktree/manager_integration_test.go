@@ -48,6 +48,58 @@ func TestManagerCreatesAndCleansRealIsolatedWorktree(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(assignment.Path, "README.md")); err != nil {
 		t.Fatalf("worktree did not start from remote main: %v", err)
 	}
+	if err := manager.Verify(context.Background(), assignment); err != nil {
+		t.Fatalf("verify retained worktree: %v", err)
+	}
+	moved := assignment.Path + "-moved"
+	if err := os.Rename(assignment.Path, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(moved, assignment.Path); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Verify(context.Background(), assignment); err == nil || !strings.Contains(err.Error(), "is a symlink") {
+		t.Fatalf("substituted worktree symlink verification error = %v", err)
+	}
+	if err := os.Remove(assignment.Path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(moved, assignment.Path); err != nil {
+		t.Fatal(err)
+	}
+	movedWorktrees := manager.WorktreesDir + "-moved"
+	if err := os.Rename(manager.WorktreesDir, movedWorktrees); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(movedWorktrees, manager.WorktreesDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Verify(context.Background(), assignment); err == nil || !strings.Contains(err.Error(), "path component") || !strings.Contains(err.Error(), "is a symlink") {
+		t.Fatalf("substituted worktrees directory verification error = %v", err)
+	}
+	if err := os.Remove(manager.WorktreesDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(movedWorktrees, manager.WorktreesDir); err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(assignment.Path, "nested")
+	if err := os.Mkdir(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Verify(context.Background(), Assignment{Path: nested, Branch: assignment.Branch}); err == nil || !strings.Contains(err.Error(), "does not match expected path") {
+		t.Fatalf("nested worktree path verification error = %v", err)
+	}
+	unrelated := filepath.Join(root, "unrelated")
+	runGit(t, "", "init", "-b", assignment.Branch, unrelated)
+	if err := manager.Verify(context.Background(), Assignment{Path: unrelated, Branch: assignment.Branch}); err == nil || !strings.Contains(err.Error(), "outside managed root") {
+		t.Fatalf("unmanaged worktree verification error = %v", err)
+	}
+	runGit(t, assignment.Path, "checkout", "-b", "changed-branch")
+	if err := manager.Verify(context.Background(), assignment); err == nil || !strings.Contains(err.Error(), "does not match expected branch") {
+		t.Fatalf("changed branch verification error = %v", err)
+	}
+	runGit(t, assignment.Path, "checkout", assignment.Branch)
 
 	if err := manager.Cleanup(context.Background(), assignment); err != nil {
 		t.Fatalf("cleanup: %v", err)

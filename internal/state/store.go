@@ -1,6 +1,7 @@
 package state
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -85,11 +86,11 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 	}
 	switch header.Version {
 	case CurrentVersion:
-		var value State
-		if err := json.Unmarshal(encoded, &value); err != nil {
+		value, err := decodeCurrentState(encoded)
+		if err != nil {
 			return State{}, false, fmt.Errorf("decode state: %w", err)
 		}
-		if err := validate(value); err != nil {
+		if err := validate(value, true); err != nil {
 			return State{}, false, err
 		}
 		return value, false, nil
@@ -135,7 +136,7 @@ func migrateV1(legacy legacyState) (State, error) {
 			})
 		}
 	}
-	if err := validate(value); err != nil {
+	if err := validate(value, false); err != nil {
 		return State{}, fmt.Errorf("migrate version 1 state: %w", err)
 	}
 	return value, nil
@@ -145,7 +146,7 @@ func (s FileStore) Save(value State) error {
 	if value.Version == 0 {
 		value.Version = CurrentVersion
 	}
-	if err := validate(value); err != nil {
+	if err := validate(value, false); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
@@ -193,6 +194,105 @@ func (s FileStore) Save(value State) error {
 	return nil
 }
 
+func decodeCurrentState(encoded json.RawMessage) (State, error) {
+	var raw struct {
+		Version             int               `json:"version"`
+		Repo                string            `json:"repo"`
+		DefaultBranch       string            `json:"defaultBranch"`
+		MaxConcurrentIssues int               `json:"maxConcurrentIssues"`
+		Runs                []json.RawMessage `json:"runs"`
+		Leases              []scheduler.Lease `json:"leases"`
+	}
+	if err := json.Unmarshal(encoded, &raw); err != nil {
+		return State{}, err
+	}
+	value := State{
+		Version: raw.Version, Repo: raw.Repo, DefaultBranch: raw.DefaultBranch,
+		MaxConcurrentIssues: raw.MaxConcurrentIssues, Leases: raw.Leases,
+		Runs: make([]scheduler.Run, 0, len(raw.Runs)),
+	}
+	for index, encodedRun := range raw.Runs {
+		run, err := decodeRecoverableRun(encodedRun)
+		if err != nil {
+			return State{}, fmt.Errorf("decode Run %d: %w", index+1, err)
+		}
+		value.Runs = append(value.Runs, run)
+	}
+	return value, nil
+}
+
+func decodeRecoverableRun(encoded json.RawMessage) (scheduler.Run, error) {
+	continuation, hasContinuation, invalidContinuationKey, err := inspectContinuationField(encoded)
+	if err != nil {
+		return scheduler.Run{}, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		return scheduler.Run{}, err
+	}
+	for field := range fields {
+		if strings.EqualFold(field, "continuation") {
+			delete(fields, field)
+		}
+	}
+	withoutContinuation, err := json.Marshal(fields)
+	if err != nil {
+		return scheduler.Run{}, err
+	}
+	var run scheduler.Run
+	if err := json.Unmarshal(withoutContinuation, &run); err != nil {
+		return scheduler.Run{}, err
+	}
+	if hasContinuation && string(continuation) != "null" {
+		var boundary scheduler.ContinuationBoundary
+		if !invalidContinuationKey && json.Unmarshal(continuation, &boundary) == nil {
+			run.Continuation = &boundary
+		} else {
+			run.Continuation = &scheduler.ContinuationBoundary{}
+		}
+	} else if invalidContinuationKey {
+		run.Continuation = &scheduler.ContinuationBoundary{}
+	}
+	return run, nil
+}
+
+func inspectContinuationField(encoded json.RawMessage) (json.RawMessage, bool, bool, error) {
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	opening, err := decoder.Token()
+	if err != nil {
+		return nil, false, false, err
+	}
+	if opening != json.Delim('{') {
+		return nil, false, false, errors.New("Run is not a JSON object")
+	}
+	var continuation json.RawMessage
+	count := 0
+	invalidKey := false
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, false, false, err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, false, false, errors.New("Run contains an invalid JSON field")
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, false, false, err
+		}
+		if strings.EqualFold(key, "continuation") {
+			count++
+			continuation = value
+			invalidKey = invalidKey || key != "continuation"
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, false, false, err
+	}
+	return continuation, count > 0, invalidKey || count > 1, nil
+}
+
 func ensureEOF(decoder *json.Decoder) error {
 	var trailing any
 	if err := decoder.Decode(&trailing); errors.Is(err, io.EOF) {
@@ -209,7 +309,7 @@ func validateV1(value legacyState) error {
 	}
 	issues := make(map[int]struct{}, len(value.Runs))
 	for _, run := range value.Runs {
-		if err := validateRun(run, false); err != nil {
+		if err := validateRun(run, false, false); err != nil {
 			return err
 		}
 		if _, exists := issues[run.Issue]; exists {
@@ -220,13 +320,13 @@ func validateV1(value legacyState) error {
 	return nil
 }
 
-func validate(value State) error {
+func validate(value State, recoverUnsafeContinuation bool) error {
 	if value.Version != CurrentVersion {
 		return fmt.Errorf("unsupported state version %d", value.Version)
 	}
 	runs := make(map[string]scheduler.Run, len(value.Runs))
 	for _, run := range value.Runs {
-		if err := validateRun(run, true); err != nil {
+		if err := validateRun(run, true, recoverUnsafeContinuation); err != nil {
 			return err
 		}
 		if _, exists := runs[run.RunID]; exists {
@@ -285,7 +385,7 @@ func validate(value State) error {
 	return nil
 }
 
-func validateRun(run scheduler.Run, requireWorkerMode bool) error {
+func validateRun(run scheduler.Run, requireWorkerMode, recoverUnsafeContinuation bool) error {
 	if run.Issue <= 0 {
 		return fmt.Errorf("state contains invalid issue number %d", run.Issue)
 	}
@@ -298,7 +398,8 @@ func validateRun(run scheduler.Run, requireWorkerMode bool) error {
 	if requireWorkerMode && run.WorkerMode != scheduler.WorkerModePrint && run.WorkerMode != scheduler.WorkerModeRPC {
 		return fmt.Errorf("state contains Run %q with unknown worker mode %q", run.RunID, run.WorkerMode)
 	}
-	if run.WorkerMode == scheduler.WorkerModeRPC && (run.SessionID == "" || run.SessionDir == "") {
+	unsafeContinuation := run.Status == scheduler.StatusNeedsHuman || recoverUnsafeContinuation && (run.Status == scheduler.StatusSuspended || run.Status == scheduler.StatusRunning)
+	if run.WorkerMode == scheduler.WorkerModeRPC && (run.SessionID == "" || run.SessionDir == "") && !unsafeContinuation {
 		return fmt.Errorf("state contains RPC Run %q without durable session identity and storage", run.RunID)
 	}
 	if run.WorkerLogOpen && run.LogPath == "" {
@@ -309,7 +410,7 @@ func validateRun(run scheduler.Run, requireWorkerMode bool) error {
 			return fmt.Errorf("state contains running issue #%d without durable process identity", run.Issue)
 		}
 	}
-	if run.Continuation != nil {
+	if run.Continuation != nil && !unsafeContinuation {
 		boundary := run.Continuation
 		_, hashErr := hex.DecodeString(boundary.SHA256)
 		if run.WorkerMode != scheduler.WorkerModeRPC || boundary.SessionID != run.SessionID || boundary.Worktree != run.Worktree ||
@@ -321,10 +422,13 @@ func validateRun(run scheduler.Run, requireWorkerMode bool) error {
 			return fmt.Errorf("state contains Run %q with a continuation file outside its session directory", run.RunID)
 		}
 	}
-	if run.Status == scheduler.StatusSuspended {
+	if run.Status == scheduler.StatusSuspended && !unsafeContinuation {
 		if run.PID != 0 || run.ProcessIdentity != "" || run.Continuation == nil {
 			return fmt.Errorf("state contains suspended issue #%d without a verified stopped continuation", run.Issue)
 		}
+	}
+	if run.ResumePending && ((run.Status != scheduler.StatusSuspended && run.Status != scheduler.StatusNeedsHuman) || run.PID != 0 || run.ProcessIdentity != "" || run.Continuation == nil && run.Status != scheduler.StatusNeedsHuman && !recoverUnsafeContinuation) {
+		return fmt.Errorf("state contains Run %q with an invalid pending Resume", run.RunID)
 	}
 	return nil
 }

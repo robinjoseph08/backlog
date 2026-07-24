@@ -404,13 +404,18 @@ func TestFileStorePersistsOnlyVerifiedStoppedSuspension(t *testing.T) {
 			Worktree: filepath.Join(root, "worktree"), LeafID: "leaf", EntryCount: 3, SHA256: strings.Repeat("a", 64), VerifiedAt: verifiedAt,
 		},
 	}
+	run.ResumePending = true
 	value := State{Version: CurrentVersion, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: "run-8", Issue: 8, RunID: "run-8"}}}
 	if err := store.Save(value); err != nil {
 		t.Fatalf("save suspended Run: %v", err)
 	}
 	got, err := store.Load()
-	if err != nil || got.Runs[0].Continuation == nil || got.Runs[0].Continuation.LeafID != "leaf" || len(got.Leases) != 1 {
+	if err != nil || got.Runs[0].Continuation == nil || got.Runs[0].Continuation.LeafID != "leaf" || !got.Runs[0].ResumePending || len(got.Leases) != 1 {
 		t.Fatalf("loaded suspension = %#v, err = %v", got, err)
+	}
+	got.Runs[0].Status = scheduler.StatusNeedsHuman
+	if err := store.Save(got); err != nil {
+		t.Fatalf("save interrupted pending Resume as needs-human: %v", err)
 	}
 
 	invalid := value
@@ -427,6 +432,132 @@ func TestFileStorePersistsOnlyVerifiedStoppedSuspension(t *testing.T) {
 	invalid.Runs[0].Continuation = &boundary
 	if err := store.Save(invalid); err == nil || !strings.Contains(err.Error(), "outside its session directory") {
 		t.Fatalf("outside continuation path error = %v", err)
+	}
+}
+
+func TestFileStoreLoadsUnsafeSuspensionForNeedsHumanRecovery(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	path := filepath.Join(root, "state.json")
+	baseRun := scheduler.Run{
+		Issue: 9, RunID: "run-9", Status: scheduler.StatusSuspended, WorkerMode: scheduler.WorkerModeRPC,
+		Branch: "agent/issue-9-run-9", Worktree: filepath.Join(root, "worktree"),
+		SessionID: "backlog-run-9", SessionDir: filepath.Join(root, "sessions", "run-9"),
+		Continuation: &scheduler.ContinuationBoundary{
+			SessionID: "backlog-run-9", SessionFile: filepath.Join(root, "sessions", "run-9", "session.jsonl"),
+			Worktree: filepath.Join(root, "worktree"), LeafID: "leaf", EntryCount: 3, SHA256: strings.Repeat("a", 64), VerifiedAt: time.Now(),
+		},
+	}
+	tests := []struct {
+		name   string
+		mutate func(*scheduler.Run)
+	}{
+		{name: "missing continuation", mutate: func(run *scheduler.Run) { run.Continuation = nil }},
+		{name: "pending Resume missing continuation", mutate: func(run *scheduler.Run) {
+			run.ResumePending = true
+			run.Continuation = nil
+		}},
+		{name: "malformed continuation", mutate: func(run *scheduler.Run) { run.Continuation.EntryCount = 0 }},
+		{name: "legacy print suspension", mutate: func(run *scheduler.Run) {
+			run.WorkerMode = scheduler.WorkerModePrint
+			run.SessionID = ""
+			run.SessionDir = ""
+			run.Continuation = nil
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			run := baseRun
+			boundary := *baseRun.Continuation
+			run.Continuation = &boundary
+			test.mutate(&run)
+			value := State{Version: CurrentVersion, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: "lease-9", Issue: 9, RunID: run.RunID}}}
+			encoded, err := json.Marshal(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, encoded, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := (FileStore{Path: path}).Load()
+			if err != nil {
+				t.Fatalf("load unsafe suspension for reconciliation: %v", err)
+			}
+			loaded.Runs[0].Status = scheduler.StatusNeedsHuman
+			loaded.Runs[0].Error = "unsafe continuation"
+			if err := (FileStore{Path: path}).Save(loaded); err != nil {
+				t.Fatalf("persist needs-human recovery: %v", err)
+			}
+			if len(loaded.Leases) != 1 {
+				t.Fatalf("unsafe suspension Lease = %#v", loaded.Leases)
+			}
+		})
+	}
+}
+
+func TestDecodeRecoverableRunPreservesMalformedContinuationEvidence(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		encoded          string
+		wantContinuation bool
+	}{
+		{name: "malformed value", encoded: `{"continuation":"malformed"}`, wantContinuation: true},
+		{name: "case-variant key", encoded: `{"Continuation":null}`, wantContinuation: true},
+		{name: "duplicate exact key", encoded: `{"continuation":null,"continuation":null}`, wantContinuation: true},
+		{name: "absent key", encoded: `{}`, wantContinuation: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			run, err := decodeRecoverableRun(json.RawMessage(test.encoded))
+			if err != nil {
+				t.Fatalf("decode recoverable Run: %v", err)
+			}
+			if (run.Continuation != nil) != test.wantContinuation {
+				t.Fatalf("Continuation = %#v, want present %t", run.Continuation, test.wantContinuation)
+			}
+			if run.Continuation != nil && *run.Continuation != (scheduler.ContinuationBoundary{}) {
+				t.Fatalf("Continuation = %#v, want empty recovery sentinel", run.Continuation)
+			}
+		})
+	}
+}
+
+func TestFileStoreLoadsStructurallyMalformedContinuationForRecovery(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	path := filepath.Join(root, "state.json")
+	encoded := map[string]any{
+		"version": CurrentVersion,
+		"runs": []any{map[string]any{
+			"issue": 9, "runId": "run-9", "status": "suspended", "workerMode": "rpc",
+			"branch": "agent/issue-9-run-9", "worktree": filepath.Join(root, "worktree"),
+			"sessionId": "session-9", "sessionDir": filepath.Join(root, "sessions"),
+			"startedAt": time.Now(), "updatedAt": time.Now(), "continuation": "malformed",
+		}},
+		"leases": []any{map[string]any{"leaseId": "lease-9", "issue": 9, "runId": "run-9"}},
+	}
+	contents, err := json.Marshal(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := (FileStore{Path: path}).Load()
+	if err != nil {
+		t.Fatalf("load malformed continuation for recovery: %v", err)
+	}
+	if len(loaded.Runs) != 1 || loaded.Runs[0].Continuation == nil || *loaded.Runs[0].Continuation != (scheduler.ContinuationBoundary{}) || len(loaded.Leases) != 1 {
+		t.Fatalf("recoverable malformed continuation = %#v", loaded)
+	}
+	loaded.Runs[0].Status = scheduler.StatusNeedsHuman
+	loaded.Runs[0].Error = "malformed continuation"
+	if err := (FileStore{Path: path}).Save(loaded); err != nil {
+		t.Fatalf("persist malformed continuation recovery: %v", err)
 	}
 }
 

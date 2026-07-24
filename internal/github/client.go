@@ -1,10 +1,12 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os/exec"
 	"sort"
@@ -26,6 +28,11 @@ type CompletionOutcome struct {
 	Merged         bool
 	IssueClosed    bool
 	AutoMergeArmed bool
+}
+
+type IssueState struct {
+	Open   bool
+	Labels []string
 }
 
 type ResetIssue struct {
@@ -230,6 +237,42 @@ func (c Client) resolveReference(ctx context.Context, currentRepo string, refere
 	return blocker, strings.EqualFold(issue.State, "open"), nil
 }
 
+func (c Client) IssueState(ctx context.Context, repo string, issue int) (IssueState, error) {
+	var response struct {
+		Number int    `json:"number"`
+		URL    string `json:"url"`
+		State  string `json:"state"`
+		Labels []struct {
+			Name string `json:"name"`
+		} `json:"labels"`
+	}
+	if err := c.jsonCommand(ctx, &response, "issue", "view", fmt.Sprint(issue), "--repo", repo, "--json", "number,url,state,labels"); err != nil {
+		return IssueState{}, fmt.Errorf("inspect issue state and labels: %w", err)
+	}
+	if response.Number != issue || !resourceURLMatches(response.URL, repo, "issues", issue) ||
+		(!strings.EqualFold(response.State, "open") && !strings.EqualFold(response.State, "closed")) {
+		return IssueState{}, errors.New("inspect issue state and labels: gh returned incomplete or mismatched issue identity/state")
+	}
+	labels := make([]string, 0, len(response.Labels))
+	for _, label := range response.Labels {
+		if label.Name == "" {
+			return IssueState{}, errors.New("inspect issue state and labels: GitHub returned an unnamed label")
+		}
+		for _, existing := range labels {
+			if strings.EqualFold(existing, label.Name) {
+				return IssueState{}, fmt.Errorf("inspect issue state and labels: GitHub returned duplicate label %q", label.Name)
+			}
+		}
+		for _, managed := range []string{"in-progress", "ready-for-agent", "needs-triage", "needs-info", "ready-for-human", "wontfix"} {
+			if label.Name != managed && strings.EqualFold(label.Name, managed) {
+				return IssueState{}, fmt.Errorf("inspect issue state and labels: GitHub returned non-canonical managed label %q", label.Name)
+			}
+		}
+		labels = append(labels, label.Name)
+	}
+	return IssueState{Open: strings.EqualFold(response.State, "open"), Labels: labels}, nil
+}
+
 // ResetResources reads the issue and every pull request for the exact owned
 // branch. Incomplete or mismatched identities fail closed.
 func (c Client) ResetResources(ctx context.Context, repo string, issueNumber int, branch string) (ResetIssue, []ResetPullRequest, error) {
@@ -381,11 +424,30 @@ func validCommitOID(value string) bool {
 
 func resourceURLMatches(rawURL, repo, resource string, number int) bool {
 	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "github.com") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+	if err != nil || parsed.Scheme != "https" || !asciiEqualFold(parsed.Host, "github.com") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return false
 	}
 	expectedPath := fmt.Sprintf("/%s/%s/%d", repo, resource, number)
-	return strings.EqualFold(strings.TrimSuffix(parsed.Path, "/"), expectedPath)
+	return asciiEqualFold(strings.TrimSuffix(parsed.Path, "/"), expectedPath)
+}
+
+func asciiEqualFold(left, right string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range len(left) {
+		leftByte, rightByte := left[index], right[index]
+		if leftByte >= 'A' && leftByte <= 'Z' {
+			leftByte += 'a' - 'A'
+		}
+		if rightByte >= 'A' && rightByte <= 'Z' {
+			rightByte += 'a' - 'A'
+		}
+		if leftByte != rightByte {
+			return false
+		}
+	}
+	return true
 }
 
 func resetMergedState(raw json.RawMessage) (bool, error) {
@@ -442,32 +504,73 @@ func (c Client) RemoveIssueLabel(ctx context.Context, repo string, issue int, la
 }
 
 func (c Client) Completion(ctx context.Context, repo string, issue int, branch string) (CompletionOutcome, error) {
+	parts := strings.SplitN(repo, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || branch == "" {
+		return CompletionOutcome{}, fmt.Errorf("find pull request: invalid repository or branch identity")
+	}
 	var pulls []struct {
 		Number           int             `json:"number"`
 		URL              string          `json:"url"`
 		State            string          `json:"state"`
-		MergedAt         *time.Time      `json:"mergedAt"`
+		MergedAt         json.RawMessage `json:"mergedAt"`
 		AutoMergeRequest json.RawMessage `json:"autoMergeRequest"`
-		IsDraft          bool            `json:"isDraft"`
+		IsDraft          *bool           `json:"isDraft"`
+		HeadRefName      string          `json:"headRefName"`
+		HeadOwner        struct {
+			Login string `json:"login"`
+		} `json:"headRepositoryOwner"`
+		HeadRepository struct {
+			NameWithOwner string `json:"nameWithOwner"`
+		} `json:"headRepository"`
 	}
-	if err := c.jsonCommand(ctx, &pulls, "pr", "list", "--repo", repo, "--state", "all", "--head", branch,
-		"--json", "number,url,state,mergedAt,autoMergeRequest,isDraft"); err != nil {
+	var pullsJSON json.RawMessage
+	if err := c.jsonCommand(ctx, &pullsJSON, "pr", "list", "--repo", repo, "--state", "all", "--head", branch, "--limit", "1000",
+		"--json", "number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository"); err != nil {
 		return CompletionOutcome{}, fmt.Errorf("find pull request: %w", err)
+	}
+	if len(pullsJSON) == 0 || string(pullsJSON) == "null" || json.Unmarshal(pullsJSON, &pulls) != nil {
+		return CompletionOutcome{}, errors.New("find pull request: gh returned an unknown pull request list")
+	}
+	if len(pulls) == 1000 {
+		return CompletionOutcome{}, errors.New("find pull request: result reached the inspection limit; completeness is unknown")
+	}
+	for _, pull := range pulls {
+		if pull.Number <= 0 || !resourceURLMatches(pull.URL, repo, "pull", pull.Number) || pull.HeadRefName != branch ||
+			!strings.EqualFold(pull.HeadOwner.Login, parts[0]) || !strings.EqualFold(pull.HeadRepository.NameWithOwner, repo) {
+			return CompletionOutcome{}, errors.New("find pull request: gh returned incomplete or mismatched pull request identity")
+		}
+		if !strings.EqualFold(pull.State, "open") && !strings.EqualFold(pull.State, "closed") && !strings.EqualFold(pull.State, "merged") {
+			return CompletionOutcome{}, fmt.Errorf("find pull request #%d: unknown state %q", pull.Number, pull.State)
+		}
+		if _, err := resetMergedState(pull.MergedAt); err != nil {
+			return CompletionOutcome{}, fmt.Errorf("find pull request #%d: %w", pull.Number, err)
+		}
+		if _, err := resetAutoMergeState(pull.AutoMergeRequest, pull.IsDraft); err != nil {
+			return CompletionOutcome{}, fmt.Errorf("find pull request #%d: %w", pull.Number, err)
+		}
 	}
 	outcome := CompletionOutcome{}
 	if len(pulls) > 0 {
 		sort.SliceStable(pulls, func(i, j int) bool { return pulls[i].Number > pulls[j].Number })
+		merged, _ := resetMergedState(pulls[0].MergedAt)
+		autoMergeArmed, _ := resetAutoMergeState(pulls[0].AutoMergeRequest, pulls[0].IsDraft)
 		outcome.PRFound = true
 		outcome.PullRequest = pulls[0].URL
-		outcome.Merged = pulls[0].MergedAt != nil || strings.EqualFold(pulls[0].State, "merged")
-		outcome.AutoMergeArmed = !pulls[0].IsDraft && len(pulls[0].AutoMergeRequest) > 0 && string(pulls[0].AutoMergeRequest) != "null"
+		outcome.Merged = merged || strings.EqualFold(pulls[0].State, "merged")
+		outcome.AutoMergeArmed = autoMergeArmed
 	}
 	var issueState struct {
-		State string `json:"state"`
+		Number int    `json:"number"`
+		URL    string `json:"url"`
+		State  string `json:"state"`
 	}
 	if err := c.jsonCommand(ctx, &issueState, "issue", "view", fmt.Sprint(issue), "--repo", repo,
-		"--json", "state,title,url"); err != nil {
+		"--json", "number,state,title,url"); err != nil {
 		return CompletionOutcome{}, fmt.Errorf("inspect issue: %w", err)
+	}
+	if issueState.Number != issue || !resourceURLMatches(issueState.URL, repo, "issues", issue) ||
+		(!strings.EqualFold(issueState.State, "open") && !strings.EqualFold(issueState.State, "closed")) {
+		return CompletionOutcome{}, errors.New("inspect issue: gh returned incomplete or mismatched issue identity/state")
 	}
 	outcome.IssueClosed = strings.EqualFold(issueState.State, "closed")
 	return outcome, nil
@@ -508,8 +611,93 @@ func (c Client) jsonCommand(ctx context.Context, target any, args ...string) err
 		}
 		return fmt.Errorf("gh %s: %w", strings.Join(args, " "), err)
 	}
+	if err := rejectDuplicateJSONFields(output); err != nil {
+		return fmt.Errorf("decode gh %s output: %w", strings.Join(args, " "), err)
+	}
 	if err := json.Unmarshal(output, target); err != nil {
 		return fmt.Errorf("decode gh %s output: %w", strings.Join(args, " "), err)
+	}
+	return nil
+}
+
+var canonicalGitHubJSONFields = []string{
+	"nameWithOwner", "name", "defaultBranchRef", "number", "title", "createdAt", "url", "body", "state",
+	"created_at", "html_url", "labels", "mergedAt", "autoMergeRequest", "isDraft", "headRefName",
+	"login", "headRepositoryOwner", "headRepository",
+}
+
+func rejectDuplicateJSONFields(output []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	if err := consumeJSONValue(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
+
+func consumeJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		fields := make(map[string]struct{})
+		for decoder.More() {
+			fieldToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			field, ok := fieldToken.(string)
+			if !ok {
+				return errors.New("invalid JSON object field")
+			}
+			for existing := range fields {
+				if strings.EqualFold(existing, field) {
+					return fmt.Errorf("duplicate JSON field %q", field)
+				}
+			}
+			for _, canonical := range canonicalGitHubJSONFields {
+				if field != canonical && strings.EqualFold(field, canonical) {
+					return fmt.Errorf("non-canonical JSON field %q", field)
+				}
+			}
+			fields[field] = struct{}{}
+			if err := consumeJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if closing != json.Delim('}') {
+			return errors.New("invalid JSON object closing delimiter")
+		}
+	case '[':
+		for decoder.More() {
+			if err := consumeJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if closing != json.Delim(']') {
+			return errors.New("invalid JSON array closing delimiter")
+		}
+	default:
+		return errors.New("invalid JSON opening delimiter")
 	}
 	return nil
 }

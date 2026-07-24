@@ -3,6 +3,8 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -46,10 +48,10 @@ case "$*" in
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/32/comments?per_page=100 --paginate --slurp"|\
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/32/dependencies/blocked_by?per_page=100 --paginate --slurp")
     printf '%s\n' '[[]]' ;;
-  "pr list --repo acme/widgets --state all --head agent/issue-31-"*" --json number,url,state,mergedAt,autoMergeRequest,isDraft")
+  "pr list --repo acme/widgets --state all --head agent/issue-31-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
     printf '%s\n' '[]' ;;
-  "issue view 31 --repo acme/widgets --json state,title,url")
-    printf '%s\n' '{"state":"OPEN","title":"First","url":"https://example.test/issues/31"}' ;;
+  "issue view 31 --repo acme/widgets --json number,state,title,url")
+    printf '%s\n' '{"number":31,"state":"OPEN","title":"First","url":"https://github.com/acme/widgets/issues/31"}' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
 `)
@@ -84,6 +86,8 @@ IFS= read -r state
 printf '{"id":"backlog-suspend-state","type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":"%s","sessionId":"%s"}}\n' "$session_file" "$session_id"
 IFS= read -r entries
 printf '%s\n' '{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"work"}}],"leafId":"leaf"}}'
+IFS= read -r final_state
+printf '{"id":"backlog-suspend-final-state","type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":"%s","sessionId":"%s"}}\n' "$session_file" "$session_id"
 while IFS= read -r ignored; do :; done
 `)
 
@@ -162,6 +166,132 @@ while IFS= read -r ignored; do :; done
 	}
 }
 
+func TestCompiledExecutableRestartResumesSuspendedRunBeforeNewCandidate(t *testing.T) {
+	root := t.TempDir()
+	repository := filepath.Join(root, "repo")
+	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, output)
+	}
+	binary := buildExecutable(t, root)
+	stateDir := filepath.Join(root, "state")
+	statePath := filepath.Join(stateDir, "state.json")
+	sessionDir := filepath.Join(stateDir, "sessions", "run-91")
+	worktreePath := filepath.Join(stateDir, "worktrees", "issue-91-run-91")
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(worktreePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sessionFile := filepath.Join(sessionDir, "session.jsonl")
+	sessionContent := fmt.Sprintf("{\"type\":\"session\",\"version\":3,\"id\":\"session-91\",\"cwd\":%q}\n{\"type\":\"message\",\"id\":\"leaf\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"continue\"}}\n", worktreePath)
+	if err := os.WriteFile(sessionFile, []byte(sessionContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256([]byte(sessionContent))
+	persisted := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
+		Runs: []scheduler.Run{{
+			Issue: 91, RunID: "run-91", Status: scheduler.StatusSuspended, WorkerMode: scheduler.WorkerModeRPC,
+			Branch: "agent/issue-91-run-91", Worktree: worktreePath, SessionName: "afk #91", SessionID: "session-91", SessionDir: sessionDir,
+			Continuation: &scheduler.ContinuationBoundary{
+				SessionID: "session-91", SessionFile: sessionFile, Worktree: worktreePath, LeafID: "leaf", EntryCount: 1,
+				SHA256: hex.EncodeToString(hash[:]), VerifiedAt: time.Now(),
+			},
+			StartedAt: time.Now().Add(-time.Hour), UpdatedAt: time.Now(),
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "lease-91", Issue: 91, RunID: "run-91"}},
+	}
+	if err := (state.FileStore{Path: statePath}).Save(persisted); err != nil {
+		t.Fatal(err)
+	}
+
+	orderPath := filepath.Join(root, "worker-order")
+	resumedDone := filepath.Join(root, "resumed-done")
+	candidateDone := filepath.Join(root, "candidate-done")
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef")
+    printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
+    if test -f `+quote(candidateDone)+`; then printf '%s\n' '[]'; else printf '%s\n' '[{"number":92,"title":"new","createdAt":"2026-01-01T00:00:00Z","url":"https://example.test/issues/92"}]'; fi ;;
+  "issue view 92 --repo acme/widgets --json number,title,body,state,url,createdAt")
+    printf '%s\n' '{"number":92,"title":"new","body":"","state":"OPEN","url":"https://example.test/issues/92","createdAt":"2026-01-01T00:00:00Z"}' ;;
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/92/comments?per_page=100 --paginate --slurp"|\
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/92/dependencies/blocked_by?per_page=100 --paginate --slurp") printf '%s\n' '[[]]' ;;
+  "issue view 91 --repo acme/widgets --json number,url,state,labels") printf '%s\n' '{"number":91,"url":"https://github.com/acme/widgets/issues/91","state":"OPEN","labels":[{"name":"in-progress"},{"name":"spec"}]}' ;;
+  "pr list --repo acme/widgets --state all --head agent/issue-91-run-91 --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+    if test -f `+quote(resumedDone)+`; then printf '%s\n' '[{"number":191,"url":"https://github.com/acme/widgets/pull/191","state":"MERGED","mergedAt":"2026-01-01T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-91-run-91","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]'; else printf '%s\n' '[]'; fi ;;
+  "issue view 91 --repo acme/widgets --json number,state,title,url")
+    if test -f `+quote(resumedDone)+`; then printf '%s\n' '{"number":91,"state":"CLOSED","url":"https://github.com/acme/widgets/issues/91"}'; else printf '%s\n' '{"number":91,"state":"OPEN","url":"https://github.com/acme/widgets/issues/91"}'; fi ;;
+  "pr list --repo acme/widgets --state all --head agent/issue-92-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+    head=$8
+    printf '[{"number":192,"url":"https://github.com/acme/widgets/pull/192","state":"MERGED","mergedAt":"2026-01-01T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"%s","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]\n' "$head" ;;
+  "issue view 92 --repo acme/widgets --json number,state,title,url") touch `+quote(candidateDone)+`; printf '%s\n' '{"number":92,"state":"CLOSED","url":"https://github.com/acme/widgets/issues/92"}' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	git := writeExecutable(t, `#!/bin/sh
+set -eu
+if [ "$3" = "rev-parse" ] && [ "$4" = "--show-toplevel" ]; then
+  if [ "$2" = `+quote(worktreePath)+` ]; then printf '%s\n' `+quote(worktreePath)+`; else printf '%s\n' `+quote(repository)+`; fi
+  exit 0
+fi
+if [ "$3" = "rev-parse" ] && [ "$4" = "--git-common-dir" ]; then printf '%s\n' `+quote(filepath.Join(repository, ".git"))+`; exit 0; fi
+if [ "$3" = "branch" ] && [ "$4" = "--show-current" ]; then printf '%s\n' 'agent/issue-91-run-91'; exit 0; fi
+if [ "$3" = "worktree" ] && [ "$4" = "add" ]; then mkdir -p "$7"; exit 0; fi
+if [ "$3" = "worktree" ] && [ "$4" = "remove" ]; then rm -rf "$6"; exit 0; fi
+exit 0
+`)
+	pi := writeExecutable(t, `#!/bin/sh
+set -eu
+session_id=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --session-id) session_id=$2; shift 2 ;;
+    --session) test "$2" = `+quote(sessionFile)+`; session_id=session-91; shift 2 ;;
+    *) shift ;;
+  esac
+done
+IFS= read -r prompt
+case "$session_id" in
+  session-91)
+    printf '%s\n' "$session_id" >> `+quote(orderPath)+`
+    printf '%s\n' "$prompt" | grep -q 'Reassess the repository and GitHub state'
+    touch `+quote(resumedDone)+` ;;
+  backlog-*)
+    test -f `+quote(resumedDone)+`
+    printf '%s\n' "$session_id" >> `+quote(orderPath)+`
+    printf '%s\n' "$prompt" | grep -q '/skill:afk 92' ;;
+  *) exit 9 ;;
+esac
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+while IFS= read -r ignored; do :; done
+`)
+
+	command := exec.Command(binary, "run", "--repo-dir", repository, "--state-dir", stateDir,
+		"--max-workers", "1", "--poll", "5ms", "--gh", gh, "--git", git, "--pi", pi)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("restart executable: %v\n%s", err, output)
+	}
+	order, err := os.ReadFile(orderPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Fields(string(order))
+	if len(lines) != 2 || lines[0] != "session-91" || !strings.HasPrefix(lines[1], "backlog-") {
+		t.Fatalf("Worker order = %q, want resumed session before Candidate", order)
+	}
+	final, err := (state.FileStore{Path: statePath}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(final.Runs) != 2 || final.Runs[0].RunID != "run-91" || final.Runs[0].Status != scheduler.StatusMerged || final.Runs[1].Status != scheduler.StatusMerged || len(final.Leases) != 0 {
+		t.Fatalf("final restarted state = %#v", final)
+	}
+}
+
 func TestCompiledExecutableSuspendsDirectlyOnSIGTERM(t *testing.T) {
 	root := t.TempDir()
 	repository := filepath.Join(root, "repo")
@@ -184,10 +314,10 @@ case "$*" in
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/33/comments?per_page=100 --paginate --slurp"|\
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/33/dependencies/blocked_by?per_page=100 --paginate --slurp")
     printf '%s\n' '[[]]' ;;
-  "pr list --repo acme/widgets --state all --head agent/issue-33-"*" --json number,url,state,mergedAt,autoMergeRequest,isDraft")
+  "pr list --repo acme/widgets --state all --head agent/issue-33-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
     printf '%s\n' '[]' ;;
-  "issue view 33 --repo acme/widgets --json state,title,url")
-    printf '%s\n' '{"state":"OPEN","title":"Terminate","url":"https://example.test/issues/33"}' ;;
+  "issue view 33 --repo acme/widgets --json number,state,title,url")
+    printf '%s\n' '{"number":33,"state":"OPEN","title":"Terminate","url":"https://github.com/acme/widgets/issues/33"}' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
 `)
@@ -221,6 +351,8 @@ IFS= read -r state
 printf '{"id":"backlog-suspend-state","type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":"%s","sessionId":"%s"}}\n' "$session_file" "$session_id"
 IFS= read -r entries
 printf '%s\n' '{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"work"}}],"leafId":"leaf"}}'
+IFS= read -r final_state
+printf '{"id":"backlog-suspend-final-state","type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":"%s","sessionId":"%s"}}\n' "$session_file" "$session_id"
 while IFS= read -r ignored; do :; done
 `)
 
@@ -415,11 +547,11 @@ case "$*" in
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/27/comments?per_page=100 --paginate --slurp"|\
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/27/dependencies/blocked_by?per_page=100 --paginate --slurp")
     printf '%s\n' '[[]]' ;;
-  "pr list --repo acme/widgets --state all --head agent/issue-27-"*" --json number,url,state,mergedAt,autoMergeRequest,isDraft")
-    printf '%s\n' '[{"number":27,"url":"https://example.test/pull/27","state":"MERGED","mergedAt":"2026-07-27T00:00:00Z"}]' ;;
-  "issue view 27 --repo acme/widgets --json state,title,url")
+  "pr list --repo acme/widgets --state all --head agent/issue-27-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+    printf '[{"number":27,"url":"https://github.com/acme/widgets/pull/27","state":"MERGED","mergedAt":"2026-07-27T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"%s","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]\n' "$8" ;;
+  "issue view 27 --repo acme/widgets --json number,state,title,url")
     touch `+quote(closedMarker)+`
-    printf '%s\n' '{"state":"CLOSED","title":"Follow me","url":"https://example.test/issues/27"}' ;;
+    printf '%s\n' '{"number":27,"state":"CLOSED","title":"Follow me","url":"https://github.com/acme/widgets/issues/27"}' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
 `)
@@ -590,13 +722,14 @@ case "$*" in
     printf '%s\n' '{"number":5,"title":"RPC","body":"","state":"OPEN","url":"https://example.test/issues/5","createdAt":"2026-01-01T00:00:00Z"}' ;;
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/5/comments?per_page=100 --paginate --slurp") printf '%s\n' '[[]]' ;;
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/5/dependencies/blocked_by?per_page=100 --paginate --slurp") printf '%s\n' '[[]]' ;;
-  "pr list --repo acme/widgets --state all --head agent/issue-5-"*" --json number,url,state,mergedAt,autoMergeRequest,isDraft")
+  "pr list --repo acme/widgets --state all --head agent/issue-5-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
     test -f `+quote(piAlive)+`
-    printf '%s\n' '[{"number":5,"url":"https://example.test/pull/5","state":"MERGED","mergedAt":"2026-07-22T00:00:00Z"}]' ;;
-  "issue view 5 --repo acme/widgets --json state,title,url")
+    head=$8
+    printf '[{"number":5,"url":"https://github.com/acme/widgets/pull/5","state":"MERGED","mergedAt":"2026-07-22T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"%s","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]\n' "$head" ;;
+  "issue view 5 --repo acme/widgets --json number,state,title,url")
     test -f `+quote(piAlive)+`
     touch `+quote(reconciledAlive)+` `+quote(finished)+`
-    printf '%s\n' '{"state":"CLOSED","title":"RPC","url":"https://example.test/issues/5"}' ;;
+    printf '%s\n' '{"number":5,"state":"CLOSED","title":"RPC","url":"https://github.com/acme/widgets/issues/5"}' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
 `)
@@ -877,10 +1010,10 @@ set -eu
 case "$*" in
   "repo view --json nameWithOwner,defaultBranchRef")
     printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
-  "pr list --repo acme/widgets --state all --head agent/issue-42-legacy-running --json number,url,state,mergedAt,autoMergeRequest,isDraft")
-    printf '%s\n' '[{"number":42,"url":"https://example.test/pull/42","state":"MERGED","mergedAt":"2026-07-03T00:00:00Z"}]' ;;
-  "issue view 42 --repo acme/widgets --json state,title,url")
-    printf '%s\n' '{"state":"CLOSED","title":"Migrated","url":"https://example.test/issues/42"}' ;;
+  "pr list --repo acme/widgets --state all --head agent/issue-42-legacy-running --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+    printf '%s\n' '[{"number":42,"url":"https://github.com/acme/widgets/pull/42","state":"MERGED","mergedAt":"2026-07-03T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-42-legacy-running","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+  "issue view 42 --repo acme/widgets --json number,state,title,url")
+    printf '%s\n' '{"number":42,"state":"CLOSED","title":"Migrated","url":"https://github.com/acme/widgets/issues/42"}' ;;
   "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
     printf '%s\n' '[]' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
@@ -918,7 +1051,7 @@ esac
 	reconciled := final.Runs[1]
 	if reconciled.RunID != "legacy-running" || reconciled.Status != scheduler.StatusMerged || reconciled.WorkerMode != scheduler.WorkerModePrint ||
 		reconciled.Branch != "agent/issue-42-legacy-running" || reconciled.Worktree != worktreePath || reconciled.SessionName != "afk #42" ||
-		reconciled.LogPath != "/retained/legacy.jsonl" || reconciled.StderrPath != "/retained/legacy.stderr.log" || reconciled.PullRequest != "https://example.test/pull/42" ||
+		reconciled.LogPath != "/retained/legacy.jsonl" || reconciled.StderrPath != "/retained/legacy.stderr.log" || reconciled.PullRequest != "https://github.com/acme/widgets/pull/42" ||
 		reconciled.IssueTitle != "" || reconciled.IssueURL != "" {
 		t.Fatalf("startup reconciliation lost migrated artifacts: %#v", reconciled)
 	}

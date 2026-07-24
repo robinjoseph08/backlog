@@ -63,6 +63,111 @@ func (m Manager) Prepare(ctx context.Context, assignment Assignment) error {
 	return nil
 }
 
+// Verify proves that the retained path is the expected Git worktree and is
+// still checked out on the Run's exact branch.
+func (m Manager) Verify(ctx context.Context, assignment Assignment) error {
+	if assignment.Path == "" || assignment.Branch == "" {
+		return fmt.Errorf("worktree assignment is incomplete")
+	}
+	if err := rejectSymlinkedWorktreePath(m.WorktreesDir, assignment.Path); err != nil {
+		return err
+	}
+	info, err := os.Lstat(assignment.Path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("worktree %q is missing", assignment.Path)
+		}
+		return fmt.Errorf("inspect worktree path: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("worktree %q is a symlink", assignment.Path)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("worktree %q is not a directory", assignment.Path)
+	}
+	expectedPath, err := filepath.EvalSymlinks(assignment.Path)
+	if err != nil {
+		return fmt.Errorf("resolve expected worktree: %w", err)
+	}
+	root, err := m.gitOutput(ctx, "-C", assignment.Path, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return fmt.Errorf("inspect worktree root: %w", err)
+	}
+	actualPath, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return fmt.Errorf("resolve actual worktree: %w", err)
+	}
+	if filepath.Clean(actualPath) != filepath.Clean(expectedPath) {
+		return fmt.Errorf("Git worktree root %q does not match expected path %q", actualPath, expectedPath)
+	}
+	expectedCommon, err := m.gitOutput(ctx, "-C", m.RepositoryDir, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return fmt.Errorf("inspect repository common directory: %w", err)
+	}
+	actualCommon, err := m.gitOutput(ctx, "-C", assignment.Path, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return fmt.Errorf("inspect worktree common directory: %w", err)
+	}
+	expectedCommon, err = resolveGitDirectory(m.RepositoryDir, expectedCommon)
+	if err != nil {
+		return fmt.Errorf("resolve repository common directory: %w", err)
+	}
+	actualCommon, err = resolveGitDirectory(assignment.Path, actualCommon)
+	if err != nil {
+		return fmt.Errorf("resolve worktree common directory: %w", err)
+	}
+	if expectedCommon != actualCommon {
+		return fmt.Errorf("worktree Git common directory %q does not match repository %q", actualCommon, expectedCommon)
+	}
+	branch, err := m.gitOutput(ctx, "-C", assignment.Path, "branch", "--show-current")
+	if err != nil {
+		return fmt.Errorf("inspect worktree branch: %w", err)
+	}
+	if branch != assignment.Branch {
+		return fmt.Errorf("worktree branch %q does not match expected branch %q", branch, assignment.Branch)
+	}
+	return nil
+}
+
+func rejectSymlinkedWorktreePath(worktreesDir, worktreePath string) error {
+	relative, err := filepath.Rel(worktreesDir, worktreePath)
+	if err != nil || relative == "." || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("worktree %q is outside managed root %q", worktreePath, worktreesDir)
+	}
+	current := filepath.Clean(worktreesDir)
+	components := append([]string{""}, strings.Split(relative, string(filepath.Separator))...)
+	for index, component := range components {
+		if component != "" {
+			current = filepath.Join(current, component)
+		}
+		if index == len(components)-1 {
+			break
+		}
+		info, err := os.Lstat(current)
+		if err != nil {
+			return fmt.Errorf("inspect worktree path component %q: %w", current, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("worktree path component %q is a symlink", current)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("worktree path component %q is not a directory", current)
+		}
+	}
+	return nil
+}
+
+func resolveGitDirectory(base, path string) (string, error) {
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(base, path)
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(resolved), nil
+}
+
 func (m Manager) Cleanup(ctx context.Context, assignment Assignment) error {
 	if assignment.Path == "" || assignment.Branch == "" {
 		return fmt.Errorf("worktree assignment is incomplete")
@@ -153,6 +258,11 @@ func waitForFetchAttempt(ctx context.Context, delay time.Duration) error {
 }
 
 func (m Manager) git(ctx context.Context, args ...string) error {
+	_, err := m.gitOutput(ctx, args...)
+	return err
+}
+
+func (m Manager) gitOutput(ctx context.Context, args ...string) (string, error) {
 	executable := m.GitExecutable
 	if executable == "" {
 		executable = "git"
@@ -162,9 +272,9 @@ func (m Manager) git(ctx context.Context, args ...string) error {
 	if err != nil {
 		message := strings.TrimSpace(string(output))
 		if message != "" {
-			return fmt.Errorf("git %s: %s", strings.Join(args, " "), message)
+			return "", fmt.Errorf("git %s: %s", strings.Join(args, " "), message)
 		}
-		return fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
-	return nil
+	return strings.TrimSpace(string(output)), nil
 }

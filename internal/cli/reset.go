@@ -937,6 +937,9 @@ func resetRun(current state.State, issue int) (scheduler.Run, scheduler.Lease, e
 }
 
 func inspectWorkerAbsent(run scheduler.Run) error {
+	if run.ResumePending {
+		return errors.New("replacement Worker launch is pending; Worker absence is uncertain")
+	}
 	pid := run.PID
 	if pid == 0 {
 		if run.ProcessIdentity == "" {
