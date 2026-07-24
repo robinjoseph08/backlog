@@ -50,8 +50,8 @@ case "$*" in
     printf '%s\n' '[[]]' ;;
   "pr list --repo acme/widgets --state all --head agent/issue-31-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
     printf '%s\n' '[]' ;;
-  "issue view 31 --repo acme/widgets --json state,title,url")
-    printf '%s\n' '{"state":"OPEN","title":"First","url":"https://example.test/issues/31"}' ;;
+  "issue view 31 --repo acme/widgets --json number,state,title,url")
+    printf '%s\n' '{"number":31,"state":"OPEN","title":"First","url":"https://github.com/acme/widgets/issues/31"}' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
 `)
@@ -218,15 +218,15 @@ case "$*" in
     printf '%s\n' '{"number":92,"title":"new","body":"","state":"OPEN","url":"https://example.test/issues/92","createdAt":"2026-01-01T00:00:00Z"}' ;;
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/92/comments?per_page=100 --paginate --slurp"|\
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/92/dependencies/blocked_by?per_page=100 --paginate --slurp") printf '%s\n' '[[]]' ;;
-  "issue view 91 --repo acme/widgets --json state,labels") printf '%s\n' '{"state":"OPEN","labels":[{"name":"in-progress"},{"name":"spec"}]}' ;;
+  "issue view 91 --repo acme/widgets --json number,url,state,labels") printf '%s\n' '{"number":91,"url":"https://github.com/acme/widgets/issues/91","state":"OPEN","labels":[{"name":"in-progress"},{"name":"spec"}]}' ;;
   "pr list --repo acme/widgets --state all --head agent/issue-91-run-91 --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
     if test -f `+quote(resumedDone)+`; then printf '%s\n' '[{"number":191,"url":"https://github.com/acme/widgets/pull/191","state":"MERGED","mergedAt":"2026-01-01T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-91-run-91","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]'; else printf '%s\n' '[]'; fi ;;
-  "issue view 91 --repo acme/widgets --json state,title,url")
-    if test -f `+quote(resumedDone)+`; then printf '%s\n' '{"state":"CLOSED"}'; else printf '%s\n' '{"state":"OPEN"}'; fi ;;
+  "issue view 91 --repo acme/widgets --json number,state,title,url")
+    if test -f `+quote(resumedDone)+`; then printf '%s\n' '{"number":91,"state":"CLOSED","url":"https://github.com/acme/widgets/issues/91"}'; else printf '%s\n' '{"number":91,"state":"OPEN","url":"https://github.com/acme/widgets/issues/91"}'; fi ;;
   "pr list --repo acme/widgets --state all --head agent/issue-92-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
     head=$8
     printf '[{"number":192,"url":"https://github.com/acme/widgets/pull/192","state":"MERGED","mergedAt":"2026-01-01T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"%s","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]\n' "$head" ;;
-  "issue view 92 --repo acme/widgets --json state,title,url") touch `+quote(candidateDone)+`; printf '%s\n' '{"state":"CLOSED"}' ;;
+  "issue view 92 --repo acme/widgets --json number,state,title,url") touch `+quote(candidateDone)+`; printf '%s\n' '{"number":92,"state":"CLOSED","url":"https://github.com/acme/widgets/issues/92"}' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
 `)
@@ -314,8 +314,8 @@ case "$*" in
     printf '%s\n' '[[]]' ;;
   "pr list --repo acme/widgets --state all --head agent/issue-33-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
     printf '%s\n' '[]' ;;
-  "issue view 33 --repo acme/widgets --json state,title,url")
-    printf '%s\n' '{"state":"OPEN","title":"Terminate","url":"https://example.test/issues/33"}' ;;
+  "issue view 33 --repo acme/widgets --json number,state,title,url")
+    printf '%s\n' '{"number":33,"state":"OPEN","title":"Terminate","url":"https://github.com/acme/widgets/issues/33"}' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
 `)
@@ -572,10 +572,10 @@ case "$*" in
     test -f `+quote(piAlive)+`
     head=$8
     printf '[{"number":5,"url":"https://github.com/acme/widgets/pull/5","state":"MERGED","mergedAt":"2026-07-22T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"%s","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]\n' "$head" ;;
-  "issue view 5 --repo acme/widgets --json state,title,url")
+  "issue view 5 --repo acme/widgets --json number,state,title,url")
     test -f `+quote(piAlive)+`
     touch `+quote(reconciledAlive)+` `+quote(finished)+`
-    printf '%s\n' '{"state":"CLOSED","title":"RPC","url":"https://example.test/issues/5"}' ;;
+    printf '%s\n' '{"number":5,"state":"CLOSED","title":"RPC","url":"https://github.com/acme/widgets/issues/5"}' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
 `)
@@ -787,8 +787,8 @@ case "$*" in
     printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
   "pr list --repo acme/widgets --state all --head agent/issue-42-legacy-running --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
     printf '%s\n' '[{"number":42,"url":"https://github.com/acme/widgets/pull/42","state":"MERGED","mergedAt":"2026-07-03T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-42-legacy-running","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
-  "issue view 42 --repo acme/widgets --json state,title,url")
-    printf '%s\n' '{"state":"CLOSED","title":"Migrated","url":"https://example.test/issues/42"}' ;;
+  "issue view 42 --repo acme/widgets --json number,state,title,url")
+    printf '%s\n' '{"number":42,"state":"CLOSED","title":"Migrated","url":"https://github.com/acme/widgets/issues/42"}' ;;
   "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
     printf '%s\n' '[]' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;

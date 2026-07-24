@@ -228,13 +228,19 @@ func (c Client) resolveReference(ctx context.Context, currentRepo string, refere
 
 func (c Client) IssueState(ctx context.Context, repo string, issue int) (IssueState, error) {
 	var response struct {
+		Number int    `json:"number"`
+		URL    string `json:"url"`
 		State  string `json:"state"`
 		Labels []struct {
 			Name string `json:"name"`
 		} `json:"labels"`
 	}
-	if err := c.jsonCommand(ctx, &response, "issue", "view", fmt.Sprint(issue), "--repo", repo, "--json", "state,labels"); err != nil {
+	if err := c.jsonCommand(ctx, &response, "issue", "view", fmt.Sprint(issue), "--repo", repo, "--json", "number,url,state,labels"); err != nil {
 		return IssueState{}, fmt.Errorf("inspect issue state and labels: %w", err)
+	}
+	if response.Number != issue || !resourceURLMatches(response.URL, repo, "issues", issue) ||
+		(!strings.EqualFold(response.State, "open") && !strings.EqualFold(response.State, "closed")) {
+		return IssueState{}, errors.New("inspect issue state and labels: gh returned incomplete or mismatched issue identity/state")
 	}
 	labels := make([]string, 0, len(response.Labels))
 	for _, label := range response.Labels {
@@ -434,14 +440,17 @@ func (c Client) Completion(ctx context.Context, repo string, issue int, branch s
 		outcome.AutoMergeArmed = autoMergeArmed
 	}
 	var issueState struct {
-		State string `json:"state"`
+		Number int    `json:"number"`
+		URL    string `json:"url"`
+		State  string `json:"state"`
 	}
 	if err := c.jsonCommand(ctx, &issueState, "issue", "view", fmt.Sprint(issue), "--repo", repo,
-		"--json", "state,title,url"); err != nil {
+		"--json", "number,state,title,url"); err != nil {
 		return CompletionOutcome{}, fmt.Errorf("inspect issue: %w", err)
 	}
-	if !strings.EqualFold(issueState.State, "open") && !strings.EqualFold(issueState.State, "closed") {
-		return CompletionOutcome{}, fmt.Errorf("inspect issue: gh returned unknown state %q", issueState.State)
+	if issueState.Number != issue || !resourceURLMatches(issueState.URL, repo, "issues", issue) ||
+		(!strings.EqualFold(issueState.State, "open") && !strings.EqualFold(issueState.State, "closed")) {
+		return CompletionOutcome{}, errors.New("inspect issue: gh returned incomplete or mismatched issue identity/state")
 	}
 	outcome.IssueClosed = strings.EqualFold(issueState.State, "closed")
 	return outcome, nil
