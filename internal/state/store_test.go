@@ -2,6 +2,7 @@ package state
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -481,6 +482,37 @@ func TestFileStoreRejectsRunningLeaseWithoutStartIdentity(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("save succeeded, want missing process start identity error")
+	}
+}
+
+func TestReadOnlyLocksDoNotCreateOrChangeResources(t *testing.T) {
+	t.Parallel()
+
+	directory := t.TempDir()
+	before, err := os.Stat(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := AcquireReadOnlyLock(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Mode() != after.Mode() || before.Size() != after.Size() {
+		t.Fatalf("read-only lock changed directory metadata: before=%v after=%v", before, after)
+	}
+	missing := filepath.Join(directory, "missing.lock")
+	if lock, exists, err := AcquireExistingReadOnlyLock(missing); err != nil || exists || lock != nil {
+		t.Fatalf("optional missing lock = %#v, %t, %v", lock, exists, err)
+	}
+	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("optional lock created a file: %v", err)
 	}
 }
 
