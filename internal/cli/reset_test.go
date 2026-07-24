@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	ghadapter "github.com/robinjoseph08/backlog/internal/github"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 )
@@ -663,6 +666,59 @@ func TestResetMutationRequiresYesWhenNonInteractive(t *testing.T) {
 	}
 }
 
+func TestResetRefusesMutationWhenPlanOrPromptCannotBePrinted(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		interactive bool
+		input       string
+		failOn      string
+	}{
+		{name: "initial plan", interactive: true, input: "yes\n", failOn: "Reset Plan"},
+		{name: "interactive prompt", interactive: true, input: "yes\n", failOn: "Proceed with Reset"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "spec"})
+			beforeState := fileDigest(t, fixture.store.Path)
+			beforeGitHub := fileDigest(t, fixture.githubState)
+			stdout := &failOnTextWriter{text: test.failOn}
+			var stderr bytes.Buffer
+			err := resetCommandWithInput(context.Background(), fixture.resetArgs(), strings.NewReader(test.input), test.interactive, stdout, &stderr)
+			if err == nil || !strings.Contains(err.Error(), "output") && !strings.Contains(err.Error(), "confirmation") {
+				t.Fatalf("error = %v", err)
+			}
+			if fileDigest(t, fixture.store.Path) != beforeState || fileDigest(t, fixture.githubState) != beforeGitHub {
+				t.Fatal("output failure allowed Reset mutation")
+			}
+		})
+	}
+}
+
+func TestResetConfirmationStopsWaitingWhenContextIsCancelled(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	prompted := make(chan struct{})
+	stdout := writerFunc(func(data []byte) (int, error) {
+		select {
+		case <-prompted:
+		default:
+			close(prompted)
+		}
+		return len(data), nil
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, err := confirmReset(ctx, bufio.NewReader(reader), stdout)
+		done <- err
+	}()
+	<-prompted
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("confirmation error = %v", err)
+	}
+}
+
 func TestResetInteractiveDefaultNoInputsMakeNoChanges(t *testing.T) {
 	for _, test := range []struct {
 		name  string
@@ -691,11 +747,12 @@ func TestResetInteractiveDefaultNoInputsMakeNoChanges(t *testing.T) {
 	}
 }
 
-func TestResetFinalizesArtifactFreeStaleRunStatuses(t *testing.T) {
+func TestResetFinalizesArtifactFreeEligibleRunStatuses(t *testing.T) {
 	for _, status := range []scheduler.Status{
 		scheduler.StatusClaimed,
 		scheduler.StatusWorktreeReady,
 		scheduler.StatusRunning,
+		scheduler.StatusNeedsHuman,
 	} {
 		t.Run(string(status), func(t *testing.T) {
 			fixture := newArtifactFreeResetFixture(t, []string{"ready-for-agent", "spec"})
@@ -741,6 +798,34 @@ func TestResetFinalizesArtifactFreeStaleRunStatuses(t *testing.T) {
 				t.Fatalf("final state = %#v", final)
 			}
 		})
+	}
+}
+
+func TestResetFinalizationPersistsRunAndLeaseTogether(t *testing.T) {
+	t.Parallel()
+	fixture := newArtifactFreeResetFixture(t, []string{"ready-for-agent", "spec"})
+	commonDirectory, err := gitCommonDirectory(context.Background(), fixture.git, fixture.repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &recordingResetStore{resetStateStore: fixture.store}
+	executor := resetExecutor{
+		store: store, github: ghadapter.Client{Executable: fixture.gh, Dir: fixture.repository}, issue: 42,
+		repositoryRoot: fixture.repository, commonDirectory: commonDirectory, stateDirectory: fixture.stateDir, gitExecutable: fixture.git,
+	}
+	approved, err := executor.inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.apply(context.Background(), approved); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.saves) != 1 {
+		t.Fatalf("state saves = %d, want one atomic finalization", len(store.saves))
+	}
+	persisted := store.saves[0]
+	if len(persisted.Runs) != 1 || persisted.Runs[0].Status != scheduler.StatusReset || len(persisted.Leases) != 0 {
+		t.Fatalf("atomic finalization snapshot = %#v", persisted)
 	}
 }
 
@@ -799,6 +884,30 @@ func TestResetRepeatsOnlyAfterVerifyingOldLeaseAbsent(t *testing.T) {
 	}
 }
 
+func TestRetryMatchesResetNonMutationPaths(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		extra []string
+	}{
+		{name: "non-interactive mutation refusal"},
+		{name: "dry-run", extra: []string{"--dry-run"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "spec"})
+			var resetOut, resetErr, retryOut, retryErr bytes.Buffer
+			resetExit := Main(context.Background(), fixture.args("reset", test.extra...), &resetOut, &resetErr)
+			retryExit := Main(context.Background(), fixture.args("retry", test.extra...), &retryOut, &retryErr)
+			warning := "Warning: backlog retry is deprecated; use backlog reset.\n"
+			if resetExit != retryExit || resetOut.String() != retryOut.String() || strings.TrimPrefix(retryErr.String(), warning) != resetErr.String() {
+				t.Fatalf("reset/retry differ: exits %d/%d, stdout %q/%q, stderr %q/%q", resetExit, retryExit, resetOut.String(), retryOut.String(), resetErr.String(), retryErr.String())
+			}
+			if !strings.HasPrefix(retryErr.String(), warning) {
+				t.Fatalf("retry warning = %q", retryErr.String())
+			}
+		})
+	}
+}
+
 func TestRetryUsesResetMutationPathWithDeprecationWarning(t *testing.T) {
 	t.Parallel()
 	resetFixture := newArtifactFreeResetFixture(t, []string{"in-progress", "spec"})
@@ -820,6 +929,37 @@ func TestRetryUsesResetMutationPathWithDeprecationWarning(t *testing.T) {
 	if resetState.Runs[0].Status != retryState.Runs[0].Status || len(resetState.Leases) != len(retryState.Leases) ||
 		strings.Join(resetFixture.labels(t), ",") != strings.Join(retryFixture.labels(t), ",") {
 		t.Fatalf("reset/retry mutations differ: %#v / %#v", resetState, retryState)
+	}
+}
+
+func TestResetStopsWhenHumanWorkflowLabelAppearsAfterFirstMutation(t *testing.T) {
+	t.Parallel()
+	fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "spec"})
+	underlyingGH := fixture.gh
+	fixture.gh = writeExecutable(t, `#!/bin/sh
+set -eu
+if [ "$*" = "issue edit 42 --repo acme/widgets --remove-label in-progress" ]; then
+  `+quote(underlyingGH)+` "$@"
+  temporary=`+quote(fixture.githubState)+`.tmp
+  jq '.labels += ["needs-info"]' `+quote(fixture.githubState)+` > "$temporary"
+  mv "$temporary" `+quote(fixture.githubState)+`
+  exit 0
+fi
+exec `+quote(underlyingGH)+` "$@"
+`)
+	var stdout, stderr bytes.Buffer
+	if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit == 0 || !strings.Contains(stderr.String(), "human workflow label") {
+		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusResetting || len(current.Leases) != 1 {
+		t.Fatalf("human-label race released ownership: %#v", current)
+	}
+	if got := strings.Join(fixture.labels(t), ","); got != "needs-info,spec" {
+		t.Fatalf("labels after refusal = %q", got)
 	}
 }
 
@@ -872,6 +1012,66 @@ esac
 	}
 	if fileDigest(t, fixture.store.Path) != before {
 		t.Fatal("second confirmation refusal changed state")
+	}
+}
+
+func TestResetYesPrintsChangedPlanAndContinues(t *testing.T) {
+	t.Parallel()
+	fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "spec"})
+	underlyingGH := fixture.gh
+	viewed := filepath.Join(t.TempDir(), "viewed")
+	fixture.gh = writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    if test -f `+quote(viewed)+`; then
+      temporary=`+quote(fixture.githubState)+`.tmp
+      jq 'if any(.labels[]; . == "ready-for-agent") then . else .labels += ["ready-for-agent"] end' `+quote(fixture.githubState)+` > "$temporary"
+      mv "$temporary" `+quote(fixture.githubState)+`
+    else
+      touch `+quote(viewed)+`
+    fi ;;
+esac
+exec `+quote(underlyingGH)+` "$@"
+`)
+	var stdout, stderr bytes.Buffer
+	if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit != 0 {
+		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+	}
+	if strings.Count(stdout.String(), "Reset Plan for issue #42") != 2 || !strings.Contains(stdout.String(), "using the current plan") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestResetYesRefusesMutationWhenChangedPlanCannotBePrinted(t *testing.T) {
+	t.Parallel()
+	fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "spec"})
+	underlyingGH := fixture.gh
+	viewed := filepath.Join(t.TempDir(), "viewed")
+	fixture.gh = writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    if test -f `+quote(viewed)+`; then
+      temporary=`+quote(fixture.githubState)+`.tmp
+      jq 'if any(.labels[]; . == "ready-for-agent") then . else .labels += ["ready-for-agent"] end' `+quote(fixture.githubState)+` > "$temporary"
+      mv "$temporary" `+quote(fixture.githubState)+`
+    else
+      touch `+quote(viewed)+`
+    fi ;;
+esac
+exec `+quote(underlyingGH)+` "$@"
+`)
+	before := fileDigest(t, fixture.store.Path)
+	stdout := &failOnTextWriter{text: "using the current plan"}
+	var stderr bytes.Buffer
+	args := append(fixture.resetArgs(), "--yes")
+	err := resetCommandWithInput(context.Background(), args, strings.NewReader(""), false, stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "output") {
+		t.Fatalf("error = %v", err)
+	}
+	if fileDigest(t, fixture.store.Path) != before {
+		t.Fatal("changed-plan output failure allowed Reset mutation")
 	}
 }
 
@@ -944,6 +1144,62 @@ exec `+quote(underlyingGH)+` "$@"
 	}
 }
 
+func TestResetVerifiesUnrelatedLabelsSurviveMutation(t *testing.T) {
+	t.Parallel()
+	fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "spec"})
+	underlyingGH := fixture.gh
+	fixture.gh = writeExecutable(t, `#!/bin/sh
+set -eu
+if [ "$*" = "issue edit 42 --repo acme/widgets --remove-label in-progress" ]; then
+  `+quote(underlyingGH)+` "$@"
+  temporary=`+quote(fixture.githubState)+`.tmp
+  jq '.labels = [.labels[] | select(. != "spec")]' `+quote(fixture.githubState)+` > "$temporary"
+  mv "$temporary" `+quote(fixture.githubState)+`
+  exit 0
+fi
+exec `+quote(underlyingGH)+` "$@"
+`)
+	var stdout, stderr bytes.Buffer
+	exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr)
+	if exit == 0 || !strings.Contains(stderr.String(), "did not satisfy its verified postcondition") {
+		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusResetting || len(current.Leases) != 1 {
+		t.Fatalf("unrelated-label loss released ownership: %#v", current)
+	}
+}
+
+func TestResetVerifiesAddedLabelMutationBeforeFinalization(t *testing.T) {
+	t.Parallel()
+	fixture := newArtifactFreeResetFixture(t, []string{"spec"})
+	fixture.gh = writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef") printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"spec"}]}' ;;
+  "issue edit 42 --repo acme/widgets --add-label ready-for-agent") : ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	var stdout, stderr bytes.Buffer
+	exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr)
+	if exit == 0 || !strings.Contains(stderr.String(), "did not satisfy its verified postcondition") {
+		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusResetting || len(current.Leases) != 1 {
+		t.Fatalf("failed verification released ownership: %#v", current)
+	}
+}
+
 func TestResetVerifiesLabelMutationBeforeFinalization(t *testing.T) {
 	t.Parallel()
 	fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "spec"})
@@ -969,6 +1225,33 @@ esac
 	if len(current.Runs) != 1 || current.Runs[0].Status != scheduler.StatusResetting || len(current.Leases) != 1 {
 		t.Fatalf("failed verification released ownership: %#v", current)
 	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(data []byte) (int, error) {
+	return f(data)
+}
+
+type failOnTextWriter struct {
+	text string
+}
+
+func (w *failOnTextWriter) Write(data []byte) (int, error) {
+	if strings.Contains(string(data), w.text) {
+		return 0, errors.New("injected output failure")
+	}
+	return len(data), nil
+}
+
+type recordingResetStore struct {
+	resetStateStore
+	saves []state.State
+}
+
+func (s *recordingResetStore) Save(current state.State) error {
+	s.saves = append(s.saves, current)
+	return s.resetStateStore.Save(current)
 }
 
 func fileDigest(t *testing.T, path string) [32]byte {

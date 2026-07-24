@@ -57,6 +57,7 @@ func TestRunStateTransitionsAreExplicit(t *testing.T) {
 		{StatusNeedsHuman, StatusResetting},
 		{StatusSuspended, StatusResetting},
 		{StatusFailed, StatusReset},
+		{StatusNeedsHuman, StatusReset},
 		{StatusSuspended, StatusReset},
 		{StatusResetting, StatusReset},
 	}

@@ -12,7 +12,7 @@ Each issue receives its own lease, Git branch, Git worktree, Pi process, named P
 - GitHub CLI `gh`, authenticated for the target repository
 - Pi 0.80.4 or newer with the global `afk` skill available
 - A Git remote named `origin`
-- GitHub API access with Issues read permission
+- GitHub API access with Issues write permission
 
 The runner uses GitHub's versioned issue dependency endpoint. A dependency lookup failure stops scheduling rather than treating the issue as unblocked.
 

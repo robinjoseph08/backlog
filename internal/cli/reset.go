@@ -33,6 +33,8 @@ func resetCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 }
 
 func resetCommandWithInput(ctx context.Context, args []string, stdin io.Reader, interactive bool, stdout, stderr io.Writer) error {
+	output := &resetOutputWriter{writer: stdout}
+	stdout = output
 	flags := flag.NewFlagSet("reset", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() {
@@ -101,9 +103,12 @@ func resetCommandWithInput(ctx context.Context, args []string, stdin io.Reader, 
 		return err
 	}
 	printResetPlan(stdout, plan)
+	if err := output.Err(); err != nil {
+		return err
+	}
 	if *dryRun {
 		fmt.Fprintln(stdout, "Dry-run: no changes made.")
-		return nil
+		return output.Err()
 	}
 	if err := validateArtifactFreeMutation(plan); err != nil {
 		return err
@@ -127,17 +132,20 @@ func resetCommandWithInput(ctx context.Context, args []string, stdin io.Reader, 
 			fmt.Fprintln(stdout, "Reset Plan changed after confirmation; using the current plan:")
 			printResetPlan(stdout, fresh)
 		}
+		if err := output.Err(); err != nil {
+			return err
+		}
 		plan = fresh
 	} else {
 		reader := bufio.NewReader(stdin)
 		for {
-			confirmed, err := confirmReset(reader, stdout)
+			confirmed, err := confirmReset(ctx, reader, stdout)
 			if err != nil {
 				return err
 			}
 			if !confirmed {
 				fmt.Fprintln(stdout, "Reset cancelled; no changes made.")
-				return nil
+				return output.Err()
 			}
 			fresh, err := executor.inspect(ctx)
 			if err != nil {
@@ -155,10 +163,16 @@ func resetCommandWithInput(ctx context.Context, args []string, stdin io.Reader, 
 			}
 			fmt.Fprintln(stdout, "Reset Plan changed after confirmation; confirm the current plan again:")
 			printResetPlan(stdout, fresh)
+			if err := output.Err(); err != nil {
+				return err
+			}
 			plan = fresh
 		}
 	}
 
+	if err := output.Err(); err != nil {
+		return err
+	}
 	if err := ensureResetStateBinding(commonDirectory, resolvedState); err != nil {
 		return err
 	}
@@ -166,7 +180,7 @@ func resetCommandWithInput(ctx context.Context, args []string, stdin io.Reader, 
 		return err
 	}
 	fmt.Fprintf(stdout, "Reset complete for issue #%d. No replacement Run was created.\n", issueNumber)
-	return nil
+	return output.Err()
 }
 
 func ensureResetStateBinding(commonDirectory, stateDirectory string) error {
@@ -184,21 +198,67 @@ func inputIsInteractive(file *os.File) bool {
 	return term.IsTerminal(int(file.Fd()))
 }
 
-func confirmReset(reader *bufio.Reader, stdout io.Writer) (bool, error) {
-	fmt.Fprint(stdout, "Proceed with Reset? [y/N] ")
-	line, err := reader.ReadString('\n')
-	if errors.Is(err, io.EOF) {
-		return false, nil
+func confirmReset(ctx context.Context, reader *bufio.Reader, stdout io.Writer) (bool, error) {
+	if _, err := fmt.Fprint(stdout, "Proceed with Reset? [y/N] "); err != nil {
+		return false, fmt.Errorf("print Reset confirmation: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	type result struct {
+		line string
+		err  error
+	}
+	resultChannel := make(chan result, 1)
+	go func() {
+		line, err := reader.ReadString('\n')
+		resultChannel <- result{line: line, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case read := <-resultChannel:
+		if errors.Is(read.err, io.EOF) {
+			return false, nil
+		}
+		if read.err != nil {
+			return false, fmt.Errorf("read Reset confirmation: %w", read.err)
+		}
+		answer := strings.ToLower(strings.TrimSpace(read.line))
+		return answer == "y" || answer == "yes", nil
+	}
+}
+
+type resetOutputWriter struct {
+	writer io.Writer
+	err    error
+}
+
+func (w *resetOutputWriter) Write(data []byte) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+	written, err := w.writer.Write(data)
+	if err == nil && written != len(data) {
+		err = io.ErrShortWrite
 	}
 	if err != nil {
-		return false, fmt.Errorf("read Reset confirmation: %w", err)
+		w.err = fmt.Errorf("write Reset output: %w", err)
 	}
-	answer := strings.ToLower(strings.TrimSpace(line))
-	return answer == "y" || answer == "yes", nil
+	return written, err
+}
+
+func (w *resetOutputWriter) Err() error {
+	return w.err
+}
+
+type resetStateStore interface {
+	Preview() (state.State, bool, error)
+	Save(state.State) error
 }
 
 type resetExecutor struct {
-	store           state.FileStore
+	store           resetStateStore
 	github          ghadapter.Client
 	issue           int
 	repositoryRoot  string
@@ -354,8 +414,8 @@ func (e resetExecutor) apply(ctx context.Context, approved reset.Plan) error {
 			if err != nil {
 				return err
 			}
-			if normalizedLabelSet(after.Snapshot.Issue.Labels)["in-progress"] {
-				return errors.New("remove issue label in-progress did not satisfy its verified postcondition")
+			if err := verifyLabelMutation(before.Snapshot.Issue.Labels, after.Snapshot.Issue.Labels, "", "in-progress"); err != nil {
+				return err
 			}
 		case !labels["ready-for-agent"]:
 			before, err := e.inspect(ctx)
@@ -382,8 +442,8 @@ func (e resetExecutor) apply(ctx context.Context, approved reset.Plan) error {
 			if err != nil {
 				return err
 			}
-			if !normalizedLabelSet(after.Snapshot.Issue.Labels)["ready-for-agent"] {
-				return errors.New("add issue label ready-for-agent did not satisfy its verified postcondition")
+			if err := verifyLabelMutation(before.Snapshot.Issue.Labels, after.Snapshot.Issue.Labels, "ready-for-agent", ""); err != nil {
+				return err
 			}
 		default:
 			return e.finalize(ctx, plan)
@@ -397,6 +457,30 @@ func normalizedLabelSet(labels []string) map[string]bool {
 		result[strings.ToLower(label)] = true
 	}
 	return result
+}
+
+func verifyLabelMutation(before, after []string, added, removed string) error {
+	expected := normalizedLabelSet(before)
+	if added != "" {
+		expected[strings.ToLower(added)] = true
+	}
+	if removed != "" {
+		delete(expected, strings.ToLower(removed))
+	}
+	actual := normalizedLabelSet(after)
+	if len(expected) == len(actual) {
+		matches := true
+		for label := range expected {
+			if !actual[label] {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return nil
+		}
+	}
+	return fmt.Errorf("issue label mutation did not satisfy its verified postcondition: labels changed from %s to %s", formatLabels(before), formatLabels(after))
 }
 
 func (e resetExecutor) repositorySlug() (string, error) {
