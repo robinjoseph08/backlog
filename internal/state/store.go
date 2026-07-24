@@ -1,6 +1,7 @@
 package state
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -221,12 +222,19 @@ func decodeCurrentState(encoded json.RawMessage) (State, error) {
 }
 
 func decodeRecoverableRun(encoded json.RawMessage) (scheduler.Run, error) {
+	continuation, hasContinuation, invalidContinuationKey, err := inspectContinuationField(encoded)
+	if err != nil {
+		return scheduler.Run{}, err
+	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(encoded, &fields); err != nil {
 		return scheduler.Run{}, err
 	}
-	continuation, hasContinuation := fields["continuation"]
-	delete(fields, "continuation")
+	for field := range fields {
+		if strings.EqualFold(field, "continuation") {
+			delete(fields, field)
+		}
+	}
 	withoutContinuation, err := json.Marshal(fields)
 	if err != nil {
 		return scheduler.Run{}, err
@@ -237,11 +245,52 @@ func decodeRecoverableRun(encoded json.RawMessage) (scheduler.Run, error) {
 	}
 	if hasContinuation && string(continuation) != "null" {
 		var boundary scheduler.ContinuationBoundary
-		if err := json.Unmarshal(continuation, &boundary); err == nil {
+		if !invalidContinuationKey && json.Unmarshal(continuation, &boundary) == nil {
 			run.Continuation = &boundary
+		} else {
+			run.Continuation = &scheduler.ContinuationBoundary{}
 		}
+	} else if invalidContinuationKey {
+		run.Continuation = &scheduler.ContinuationBoundary{}
 	}
 	return run, nil
+}
+
+func inspectContinuationField(encoded json.RawMessage) (json.RawMessage, bool, bool, error) {
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	opening, err := decoder.Token()
+	if err != nil {
+		return nil, false, false, err
+	}
+	if opening != json.Delim('{') {
+		return nil, false, false, errors.New("Run is not a JSON object")
+	}
+	var continuation json.RawMessage
+	count := 0
+	invalidKey := false
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, false, false, err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, false, false, errors.New("Run contains an invalid JSON field")
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, false, false, err
+		}
+		if strings.EqualFold(key, "continuation") {
+			count++
+			continuation = value
+			invalidKey = invalidKey || key != "continuation"
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, false, false, err
+	}
+	return continuation, count > 0, invalidKey || count > 1, nil
 }
 
 func ensureEOF(decoder *json.Decoder) error {

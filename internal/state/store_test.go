@@ -489,6 +489,35 @@ func TestFileStoreLoadsUnsafeSuspensionForNeedsHumanRecovery(t *testing.T) {
 	}
 }
 
+func TestDecodeRecoverableRunPreservesMalformedContinuationEvidence(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		encoded          string
+		wantContinuation bool
+	}{
+		{name: "malformed value", encoded: `{"continuation":"malformed"}`, wantContinuation: true},
+		{name: "case-variant key", encoded: `{"Continuation":null}`, wantContinuation: true},
+		{name: "duplicate exact key", encoded: `{"continuation":null,"continuation":null}`, wantContinuation: true},
+		{name: "absent key", encoded: `{}`, wantContinuation: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			run, err := decodeRecoverableRun(json.RawMessage(test.encoded))
+			if err != nil {
+				t.Fatalf("decode recoverable Run: %v", err)
+			}
+			if (run.Continuation != nil) != test.wantContinuation {
+				t.Fatalf("Continuation = %#v, want present %t", run.Continuation, test.wantContinuation)
+			}
+			if run.Continuation != nil && *run.Continuation != (scheduler.ContinuationBoundary{}) {
+				t.Fatalf("Continuation = %#v, want empty recovery sentinel", run.Continuation)
+			}
+		})
+	}
+}
+
 func TestFileStoreLoadsStructurallyMalformedContinuationForRecovery(t *testing.T) {
 	t.Parallel()
 
@@ -515,7 +544,7 @@ func TestFileStoreLoadsStructurallyMalformedContinuationForRecovery(t *testing.T
 	if err != nil {
 		t.Fatalf("load malformed continuation for recovery: %v", err)
 	}
-	if len(loaded.Runs) != 1 || loaded.Runs[0].Continuation != nil || len(loaded.Leases) != 1 {
+	if len(loaded.Runs) != 1 || loaded.Runs[0].Continuation == nil || *loaded.Runs[0].Continuation != (scheduler.ContinuationBoundary{}) || len(loaded.Leases) != 1 {
 		t.Fatalf("recoverable malformed continuation = %#v", loaded)
 	}
 	loaded.Runs[0].Status = scheduler.StatusNeedsHuman

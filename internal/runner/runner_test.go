@@ -1974,7 +1974,7 @@ func TestRunnerRejectsCrashRecoveryWhenProcessGroupInspectionIsUncertain(t *test
 	}
 }
 
-func TestRunnerClassifiesMalformedPersistedRunningContinuationAsNeedsHuman(t *testing.T) {
+func TestRunnerClassifiesStructurallyMalformedPersistedRunningContinuationAsNeedsHuman(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -1982,12 +1982,20 @@ func TestRunnerClassifiesMalformedPersistedRunningContinuationAsNeedsHuman(t *te
 	run.Status = scheduler.StatusRunning
 	run.PID = 999999
 	run.ProcessIdentity = "999999:old"
-	run.Continuation.EntryCount = 0
 	persisted := state.State{
 		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
 		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: "lease-66", Issue: 66, RunID: run.RunID}},
 	}
 	encoded, err := json.Marshal(persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var malformed map[string]any
+	if err := json.Unmarshal(encoded, &malformed); err != nil {
+		t.Fatal(err)
+	}
+	malformed["runs"].([]any)[0].(map[string]any)["continuation"] = "malformed"
+	encoded, err = json.Marshal(malformed)
 	if err != nil {
 		t.Fatal(err)
 	}
