@@ -639,18 +639,19 @@ func VerifyContinuation(expected ContinuationRequest, continuation Continuation)
 		return fmt.Errorf("Pi session file has %d entries, continuation marker recorded %d", len(records)-1, continuation.EntryCount)
 	}
 	var header struct {
-		Type string `json:"type"`
-		ID   string `json:"id"`
-		CWD  string `json:"cwd"`
+		Type    string `json:"type"`
+		Version *int   `json:"version"`
+		ID      string `json:"id"`
+		CWD     string `json:"cwd"`
 	}
 	if _, err := decodeExactJSON(records[0]); err != nil {
 		return fmt.Errorf("decode Pi session header: %w", err)
 	}
-	if err := rejectNonCanonicalJSONFields(records[0], "type", "id", "cwd"); err != nil {
+	if err := rejectNonCanonicalJSONFields(records[0], "type", "version", "id", "cwd"); err != nil {
 		return fmt.Errorf("decode Pi session header: %w", err)
 	}
-	if err := json.Unmarshal(records[0], &header); err != nil || header.Type != "session" {
-		return errors.New("Pi session file has an invalid header")
+	if err := json.Unmarshal(records[0], &header); err != nil || header.Type != "session" || header.Version == nil || *header.Version != 3 {
+		return errors.New("Pi session file has an invalid or unsupported header")
 	}
 	if header.ID != expected.SessionID || header.CWD != expected.Worktree {
 		return fmt.Errorf("Pi session header identity/path %q/%q does not match %q/%q", header.ID, header.CWD, expected.SessionID, expected.Worktree)
@@ -754,18 +755,19 @@ func verifyAndSyncSession(path string, expected ContinuationRequest, rpcEntries 
 		return "", fmt.Errorf("Pi session file has %d entries, RPC reported %d", len(records)-1, len(rpcEntries))
 	}
 	var header struct {
-		Type string `json:"type"`
-		ID   string `json:"id"`
-		CWD  string `json:"cwd"`
+		Type    string `json:"type"`
+		Version *int   `json:"version"`
+		ID      string `json:"id"`
+		CWD     string `json:"cwd"`
 	}
 	if _, err := decodeExactJSON(records[0]); err != nil {
 		return "", fmt.Errorf("decode Pi session header: %w", err)
 	}
-	if err := rejectNonCanonicalJSONFields(records[0], "type", "id", "cwd"); err != nil {
+	if err := rejectNonCanonicalJSONFields(records[0], "type", "version", "id", "cwd"); err != nil {
 		return "", fmt.Errorf("decode Pi session header: %w", err)
 	}
-	if err := json.Unmarshal(records[0], &header); err != nil || header.Type != "session" {
-		return "", errors.New("Pi session file has an invalid header")
+	if err := json.Unmarshal(records[0], &header); err != nil || header.Type != "session" || header.Version == nil || *header.Version != 3 {
+		return "", errors.New("Pi session file has an invalid or unsupported header")
 	}
 	if header.ID != expected.SessionID || header.CWD != expected.Worktree {
 		return "", fmt.Errorf("Pi session header identity/path %q/%q does not match %q/%q", header.ID, header.CWD, expected.SessionID, expected.Worktree)
@@ -913,8 +915,18 @@ func verifyContinuationLeaf(entries []json.RawMessage, leafID string) error {
 		if err := json.Unmarshal(raw, &value); err != nil || value.ID == "" || value.Type == "" {
 			return errors.New("Pi session contains an entry without durable identity and type")
 		}
-		if value.Type != "message" && strings.EqualFold(value.Type, "message") {
-			return fmt.Errorf("Pi session entry %q has non-canonical type %q", value.ID, value.Type)
+		validType := false
+		for _, entryType := range []string{"message", "thinking_level_change", "model_change", "compaction", "branch_summary", "custom", "custom_message", "label", "session_info"} {
+			if value.Type == entryType {
+				validType = true
+				break
+			}
+			if strings.EqualFold(value.Type, entryType) {
+				return fmt.Errorf("Pi session entry %q has non-canonical type %q", value.ID, value.Type)
+			}
+		}
+		if !validType {
+			return fmt.Errorf("Pi session entry %q has unsupported type %q", value.ID, value.Type)
 		}
 		if value.Type == "message" && (len(value.Message) == 0 || string(value.Message) == "null") {
 			return fmt.Errorf("Pi session message entry %q has no message metadata", value.ID)
@@ -937,9 +949,6 @@ func verifyContinuationLeaf(entries []json.RawMessage, leafID string) error {
 	}
 	if ordered[len(ordered)-1].ID != leafID {
 		return fmt.Errorf("Pi session leaf %q is not the durable file leaf %q", leafID, ordered[len(ordered)-1].ID)
-	}
-	if ordered[len(ordered)-1].Type != "message" {
-		return fmt.Errorf("Pi session durable leaf %q has unsupported type %q", leafID, ordered[len(ordered)-1].Type)
 	}
 	var branch []entry
 	seen := make(map[string]struct{})
@@ -982,7 +991,7 @@ func verifyContinuationLeaf(entries []json.RawMessage, leafID string) error {
 			return fmt.Errorf("Pi session message %q has no role", value.ID)
 		}
 		switch message.Role {
-		case "user":
+		case "user", "custom", "bashExecution", "branchSummary", "compactionSummary":
 		case "assistant":
 			var rawContents []json.RawMessage
 			if err := json.Unmarshal(message.Content, &rawContents); err != nil {

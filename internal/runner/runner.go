@@ -837,9 +837,19 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 	run.Error = ""
 	replaceRun(current, run)
 	if err := r.Store.Save(*current); err != nil {
-		_ = process.Abort()
-		_ = process.Close()
-		return nil, fmt.Errorf("persist replacement Worker identity before release for issue #%d: %w", run.Issue, err)
+		abortErr := process.Abort()
+		closed := process.Close()
+		run = findActiveRun(current, run.Issue)
+		if closed.GroupExited {
+			run.PID = 0
+			run.ProcessIdentity = ""
+			replaceRun(current, run)
+		}
+		failureErr := r.rejectResume(current, run.Issue, fmt.Sprintf("persist replacement Worker identity before release: %v; abort: %v; close: %v", err, abortErr, closed.Err))
+		return nil, errors.Join(
+			fmt.Errorf("persist replacement Worker identity before release for issue #%d: %w", run.Issue, err),
+			failureErr,
+		)
 	}
 	if err := verifyContinuationArtifacts(run); err != nil {
 		_ = process.Abort()

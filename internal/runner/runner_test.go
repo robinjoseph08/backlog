@@ -2265,6 +2265,31 @@ func TestRunnerFailsClosedWhenReplacementWorkerCannotLaunchSafely(t *testing.T) 
 	}
 }
 
+func TestRunnerRetainsUnverifiedReplacementAfterIdentityPersistenceFailure(t *testing.T) {
+	t.Parallel()
+
+	run := resumableRun(t, 88, "persist-88")
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: "lease-88", Issue: 88, RunID: run.RunID}},
+	}, failAtSave: 2}
+	runner := testRunner(&fakeGitHub{}, workers, store, 1)
+	runner.Output = io.Discard
+	current := store.LoadValue()
+
+	process, err := runner.resume(context.Background(), context.Background(), &current, run)
+	if err == nil || !strings.Contains(err.Error(), "persist replacement Worker identity") || process != nil {
+		t.Fatalf("replacement persistence result = %#v, %v", process, err)
+	}
+	got := store.LoadValue()
+	resumed := findActiveRun(&got, 88)
+	if resumed.Status != scheduler.StatusNeedsHuman || resumed.PID != 1088 || resumed.ProcessIdentity != "identity-1088" ||
+		!strings.Contains(resumed.Error, "persist replacement Worker identity") || len(got.Leases) != 1 || workers.abortedCount() == 0 {
+		t.Fatalf("unverified replacement persistence = %#v", got)
+	}
+}
+
 func TestRunnerInterruptedReplacementIdentityMarksSuspensionIncomplete(t *testing.T) {
 	t.Parallel()
 

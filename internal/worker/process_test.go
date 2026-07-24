@@ -700,7 +700,7 @@ func TestProcessSuspendRejectsTrailingProtocolFailureBeforeFinalBarrier(t *testi
 	if err := os.MkdirAll(worktree, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	header := `{"type":"session","id":"backlog-run-53","cwd":` + strconv.Quote(worktree) + `}`
+	header := `{"type":"session","version":3,"id":"backlog-run-53","cwd":` + strconv.Quote(worktree) + `}`
 	entry := `{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"work"}}`
 	stateData := `{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(sessionFile) + `,"sessionId":"backlog-run-53"}`
 	pi := fakePi(t, `
@@ -853,7 +853,7 @@ func TestProcessSuspendRejectsIncompleteIdleStateAndWrongSession(t *testing.T) {
 			if err := os.MkdirAll(worktree, 0o700); err != nil {
 				t.Fatal(err)
 			}
-			header := `{"type":"session","id":"backlog-run-52","cwd":` + strconv.Quote(worktree) + `}`
+			header := `{"type":"session","version":3,"id":"backlog-run-52","cwd":` + strconv.Quote(worktree) + `}`
 			entry := `{"type":"message","id":"user","parentId":null,"message":{"role":"user","content":"work"}}`
 			stateResponse := `{"id":"backlog-suspend-state","type":"response","command":"get_state","success":true,"data":` + test.stateData(sessionFile) + `}`
 			entriesData := `{"entries":[` + entry + `],"leafId":"user"}`
@@ -928,7 +928,7 @@ func TestVerifySessionBoundaryRejectsPathIdentityAndEntryMismatches(t *testing.T
 
 	worktree := filepath.Join(root, "worktree")
 	sessionFile := filepath.Join(sessionDir, "session.jsonl")
-	header := `{"type":"session","id":"session-1","cwd":` + strconv.Quote(worktree) + `}`
+	header := `{"type":"session","version":3,"id":"session-1","cwd":` + strconv.Quote(worktree) + `}`
 	diskEntry := `{"type":"message","id":"leaf","parentId":null,"value":9007199254740992,"message":{"role":"user"}}`
 	if err := os.WriteFile(sessionFile, []byte(header+"\n"+diskEntry+"\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -1034,6 +1034,34 @@ func TestVerifyContinuationRevalidatesPersistedSessionIdentityLeafAndHash(t *tes
 	}
 }
 
+func TestVerifyContinuationAcceptsDocumentedMessageRolesAndNonMessageLeaf(t *testing.T) {
+	t.Parallel()
+
+	sessionDir := t.TempDir()
+	worktree := t.TempDir()
+	sessionFile := filepath.Join(sessionDir, "session.jsonl")
+	entries := []string{
+		`{"type":"message","id":"user","parentId":null,"message":{"role":"user","content":"continue"}}`,
+		`{"type":"message","id":"custom-message","parentId":"user","message":{"role":"custom"}}`,
+		`{"type":"message","id":"bash-message","parentId":"custom-message","message":{"role":"bashExecution"}}`,
+		`{"type":"message","id":"branch-message","parentId":"bash-message","message":{"role":"branchSummary"}}`,
+		`{"type":"message","id":"compaction-message","parentId":"branch-message","message":{"role":"compactionSummary"}}`,
+		`{"type":"session_info","id":"leaf","parentId":"compaction-message","name":"resumable"}`,
+	}
+	content := `{"type":"session","version":3,"id":"session-1","cwd":` + strconv.Quote(worktree) + `}` + "\n" + strings.Join(entries, "\n") + "\n"
+	if err := os.WriteFile(sessionFile, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256([]byte(content))
+	err := VerifyContinuation(
+		ContinuationRequest{SessionID: "session-1", SessionDir: sessionDir, Worktree: worktree},
+		Continuation{SessionID: "session-1", SessionFile: sessionFile, Worktree: worktree, LeafID: "leaf", EntryCount: len(entries), SHA256: hex.EncodeToString(hash[:])},
+	)
+	if err != nil {
+		t.Fatalf("documented Pi session structure: %v", err)
+	}
+}
+
 func TestVerifyContinuationRejectsCaseVariantIdentityAliases(t *testing.T) {
 	t.Parallel()
 
@@ -1042,10 +1070,11 @@ func TestVerifyContinuationRejectsCaseVariantIdentityAliases(t *testing.T) {
 	sessionFile := filepath.Join(sessionDir, "session.jsonl")
 	expected := ContinuationRequest{SessionID: "session-1", SessionDir: sessionDir, Worktree: worktree}
 	tests := []struct {
-		name    string
-		header  string
-		entries string
-		want    string
+		name      string
+		header    string
+		entries   string
+		want      string
+		rawHeader bool
 	}{
 		{
 			name:    "session header",
@@ -1070,6 +1099,27 @@ func TestVerifyContinuationRejectsCaseVariantIdentityAliases(t *testing.T) {
 			header:  `{"type":"session","id":"session-1","cwd":` + strconv.Quote(worktree) + `}`,
 			entries: `{"type":"message","ID":"leaf","parentId":null,"message":{"role":"user","content":"continue"}}`,
 			want:    "non-canonical key",
+		},
+		{
+			name:      "missing header version",
+			header:    `{"type":"session","id":"session-1","cwd":` + strconv.Quote(worktree) + `}`,
+			entries:   `{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"continue"}}`,
+			want:      "invalid or unsupported header",
+			rawHeader: true,
+		},
+		{
+			name:      "aliased header version",
+			header:    `{"type":"session","Version":3,"id":"session-1","cwd":` + strconv.Quote(worktree) + `}`,
+			entries:   `{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"continue"}}`,
+			want:      "non-canonical key",
+			rawHeader: true,
+		},
+		{
+			name:      "unsupported header version",
+			header:    `{"type":"session","version":2,"id":"session-1","cwd":` + strconv.Quote(worktree) + `}`,
+			entries:   `{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"continue"}}`,
+			want:      "invalid or unsupported header",
+			rawHeader: true,
 		},
 		{
 			name:    "missing entry type",
@@ -1117,7 +1167,11 @@ func TestVerifyContinuationRejectsCaseVariantIdentityAliases(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			content := test.header + "\n" + test.entries + "\n"
+			header := test.header
+			if !test.rawHeader && !strings.Contains(header, `"version"`) {
+				header = strings.Replace(header, `"type":"session"`, `"type":"session","version":3`, 1)
+			}
+			content := header + "\n" + test.entries + "\n"
 			if err := os.WriteFile(sessionFile, []byte(content), 0o600); err != nil {
 				t.Fatal(err)
 			}
