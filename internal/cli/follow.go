@@ -111,7 +111,10 @@ func followRaw(ctx context.Context, source followStateSource, runID string, outp
 
 	stream := rawLogStream{file: logFile, output: output}
 	for {
-		if err := stream.emitAvailable(); err != nil {
+		if err := stream.emitAvailable(ctx); err != nil {
+			if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+				return nil
+			}
 			return fmt.Errorf("follow Run %q Worker log %q: %w", runID, logPath, err)
 		}
 		selected, err = loadFollowRun(source, runID)
@@ -122,7 +125,10 @@ func followRaw(ctx context.Context, source followStateSource, runID string, outp
 			return fmt.Errorf("Run %q Worker log changed from %q to %q", runID, logPath, selected.LogPath)
 		}
 		if scheduler.IsTerminal(selected.Status) && !selected.WorkerLogOpen {
-			if err := stream.emitAvailable(); err != nil {
+			if err := stream.emitAvailable(ctx); err != nil {
+				if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+					return nil
+				}
 				return fmt.Errorf("finish following Run %q Worker log %q: %w", runID, logPath, err)
 			}
 			return nil
@@ -164,35 +170,55 @@ type rawLogStream struct {
 	emittedOffset int64
 }
 
-func (s *rawLogStream) emitAvailable() error {
+func (s *rawLogStream) emitAvailable(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	info, err := s.file.Stat()
+	if err != nil {
+		return fmt.Errorf("inspect raw JSONL: %w", err)
+	}
+	remaining := info.Size() - s.scannedOffset
 	buffer := make([]byte, 32*1024)
-	for {
-		count, err := s.file.Read(buffer)
+	for remaining > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		readSize := min(int64(len(buffer)), remaining)
+		count, readErr := s.file.Read(buffer[:readSize])
 		if count > 0 {
 			s.scannedOffset += int64(count)
+			remaining -= int64(count)
 			if newline := bytes.LastIndexByte(buffer[:count], '\n'); newline >= 0 {
 				completeOffset := s.scannedOffset - int64(count-newline-1)
-				if err := s.emitThrough(completeOffset, buffer); err != nil {
+				if err := s.emitThrough(ctx, completeOffset, buffer); err != nil {
 					return err
 				}
 			}
 		}
-		if errors.Is(err, io.EOF) {
-			return nil
+		if readErr != nil {
+			return fmt.Errorf("read raw JSONL: %w", readErr)
 		}
-		if err != nil {
-			return fmt.Errorf("read raw JSONL: %w", err)
+		if count == 0 {
+			return fmt.Errorf("read raw JSONL: %w", io.ErrNoProgress)
 		}
 	}
+	return nil
 }
 
-func (s *rawLogStream) emitThrough(completeOffset int64, buffer []byte) error {
+func (s *rawLogStream) emitThrough(ctx context.Context, completeOffset int64, buffer []byte) error {
 	reader := io.NewSectionReader(s.file, s.emittedOffset, completeOffset-s.emittedOffset)
 	remaining := completeOffset - s.emittedOffset
 	for remaining > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		count, err := reader.Read(buffer)
 		if count > 0 {
-			if writeErr := writeAll(s.output, buffer[:count]); writeErr != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if writeErr := writeAllContext(ctx, s.output, buffer[:count]); writeErr != nil {
 				return fmt.Errorf("write raw JSONL: %w", writeErr)
 			}
 			remaining -= int64(count)
@@ -209,7 +235,14 @@ func (s *rawLogStream) emitThrough(completeOffset int64, buffer []byte) error {
 }
 
 func writeAll(writer io.Writer, data []byte) error {
+	return writeAllContext(context.Background(), writer, data)
+}
+
+func writeAllContext(ctx context.Context, writer io.Writer, data []byte) error {
 	for len(data) > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		written, err := writer.Write(data)
 		if err != nil {
 			return err

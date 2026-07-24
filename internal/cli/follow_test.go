@@ -314,6 +314,39 @@ func TestFollowRawDetachesOnCancellation(t *testing.T) {
 	}
 }
 
+func TestFollowRawChecksCancellationWhileEmittingBacklog(t *testing.T) {
+	t.Parallel()
+
+	directory := t.TempDir()
+	logPath := filepath.Join(directory, "large.jsonl")
+	contents := bytes.Repeat([]byte("complete record\n"), 16*1024)
+	if err := os.WriteFile(logPath, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := state.FileStore{Path: filepath.Join(directory, "state.json")}
+	if err := store.Save(state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{{
+		Issue: 27, RunID: "large", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint, LogPath: logPath,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	output := &cancelingWriter{cancel: cancel}
+	done := make(chan error, 1)
+	go func() { done <- followRaw(ctx, store, "large", output, time.Millisecond) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("detach while emitting: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("follower did not detach while emitting existing records")
+	}
+	if got := output.Len(); got == 0 || got >= len(contents) {
+		t.Fatalf("bytes emitted before detach = %d, want between 0 and %d", got, len(contents))
+	}
+}
+
 func TestFollowRawReportsChangedLogIdentity(t *testing.T) {
 	t.Parallel()
 
@@ -346,7 +379,7 @@ func TestRawLogStreamReportsReadAndShortWriteFailures(t *testing.T) {
 	if err := closed.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := (&rawLogStream{file: closed, output: io.Discard}).emitAvailable(); err == nil || !strings.Contains(err.Error(), "read raw JSONL") {
+	if err := (&rawLogStream{file: closed, output: io.Discard}).emitAvailable(context.Background()); err == nil || !strings.Contains(err.Error(), "inspect raw JSONL") {
 		t.Fatalf("closed-file error = %v", err)
 	}
 	if err := writeAll(zeroWriter{}, []byte("record")); !errors.Is(err, io.ErrShortWrite) {
@@ -504,6 +537,18 @@ func (s *closingFollowSource) Preview() (state.State, bool, error) {
 type failingWriter struct{}
 
 func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("output denied") }
+
+type cancelingWriter struct {
+	bytes.Buffer
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (w *cancelingWriter) Write(data []byte) (int, error) {
+	written, err := w.Buffer.Write(data)
+	w.once.Do(w.cancel)
+	return written, err
+}
 
 type zeroWriter struct{}
 

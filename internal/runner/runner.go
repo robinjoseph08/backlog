@@ -325,7 +325,8 @@ func (r *Runner) Run(ctx context.Context) error {
 				completion.result.ExitCode = closed.ExitCode
 				completion.result.Err = errors.Join(completion.result.Err, closed.Err)
 			}
-			runID := findActiveRun(&current, completion.issue).RunID
+			completedRun := findActiveRun(&current, completion.issue)
+			runID := completedRun.RunID
 			if closedBeforeReconciliation && workerLogIsClosed(closed) {
 				markWorkerLogClosed(&current, runID)
 			}
@@ -361,16 +362,34 @@ func (r *Runner) Run(ctx context.Context) error {
 					if err := r.Store.Save(current); err != nil {
 						markerErr := fmt.Errorf("persist closed Worker log for Run %s: %w", runID, err)
 						var completedShutdownErr error
-						if !closed.GroupExited {
+						groupExited := closed.GroupExited
+						if !groupExited {
 							if abortErr := process.Abort(); abortErr != nil && !errors.Is(abortErr, os.ErrProcessDone) {
 								completedShutdownErr = errors.Join(completedShutdownErr, fmt.Errorf("abort completed issue #%d Worker: %w", completion.issue, abortErr))
 							}
 							reclosed := process.Close()
+							groupExited = reclosed.GroupExited
 							if reclosed.Err != nil && !errors.Is(reclosed.Err, context.Canceled) {
 								completedShutdownErr = errors.Join(completedShutdownErr, fmt.Errorf("close completed issue #%d Worker: %w", completion.issue, reclosed.Err))
 							}
-							if !reclosed.GroupExited {
+							if !groupExited {
 								completedShutdownErr = errors.Join(completedShutdownErr, fmt.Errorf("completed issue #%d Worker process group did not exit", completion.issue))
+							}
+						}
+						completedFailure := errors.Join(closed.Err, completedShutdownErr)
+						if completion.result.Settled {
+							if completedFailure == nil {
+								completedShutdownErr = errors.Join(completedShutdownErr, r.finalizeSettledWorker(ctx, &current, runID, nil, true))
+							} else {
+								completed := findRun(current.Runs, runID)
+								if completed.Status == scheduler.StatusMerged || completed.Status == scheduler.StatusWaitingForMerge {
+									r.retainProvisionalCompletion(&current, &completed, fmt.Sprintf("Pi RPC stream or process-group shutdown failed after settlement: %v", completedFailure))
+									if !groupExited {
+										completed.PID = completedRun.PID
+										completed.ProcessIdentity = completedRun.ProcessIdentity
+										replaceRun(&current, completed)
+									}
+								}
 							}
 						}
 						delete(localWorkers, completion.issue)

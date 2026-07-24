@@ -191,51 +191,80 @@ func TestRunnerClosesWorkerAndRetainsLeaseWhenCompletionSaveFails(t *testing.T) 
 	}
 }
 
-func TestRunnerShutsDownOtherWorkersWhenLogClosureSaveFails(t *testing.T) {
+func TestRunnerShutsDownWorkersWhenLogClosureSaveFails(t *testing.T) {
 	t.Parallel()
 
-	github := &fakeGitHub{candidates: []scheduler.Candidate{
-		{Number: 12, CreatedAt: time.Now()},
-		{Number: 13, CreatedAt: time.Now().Add(time.Second)},
-	}}
-	workers := newFakeWorkers()
-	workers.startupCloseResult = worker.Result{LogClosed: true}
-	workers.settledCloseLeavesGroup = true
-	workers.abortClosesProcessGroup = true
-	// Startup writes once, then each Worker writes its Lease, planned and
-	// prepared worktree, log paths, and process identity. The completed Run is
-	// save 12 and its log closure marker is save 13.
-	store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 13}
-	runner := testRunner(github, workers, store, 2)
-	done := make(chan error, 1)
-	go func() { done <- runner.Run(context.Background()) }()
+	tests := []struct {
+		name                    string
+		completedClose          worker.Result
+		abortClosesProcessGroup bool
+		wantStatus              scheduler.Status
+		wantPID                 int
+		wantAborts              int
+	}{
+		{
+			name: "completed process group exits after abort", completedClose: worker.Result{LogClosed: true},
+			abortClosesProcessGroup: true, wantStatus: scheduler.StatusMerged, wantAborts: 2,
+		},
+		{
+			name: "completed close reports an error", completedClose: worker.Result{LogClosed: true, GroupExited: true, Err: errors.New("close failed")},
+			wantStatus: scheduler.StatusNeedsHuman, wantAborts: 1,
+		},
+		{
+			name: "completed process group remains live", completedClose: worker.Result{LogClosed: true},
+			wantStatus: scheduler.StatusNeedsHuman, wantPID: 1012, wantAborts: 2,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			github := &fakeGitHub{candidates: []scheduler.Candidate{
+				{Number: 12, CreatedAt: time.Now()},
+				{Number: 13, CreatedAt: time.Now().Add(time.Second)},
+			}}
+			workers := newFakeWorkers()
+			workers.startupCloseResult = worker.Result{LogClosed: true, GroupExited: true}
+			workers.settledCloseLeavesGroup = true
+			workers.abortClosesProcessGroup = test.abortClosesProcessGroup
+			// Startup writes once, then each Worker writes its Lease, planned and
+			// prepared worktree, log paths, and process identity. The completed Run
+			// is save 12 and its log closure marker is save 13.
+			store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 13}
+			runner := testRunner(github, workers, store, 2)
+			done := make(chan error, 1)
+			go func() { done <- runner.Run(context.Background()) }()
 
-	workers.waitForStarts(t, 12, 13)
-	github.setCompletion(12, mergedOutcome(12))
-	workers.complete(12, worker.Result{ExitCode: 0})
+			workers.waitForStarts(t, 12, 13)
+			workers.setCloseResult(12, test.completedClose)
+			github.setCompletion(12, mergedOutcome(12))
+			workers.complete(12, worker.Result{ExitCode: 0})
 
-	select {
-	case err := <-done:
-		if err == nil || !strings.Contains(err.Error(), "persist closed Worker log") {
-			t.Fatalf("run error = %v, want Worker log closure persistence failure", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Runner did not shut down after Worker log closure persistence failed")
-	}
-	if got := workers.abortedCount(); got != 2 {
-		t.Fatalf("aborted Workers = %d, want completed and other owned Workers aborted", got)
-	}
-	if got := workers.runningCount(); got != 0 {
-		t.Fatalf("running Workers = %d, want all Workers closed", got)
-	}
-	got := store.LoadValue()
-	merged := findRun(got.Runs, "run-12")
-	failed := findRun(got.Runs, "run-13")
-	if merged.Status != scheduler.StatusMerged || merged.WorkerLogOpen {
-		t.Fatalf("completed Run after closure save failure = %#v", merged)
-	}
-	if failed.Status != scheduler.StatusFailed || failed.WorkerLogOpen || !strings.Contains(failed.Error, "log closure persistence failed") {
-		t.Fatalf("other Run after closure save failure = %#v", failed)
+			select {
+			case err := <-done:
+				if err == nil || !strings.Contains(err.Error(), "persist closed Worker log") {
+					t.Fatalf("run error = %v, want Worker log closure persistence failure", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("Runner did not shut down after Worker log closure persistence failed")
+			}
+			if got := workers.abortedCount(); got != test.wantAborts {
+				t.Fatalf("aborted Workers = %d, want %d", got, test.wantAborts)
+			}
+			if got := workers.runningCount(); got != 0 {
+				t.Fatalf("running Workers = %d, want all Workers closed", got)
+			}
+			got := store.LoadValue()
+			completed := findRun(got.Runs, "run-12")
+			failed := findRun(got.Runs, "run-13")
+			if completed.Status != test.wantStatus || completed.WorkerLogOpen || completed.PID != test.wantPID {
+				t.Fatalf("completed Run after closure save failure = %#v, want status %s and PID %d", completed, test.wantStatus, test.wantPID)
+			}
+			if test.wantStatus == scheduler.StatusNeedsHuman && (len(got.Leases) != 2 || completed.Error == "") {
+				t.Fatalf("unverified completed Run did not retain its Lease and diagnostic: %#v", got)
+			}
+			if failed.Status != scheduler.StatusFailed || failed.WorkerLogOpen || !strings.Contains(failed.Error, "log closure persistence failed") {
+				t.Fatalf("other Run after closure save failure = %#v", failed)
+			}
+		})
 	}
 }
 
