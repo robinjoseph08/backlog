@@ -24,6 +24,10 @@ _Avoid_: Claim, lock
 One isolated attempt to take an eligible candidate through the AFK workflow and verify its GitHub outcome.
 _Avoid_: Task, execution
 
+**Intervention-required Run**:
+An incomplete Run that retains its Lease because Backlog cannot safely continue or release ownership without human judgment.
+_Avoid_: Past failed Run, historical failure
+
 **Drain**:
 A runner shutdown phase that stops creating Leases while allowing every live Worker to finish before the runner exits.
 _Avoid_: Pause, cancellation
@@ -47,6 +51,18 @@ _Avoid_: Generic cleanup plan
 **Worker**:
 The live Pi process belonging to a run.
 _Avoid_: Agent, subagent
+
+**Subagent**:
+A subordinate autonomous executor launched by a Worker to perform part of its Run.
+_Avoid_: Worker, Run
+
+**Activity**:
+A semantically meaningful change from a Worker or Subagent that provides evidence a Run may be advancing. Cosmetic refreshes and mere liveness are not Activity.
+_Avoid_: Output, heartbeat
+
+**Follow**:
+Continuous read-only observation of one specific Run and its Activity.
+_Avoid_: Attach, control
 
 **Completion**:
 A GitHub-verified outcome in which the expected pull request is merged and the issue is closed when appropriate.
