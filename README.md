@@ -86,7 +86,9 @@ AFK repeats its own blocker check inside the worker as a final safety check.
 
 ## Worker behavior
 
-For issue `#123`, the runner starts Pi in RPC mode in the issue worktree using a deterministic session ID derived from the Run ID and a dedicated session directory under Backlog state. A start gate prevents Pi from opening the session or receiving the AFK prompt until the Worker PID and process-start identity are durable.
+For issue `#123`, the runner fetches the latest default branch before creating an isolated worktree. A failed fetch is attempted up to three times, with waits of one and two seconds between attempts. Shutdown cancellation interrupts those waits.
+
+The runner starts Pi in RPC mode in the issue worktree using a deterministic session ID derived from the Run ID and a dedicated session directory under Backlog state. A start gate prevents Pi from opening the session or receiving the AFK prompt until the Worker PID and process-start identity are durable.
 
 Backlog submits `/skill:afk 123` as a correlated RPC `prompt` command. Standard output uses strict LF-delimited JSONL and is saved separately from standard error. Malformed or truncated records, mismatched or duplicate responses, and invalid lifecycle ordering fail closed and preserve the worktree.
 

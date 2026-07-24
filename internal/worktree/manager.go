@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 type Assignment struct {
@@ -20,7 +21,11 @@ type Manager struct {
 	RepositoryDir string
 	WorktreesDir  string
 	DefaultBranch string
+
+	fetchRetryDelay func(attempt int) time.Duration
 }
+
+const fetchMaxAttempts = 3
 
 var unsafeRunID = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 
@@ -48,7 +53,7 @@ func (m Manager) Prepare(ctx context.Context, assignment Assignment) error {
 	if err := os.MkdirAll(m.WorktreesDir, 0o700); err != nil {
 		return fmt.Errorf("create worktree directory: %w", err)
 	}
-	if err := m.git(ctx, "-C", m.RepositoryDir, "fetch", "origin", m.DefaultBranch); err != nil {
+	if err := m.fetchBase(ctx); err != nil {
 		return fmt.Errorf("fetch base branch: %w", err)
 	}
 	if err := m.git(ctx, "-C", m.RepositoryDir, "worktree", "add", "-b", assignment.Branch,
@@ -106,6 +111,45 @@ func (m Manager) branchExists(ctx context.Context, branch string) (bool, error) 
 func (m Manager) Exists(assignment Assignment) bool {
 	info, err := os.Stat(assignment.Path)
 	return err == nil && info.IsDir()
+}
+
+func (m Manager) fetchBase(ctx context.Context) error {
+	var fetchErr error
+	for attempt := 1; attempt <= fetchMaxAttempts; attempt++ {
+		fetchErr = m.git(ctx, "-C", m.RepositoryDir, "fetch", "origin", m.DefaultBranch)
+		if fetchErr == nil {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if attempt == fetchMaxAttempts {
+			break
+		}
+		delay := defaultFetchRetryDelay(attempt)
+		if m.fetchRetryDelay != nil {
+			delay = m.fetchRetryDelay(attempt)
+		}
+		if err := waitForFetchAttempt(ctx, delay); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("after %d attempts: %w", fetchMaxAttempts, fetchErr)
+}
+
+func defaultFetchRetryDelay(attempt int) time.Duration {
+	return time.Second << (attempt - 1)
+}
+
+func waitForFetchAttempt(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (m Manager) git(ctx context.Context, args ...string) error {
