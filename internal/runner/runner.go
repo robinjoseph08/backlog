@@ -1223,7 +1223,7 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 	closeProcess := func(issue int, process WorkerProcess) {
 		go func() {
 			result := process.CloseContext(ctx, r.authorizeSuspensionKill(runIDs[issue], process))
-			if result.GroupExited && !result.ForceStopped {
+			if result.GroupExited && !result.ForceStopped && ctx.Err() == nil {
 				forceStopRemaining.Add(-1)
 			}
 			closeResults <- suspensionCloseResult{issue: issue, result: result}
