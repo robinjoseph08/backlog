@@ -64,6 +64,7 @@ type Run struct {
 	SessionID       string                `json:"sessionId,omitempty"`
 	SessionDir      string                `json:"sessionDir,omitempty"`
 	Continuation    *ContinuationBoundary `json:"continuation,omitempty"`
+	ResumePending   bool                  `json:"resumePending,omitempty"`
 	LogPath         string                `json:"logPath,omitempty"`
 	StderrPath      string                `json:"stderrPath,omitempty"`
 	PullRequest     string                `json:"pullRequest,omitempty"`

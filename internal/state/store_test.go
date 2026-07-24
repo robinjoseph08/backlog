@@ -386,13 +386,18 @@ func TestFileStorePersistsOnlyVerifiedStoppedSuspension(t *testing.T) {
 			Worktree: filepath.Join(root, "worktree"), LeafID: "leaf", EntryCount: 3, SHA256: strings.Repeat("a", 64), VerifiedAt: verifiedAt,
 		},
 	}
+	run.ResumePending = true
 	value := State{Version: CurrentVersion, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: "run-8", Issue: 8, RunID: "run-8"}}}
 	if err := store.Save(value); err != nil {
 		t.Fatalf("save suspended Run: %v", err)
 	}
 	got, err := store.Load()
-	if err != nil || got.Runs[0].Continuation == nil || got.Runs[0].Continuation.LeafID != "leaf" || len(got.Leases) != 1 {
+	if err != nil || got.Runs[0].Continuation == nil || got.Runs[0].Continuation.LeafID != "leaf" || !got.Runs[0].ResumePending || len(got.Leases) != 1 {
 		t.Fatalf("loaded suspension = %#v, err = %v", got, err)
+	}
+	got.Runs[0].Status = scheduler.StatusNeedsHuman
+	if err := store.Save(got); err != nil {
+		t.Fatalf("save interrupted pending Resume as needs-human: %v", err)
 	}
 
 	invalid := value

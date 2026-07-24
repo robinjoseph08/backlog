@@ -427,6 +427,15 @@ func TestResetDryRunRefusesLiveWorker(t *testing.T) {
 	}
 }
 
+func TestResetInspectionRefusesPendingReplacementWorker(t *testing.T) {
+	t.Parallel()
+
+	run := scheduler.Run{Issue: 1, RunID: "pending", ResumePending: true}
+	if err := inspectWorkerAbsent(run); err == nil || !strings.Contains(err.Error(), "absence is uncertain") {
+		t.Fatalf("pending replacement Worker error = %v", err)
+	}
+}
+
 func TestResetInspectionAcceptsRetainedIdentityAfterWorkerExit(t *testing.T) {
 	t.Parallel()
 

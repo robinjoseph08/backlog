@@ -48,7 +48,7 @@ case "$*" in
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/32/comments?per_page=100 --paginate --slurp"|\
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/32/dependencies/blocked_by?per_page=100 --paginate --slurp")
     printf '%s\n' '[[]]' ;;
-  "pr list --repo acme/widgets --state all --head agent/issue-31-"*" --json number,url,state,mergedAt,autoMergeRequest,isDraft")
+  "pr list --repo acme/widgets --state all --head acme:agent/issue-31-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
     printf '%s\n' '[]' ;;
   "issue view 31 --repo acme/widgets --json state,title,url")
     printf '%s\n' '{"state":"OPEN","title":"First","url":"https://example.test/issues/31"}' ;;
@@ -219,12 +219,13 @@ case "$*" in
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/92/comments?per_page=100 --paginate --slurp"|\
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/92/dependencies/blocked_by?per_page=100 --paginate --slurp") printf '%s\n' '[[]]' ;;
   "issue view 91 --repo acme/widgets --json state,labels") printf '%s\n' '{"state":"OPEN","labels":[{"name":"in-progress"},{"name":"spec"}]}' ;;
-  "pr list --repo acme/widgets --state all --head agent/issue-91-run-91 --json number,url,state,mergedAt,autoMergeRequest,isDraft")
-    if test -f `+quote(resumedDone)+`; then printf '%s\n' '[{"number":191,"url":"https://example.test/pull/191","state":"MERGED","mergedAt":"2026-01-01T00:00:00Z"}]'; else printf '%s\n' '[]'; fi ;;
+  "pr list --repo acme/widgets --state all --head acme:agent/issue-91-run-91 --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+    if test -f `+quote(resumedDone)+`; then printf '%s\n' '[{"number":191,"url":"https://github.com/acme/widgets/pull/191","state":"MERGED","mergedAt":"2026-01-01T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-91-run-91","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]'; else printf '%s\n' '[]'; fi ;;
   "issue view 91 --repo acme/widgets --json state,title,url")
     if test -f `+quote(resumedDone)+`; then printf '%s\n' '{"state":"CLOSED"}'; else printf '%s\n' '{"state":"OPEN"}'; fi ;;
-  "pr list --repo acme/widgets --state all --head agent/issue-92-"*" --json number,url,state,mergedAt,autoMergeRequest,isDraft")
-    printf '%s\n' '[{"number":192,"url":"https://example.test/pull/192","state":"MERGED","mergedAt":"2026-01-01T00:00:00Z"}]' ;;
+  "pr list --repo acme/widgets --state all --head acme:agent/issue-92-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+    head=${8#acme:}
+    printf '[{"number":192,"url":"https://github.com/acme/widgets/pull/192","state":"MERGED","mergedAt":"2026-01-01T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"%s","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]\n' "$head" ;;
   "issue view 92 --repo acme/widgets --json state,title,url") touch `+quote(candidateDone)+`; printf '%s\n' '{"state":"CLOSED"}' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
@@ -311,7 +312,7 @@ case "$*" in
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/33/comments?per_page=100 --paginate --slurp"|\
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/33/dependencies/blocked_by?per_page=100 --paginate --slurp")
     printf '%s\n' '[[]]' ;;
-  "pr list --repo acme/widgets --state all --head agent/issue-33-"*" --json number,url,state,mergedAt,autoMergeRequest,isDraft")
+  "pr list --repo acme/widgets --state all --head acme:agent/issue-33-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
     printf '%s\n' '[]' ;;
   "issue view 33 --repo acme/widgets --json state,title,url")
     printf '%s\n' '{"state":"OPEN","title":"Terminate","url":"https://example.test/issues/33"}' ;;
@@ -434,9 +435,10 @@ case "$*" in
     printf '%s\n' '{"number":5,"title":"RPC","body":"","state":"OPEN","url":"https://example.test/issues/5","createdAt":"2026-01-01T00:00:00Z"}' ;;
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/5/comments?per_page=100 --paginate --slurp") printf '%s\n' '[[]]' ;;
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/5/dependencies/blocked_by?per_page=100 --paginate --slurp") printf '%s\n' '[[]]' ;;
-  "pr list --repo acme/widgets --state all --head agent/issue-5-"*" --json number,url,state,mergedAt,autoMergeRequest,isDraft")
+  "pr list --repo acme/widgets --state all --head acme:agent/issue-5-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
     test -f `+quote(piAlive)+`
-    printf '%s\n' '[{"number":5,"url":"https://example.test/pull/5","state":"MERGED","mergedAt":"2026-07-22T00:00:00Z"}]' ;;
+    head=${8#acme:}
+    printf '[{"number":5,"url":"https://github.com/acme/widgets/pull/5","state":"MERGED","mergedAt":"2026-07-22T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"%s","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]\n' "$head" ;;
   "issue view 5 --repo acme/widgets --json state,title,url")
     test -f `+quote(piAlive)+`
     touch `+quote(reconciledAlive)+` `+quote(finished)+`
@@ -650,8 +652,8 @@ set -eu
 case "$*" in
   "repo view --json nameWithOwner,defaultBranchRef")
     printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
-  "pr list --repo acme/widgets --state all --head agent/issue-42-legacy-running --json number,url,state,mergedAt,autoMergeRequest,isDraft")
-    printf '%s\n' '[{"number":42,"url":"https://example.test/pull/42","state":"MERGED","mergedAt":"2026-07-03T00:00:00Z"}]' ;;
+  "pr list --repo acme/widgets --state all --head acme:agent/issue-42-legacy-running --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+    printf '%s\n' '[{"number":42,"url":"https://github.com/acme/widgets/pull/42","state":"MERGED","mergedAt":"2026-07-03T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-42-legacy-running","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
   "issue view 42 --repo acme/widgets --json state,title,url")
     printf '%s\n' '{"state":"CLOSED","title":"Migrated","url":"https://example.test/issues/42"}' ;;
   "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
@@ -690,7 +692,7 @@ esac
 	reconciled := final.Runs[1]
 	if reconciled.RunID != "legacy-running" || reconciled.Status != scheduler.StatusMerged || reconciled.WorkerMode != scheduler.WorkerModePrint ||
 		reconciled.Branch != "agent/issue-42-legacy-running" || reconciled.Worktree != worktreePath || reconciled.SessionName != "afk #42" ||
-		reconciled.LogPath != "/retained/legacy.jsonl" || reconciled.StderrPath != "/retained/legacy.stderr.log" || reconciled.PullRequest != "https://example.test/pull/42" {
+		reconciled.LogPath != "/retained/legacy.jsonl" || reconciled.StderrPath != "/retained/legacy.stderr.log" || reconciled.PullRequest != "https://github.com/acme/widgets/pull/42" {
 		t.Fatalf("startup reconciliation lost migrated artifacts: %#v", reconciled)
 	}
 }

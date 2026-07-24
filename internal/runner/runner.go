@@ -681,6 +681,15 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("verify GitHub Completion before Resume: %v", err))
 	}
 	if outcome.Merged || (outcome.PRFound && outcome.AutoMergeArmed) {
+		if outcome.Merged {
+			assignment := worktree.Assignment{Path: run.Worktree, Branch: run.Branch}
+			if err := r.Worktrees.Verify(operationCtx, assignment); err != nil {
+				if operationCtx.Err() != nil {
+					return nil, operationCtx.Err()
+				}
+				return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("verify retained branch and worktree before Completion cleanup: %v", err))
+			}
+		}
 		if err := r.applyOutcome(operationCtx, current, run, outcome, true, true); err != nil {
 			return nil, err
 		}
@@ -717,27 +726,38 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("verify retained branch and worktree before Resume: %v", err))
 	}
 	boundary := run.Continuation
+	run.ResumePending = true
+	run.UpdatedAt = r.Now().UTC()
+	replaceRun(current, run)
+	if err := r.Store.Save(*current); err != nil {
+		return nil, fmt.Errorf("persist pending replacement Worker before Resume for issue #%d: %w", run.Issue, err)
+	}
 	process, err := r.Workers.Start(workerCtx, worker.Request{
 		Issue: run.Issue, RunID: run.RunID, Worktree: run.Worktree, SessionName: run.SessionName,
 		SessionID: run.SessionID, SessionDir: run.SessionDir, SessionFile: boundary.SessionFile, Resume: true,
 	})
 	if err != nil {
+		run = findActiveRun(current, run.Issue)
+		run.ResumePending = false
+		replaceRun(current, run)
 		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("start replacement Pi Worker: %v", err))
 	}
 	identity, err := r.PIDIdentity(process.PID())
 	if err != nil {
 		_ = process.Abort()
 		closed := process.Close()
+		run = findActiveRun(current, run.Issue)
+		run.ResumePending = false
 		if !closed.GroupExited {
-			run = findActiveRun(current, run.Issue)
 			run.PID = process.PID()
 			run.ProcessIdentity = ""
-			replaceRun(current, run)
 		}
+		replaceRun(current, run)
 		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("record replacement Pi Worker identity: %v; close: %v", err, closed.Err))
 	}
 	now := r.Now().UTC()
 	transitionStatus(&run, scheduler.StatusRunning)
+	run.ResumePending = false
 	run.PID = process.PID()
 	run.ProcessIdentity = identity
 	run.StartedAt = now
@@ -911,7 +931,7 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 					continue
 				}
 				if r.Now().Sub(run.StartedAt) > r.Config.MaxWorkerAge {
-					r.needsHuman(current, run.Issue, "recorded worker exceeded the maximum age; verify process identity before retrying")
+					r.needsHumanWithLiveWorker(current, run.Issue, "recorded worker exceeded the maximum age; verify process identity before retrying")
 					changed = true
 					continue
 				}
@@ -960,6 +980,11 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 				return ctx.Err()
 			}
 			r.needsHuman(current, run.Issue, fmt.Sprintf("reconcile GitHub outcome: %v", err))
+			changed = true
+			continue
+		}
+		if run.ResumePending {
+			r.needsHuman(current, run.Issue, "replacement Worker launch was interrupted before its process identity became durable")
 			changed = true
 			continue
 		}
@@ -1455,7 +1480,7 @@ func removeLease(current *state.State, runID string) {
 func nextSuspendedRun(current *state.State) scheduler.Run {
 	for _, lease := range current.Leases {
 		run := findRun(current.Runs, lease.RunID)
-		if run.Status == scheduler.StatusSuspended {
+		if run.Status == scheduler.StatusSuspended && !run.ResumePending {
 			return run
 		}
 	}
