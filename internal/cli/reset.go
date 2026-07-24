@@ -432,7 +432,7 @@ func (e resetExecutor) apply(ctx context.Context, approved reset.Plan) error {
 			return err
 		}
 
-		pull, hasOpenPull := firstOpenPullRequest(plan.Snapshot.PullRequests)
+		pull, hasOpenPull := reset.NextPullRequestForReset(plan.Snapshot)
 		labels := normalizedLabelSet(plan.Snapshot.Issue.Labels)
 		needsProgress := hasOpenPull || plan.Snapshot.RemoteBranch.Present || labels["in-progress"] || !labels["ready-for-agent"]
 		if plan.Snapshot.Run.Status == scheduler.StatusWaitingForMerge && (!hasOpenPull || !pull.AutoMergeArmed) {
@@ -640,20 +640,6 @@ func verifyGitHubIdentityContinuity(expected, actual reset.Snapshot) error {
 		return fmt.Errorf("owned remote branch name changed while resetting Run %s", expected.Run.RunID)
 	}
 	return nil
-}
-
-func firstOpenPullRequest(pulls []reset.PullRequest) (reset.PullRequest, bool) {
-	result := reset.PullRequest{}
-	found := false
-	for _, pull := range pulls {
-		if pull.State != reset.PullRequestOpen {
-			continue
-		}
-		if !found || (pull.AutoMergeArmed && !result.AutoMergeArmed) || (pull.AutoMergeArmed == result.AutoMergeArmed && pull.Number < result.Number) {
-			result, found = pull, true
-		}
-	}
-	return result, found
 }
 
 func pullRequestByNumber(pulls []reset.PullRequest, number int) (reset.PullRequest, bool) {

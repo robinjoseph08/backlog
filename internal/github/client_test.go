@@ -247,6 +247,12 @@ func TestClientResetInspectionRefusesSameOwnerForkAndUnknownFields(t *testing.T)
 			want:  "unknown auto-merge state",
 		},
 		{
+			name:  "draft with auto merge request",
+			issue: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[]}`,
+			pull:  `[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"OPEN","mergedAt":null,"autoMergeRequest":{"mergeMethod":"SQUASH"},"isDraft":true,"headRefName":"agent/issue-42-run","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]`,
+			want:  "unknown auto-merge state",
+		},
+		{
 			name:  "missing merged state",
 			issue: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[]}`,
 			pull:  `[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"OPEN","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-42-run","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]`,

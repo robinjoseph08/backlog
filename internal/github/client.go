@@ -404,10 +404,10 @@ func resetAutoMergeState(raw json.RawMessage, isDraft *bool) (bool, error) {
 		return false, nil
 	}
 	var request map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &request); err != nil || request == nil {
+	if err := json.Unmarshal(raw, &request); err != nil || request == nil || *isDraft {
 		return false, errors.New("gh returned unknown auto-merge state")
 	}
-	return !*isDraft, nil
+	return true, nil
 }
 
 // DisablePullRequestAutoMerge disarms one freshly verified pull request.

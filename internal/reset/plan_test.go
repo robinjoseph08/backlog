@@ -38,6 +38,34 @@ func TestBuildTailorsOrderedResetActions(t *testing.T) {
 	}
 }
 
+func TestBuildOrdersWaitingForMergeRecordedPullRequestBeforeOtherBranchPullRequests(t *testing.T) {
+	snapshot := minimalSnapshot([]string{"ready-for-agent"})
+	snapshot.Run.Status = scheduler.StatusWaitingForMerge
+	snapshot.Run.Branch = "agent/issue-42-run-42"
+	snapshot.Run.PullRequest = "https://github.com/acme/widgets/pull/8"
+	snapshot.PullRequests = []PullRequest{
+		{Number: 7, URL: "https://github.com/acme/widgets/pull/7", Branch: snapshot.Run.Branch, Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", State: PullRequestOpen, AutoMergeArmed: true},
+		{Number: 8, URL: snapshot.Run.PullRequest, Branch: snapshot.Run.Branch, Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", State: PullRequestOpen, AutoMergeArmed: true},
+	}
+
+	plan, err := Build(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"disable auto-merge for pull request #8 (https://github.com/acme/widgets/pull/8)",
+		"disable auto-merge for pull request #7 (https://github.com/acme/widgets/pull/7)",
+		"explain Reset on pull request #7 (https://github.com/acme/widgets/pull/7)",
+		"close unmerged pull request #7 (https://github.com/acme/widgets/pull/7)",
+		"explain Reset on pull request #8 (https://github.com/acme/widgets/pull/8)",
+		"close unmerged pull request #8 (https://github.com/acme/widgets/pull/8)",
+		"mark Run run-42 reset and release Lease lease-42",
+	}
+	if strings.Join(plan.Actions, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("actions =\n%s\nwant =\n%s", strings.Join(plan.Actions, "\n"), strings.Join(want, "\n"))
+	}
+}
+
 func TestBuildOmitsAlreadySatisfiedActionsForEveryManagedLabelCombination(t *testing.T) {
 	tests := []struct {
 		name   string
