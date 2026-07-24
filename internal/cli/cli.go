@@ -275,7 +275,11 @@ func statusCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 	fmt.Fprintf(stdout, "Runs: %d\n", len(current.Runs))
 	fmt.Fprintf(stdout, "Active Leases: %d\n", len(current.Leases))
 	for _, run := range current.Runs {
-		fmt.Fprintf(stdout, "  #%d  %-17s  %s", run.Issue, run.Status, run.Branch)
+		issue := fmt.Sprintf("#%d", run.Issue)
+		if run.IssueTitle != "" {
+			issue += "  " + run.IssueTitle
+		}
+		fmt.Fprintf(stdout, "  %s  %-17s  %s", issue, run.Status, run.Branch)
 		if run.Error != "" {
 			fmt.Fprintf(stdout, "  (%s)", run.Error)
 		}

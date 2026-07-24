@@ -53,6 +53,8 @@ type ContinuationBoundary struct {
 
 type Run struct {
 	Issue           int                   `json:"issue"`
+	IssueTitle      string                `json:"issueTitle,omitempty"`
+	IssueURL        string                `json:"issueUrl,omitempty"`
 	RunID           string                `json:"runId"`
 	Status          Status                `json:"status"`
 	WorkerMode      WorkerMode            `json:"workerMode"`

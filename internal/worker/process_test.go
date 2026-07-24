@@ -82,6 +82,10 @@ echo 'diagnostic' >&2
 	if process.PID() <= 0 {
 		t.Fatalf("pid = %d, want positive", process.PID())
 	}
+	logPath, stderrPath := process.LogPaths()
+	if logPath != filepath.Join(root, "logs", "run-42.jsonl") || stderrPath != filepath.Join(root, "logs", "run-42.stderr.log") {
+		t.Fatalf("startup log identities = %q/%q", logPath, stderrPath)
+	}
 	if got := process.command.Args[3]; got != "backlog-gate" {
 		t.Fatalf("wrapper process name = %q, want backlog-gate", got)
 	}
@@ -594,8 +598,8 @@ func TestCloseContextPreservesNaturalExitBetweenAuthorizationAndSignal(t *testin
 	root := t.TempDir()
 	pi := fakePi(t, `
 IFS= read -r command
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 trap 'exit 7' TERM
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 while :; do sleep 1; done
 `)
 	process, err := (Supervisor{
