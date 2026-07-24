@@ -457,7 +457,6 @@ func (r *Runner) suspensionContext() (context.Context, context.CancelFunc) {
 
 func (r *Runner) handleSignal(event signalEvent, workers int) bool {
 	if event.forceStop {
-		r.logf("Force stop: additional %s accepted; force stopping remaining verified Worker groups", event.signal)
 		return true
 	}
 	if event.signal == syscall.SIGTERM {
@@ -981,6 +980,15 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 	r.logf("Suspension: establishing continuation boundaries for %s; one %s deadline; next SIGINT will force stop remaining verified Worker groups", workerSummary(len(local)), r.Config.SuspensionTimeout)
 
 	workerCount := len(local)
+	go func() {
+		<-ctx.Done()
+		switch {
+		case r.forceStopRequested.Load():
+			r.logf("Force stop: additional signal accepted; force stopping %s after identity revalidation; next SIGINT will repeat the force-stop request", workerSummary(workerCount))
+		case errors.Is(ctx.Err(), context.DeadlineExceeded):
+			r.logf("Force stop: suspension deadline expired; force stopping %s after identity revalidation; next SIGINT will repeat the force-stop request", workerSummary(workerCount))
+		}
+	}()
 	boundaries := make(chan suspensionBoundaryResult, workerCount)
 	runIDs := make(map[int]string, workerCount)
 	for issue, process := range local {
@@ -1157,16 +1165,23 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 			}
 			replaceRun(current, run)
 		}
-		if err := r.Store.Save(*current); err != nil {
-			clean = false
-			persistenceErrors = append(persistenceErrors, fmt.Errorf("persist suspended issue #%d: %w", closed.issue, err))
-		} else if closed.result.GroupExited && run.Status == scheduler.StatusMerged {
-			if err := r.finalizeSettledWorker(ctx, current, run.RunID, nil, true); err != nil {
+		if closed.result.GroupExited && run.Status == scheduler.StatusMerged {
+			// Force escalation cancels the shared suspension context. Cleanup gets
+			// a fresh bounded context and completes before merged state becomes
+			// durable, so cancellation cannot overwrite a terminal outcome.
+			cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), r.Config.SuspensionTimeout)
+			err := r.finalizeSettledWorker(cleanupCtx, current, run.RunID, nil, true)
+			cancelCleanup()
+			if err != nil {
 				clean = false
 				persistenceErrors = append(persistenceErrors, err)
 			} else if findRun(current.Runs, run.RunID).Status != scheduler.StatusMerged {
 				clean = false
 			}
+		}
+		if err := r.Store.Save(*current); err != nil {
+			clean = false
+			persistenceErrors = append(persistenceErrors, fmt.Errorf("persist suspended issue #%d: %w", closed.issue, err))
 		}
 		r.logf("Suspension: %s remaining", workerSummary(len(local)))
 	}

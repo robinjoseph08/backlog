@@ -1464,6 +1464,7 @@ func TestRunnerThirdSIGINTAndTimeoutUseTheSameVerifiedForceStopPath(t *testing.T
 		timeout   time.Duration
 		exitCode  int
 		immediate bool
+		forceLog  string
 	}{
 		{
 			name: "third SIGINT",
@@ -1474,6 +1475,7 @@ func TestRunnerThirdSIGINTAndTimeoutUseTheSameVerifiedForceStopPath(t *testing.T
 				signals <- os.Interrupt
 			},
 			timeout: 5 * time.Second, exitCode: 130, immediate: true,
+			forceLog: "Force stop: additional signal accepted; force stopping 1 Worker after identity revalidation; next SIGINT will repeat the force-stop request",
 		},
 		{
 			name: "SIGTERM followed by force SIGINT",
@@ -1483,6 +1485,7 @@ func TestRunnerThirdSIGINTAndTimeoutUseTheSameVerifiedForceStopPath(t *testing.T
 				signals <- os.Interrupt
 			},
 			timeout: 5 * time.Second, exitCode: 143, immediate: true,
+			forceLog: "Force stop: additional signal accepted; force stopping 1 Worker after identity revalidation; next SIGINT will repeat the force-stop request",
 		},
 		{
 			name: "suspension timeout",
@@ -1490,6 +1493,7 @@ func TestRunnerThirdSIGINTAndTimeoutUseTheSameVerifiedForceStopPath(t *testing.T
 				signals <- syscall.SIGTERM
 			},
 			timeout: 30 * time.Millisecond, exitCode: 143,
+			forceLog: "Force stop: suspension deadline expired; force stopping 1 Worker after identity revalidation; next SIGINT will repeat the force-stop request",
 		},
 	}
 	for index, test := range tests {
@@ -1504,6 +1508,8 @@ func TestRunnerThirdSIGINTAndTimeoutUseTheSameVerifiedForceStopPath(t *testing.T
 			runner := testRunner(github, workers, store, 1)
 			runner.Config.SuspensionTimeout = test.timeout
 			runner.Signals = signals
+			output := newSynchronizedOutput()
+			runner.Output = output
 			var processCheckMu sync.Mutex
 			identityChecks := 0
 			livenessChecks := 0
@@ -1529,6 +1535,7 @@ func TestRunnerThirdSIGINTAndTimeoutUseTheSameVerifiedForceStopPath(t *testing.T
 			if !isSignalExit(err, test.exitCode) {
 				t.Fatalf("run: %v, want signal exit %d", err, test.exitCode)
 			}
+			output.waitFor(t, test.forceLog)
 			if test.immediate && time.Since(started) > time.Second {
 				t.Fatalf("force signal did not bypass suspension deadline: %s", time.Since(started))
 			}
@@ -1601,6 +1608,42 @@ func TestRunnerForceEscalationPreservesDurableTerminalOutcomes(t *testing.T) {
 				t.Fatalf("authorized force stops = %d, want 0 for terminal Run", got)
 			}
 		})
+	}
+}
+
+func TestRunnerForceEscalationCleansBeforePersistingNewMergedOutcome(t *testing.T) {
+	const issue = 73
+	github := &fakeGitHub{
+		candidates:  []scheduler.Candidate{{Number: issue, CreatedAt: time.Now()}},
+		completions: map[int]ghadapter.CompletionOutcome{issue: mergedOutcome(issue)},
+	}
+	workers := newFakeWorkers()
+	workers.authorizeClose = true
+	workers.waitForForce = true
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	signals := make(chan os.Signal, 3)
+	runner := testRunner(github, workers, store, 1)
+	runner.Config.SuspensionTimeout = 5 * time.Second
+	runner.Signals = signals
+	worktrees := &liveContextWorktrees{}
+	runner.Worktrees = worktrees
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, issue)
+	signals <- os.Interrupt
+	signals <- os.Interrupt
+	<-workers.closeContextStarted
+	signals <- os.Interrupt
+	if err := <-done; !isSignalExit(err, 130) {
+		t.Fatalf("run: %v, want signal exit 130", err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusMerged || got.Runs[0].CompletedAt == nil || len(got.Leases) != 0 {
+		t.Fatalf("merged Run after force escalation = %#v", got)
+	}
+	if got := worktrees.cleanupCount(); got != 1 {
+		t.Fatalf("worktree cleanup count = %d, want 1", got)
 	}
 }
 
@@ -2217,6 +2260,17 @@ type blockingWorktrees struct {
 type blockingCleanupWorktrees struct {
 	fakeWorktrees
 	cleanupStarted chan struct{}
+}
+
+type liveContextWorktrees struct {
+	fakeWorktrees
+}
+
+func (w *liveContextWorktrees) Cleanup(ctx context.Context, assignment worktree.Assignment) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("cleanup started with canceled context: %w", err)
+	}
+	return w.fakeWorktrees.Cleanup(ctx, assignment)
 }
 
 func (w *blockingCleanupWorktrees) Cleanup(ctx context.Context, _ worktree.Assignment) error {
