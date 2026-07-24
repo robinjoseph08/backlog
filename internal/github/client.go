@@ -27,6 +27,21 @@ type CompletionOutcome struct {
 	AutoMergeArmed bool
 }
 
+type ResetIssue struct {
+	Number int
+	URL    string
+	State  string
+	Labels []string
+}
+
+type ResetPullRequest struct {
+	Number         int
+	URL            string
+	State          string
+	Merged         bool
+	AutoMergeArmed bool
+}
+
 type Client struct {
 	Executable string
 	Dir        string
@@ -203,6 +218,76 @@ func (c Client) resolveReference(ctx context.Context, currentRepo string, refere
 		blocker.Owner, blocker.Repo = parts[0], parts[1]
 	}
 	return blocker, strings.EqualFold(issue.State, "open"), nil
+}
+
+// ResetResources reads the issue and every pull request for the exact owned
+// branch. Incomplete or mismatched identities fail closed.
+func (c Client) ResetResources(ctx context.Context, repo string, issueNumber int, branch string) (ResetIssue, []ResetPullRequest, error) {
+	var issue struct {
+		Number int    `json:"number"`
+		URL    string `json:"url"`
+		State  string `json:"state"`
+		Labels []struct {
+			Name string `json:"name"`
+		} `json:"labels"`
+	}
+	if err := c.jsonCommand(ctx, &issue, "issue", "view", fmt.Sprint(issueNumber), "--repo", repo,
+		"--json", "number,url,state,labels"); err != nil {
+		return ResetIssue{}, nil, fmt.Errorf("inspect Reset issue: %w", err)
+	}
+	if issue.Number != issueNumber || issue.URL == "" || (!strings.EqualFold(issue.State, "open") && !strings.EqualFold(issue.State, "closed")) {
+		return ResetIssue{}, nil, fmt.Errorf("inspect Reset issue: gh returned incomplete or unknown issue identity/state")
+	}
+	resultIssue := ResetIssue{Number: issue.Number, URL: issue.URL, State: strings.ToLower(issue.State)}
+	for _, label := range issue.Labels {
+		if label.Name == "" {
+			return ResetIssue{}, nil, fmt.Errorf("inspect Reset issue: gh returned a label without identity")
+		}
+		resultIssue.Labels = append(resultIssue.Labels, label.Name)
+	}
+
+	if branch == "" {
+		return resultIssue, nil, nil
+	}
+	parts := strings.SplitN(repo, "/", 2)
+	if len(parts) != 2 || parts[0] == "" {
+		return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull requests: invalid repository %q", repo)
+	}
+	var pulls []struct {
+		Number           int             `json:"number"`
+		URL              string          `json:"url"`
+		State            string          `json:"state"`
+		MergedAt         *time.Time      `json:"mergedAt"`
+		AutoMergeRequest json.RawMessage `json:"autoMergeRequest"`
+		IsDraft          bool            `json:"isDraft"`
+		HeadRefName      string          `json:"headRefName"`
+		HeadOwner        struct {
+			Login string `json:"login"`
+		} `json:"headRepositoryOwner"`
+	}
+	if err := c.jsonCommand(ctx, &pulls, "pr", "list", "--repo", repo, "--state", "all", "--head", branch,
+		"--json", "number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner"); err != nil {
+		return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull requests: %w", err)
+	}
+	resultPulls := make([]ResetPullRequest, 0, len(pulls))
+	for _, pull := range pulls {
+		if pull.Number <= 0 || pull.URL == "" || pull.HeadRefName != branch || !strings.EqualFold(pull.HeadOwner.Login, parts[0]) {
+			return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull requests: gh returned incomplete or mismatched pull request identity")
+		}
+		state := strings.ToLower(pull.State)
+		if state != "open" && state != "closed" && state != "merged" {
+			return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull request #%d: unknown state %q", pull.Number, pull.State)
+		}
+		merged := pull.MergedAt != nil || state == "merged"
+		if merged {
+			state = "merged"
+		}
+		resultPulls = append(resultPulls, ResetPullRequest{
+			Number: pull.Number, URL: pull.URL, State: state, Merged: merged,
+			AutoMergeArmed: !pull.IsDraft && len(pull.AutoMergeRequest) > 0 && string(pull.AutoMergeRequest) != "null",
+		})
+	}
+	return resultIssue, resultPulls, nil
 }
 
 func (c Client) Completion(ctx context.Context, repo string, issue int, branch string) (CompletionOutcome, error) {

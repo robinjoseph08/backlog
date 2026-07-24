@@ -349,16 +349,48 @@ func AcquireLock(path string) (*Lock, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open repository lock: %w", err)
 	}
+	lock, err := acquireOpenFileLock(file)
+	if err != nil {
+		return nil, err
+	}
+	if err := file.Truncate(0); err == nil {
+		_, _ = fmt.Fprintf(file, "%d\n", os.Getpid())
+		_ = file.Sync()
+	}
+	return lock, nil
+}
+
+// AcquireReadOnlyLock coordinates through an existing file or directory
+// without creating, truncating, or otherwise changing it.
+func AcquireReadOnlyLock(path string) (*Lock, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open read-only repository lock: %w", err)
+	}
+	return acquireOpenFileLock(file)
+}
+
+// AcquireExistingReadOnlyLock is the optional-file form used to interoperate
+// with older lock files while preserving a mutation-free inspection.
+func AcquireExistingReadOnlyLock(path string) (*Lock, bool, error) {
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("open existing repository lock: %w", err)
+	}
+	lock, err := acquireOpenFileLock(file)
+	return lock, true, err
+}
+
+func acquireOpenFileLock(file *os.File) (*Lock, error) {
 	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		file.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) {
 			return nil, errors.New("repository runner already active")
 		}
 		return nil, fmt.Errorf("acquire repository lock: %w", err)
-	}
-	if err := file.Truncate(0); err == nil {
-		_, _ = fmt.Fprintf(file, "%d\n", os.Getpid())
-		_ = file.Sync()
 	}
 	return &Lock{file: file, held: true}, nil
 }

@@ -1,0 +1,623 @@
+package cli
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"syscall"
+
+	ghadapter "github.com/robinjoseph08/backlog/internal/github"
+	"github.com/robinjoseph08/backlog/internal/reset"
+	"github.com/robinjoseph08/backlog/internal/scheduler"
+	"github.com/robinjoseph08/backlog/internal/state"
+	"github.com/robinjoseph08/backlog/internal/worktree"
+)
+
+func resetCommand(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("reset", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	repoDir := flags.String("repo-dir", ".", "Git repository associated with the Run")
+	stateDir := flags.String("state-dir", "", "runner state directory")
+	gitExecutable := flags.String("git", "git", "git executable")
+	ghExecutable := flags.String("gh", "gh", "gh executable")
+	dryRun := flags.Bool("dry-run", false, "print the current Reset Plan without mutation")
+	_ = flags.Bool("yes", false, "confirm a mutating Reset (not used by --dry-run)")
+	for _, arg := range args {
+		if arg == "-h" || arg == "--help" {
+			return flags.Parse([]string{arg})
+		}
+	}
+	issueArg, flagArgs, err := splitResetArguments(args)
+	if err != nil {
+		return err
+	}
+	if err := flags.Parse(flagArgs); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected reset arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	issueNumber, err := strconv.Atoi(issueArg)
+	if err != nil || issueNumber <= 0 {
+		return fmt.Errorf("invalid issue number %q", issueArg)
+	}
+	if !*dryRun {
+		return errors.New("mutating Reset is not available yet; inspect with --dry-run")
+	}
+
+	absoluteRepo, err := filepath.Abs(*repoDir)
+	if err != nil {
+		return err
+	}
+	repositoryRoot, err := gitRepositoryRoot(ctx, *gitExecutable, absoluteRepo)
+	if err != nil {
+		return err
+	}
+	commonDirectory, err := gitCommonDirectory(ctx, *gitExecutable, repositoryRoot)
+	if err != nil {
+		return err
+	}
+	resolvedState, err := repositoryStateDirectory(commonDirectory, repositoryRoot, *stateDir)
+	if err != nil {
+		return err
+	}
+	lock, err := acquireResetReadLock(commonDirectory)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lock.Release() }()
+
+	current, migrationRequired, err := (state.FileStore{Path: filepath.Join(resolvedState, "state.json")}).Preview()
+	if err != nil {
+		return err
+	}
+	if migrationRequired {
+		return errors.New("runner state requires migration; dry-run refuses to write the migration")
+	}
+	run, lease, err := resetRun(current, issueNumber)
+	if err != nil {
+		return err
+	}
+	if err := inspectWorkerAbsent(run); err != nil {
+		return err
+	}
+
+	github := ghadapter.Client{Executable: *ghExecutable, Dir: repositoryRoot}
+	repository, err := github.Repository(ctx)
+	if err != nil {
+		return err
+	}
+	if current.Repo == "" || current.Repo != repository.Slug {
+		return fmt.Errorf("Run state belongs to %q, not repository %q", current.Repo, repository.Slug)
+	}
+	if current.DefaultBranch == "" || current.DefaultBranch != repository.DefaultBranch {
+		return fmt.Errorf("Run state default branch %q does not match repository default branch %q", current.DefaultBranch, repository.DefaultBranch)
+	}
+	if err := validateOwnedPaths(run, resolvedState, repositoryRoot, repository.DefaultBranch); err != nil {
+		return err
+	}
+
+	issueResource, pullResources, err := github.ResetResources(ctx, repository.Slug, issueNumber, run.Branch)
+	if err != nil {
+		return err
+	}
+	remoteBranch, err := inspectRemoteBranch(ctx, *gitExecutable, repositoryRoot, run.Branch)
+	if err != nil {
+		return err
+	}
+	localBranch, localWorktree, err := inspectLocalResources(ctx, *gitExecutable, repositoryRoot, run)
+	if err != nil {
+		return err
+	}
+	session, err := inspectSession(run)
+	if err != nil {
+		return err
+	}
+
+	snapshot := reset.Snapshot{
+		Run: run, Lease: lease,
+		Issue:        reset.Issue{Number: issueResource.Number, URL: issueResource.URL, Open: issueResource.State == "open", Labels: issueResource.Labels},
+		RemoteBranch: remoteBranch, LocalBranch: localBranch, Worktree: localWorktree, Session: session,
+		WorkerSummary: absentWorkerSummary(run),
+	}
+	for _, pull := range pullResources {
+		snapshot.PullRequests = append(snapshot.PullRequests, reset.PullRequest{
+			Number: pull.Number, URL: pull.URL, State: reset.PullRequestState(pull.State), AutoMergeArmed: pull.AutoMergeArmed,
+		})
+	}
+	plan, err := reset.Build(snapshot)
+	if err != nil {
+		return err
+	}
+	printResetPlan(stdout, plan)
+	fmt.Fprintln(stdout, "Dry-run: no changes made.")
+	return nil
+}
+
+func splitResetArguments(args []string) (string, []string, error) {
+	if len(args) == 0 {
+		return "", nil, errors.New("usage: backlog reset <issue-number> --dry-run [flags]")
+	}
+	if !strings.HasPrefix(args[0], "-") {
+		return args[0], args[1:], nil
+	}
+	for index, value := range args {
+		if !strings.HasPrefix(value, "-") && (index == 0 || !resetFlagTakesValue(args[index-1])) {
+			remaining := append([]string{}, args[:index]...)
+			remaining = append(remaining, args[index+1:]...)
+			return value, remaining, nil
+		}
+	}
+	return "", nil, errors.New("reset requires an issue number")
+}
+
+func resetFlagTakesValue(name string) bool {
+	if strings.Contains(name, "=") {
+		return false
+	}
+	name = strings.TrimLeft(name, "-")
+	return name == "repo-dir" || name == "state-dir" || name == "git" || name == "gh"
+}
+
+type resetReadLock struct {
+	locks []*state.Lock
+}
+
+func acquireResetReadLock(commonDirectory string) (*resetReadLock, error) {
+	coordination, err := state.AcquireReadOnlyLock(commonDirectory)
+	if err != nil {
+		return nil, err
+	}
+	result := &resetReadLock{locks: []*state.Lock{coordination}}
+	for _, name := range []string{legacyLockFile, lockFile} {
+		lock, exists, err := state.AcquireExistingReadOnlyLock(filepath.Join(commonDirectory, name))
+		if err != nil {
+			_ = result.Release()
+			return nil, err
+		}
+		if exists {
+			result.locks = append(result.locks, lock)
+		}
+	}
+	return result, nil
+}
+
+func (l *resetReadLock) Release() error {
+	var result error
+	for index := len(l.locks) - 1; index >= 0; index-- {
+		result = errors.Join(result, l.locks[index].Release())
+	}
+	return result
+}
+
+func resetRun(current state.State, issue int) (scheduler.Run, scheduler.Lease, error) {
+	for _, lease := range current.Leases {
+		if lease.Issue != issue {
+			continue
+		}
+		for _, run := range current.Runs {
+			if run.RunID == lease.RunID && run.Issue == issue {
+				return run, lease, nil
+			}
+		}
+		return scheduler.Run{}, scheduler.Lease{}, fmt.Errorf("Lease %s for issue #%d has an invalid Run reference", lease.LeaseID, issue)
+	}
+	return scheduler.Run{}, scheduler.Lease{}, fmt.Errorf("issue #%d has no active Lease to Reset", issue)
+}
+
+func inspectWorkerAbsent(run scheduler.Run) error {
+	if run.PID == 0 {
+		if run.ProcessIdentity != "" {
+			return fmt.Errorf("Run %s has uncertain Worker identity without a recorded PID", run.RunID)
+		}
+		return nil
+	}
+	if run.PID < 0 || run.ProcessIdentity == "" {
+		return fmt.Errorf("Run %s has incomplete Worker identity", run.RunID)
+	}
+	processAlive, err := signalZero(run.PID)
+	if err != nil {
+		return fmt.Errorf("verify Worker PID %d: %w", run.PID, err)
+	}
+	groupAlive, err := signalZero(-run.PID)
+	if err != nil {
+		return fmt.Errorf("verify Worker process group %d: %w", run.PID, err)
+	}
+	if !processAlive && !groupAlive {
+		return nil
+	}
+	if !processAlive || !groupAlive {
+		return fmt.Errorf("Worker PID/process-group liveness is uncertain for Run %s", run.RunID)
+	}
+	identity, err := resetPIDIdentity(run.PID)
+	if err != nil {
+		return fmt.Errorf("verify live Worker identity: %w", err)
+	}
+	if identity != run.ProcessIdentity {
+		return fmt.Errorf("Worker PID %d is live with uncertain identity %q instead of %q", run.PID, identity, run.ProcessIdentity)
+	}
+	return fmt.Errorf("Worker for Run %s is live at PID %d", run.RunID, run.PID)
+}
+
+func absentWorkerSummary(run scheduler.Run) string {
+	if run.PID == 0 {
+		return "absent (no recorded PID)"
+	}
+	return fmt.Sprintf("absent (recorded PID and process group %d)", run.PID)
+}
+
+func signalZero(pid int) (bool, error) {
+	err := syscall.Kill(pid, syscall.Signal(0))
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, syscall.ESRCH):
+		return false, nil
+	case errors.Is(err, syscall.EPERM):
+		return false, errors.New("permission denied; liveness is unknown")
+	default:
+		return false, err
+	}
+}
+
+func resetPIDIdentity(pid int) (string, error) {
+	command := exec.Command("ps", "-p", fmt.Sprint(pid), "-o", "lstart=") // #nosec G204 -- validated numeric PID
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return "", err
+	}
+	started := strings.TrimSpace(string(output))
+	if started == "" {
+		return "", errors.New("empty process start identity")
+	}
+	return fmt.Sprintf("%d:%s", pid, started), nil
+}
+
+func validateOwnedPaths(run scheduler.Run, stateDir, repositoryRoot, defaultBranch string) error {
+	if (run.Branch == "") != (run.Worktree == "") {
+		return fmt.Errorf("Run %s has incomplete branch/worktree ownership", run.RunID)
+	}
+	if run.Branch != "" {
+		manager := worktree.Manager{RepositoryDir: repositoryRoot, WorktreesDir: filepath.Join(stateDir, "worktrees"), DefaultBranch: defaultBranch}
+		expected, err := manager.Plan(run.Issue, run.RunID)
+		if err != nil {
+			return err
+		}
+		if run.Branch != expected.Branch || filepath.Clean(run.Worktree) != filepath.Clean(expected.Path) {
+			return fmt.Errorf("Run %s branch/worktree identity is not Backlog-owned", run.RunID)
+		}
+	}
+	if run.WorkerMode == scheduler.WorkerModeRPC {
+		expectedSessionDir := filepath.Join(stateDir, "sessions", run.RunID)
+		if run.SessionID != "backlog-"+run.RunID || filepath.Clean(run.SessionDir) != filepath.Clean(expectedSessionDir) {
+			return fmt.Errorf("Run %s Pi session identity is not Backlog-owned", run.RunID)
+		}
+	} else if run.SessionID != "" || run.SessionDir != "" || run.Continuation != nil {
+		return fmt.Errorf("print-mode Run %s has uncertain Pi session identity", run.RunID)
+	}
+	return nil
+}
+
+func inspectRemoteBranch(ctx context.Context, gitExecutable, repositoryRoot, branch string) (reset.Branch, error) {
+	if branch == "" {
+		return reset.Branch{}, nil
+	}
+	ref := "refs/heads/" + branch
+	output, exit, err := runGitInspection(ctx, gitExecutable, repositoryRoot, "ls-remote", "--exit-code", "--heads", "origin", ref)
+	if err != nil {
+		return reset.Branch{}, fmt.Errorf("inspect remote branch %s: %w", branch, err)
+	}
+	if exit == 2 && len(bytes.TrimSpace(output)) == 0 {
+		return reset.Branch{Name: branch}, nil
+	}
+	if exit != 0 {
+		return reset.Branch{}, fmt.Errorf("inspect remote branch %s: git exited %d; state is unknown", branch, exit)
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) != 2 || fields[1] != ref || !validObjectID(fields[0]) {
+		return reset.Branch{}, fmt.Errorf("inspect remote branch %s: unknown ls-remote output", branch)
+	}
+	return reset.Branch{Name: branch, Commit: fields[0], Present: true}, nil
+}
+
+func inspectLocalResources(ctx context.Context, gitExecutable, repositoryRoot string, run scheduler.Run) (reset.Branch, reset.Worktree, error) {
+	if run.Branch == "" {
+		return reset.Branch{}, reset.Worktree{}, nil
+	}
+	ref := "refs/heads/" + run.Branch
+	output, exit, err := runGitInspection(ctx, gitExecutable, repositoryRoot, "show-ref", "--verify", "--hash", ref)
+	if err != nil {
+		return reset.Branch{}, reset.Worktree{}, fmt.Errorf("inspect local branch %s: %w", run.Branch, err)
+	}
+	local := reset.Branch{Name: run.Branch}
+	if exit == 0 {
+		commit := strings.TrimSpace(string(output))
+		if !validObjectID(commit) {
+			return reset.Branch{}, reset.Worktree{}, fmt.Errorf("inspect local branch %s: unknown object identity", run.Branch)
+		}
+		local.Commit, local.Present = commit, true
+	} else if exit != 1 || len(bytes.TrimSpace(output)) != 0 {
+		return reset.Branch{}, reset.Worktree{}, fmt.Errorf("inspect local branch %s: git exited %d with unknown output", run.Branch, exit)
+	}
+
+	output, exit, err = runGitInspection(ctx, gitExecutable, repositoryRoot, "worktree", "list", "--porcelain", "-z")
+	if err != nil || exit != 0 {
+		if err == nil {
+			err = fmt.Errorf("git exited %d", exit)
+		}
+		return reset.Branch{}, reset.Worktree{}, fmt.Errorf("inspect local worktrees: %w", err)
+	}
+	entries, err := parseWorktrees(output)
+	if err != nil {
+		return reset.Branch{}, reset.Worktree{}, err
+	}
+	expectedPath := canonicalPath(run.Worktree)
+	var registered *gitWorktree
+	for index := range entries {
+		entry := &entries[index]
+		if entry.Branch == ref && canonicalPath(entry.Path) != expectedPath {
+			return reset.Branch{}, reset.Worktree{}, fmt.Errorf("Run branch %s is assigned to unexpected worktree %s", run.Branch, entry.Path)
+		}
+		if canonicalPath(entry.Path) == expectedPath {
+			if registered != nil {
+				return reset.Branch{}, reset.Worktree{}, fmt.Errorf("Run worktree %s has duplicate Git registrations", run.Worktree)
+			}
+			registered = entry
+		}
+	}
+	info, statErr := os.Lstat(run.Worktree)
+	filesystemPresent := statErr == nil
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return reset.Branch{}, reset.Worktree{}, fmt.Errorf("inspect worktree path %s: %w", run.Worktree, statErr)
+	}
+	if filesystemPresent && (info.Mode()&os.ModeSymlink != 0 || !info.IsDir()) {
+		return reset.Branch{}, reset.Worktree{}, fmt.Errorf("worktree path %s has unknown filesystem identity", run.Worktree)
+	}
+	if registered == nil {
+		if filesystemPresent {
+			return reset.Branch{}, reset.Worktree{}, fmt.Errorf("worktree path %s exists without the expected Git registration", run.Worktree)
+		}
+		return local, reset.Worktree{Path: run.Worktree, Branch: run.Branch}, nil
+	}
+	if registered.Branch != ref || !validObjectID(registered.Commit) {
+		return reset.Branch{}, reset.Worktree{}, fmt.Errorf("worktree %s has unknown branch or commit identity", run.Worktree)
+	}
+	if !local.Present || local.Commit != registered.Commit {
+		return reset.Branch{}, reset.Worktree{}, fmt.Errorf("worktree %s commit does not match owned local branch", run.Worktree)
+	}
+	return local, reset.Worktree{Path: run.Worktree, Branch: run.Branch, Commit: registered.Commit, Present: true}, nil
+}
+
+type gitWorktree struct {
+	Path   string
+	Commit string
+	Branch string
+}
+
+func parseWorktrees(output []byte) ([]gitWorktree, error) {
+	var result []gitWorktree
+	var current gitWorktree
+	for _, raw := range bytes.Split(output, []byte{0}) {
+		line := string(raw)
+		if line == "" {
+			if current.Path != "" {
+				result = append(result, current)
+				current = gitWorktree{}
+			}
+			continue
+		}
+		key, value, found := strings.Cut(line, " ")
+		if !found {
+			if line == "bare" || line == "detached" || line == "locked" || line == "prunable" {
+				continue
+			}
+			return nil, fmt.Errorf("inspect local worktrees: unknown porcelain field %q", line)
+		}
+		switch key {
+		case "worktree":
+			if current.Path != "" {
+				return nil, errors.New("inspect local worktrees: duplicate path field")
+			}
+			current.Path = value
+		case "HEAD":
+			current.Commit = value
+		case "branch":
+			current.Branch = value
+		case "locked", "prunable":
+		default:
+			return nil, fmt.Errorf("inspect local worktrees: unknown porcelain field %q", key)
+		}
+	}
+	if current.Path != "" {
+		result = append(result, current)
+	}
+	return result, nil
+}
+
+func canonicalPath(path string) string {
+	absolute, err := filepath.Abs(path)
+	if err == nil {
+		path = absolute
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	return filepath.Clean(path)
+}
+
+func runGitInspection(ctx context.Context, executable, repositoryRoot string, args ...string) ([]byte, int, error) {
+	commandArgs := append([]string{"-C", repositoryRoot}, args...)
+	command := exec.CommandContext(ctx, executable, commandArgs...)
+	output, err := command.CombinedOutput()
+	if err == nil {
+		return output, 0, nil
+	}
+	var exitError *exec.ExitError
+	if errors.As(err, &exitError) {
+		return output, exitError.ExitCode(), nil
+	}
+	return output, -1, err
+}
+
+func validObjectID(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func inspectSession(run scheduler.Run) (reset.Session, error) {
+	if run.WorkerMode != scheduler.WorkerModeRPC {
+		return reset.Session{}, nil
+	}
+	info, err := os.Lstat(run.SessionDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return reset.Session{ID: run.SessionID, Dir: run.SessionDir}, nil
+	}
+	if err != nil {
+		return reset.Session{}, fmt.Errorf("inspect Pi session directory: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return reset.Session{}, fmt.Errorf("Pi session path %s has unknown filesystem identity", run.SessionDir)
+	}
+	files := make([]string, 0)
+	err = filepath.WalkDir(run.SessionDir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == run.SessionDir {
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("Pi session directory contains symlink %s", path)
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if !entry.Type().IsRegular() || filepath.Ext(path) != ".jsonl" {
+			return fmt.Errorf("Pi session directory contains unknown resource %s", path)
+		}
+		files = append(files, path)
+		return nil
+	})
+	if err != nil {
+		return reset.Session{}, fmt.Errorf("inspect Pi session directory: %w", err)
+	}
+	sort.Strings(files)
+	for _, path := range files {
+		if err := verifySessionHeader(path, run); err != nil {
+			return reset.Session{}, err
+		}
+	}
+	if run.Continuation != nil {
+		found := false
+		for _, path := range files {
+			if filepath.Clean(path) == filepath.Clean(run.Continuation.SessionFile) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return reset.Session{}, fmt.Errorf("Pi continuation file %s is not present in the owned session", run.Continuation.SessionFile)
+		}
+	}
+	return reset.Session{ID: run.SessionID, Dir: run.SessionDir, Present: true}, nil
+}
+
+func verifySessionHeader(path string, run scheduler.Run) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open Pi session file %s: %w", path, err)
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return fmt.Errorf("read Pi session file %s: %w", path, err)
+		}
+		return fmt.Errorf("Pi session file %s has no identity header", path)
+	}
+	var header struct {
+		Type string `json:"type"`
+		ID   string `json:"id"`
+		CWD  string `json:"cwd"`
+	}
+	if !json.Valid(scanner.Bytes()) || json.Unmarshal(scanner.Bytes(), &header) != nil || header.Type != "session" || header.ID != run.SessionID || filepath.Clean(header.CWD) != filepath.Clean(run.Worktree) {
+		return fmt.Errorf("Pi session file %s identity does not match Run %s", path, run.RunID)
+	}
+	return nil
+}
+
+func printResetPlan(writer io.Writer, plan reset.Plan) {
+	snapshot := plan.Snapshot
+	fmt.Fprintf(writer, "Reset Plan for issue #%d\n", snapshot.Run.Issue)
+	fmt.Fprintf(writer, "Run: %s (%s)\n", snapshot.Run.RunID, snapshot.Run.Status)
+	fmt.Fprintf(writer, "Lease: %s\n", snapshot.Lease.LeaseID)
+	fmt.Fprintf(writer, "Issue: %s (open; labels: %s)\n", snapshot.Issue.URL, formatLabels(snapshot.Issue.Labels))
+	fmt.Fprintf(writer, "Worker: %s\n", snapshot.WorkerSummary)
+	printBranchResource(writer, "Remote branch", snapshot.RemoteBranch)
+	printBranchResource(writer, "Local branch", snapshot.LocalBranch)
+	if snapshot.Worktree.Present {
+		fmt.Fprintf(writer, "Local worktree: %s (%s at %s)\n", snapshot.Worktree.Path, snapshot.Worktree.Branch, snapshot.Worktree.Commit)
+	} else if snapshot.Worktree.Path != "" {
+		fmt.Fprintf(writer, "Local worktree: %s (absent)\n", snapshot.Worktree.Path)
+	} else {
+		fmt.Fprintln(writer, "Local worktree: absent (not assigned)")
+	}
+	if snapshot.Session.Present {
+		fmt.Fprintf(writer, "Pi session: %s in %s\n", snapshot.Session.ID, snapshot.Session.Dir)
+	} else if snapshot.Session.ID != "" {
+		fmt.Fprintf(writer, "Pi session: %s in %s (absent)\n", snapshot.Session.ID, snapshot.Session.Dir)
+	} else {
+		fmt.Fprintln(writer, "Pi session: absent (not assigned)")
+	}
+	if len(snapshot.PullRequests) == 0 && snapshot.Run.Branch != "" {
+		fmt.Fprintf(writer, "Pull requests for branch %s: absent\n", snapshot.Run.Branch)
+	} else if len(snapshot.PullRequests) == 0 {
+		fmt.Fprintln(writer, "Pull requests: absent (no Run branch assigned)")
+	} else {
+		for _, pull := range snapshot.PullRequests {
+			autoMerge := "unarmed"
+			if pull.AutoMergeArmed {
+				autoMerge = "armed"
+			}
+			fmt.Fprintf(writer, "Pull request: #%d %s (%s; auto-merge %s)\n", pull.Number, pull.URL, pull.State, autoMerge)
+		}
+	}
+	fmt.Fprintln(writer, "Required actions:")
+	for index, action := range plan.Actions {
+		fmt.Fprintf(writer, "  %d. %s\n", index+1, action)
+	}
+}
+
+func printBranchResource(writer io.Writer, name string, branch reset.Branch) {
+	if branch.Present {
+		fmt.Fprintf(writer, "%s: %s at %s\n", name, branch.Name, branch.Commit)
+	} else if branch.Name != "" {
+		fmt.Fprintf(writer, "%s: %s (absent)\n", name, branch.Name)
+	} else {
+		fmt.Fprintf(writer, "%s: absent (not assigned)\n", name)
+	}
+}
+
+func formatLabels(labels []string) string {
+	if len(labels) == 0 {
+		return "none"
+	}
+	values := append([]string(nil), labels...)
+	sort.Strings(values)
+	return strings.Join(values, ", ")
+}

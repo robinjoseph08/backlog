@@ -102,6 +102,46 @@ esac`)
 	}
 }
 
+func TestClientInspectsResetIssueLabelsAndOwnedPullRequests(t *testing.T) {
+	t.Parallel()
+
+	gh := fakeGH(t, `
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"},{"name":"spec"}]}' ;;
+  "pr list --repo acme/widgets --state all --head agent/issue-42-run --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner")
+    printf '%s\n' '[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"OPEN","mergedAt":null,"autoMergeRequest":{"mergeMethod":"SQUASH"},"isDraft":false,"headRefName":"agent/issue-42-run","headRepositoryOwner":{"login":"acme"}}]' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+	issue, pulls, err := (Client{Executable: gh}).ResetResources(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if issue.Number != 42 || issue.State != "open" || strings.Join(issue.Labels, ",") != "in-progress,spec" {
+		t.Fatalf("issue = %#v", issue)
+	}
+	if len(pulls) != 1 || pulls[0].Number != 100 || pulls[0].State != "open" || !pulls[0].AutoMergeArmed {
+		t.Fatalf("pulls = %#v", pulls)
+	}
+}
+
+func TestClientResetInspectionRefusesMismatchedPullRequestOwner(t *testing.T) {
+	t.Parallel()
+
+	gh := fakeGH(t, `
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[]}' ;;
+  "pr list "*)
+    printf '%s\n' '[{"number":100,"url":"https://github.com/other/widgets/pull/100","state":"OPEN","headRefName":"agent/issue-42-run","headRepositoryOwner":{"login":"other"}}]' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+	_, _, err := (Client{Executable: gh}).ResetResources(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
+	if err == nil || !strings.Contains(err.Error(), "mismatched") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestClientVerifiesCompletionFromPullRequestAndIssue(t *testing.T) {
 	t.Parallel()
 

@@ -44,6 +44,10 @@ func MainWithSignals(ctx context.Context, args []string, stdout, stderr io.Write
 		commandCtx, stop := cancelContextOnSignal(ctx, signals)
 		defer stop()
 		err = statusCommand(commandCtx, args[1:], stdout, stderr)
+	case "reset":
+		commandCtx, stop := cancelContextOnSignal(ctx, signals)
+		defer stop()
+		err = resetCommand(commandCtx, args[1:], stdout, stderr)
 	case "retry":
 		commandCtx, stop := cancelContextOnSignal(ctx, signals)
 		defer stop()
@@ -480,25 +484,35 @@ const (
 )
 
 type repositoryLock struct {
-	current *state.Lock
-	legacy  *state.Lock
+	coordination *state.Lock
+	current      *state.Lock
+	legacy       *state.Lock
 }
 
 func acquireRepositoryLock(commonDirectory string) (*repositoryLock, error) {
+	if err := os.MkdirAll(commonDirectory, 0o700); err != nil {
+		return nil, fmt.Errorf("create Git common directory: %w", err)
+	}
+	coordination, err := state.AcquireReadOnlyLock(commonDirectory)
+	if err != nil {
+		return nil, err
+	}
 	legacy, err := state.AcquireLock(filepath.Join(commonDirectory, legacyLockFile))
 	if err != nil {
+		_ = coordination.Release()
 		return nil, err
 	}
 	current, err := state.AcquireLock(filepath.Join(commonDirectory, lockFile))
 	if err != nil {
 		_ = legacy.Release()
+		_ = coordination.Release()
 		return nil, err
 	}
-	return &repositoryLock{current: current, legacy: legacy}, nil
+	return &repositoryLock{coordination: coordination, current: current, legacy: legacy}, nil
 }
 
 func (l *repositoryLock) Release() error {
-	return errors.Join(l.current.Release(), l.legacy.Release())
+	return errors.Join(l.current.Release(), l.legacy.Release(), l.coordination.Release())
 }
 
 func bindStateDirectory(commonDirectory, stateDirectory string) error {
@@ -635,5 +649,6 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "Usage:")
 	fmt.Fprintln(writer, "  backlog run [flags]")
 	fmt.Fprintln(writer, "  backlog status [flags]")
+	fmt.Fprintln(writer, "  backlog reset <issue-number> --dry-run [flags]")
 	fmt.Fprintln(writer, "  backlog retry <issue-number> [flags]")
 }
