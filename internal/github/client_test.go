@@ -323,6 +323,38 @@ esac`)
 	}
 }
 
+func TestClientIssueInspectionRefusesDuplicateIdentityFields(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		response string
+	}{
+		{name: "number", response: `{"number":41,"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"}]}`},
+		{name: "URL", response: `{"number":42,"url":"https://github.com/acme/widgets/issues/41","url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"}]}`},
+		{name: "state", response: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","state":"OPEN","labels":[{"name":"in-progress"}]}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			gh := fakeGH(t, `
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    printf '%s\n' '`+test.response+`' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+
+			got, err := (Client{Executable: gh}).IssueState(context.Background(), "acme/widgets", 42)
+			if err == nil || !strings.Contains(err.Error(), "duplicate JSON field") {
+				t.Fatalf("error = %v, want duplicate identity refusal", err)
+			}
+			if got.Open || got.Labels != nil {
+				t.Fatalf("issue state = %#v, want fail-closed empty metadata", got)
+			}
+		})
+	}
+}
+
 func TestClientCompletionRefusesMismatchedIssueIdentity(t *testing.T) {
 	t.Parallel()
 
@@ -341,6 +373,40 @@ esac`)
 	}
 	if got != (CompletionOutcome{}) {
 		t.Fatalf("completion = %#v, want fail-closed empty outcome", got)
+	}
+}
+
+func TestClientCompletionRefusesDuplicateIssueIdentityFields(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		response string
+	}{
+		{name: "number", response: `{"number":41,"number":42,"state":"OPEN","url":"https://github.com/acme/widgets/issues/42"}`},
+		{name: "URL", response: `{"number":42,"state":"OPEN","url":"https://github.com/acme/widgets/issues/41","url":"https://github.com/acme/widgets/issues/42"}`},
+		{name: "state", response: `{"number":42,"state":"CLOSED","state":"OPEN","url":"https://github.com/acme/widgets/issues/42"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			gh := fakeGH(t, `
+case "$*" in
+  "pr list --repo acme/widgets --state all --head agent/issue-42-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+    printf '%s\n' '[]' ;;
+  "issue view 42 --repo acme/widgets --json number,state,title,url")
+    printf '%s\n' '`+test.response+`' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+
+			got, err := (Client{Executable: gh}).Completion(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
+			if err == nil || !strings.Contains(err.Error(), "duplicate JSON field") {
+				t.Fatalf("error = %v, want duplicate identity refusal", err)
+			}
+			if got != (CompletionOutcome{}) {
+				t.Fatalf("completion = %#v, want fail-closed empty outcome", got)
+			}
+		})
 	}
 }
 

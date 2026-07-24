@@ -1,10 +1,12 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os/exec"
 	"sort"
@@ -473,8 +475,80 @@ func (c Client) jsonCommand(ctx context.Context, target any, args ...string) err
 		}
 		return fmt.Errorf("gh %s: %w", strings.Join(args, " "), err)
 	}
+	if err := rejectDuplicateJSONFields(output); err != nil {
+		return fmt.Errorf("decode gh %s output: %w", strings.Join(args, " "), err)
+	}
 	if err := json.Unmarshal(output, target); err != nil {
 		return fmt.Errorf("decode gh %s output: %w", strings.Join(args, " "), err)
+	}
+	return nil
+}
+
+func rejectDuplicateJSONFields(output []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	if err := consumeJSONValue(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
+
+func consumeJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		fields := make(map[string]struct{})
+		for decoder.More() {
+			fieldToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			field, ok := fieldToken.(string)
+			if !ok {
+				return errors.New("invalid JSON object field")
+			}
+			if _, exists := fields[field]; exists {
+				return fmt.Errorf("duplicate JSON field %q", field)
+			}
+			fields[field] = struct{}{}
+			if err := consumeJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if closing != json.Delim('}') {
+			return errors.New("invalid JSON object closing delimiter")
+		}
+	case '[':
+		for decoder.More() {
+			if err := consumeJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if closing != json.Delim(']') {
+			return errors.New("invalid JSON array closing delimiter")
+		}
+	default:
+		return errors.New("invalid JSON opening delimiter")
 	}
 	return nil
 }
