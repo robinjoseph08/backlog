@@ -48,6 +48,14 @@ func TestManagerCreatesAndCleansRealIsolatedWorktree(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(assignment.Path, "README.md")); err != nil {
 		t.Fatalf("worktree did not start from remote main: %v", err)
 	}
+	if err := manager.Verify(context.Background(), assignment); err != nil {
+		t.Fatalf("verify retained worktree: %v", err)
+	}
+	runGit(t, assignment.Path, "checkout", "-b", "changed-branch")
+	if err := manager.Verify(context.Background(), assignment); err == nil || !strings.Contains(err.Error(), "does not match expected branch") {
+		t.Fatalf("changed branch verification error = %v", err)
+	}
+	runGit(t, assignment.Path, "checkout", assignment.Branch)
 
 	if err := manager.Cleanup(context.Background(), assignment); err != nil {
 		t.Fatalf("cleanup: %v", err)

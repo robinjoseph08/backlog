@@ -102,6 +102,24 @@ esac`)
 	}
 }
 
+func TestClientReadsIssueStateAndLabelsForResume(t *testing.T) {
+	t.Parallel()
+
+	gh := fakeGH(t, `
+case "$*" in
+  "issue view 42 --repo acme/widgets --json state,labels")
+    printf '%s\n' '{"state":"OPEN","labels":[{"name":"in-progress"},{"name":"spec"}]}' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+	got, err := (Client{Executable: gh}).IssueState(context.Background(), "acme/widgets", 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Open || len(got.Labels) != 2 || got.Labels[0] != "in-progress" || got.Labels[1] != "spec" {
+		t.Fatalf("issue state = %#v", got)
+	}
+}
+
 func TestClientVerifiesCompletionFromPullRequestAndIssue(t *testing.T) {
 	t.Parallel()
 

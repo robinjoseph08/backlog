@@ -30,6 +30,7 @@ type Request struct {
 	SessionName string
 	SessionID   string
 	SessionDir  string
+	Resume      bool
 }
 
 type ContinuationRequest struct {
@@ -87,6 +88,7 @@ type Process struct {
 	exitDone           chan struct{}
 	resultMu           sync.Mutex
 	result             Result
+	resume             bool
 }
 
 var safeRunIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
@@ -114,11 +116,15 @@ func (s Supervisor) Start(ctx context.Context, request Request) (*Process, error
 	if err := os.Remove(gatePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("reset worker start gate: %w", err)
 	}
-	stdoutLog, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	logFlags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+	if request.Resume {
+		logFlags = os.O_CREATE | os.O_WRONLY | os.O_APPEND
+	}
+	stdoutLog, err := os.OpenFile(logPath, logFlags, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("create worker event log: %w", err)
 	}
-	stderrLog, err := os.OpenFile(stderrPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	stderrLog, err := os.OpenFile(stderrPath, logFlags, 0o600)
 	if err != nil {
 		stdoutLog.Close()
 		return nil, fmt.Errorf("create worker stderr log: %w", err)
@@ -187,6 +193,7 @@ func (s Supervisor) Start(ctx context.Context, request Request) (*Process, error
 		command: command, logPath: logPath, stderrPath: stderrPath, gatePath: gatePath,
 		stdin: stdin, stdout: stdoutLog, stderr: stderrLog, events: events, terminate: terminate,
 		terminationStarted: terminationStarted, terminationDone: terminationDone, processGroupGrace: grace, exitDone: make(chan struct{}),
+		resume: request.Resume,
 	}
 	go process.reap()
 	return process, nil
@@ -223,11 +230,15 @@ func (p *Process) Release() error {
 			p.releaseErr = err
 			return
 		}
+		message := fmt.Sprintf("/skill:afk %d", p.events.issue)
+		if p.resume {
+			message = fmt.Sprintf("Reassess the repository and GitHub state before continuing the existing AFK workflow for issue #%d. Continue from this Pi session and finish the AFK workflow.", p.events.issue)
+		}
 		command := struct {
 			ID      string `json:"id"`
 			Type    string `json:"type"`
 			Message string `json:"message"`
-		}{ID: promptCommandID, Type: "prompt", Message: fmt.Sprintf("/skill:afk %d", p.events.issue)}
+		}{ID: promptCommandID, Type: "prompt", Message: message}
 		encoded, err := json.Marshal(command)
 		if err == nil {
 			encoded = append(encoded, '\n')
@@ -503,6 +514,80 @@ func releaseGate(path string) error {
 		return fmt.Errorf("release worker start gate: %w", err)
 	}
 	return file.Close()
+}
+
+// VerifyContinuation proves that a persisted continuation marker still matches
+// the complete on-disk Pi session before a replacement Worker opens it.
+func VerifyContinuation(expected ContinuationRequest, continuation Continuation) error {
+	if expected.SessionID == "" || expected.SessionDir == "" || expected.Worktree == "" {
+		return errors.New("continuation request is incomplete")
+	}
+	if continuation.SessionID != expected.SessionID || continuation.Worktree != expected.Worktree || continuation.SessionFile == "" || continuation.LeafID == "" || continuation.EntryCount <= 0 || continuation.SHA256 == "" {
+		return errors.New("continuation marker does not match the expected Pi session")
+	}
+	if err := verifySessionPath(expected.SessionDir, continuation.SessionFile); err != nil {
+		return err
+	}
+	records, sha, err := readSessionRecords(continuation.SessionFile)
+	if err != nil {
+		return err
+	}
+	if sha != continuation.SHA256 {
+		return fmt.Errorf("Pi session file hash %q does not match continuation marker %q", sha, continuation.SHA256)
+	}
+	if len(records) != continuation.EntryCount+1 {
+		return fmt.Errorf("Pi session file has %d entries, continuation marker recorded %d", len(records)-1, continuation.EntryCount)
+	}
+	var header struct {
+		Type string `json:"type"`
+		ID   string `json:"id"`
+		CWD  string `json:"cwd"`
+	}
+	if _, err := decodeExactJSON(records[0]); err != nil {
+		return fmt.Errorf("decode Pi session header: %w", err)
+	}
+	if err := json.Unmarshal(records[0], &header); err != nil || header.Type != "session" {
+		return errors.New("Pi session file has an invalid header")
+	}
+	if header.ID != expected.SessionID || header.CWD != expected.Worktree {
+		return fmt.Errorf("Pi session header identity/path %q/%q does not match %q/%q", header.ID, header.CWD, expected.SessionID, expected.Worktree)
+	}
+	entries := records[1:]
+	for index, entry := range entries {
+		if _, err := decodeExactJSON(entry); err != nil {
+			return fmt.Errorf("decode Pi session file entry %d: %w", index+1, err)
+		}
+	}
+	if err := verifyContinuationLeaf(entries, continuation.LeafID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func readSessionRecords(path string) ([]json.RawMessage, string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("open Pi session file: %w", err)
+	}
+	defer file.Close()
+	hash := sha256.New()
+	scanner := bufio.NewScanner(io.TeeReader(file, hash))
+	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	var records []json.RawMessage
+	for scanner.Scan() {
+		line := append([]byte(nil), scanner.Bytes()...)
+		if !json.Valid(line) {
+			return nil, "", fmt.Errorf("Pi session file contains malformed JSON on line %d", len(records)+1)
+		}
+		records = append(records, line)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, "", fmt.Errorf("read Pi session file: %w", err)
+	}
+	if len(records) == 0 {
+		return nil, "", errors.New("Pi session file is empty")
+	}
+	return records, hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func verifySessionPath(sessionDir, sessionFile string) error {

@@ -3,6 +3,8 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -159,6 +161,127 @@ while IFS= read -r ignored; do :; done
 	output := strings.Join(outputLines, "\n")
 	if !strings.Contains(output, "Suspension complete: 0 Workers remaining") {
 		t.Fatalf("suspension output = %q", output)
+	}
+}
+
+func TestCompiledExecutableRestartResumesSuspendedRunBeforeNewCandidate(t *testing.T) {
+	root := t.TempDir()
+	repository := filepath.Join(root, "repo")
+	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, output)
+	}
+	binary := buildExecutable(t, root)
+	stateDir := filepath.Join(root, "state")
+	statePath := filepath.Join(stateDir, "state.json")
+	sessionDir := filepath.Join(stateDir, "sessions", "run-91")
+	worktreePath := filepath.Join(stateDir, "worktrees", "issue-91-run-91")
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(worktreePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sessionFile := filepath.Join(sessionDir, "session.jsonl")
+	sessionContent := fmt.Sprintf("{\"type\":\"session\",\"version\":3,\"id\":\"session-91\",\"cwd\":%q}\n{\"type\":\"message\",\"id\":\"leaf\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"continue\"}}\n", worktreePath)
+	if err := os.WriteFile(sessionFile, []byte(sessionContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256([]byte(sessionContent))
+	persisted := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
+		Runs: []scheduler.Run{{
+			Issue: 91, RunID: "run-91", Status: scheduler.StatusSuspended, WorkerMode: scheduler.WorkerModeRPC,
+			Branch: "agent/issue-91-run-91", Worktree: worktreePath, SessionName: "afk #91", SessionID: "session-91", SessionDir: sessionDir,
+			Continuation: &scheduler.ContinuationBoundary{
+				SessionID: "session-91", SessionFile: sessionFile, Worktree: worktreePath, LeafID: "leaf", EntryCount: 1,
+				SHA256: hex.EncodeToString(hash[:]), VerifiedAt: time.Now(),
+			},
+			StartedAt: time.Now().Add(-time.Hour), UpdatedAt: time.Now(),
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "lease-91", Issue: 91, RunID: "run-91"}},
+	}
+	if err := (state.FileStore{Path: statePath}).Save(persisted); err != nil {
+		t.Fatal(err)
+	}
+
+	orderPath := filepath.Join(root, "worker-order")
+	resumedDone := filepath.Join(root, "resumed-done")
+	candidateDone := filepath.Join(root, "candidate-done")
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef")
+    printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
+    if test -f `+quote(candidateDone)+`; then printf '%s\n' '[]'; else printf '%s\n' '[{"number":92,"title":"new","createdAt":"2026-01-01T00:00:00Z","url":"https://example.test/issues/92"}]'; fi ;;
+  "issue view 92 --repo acme/widgets --json number,title,body,state,url,createdAt")
+    printf '%s\n' '{"number":92,"title":"new","body":"","state":"OPEN","url":"https://example.test/issues/92","createdAt":"2026-01-01T00:00:00Z"}' ;;
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/92/comments?per_page=100 --paginate --slurp"|\
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/92/dependencies/blocked_by?per_page=100 --paginate --slurp") printf '%s\n' '[[]]' ;;
+  "issue view 91 --repo acme/widgets --json state,labels") printf '%s\n' '{"state":"OPEN","labels":[{"name":"in-progress"},{"name":"spec"}]}' ;;
+  "pr list --repo acme/widgets --state all --head agent/issue-91-run-91 --json number,url,state,mergedAt,autoMergeRequest,isDraft")
+    if test -f `+quote(resumedDone)+`; then printf '%s\n' '[{"number":191,"url":"https://example.test/pull/191","state":"MERGED","mergedAt":"2026-01-01T00:00:00Z"}]'; else printf '%s\n' '[]'; fi ;;
+  "issue view 91 --repo acme/widgets --json state,title,url")
+    if test -f `+quote(resumedDone)+`; then printf '%s\n' '{"state":"CLOSED"}'; else printf '%s\n' '{"state":"OPEN"}'; fi ;;
+  "pr list --repo acme/widgets --state all --head agent/issue-92-"*" --json number,url,state,mergedAt,autoMergeRequest,isDraft")
+    printf '%s\n' '[{"number":192,"url":"https://example.test/pull/192","state":"MERGED","mergedAt":"2026-01-01T00:00:00Z"}]' ;;
+  "issue view 92 --repo acme/widgets --json state,title,url") touch `+quote(candidateDone)+`; printf '%s\n' '{"state":"CLOSED"}' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	git := writeExecutable(t, `#!/bin/sh
+set -eu
+if [ "$3" = "rev-parse" ] && [ "$4" = "--show-toplevel" ]; then
+  if [ "$2" = `+quote(worktreePath)+` ]; then printf '%s\n' `+quote(worktreePath)+`; else printf '%s\n' `+quote(repository)+`; fi
+  exit 0
+fi
+if [ "$3" = "rev-parse" ] && [ "$4" = "--git-common-dir" ]; then printf '%s\n' `+quote(filepath.Join(repository, ".git"))+`; exit 0; fi
+if [ "$3" = "branch" ] && [ "$4" = "--show-current" ]; then printf '%s\n' 'agent/issue-91-run-91'; exit 0; fi
+if [ "$3" = "worktree" ] && [ "$4" = "add" ]; then mkdir -p "$7"; exit 0; fi
+if [ "$3" = "worktree" ] && [ "$4" = "remove" ]; then rm -rf "$6"; exit 0; fi
+exit 0
+`)
+	pi := writeExecutable(t, `#!/bin/sh
+set -eu
+session_id=
+while [ "$#" -gt 0 ]; do
+  case "$1" in --session-id) session_id=$2; shift 2 ;; *) shift ;; esac
+done
+IFS= read -r prompt
+case "$session_id" in
+  session-91)
+    printf '%s\n' "$session_id" >> `+quote(orderPath)+`
+    printf '%s\n' "$prompt" | grep -q 'Reassess the repository and GitHub state'
+    touch `+quote(resumedDone)+` ;;
+  backlog-*)
+    test -f `+quote(resumedDone)+`
+    printf '%s\n' "$session_id" >> `+quote(orderPath)+`
+    printf '%s\n' "$prompt" | grep -q '/skill:afk 92' ;;
+  *) exit 9 ;;
+esac
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+while IFS= read -r ignored; do :; done
+`)
+
+	command := exec.Command(binary, "run", "--repo-dir", repository, "--state-dir", stateDir,
+		"--max-workers", "1", "--poll", "5ms", "--gh", gh, "--git", git, "--pi", pi)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("restart executable: %v\n%s", err, output)
+	}
+	order, err := os.ReadFile(orderPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Fields(string(order))
+	if len(lines) != 2 || lines[0] != "session-91" || !strings.HasPrefix(lines[1], "backlog-") {
+		t.Fatalf("Worker order = %q, want resumed session before Candidate", order)
+	}
+	final, err := (state.FileStore{Path: statePath}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(final.Runs) != 2 || final.Runs[0].RunID != "run-91" || final.Runs[0].Status != scheduler.StatusMerged || final.Runs[1].Status != scheduler.StatusMerged || len(final.Leases) != 0 {
+		t.Fatalf("final restarted state = %#v", final)
 	}
 }
 

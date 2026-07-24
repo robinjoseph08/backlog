@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os/exec"
@@ -25,6 +26,11 @@ type CompletionOutcome struct {
 	Merged         bool
 	IssueClosed    bool
 	AutoMergeArmed bool
+}
+
+type IssueState struct {
+	Open   bool
+	Labels []string
 }
 
 type Client struct {
@@ -203,6 +209,26 @@ func (c Client) resolveReference(ctx context.Context, currentRepo string, refere
 		blocker.Owner, blocker.Repo = parts[0], parts[1]
 	}
 	return blocker, strings.EqualFold(issue.State, "open"), nil
+}
+
+func (c Client) IssueState(ctx context.Context, repo string, issue int) (IssueState, error) {
+	var response struct {
+		State  string `json:"state"`
+		Labels []struct {
+			Name string `json:"name"`
+		} `json:"labels"`
+	}
+	if err := c.jsonCommand(ctx, &response, "issue", "view", fmt.Sprint(issue), "--repo", repo, "--json", "state,labels"); err != nil {
+		return IssueState{}, fmt.Errorf("inspect issue state and labels: %w", err)
+	}
+	labels := make([]string, 0, len(response.Labels))
+	for _, label := range response.Labels {
+		if label.Name == "" {
+			return IssueState{}, errors.New("inspect issue state and labels: GitHub returned an unnamed label")
+		}
+		labels = append(labels, label.Name)
+	}
+	return IssueState{Open: strings.EqualFold(response.State, "open"), Labels: labels}, nil
 }
 
 func (c Client) Completion(ctx context.Context, repo string, issue int, branch string) (CompletionOutcome, error) {

@@ -707,6 +707,62 @@ func TestVerifySessionBoundaryRejectsPathIdentityAndEntryMismatches(t *testing.T
 	}
 }
 
+func TestVerifyContinuationRevalidatesPersistedSessionIdentityLeafAndHash(t *testing.T) {
+	t.Parallel()
+
+	sessionDir := t.TempDir()
+	worktree := t.TempDir()
+	sessionFile := filepath.Join(sessionDir, "session.jsonl")
+	content := `{"type":"session","version":3,"id":"session-1","cwd":` + strconv.Quote(worktree) + `}` + "\n" +
+		`{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"continue"}}` + "\n"
+	if err := os.WriteFile(sessionFile, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256([]byte(content))
+	expected := ContinuationRequest{SessionID: "session-1", SessionDir: sessionDir, Worktree: worktree}
+	continuation := Continuation{
+		SessionID: "session-1", SessionFile: sessionFile, Worktree: worktree,
+		LeafID: "leaf", EntryCount: 1, SHA256: hex.EncodeToString(hash[:]),
+	}
+	if err := VerifyContinuation(expected, continuation); err != nil {
+		t.Fatalf("verify continuation: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Continuation)
+		write  string
+		want   string
+	}{
+		{name: "changed hash", mutate: func(value *Continuation) { value.SHA256 = strings.Repeat("0", 64) }, want: "hash"},
+		{name: "changed leaf", mutate: func(value *Continuation) { value.LeafID = "other" }, want: "leaf"},
+		{name: "changed count", mutate: func(value *Continuation) { value.EntryCount = 2 }, want: "entries"},
+		{name: "malformed file", write: "not-json\n", want: "malformed JSON"},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			value := continuation
+			if test.mutate != nil {
+				test.mutate(&value)
+			}
+			if test.write != "" {
+				if err := os.WriteFile(sessionFile, []byte(test.write), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					if err := os.WriteFile(sessionFile, []byte(content), 0o600); err != nil {
+						t.Error(err)
+					}
+				}()
+			}
+			if err := VerifyContinuation(expected, value); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func waitForPath(t *testing.T, path string) {
 	t.Helper()
 	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
@@ -766,6 +822,40 @@ func (w *gateCheckingWriteCloser) Write(data []byte) (int, error) {
 }
 
 func (*gateCheckingWriteCloser) Close() error { return nil }
+
+func TestReplacementWorkerPromptRequiresFreshRepositoryAndGitHubAssessment(t *testing.T) {
+	root := t.TempDir()
+	inputPath := filepath.Join(root, "input")
+	pi := fakePi(t, `
+IFS= read -r command
+printf '%s\n' "$command" > `+shellQuote(inputPath)+`
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+while IFS= read -r ignored; do :; done
+`)
+	request := request(81, "run-81", t.TempDir(), filepath.Join(root, "session"))
+	request.Resume = true
+	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if result := process.Wait(); result.Err != nil {
+		t.Fatal(result.Err)
+	}
+	if result := process.Close(); result.Err != nil {
+		t.Fatal(result.Err)
+	}
+	input, err := os.ReadFile(inputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := string(input)
+	if !strings.Contains(message, "Reassess the repository and GitHub state") || !strings.Contains(message, "existing AFK workflow") {
+		t.Fatalf("replacement prompt = %q", message)
+	}
+}
 
 func request(issue int, runID, worktree, sessionDir string) Request {
 	return Request{

@@ -37,6 +37,7 @@ type GitHub interface {
 	// callers must not create Leases from any returned candidates.
 	Candidates(context.Context, string) ([]scheduler.Candidate, error)
 	Completion(context.Context, string, int, string) (ghadapter.CompletionOutcome, error)
+	IssueState(context.Context, string, int) (ghadapter.IssueState, error)
 }
 
 type Store interface {
@@ -47,6 +48,7 @@ type Store interface {
 type Worktrees interface {
 	Plan(int, string) (worktree.Assignment, error)
 	Prepare(context.Context, worktree.Assignment) error
+	Verify(context.Context, worktree.Assignment) error
 	Cleanup(context.Context, worktree.Assignment) error
 	Exists(worktree.Assignment) bool
 }
@@ -207,6 +209,38 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 		if ctx.Err() != nil {
 			return r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped; worker was terminated and its worktree was retained")
+		}
+
+		resumedWorker := false
+		for !draining && len(localWorkers) < r.Config.MaxConcurrentIssues {
+			run := nextSuspendedRun(&current)
+			if run.RunID == "" {
+				break
+			}
+			process, startedDraining, err := r.resumeWhileObservingSignals(workerCtx, operationCtx, &current, run, signalEvents, len(localWorkers))
+			draining = startedDraining || draining
+			if err != nil && operationCtx.Err() != nil && r.suspensionExit.Load() != 0 {
+				persisted, reloadErr := r.Store.Load()
+				if reloadErr != nil {
+					return errors.Join(err, fmt.Errorf("reload state after interrupted Worker Resume: %w", reloadErr))
+				}
+				current = persisted
+				break
+			}
+			if err != nil {
+				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after a Worker Resume error; worktree retained")
+				return errors.Join(err, shutdownErr)
+			}
+			if process != nil {
+				localWorkers[run.Issue] = process
+				resumedWorker = true
+				go func(issue int, process WorkerProcess) {
+					completions <- workerCompletion{issue: issue, result: process.Wait()}
+				}(run.Issue, process)
+			}
+		}
+		if resumedWorker {
+			continue
 		}
 
 		if !draining && candidateRetry == nil {
@@ -455,6 +489,23 @@ func (r *Runner) startWhileObservingSignals(workerCtx, operationCtx context.Cont
 	}
 }
 
+func (r *Runner) resumeWhileObservingSignals(workerCtx, operationCtx context.Context, current *state.State, run scheduler.Run, signalEvents <-chan signalEvent, workers int) (WorkerProcess, bool, error) {
+	result := make(chan workerStart, 1)
+	go func() {
+		process, err := r.resume(workerCtx, operationCtx, current, run)
+		result <- workerStart{process: process, err: err}
+	}()
+	draining := false
+	for {
+		select {
+		case event := <-signalEvents:
+			draining = r.handleSignal(event, workers+1) || draining
+		case resumed := <-result:
+			return resumed.process, draining, resumed.err
+		}
+	}
+}
+
 func workerSummary(count int) string {
 	if count == 1 {
 		return "1 Worker"
@@ -611,6 +662,136 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 	return process, nil
 }
 
+func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.State, original scheduler.Run) (WorkerProcess, error) {
+	run := findActiveRun(current, original.Issue)
+	if run.RunID != original.RunID || run.Status != scheduler.StatusSuspended {
+		return nil, r.rejectResume(current, original.Issue, "durable Run or Lease identity changed before Resume")
+	}
+	outcome, err := r.GitHub.Completion(operationCtx, r.Config.Repo, run.Issue, run.Branch)
+	if err != nil {
+		if operationCtx.Err() != nil {
+			return nil, operationCtx.Err()
+		}
+		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("verify GitHub Completion before Resume: %v", err))
+	}
+	if outcome.Merged || (outcome.PRFound && outcome.AutoMergeArmed) {
+		if err := r.applyOutcome(operationCtx, current, run, outcome, true, true); err != nil {
+			return nil, err
+		}
+		if err := r.Store.Save(*current); err != nil {
+			return nil, fmt.Errorf("persist GitHub outcome before Resume for issue #%d: %w", run.Issue, err)
+		}
+		return nil, nil
+	}
+	if outcome.PRFound {
+		return nil, r.rejectResume(current, run.Issue, "GitHub state changed before Resume: an unmerged pull request is not armed for auto-merge")
+	}
+
+	issue, err := r.GitHub.IssueState(operationCtx, r.Config.Repo, run.Issue)
+	if err != nil {
+		if operationCtx.Err() != nil {
+			return nil, operationCtx.Err()
+		}
+		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("verify issue state and managed labels before Resume: %v", err))
+	}
+	if err := verifyResumeLabels(issue); err != nil {
+		return nil, r.rejectResume(current, run.Issue, err.Error())
+	}
+	if run.WorkerMode != scheduler.WorkerModeRPC {
+		return nil, r.rejectResume(current, run.Issue, "legacy print-mode Run cannot Resume automatically")
+	}
+	if run.PID != 0 || run.ProcessIdentity != "" {
+		return nil, r.rejectResume(current, run.Issue, "old Worker absence is not proven before Resume")
+	}
+	if run.SessionID == "" || run.SessionDir == "" || run.Branch == "" || run.Worktree == "" || run.Continuation == nil {
+		return nil, r.rejectResume(current, run.Issue, "continuation artifacts are incomplete before Resume")
+	}
+	assignment := worktree.Assignment{Path: run.Worktree, Branch: run.Branch}
+	if err := r.Worktrees.Verify(operationCtx, assignment); err != nil {
+		if operationCtx.Err() != nil {
+			return nil, operationCtx.Err()
+		}
+		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("verify retained branch and worktree before Resume: %v", err))
+	}
+	boundary := run.Continuation
+	if err := worker.VerifyContinuation(worker.ContinuationRequest{
+		SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree,
+	}, worker.Continuation{
+		SessionID: boundary.SessionID, SessionFile: boundary.SessionFile, Worktree: boundary.Worktree,
+		LeafID: boundary.LeafID, EntryCount: boundary.EntryCount, SHA256: boundary.SHA256,
+	}); err != nil {
+		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("verify Pi continuation before Resume: %v", err))
+	}
+
+	process, err := r.Workers.Start(workerCtx, worker.Request{
+		Issue: run.Issue, RunID: run.RunID, Worktree: run.Worktree, SessionName: run.SessionName,
+		SessionID: run.SessionID, SessionDir: run.SessionDir, Resume: true,
+	})
+	if err != nil {
+		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("start replacement Pi Worker: %v", err))
+	}
+	identity, err := r.PIDIdentity(process.PID())
+	if err != nil {
+		_ = process.Abort()
+		closed := process.Close()
+		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("record replacement Pi Worker identity: %v; close: %v", err, closed.Err))
+	}
+	now := r.Now().UTC()
+	transitionStatus(&run, scheduler.StatusRunning)
+	run.PID = process.PID()
+	run.ProcessIdentity = identity
+	run.StartedAt = now
+	run.UpdatedAt = now
+	run.Error = ""
+	replaceRun(current, run)
+	if err := r.Store.Save(*current); err != nil {
+		_ = process.Abort()
+		_ = process.Close()
+		return nil, fmt.Errorf("persist replacement Worker identity before release for issue #%d: %w", run.Issue, err)
+	}
+	if err := process.Release(); err != nil {
+		_ = process.Abort()
+		closed := process.Close()
+		run = findActiveRun(current, run.Issue)
+		run.PID = 0
+		run.ProcessIdentity = ""
+		replaceRun(current, run)
+		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("release replacement Pi Worker: %v; close: %v", err, closed.Err))
+	}
+	r.logf("resumed issue #%d in %s (pid %d, Run %s)", run.Issue, run.Worktree, process.PID(), run.RunID)
+	return process, nil
+}
+
+func verifyResumeLabels(issue ghadapter.IssueState) error {
+	if !issue.Open {
+		return errors.New("issue is not open before Resume")
+	}
+	labels := make(map[string]struct{}, len(issue.Labels))
+	for _, label := range issue.Labels {
+		labels[strings.ToLower(label)] = struct{}{}
+	}
+	for _, human := range []string{"needs-triage", "needs-info", "ready-for-human", "wontfix"} {
+		if _, exists := labels[human]; exists {
+			return fmt.Errorf("human workflow label %q blocks Resume", human)
+		}
+	}
+	if _, exists := labels["in-progress"]; !exists {
+		return errors.New("managed label in-progress is missing before Resume")
+	}
+	if _, exists := labels["ready-for-agent"]; exists {
+		return errors.New("managed label ready-for-agent is unexpectedly present before Resume")
+	}
+	return nil
+}
+
+func (r *Runner) rejectResume(current *state.State, issue int, message string) error {
+	r.needsHuman(current, issue, message)
+	if err := r.Store.Save(*current); err != nil {
+		return fmt.Errorf("persist unsafe Resume for issue #%d: %w", issue, err)
+	}
+	return nil
+}
+
 func (r *Runner) handleWorkerCompletionWhileObservingSignals(ctx context.Context, current *state.State, completion workerCompletion, signalEvents <-chan signalEvent, workers int) (bool, error) {
 	result := make(chan error, 1)
 	go func() { result <- r.handleWorkerCompletion(ctx, current, completion) }()
@@ -735,7 +916,17 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 			continue
 		}
 		allowWaiting := run.Status == scheduler.StatusWaitingForMerge || run.Status == scheduler.StatusRunning || run.Status == scheduler.StatusSuspended
-		if run.Status == scheduler.StatusSuspended && !outcome.Merged && !(outcome.PRFound && outcome.AutoMergeArmed) {
+		recoverableMarker := run.Status == scheduler.StatusRunning && run.WorkerMode == scheduler.WorkerModeRPC && run.Continuation != nil
+		if (run.Status == scheduler.StatusSuspended || recoverableMarker) && !outcome.Merged && !outcome.PRFound {
+			if recoverableMarker {
+				run.PID = 0
+				run.ProcessIdentity = ""
+				transitionStatus(&run, scheduler.StatusSuspended)
+				run.Error = ""
+				run.UpdatedAt = r.Now().UTC()
+				replaceRun(current, run)
+				changed = true
+			}
 			continue
 		}
 		if err := r.applyOutcome(ctx, current, run, outcome, allowWaiting, true); err != nil {
@@ -1183,6 +1374,16 @@ func removeLease(current *state.State, runID string) {
 			return
 		}
 	}
+}
+
+func nextSuspendedRun(current *state.State) scheduler.Run {
+	for _, lease := range current.Leases {
+		run := findRun(current.Runs, lease.RunID)
+		if run.Status == scheduler.StatusSuspended {
+			return run
+		}
+	}
+	return scheduler.Run{}
 }
 
 func unfinishedRunCount(current *state.State) int {
