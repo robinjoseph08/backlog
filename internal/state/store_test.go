@@ -436,6 +436,10 @@ func TestFileStoreLoadsUnsafeSuspensionForNeedsHumanRecovery(t *testing.T) {
 		mutate func(*scheduler.Run)
 	}{
 		{name: "missing continuation", mutate: func(run *scheduler.Run) { run.Continuation = nil }},
+		{name: "pending Resume missing continuation", mutate: func(run *scheduler.Run) {
+			run.ResumePending = true
+			run.Continuation = nil
+		}},
 		{name: "malformed continuation", mutate: func(run *scheduler.Run) { run.Continuation.EntryCount = 0 }},
 		{name: "legacy print suspension", mutate: func(run *scheduler.Run) {
 			run.WorkerMode = scheduler.WorkerModePrint

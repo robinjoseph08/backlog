@@ -321,7 +321,7 @@ func validateRun(run scheduler.Run, requireWorkerMode, recoverUnsafeContinuation
 			return fmt.Errorf("state contains suspended issue #%d without a verified stopped continuation", run.Issue)
 		}
 	}
-	if run.ResumePending && ((run.Status != scheduler.StatusSuspended && run.Status != scheduler.StatusNeedsHuman) || run.PID != 0 || run.ProcessIdentity != "" || run.Continuation == nil) {
+	if run.ResumePending && ((run.Status != scheduler.StatusSuspended && run.Status != scheduler.StatusNeedsHuman) || run.PID != 0 || run.ProcessIdentity != "" || run.Continuation == nil && run.Status != scheduler.StatusNeedsHuman && !recoverUnsafeContinuation) {
 		return fmt.Errorf("state contains Run %q with an invalid pending Resume", run.RunID)
 	}
 	return nil

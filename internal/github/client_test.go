@@ -332,9 +332,11 @@ func TestClientIssueInspectionRefusesDuplicateIdentityFields(t *testing.T) {
 	}{
 		{name: "number", response: `{"number":41,"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"}]}`},
 		{name: "number case alias", response: `{"number":41,"Number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"}]}`},
+		{name: "lone number case alias", response: `{"Number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"}]}`},
 		{name: "URL", response: `{"number":42,"url":"https://github.com/acme/widgets/issues/41","url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"}]}`},
 		{name: "state", response: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","state":"OPEN","labels":[{"name":"in-progress"}]}`},
 		{name: "Unicode state alias", response: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","\u017Ftate":"OPEN","labels":[{"name":"in-progress"}]}`},
+		{name: "lone Unicode state alias", response: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","\u017Ftate":"OPEN","labels":[{"name":"in-progress"}]}`},
 		{name: "nested label case alias", response: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"ready-for-human","Name":"in-progress"}]}`},
 	}
 	for _, test := range tests {
@@ -348,8 +350,8 @@ case "$*" in
 esac`)
 
 			got, err := (Client{Executable: gh}).IssueState(context.Background(), "acme/widgets", 42)
-			if err == nil || !strings.Contains(err.Error(), "duplicate JSON field") {
-				t.Fatalf("error = %v, want duplicate identity refusal", err)
+			if err == nil || !strings.Contains(err.Error(), "JSON field") {
+				t.Fatalf("error = %v, want ambiguous identity refusal", err)
 			}
 			if got.Open || got.Labels != nil {
 				t.Fatalf("issue state = %#v, want fail-closed empty metadata", got)
@@ -388,9 +390,11 @@ func TestClientCompletionRefusesDuplicateIssueIdentityFields(t *testing.T) {
 	}{
 		{name: "number", response: `{"number":41,"number":42,"state":"OPEN","url":"https://github.com/acme/widgets/issues/42"}`},
 		{name: "number case alias", response: `{"number":41,"Number":42,"state":"OPEN","url":"https://github.com/acme/widgets/issues/42"}`},
+		{name: "lone number case alias", response: `{"Number":42,"state":"OPEN","url":"https://github.com/acme/widgets/issues/42"}`},
 		{name: "URL", response: `{"number":42,"state":"OPEN","url":"https://github.com/acme/widgets/issues/41","url":"https://github.com/acme/widgets/issues/42"}`},
 		{name: "state", response: `{"number":42,"state":"CLOSED","state":"OPEN","url":"https://github.com/acme/widgets/issues/42"}`},
 		{name: "Unicode state alias", response: `{"number":42,"state":"CLOSED","\u017Ftate":"OPEN","url":"https://github.com/acme/widgets/issues/42"}`},
+		{name: "lone Unicode state alias", response: `{"number":42,"\u017Ftate":"OPEN","url":"https://github.com/acme/widgets/issues/42"}`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -405,8 +409,8 @@ case "$*" in
 esac`)
 
 			got, err := (Client{Executable: gh}).Completion(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
-			if err == nil || !strings.Contains(err.Error(), "duplicate JSON field") {
-				t.Fatalf("error = %v, want duplicate identity refusal", err)
+			if err == nil || !strings.Contains(err.Error(), "JSON field") {
+				t.Fatalf("error = %v, want ambiguous identity refusal", err)
 			}
 			if got != (CompletionOutcome{}) {
 				t.Fatalf("completion = %#v, want fail-closed empty outcome", got)

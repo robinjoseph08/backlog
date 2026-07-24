@@ -298,27 +298,9 @@ func (p *Process) Suspend(ctx context.Context, expected ContinuationRequest) (Co
 	if !stateResponse.Success {
 		return Continuation{}, fmt.Errorf("get Pi RPC state: %s", stateResponse.Error)
 	}
-	var rpcState struct {
-		IsStreaming         *bool  `json:"isStreaming"`
-		IsCompacting        *bool  `json:"isCompacting"`
-		SessionFile         string `json:"sessionFile"`
-		SessionID           string `json:"sessionId"`
-		PendingMessageCount *int   `json:"pendingMessageCount"`
-	}
-	if _, err := decodeExactJSON(stateResponse.Data); err != nil {
-		return Continuation{}, fmt.Errorf("decode Pi RPC state: %w", err)
-	}
-	if err := json.Unmarshal(stateResponse.Data, &rpcState); err != nil {
-		return Continuation{}, fmt.Errorf("decode Pi RPC state: %w", err)
-	}
-	if rpcState.IsStreaming == nil || rpcState.IsCompacting == nil || rpcState.PendingMessageCount == nil {
-		return Continuation{}, errors.New("Pi RPC state omitted required idle fields")
-	}
-	if *rpcState.IsStreaming || *rpcState.IsCompacting || *rpcState.PendingMessageCount != 0 {
-		return Continuation{}, fmt.Errorf("Pi RPC state is not idle (streaming=%t compacting=%t pendingMessages=%d)", *rpcState.IsStreaming, *rpcState.IsCompacting, *rpcState.PendingMessageCount)
-	}
-	if rpcState.SessionID != expected.SessionID {
-		return Continuation{}, fmt.Errorf("Pi RPC session id %q does not match %q", rpcState.SessionID, expected.SessionID)
+	rpcState, err := decodeRPCSessionState(stateResponse.Data, expected.SessionID)
+	if err != nil {
+		return Continuation{}, err
 	}
 	if err := verifySessionPath(expected.SessionDir, rpcState.SessionFile); err != nil {
 		return Continuation{}, err
@@ -338,6 +320,9 @@ func (p *Process) Suspend(ctx context.Context, expected ContinuationRequest) (Co
 	if _, err := decodeExactJSON(entriesResponse.Data); err != nil {
 		return Continuation{}, fmt.Errorf("decode Pi session entries: %w", err)
 	}
+	if err := rejectNonCanonicalJSONFields(entriesResponse.Data, "entries", "leafId"); err != nil {
+		return Continuation{}, fmt.Errorf("decode Pi session entries: %w", err)
+	}
 	if err := json.Unmarshal(entriesResponse.Data, &rpcEntries); err != nil {
 		return Continuation{}, fmt.Errorf("decode Pi session entries: %w", err)
 	}
@@ -345,11 +330,62 @@ func (p *Process) Suspend(ctx context.Context, expected ContinuationRequest) (Co
 	if err != nil {
 		return Continuation{}, err
 	}
+	finalStateResponse, err := p.rpcCommand(ctx, "backlog-suspend-final-state", "get_state")
+	if err != nil {
+		return Continuation{}, fmt.Errorf("confirm final Pi RPC state: %w", err)
+	}
+	if !finalStateResponse.Success {
+		return Continuation{}, fmt.Errorf("confirm final Pi RPC state: %s", finalStateResponse.Error)
+	}
+	finalState, err := decodeRPCSessionState(finalStateResponse.Data, expected.SessionID)
+	if err != nil {
+		return Continuation{}, fmt.Errorf("confirm final Pi RPC state: %w", err)
+	}
+	if finalState.SessionFile != rpcState.SessionFile {
+		return Continuation{}, errors.New("final Pi RPC session file changed while establishing continuation boundary")
+	}
+	if err := p.events.Idle(); err != nil {
+		return Continuation{}, fmt.Errorf("confirm final Pi RPC protocol state: %w", err)
+	}
+	if err := p.events.Err(); err != nil {
+		return Continuation{}, fmt.Errorf("confirm final Pi RPC transcript: %w", err)
+	}
 	return Continuation{
 		SessionID: expected.SessionID, SessionFile: rpcState.SessionFile, Worktree: expected.Worktree,
 		LeafID: rpcEntries.LeafID, EntryCount: len(rpcEntries.Entries), SHA256: sha,
 		LogPath: p.logPath, StderrPath: p.stderrPath,
 	}, nil
+}
+
+type rpcSessionState struct {
+	IsStreaming         *bool  `json:"isStreaming"`
+	IsCompacting        *bool  `json:"isCompacting"`
+	SessionFile         string `json:"sessionFile"`
+	SessionID           string `json:"sessionId"`
+	PendingMessageCount *int   `json:"pendingMessageCount"`
+}
+
+func decodeRPCSessionState(raw json.RawMessage, expectedSessionID string) (rpcSessionState, error) {
+	if _, err := decodeExactJSON(raw); err != nil {
+		return rpcSessionState{}, fmt.Errorf("decode Pi RPC state: %w", err)
+	}
+	if err := rejectNonCanonicalJSONFields(raw, "isStreaming", "isCompacting", "sessionFile", "sessionId", "pendingMessageCount"); err != nil {
+		return rpcSessionState{}, fmt.Errorf("decode Pi RPC state: %w", err)
+	}
+	var state rpcSessionState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return rpcSessionState{}, fmt.Errorf("decode Pi RPC state: %w", err)
+	}
+	if state.IsStreaming == nil || state.IsCompacting == nil || state.PendingMessageCount == nil {
+		return rpcSessionState{}, errors.New("Pi RPC state omitted required idle fields")
+	}
+	if *state.IsStreaming || *state.IsCompacting || *state.PendingMessageCount != 0 {
+		return rpcSessionState{}, fmt.Errorf("Pi RPC state is not idle (streaming=%t compacting=%t pendingMessages=%d)", *state.IsStreaming, *state.IsCompacting, *state.PendingMessageCount)
+	}
+	if state.SessionID != expectedSessionID {
+		return rpcSessionState{}, fmt.Errorf("Pi RPC session id %q does not match %q", state.SessionID, expectedSessionID)
+	}
+	return state, nil
 }
 
 type rpcResponse struct {
@@ -604,6 +640,9 @@ func VerifyContinuation(expected ContinuationRequest, continuation Continuation)
 	if _, err := decodeExactJSON(records[0]); err != nil {
 		return fmt.Errorf("decode Pi session header: %w", err)
 	}
+	if err := rejectNonCanonicalJSONFields(records[0], "type", "id", "cwd"); err != nil {
+		return fmt.Errorf("decode Pi session header: %w", err)
+	}
 	if err := json.Unmarshal(records[0], &header); err != nil || header.Type != "session" {
 		return errors.New("Pi session file has an invalid header")
 	}
@@ -716,6 +755,9 @@ func verifyAndSyncSession(path string, expected ContinuationRequest, rpcEntries 
 	if _, err := decodeExactJSON(records[0]); err != nil {
 		return "", fmt.Errorf("decode Pi session header: %w", err)
 	}
+	if err := rejectNonCanonicalJSONFields(records[0], "type", "id", "cwd"); err != nil {
+		return "", fmt.Errorf("decode Pi session header: %w", err)
+	}
 	if err := json.Unmarshal(records[0], &header); err != nil || header.Type != "session" {
 		return "", errors.New("Pi session file has an invalid header")
 	}
@@ -774,6 +816,24 @@ func decodeExactJSON(raw []byte) (any, error) {
 	return value, nil
 }
 
+func rejectNonCanonicalJSONFields(raw []byte, canonicalFields ...string) error {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return err
+	}
+	if object == nil {
+		return errors.New("JSON value is not an object")
+	}
+	for field := range object {
+		for _, canonical := range canonicalFields {
+			if field != canonical && strings.EqualFold(field, canonical) {
+				return fmt.Errorf("JSON object contains non-canonical key %q", field)
+			}
+		}
+	}
+	return nil
+}
+
 func rejectDuplicateJSONKeys(decoder *json.Decoder) error {
 	token, err := decoder.Token()
 	if err != nil {
@@ -795,10 +855,8 @@ func rejectDuplicateJSONKeys(decoder *json.Decoder) error {
 			if !ok {
 				return errors.New("JSON object key is not a string")
 			}
-			for existing := range keys {
-				if strings.EqualFold(existing, key) {
-					return fmt.Errorf("JSON object contains duplicate key %q", key)
-				}
+			if _, duplicate := keys[key]; duplicate {
+				return fmt.Errorf("JSON object contains duplicate key %q", key)
 			}
 			keys[key] = struct{}{}
 			if err := rejectDuplicateJSONKeys(decoder); err != nil {
@@ -834,9 +892,15 @@ func verifyContinuationLeaf(entries []json.RawMessage, leafID string) error {
 	byID := make(map[string]entry, len(entries))
 	ordered := make([]entry, 0, len(entries))
 	for _, raw := range entries {
+		if err := rejectNonCanonicalJSONFields(raw, "type", "id", "parentId", "message"); err != nil {
+			return fmt.Errorf("decode Pi session entry: %w", err)
+		}
 		var value entry
-		if err := json.Unmarshal(raw, &value); err != nil || value.ID == "" {
-			return errors.New("Pi session contains an entry without durable identity")
+		if err := json.Unmarshal(raw, &value); err != nil || value.ID == "" || value.Type == "" {
+			return errors.New("Pi session contains an entry without durable identity and type")
+		}
+		if value.Type == "message" && (len(value.Message) == 0 || string(value.Message) == "null") {
+			return fmt.Errorf("Pi session message entry %q has no message metadata", value.ID)
 		}
 		if _, duplicate := byID[value.ID]; duplicate {
 			return fmt.Errorf("Pi session contains duplicate entry %q", value.ID)
@@ -878,19 +942,32 @@ func verifyContinuationLeaf(entries []json.RawMessage, leafID string) error {
 			ToolCallID string          `json:"toolCallId"`
 			Content    json.RawMessage `json:"content"`
 		}
+		if err := rejectNonCanonicalJSONFields(value.Message, "role", "toolCallId", "content"); err != nil {
+			return fmt.Errorf("decode Pi session message %q: %w", value.ID, err)
+		}
 		if err := json.Unmarshal(value.Message, &message); err != nil {
 			return fmt.Errorf("decode Pi session message %q: %w", value.ID, err)
 		}
+		if message.Role == "" {
+			return fmt.Errorf("Pi session message %q has no role", value.ID)
+		}
 		switch message.Role {
 		case "assistant":
-			var contents []struct {
-				Type string `json:"type"`
-				ID   string `json:"id"`
-			}
-			if err := json.Unmarshal(message.Content, &contents); err != nil {
+			var rawContents []json.RawMessage
+			if err := json.Unmarshal(message.Content, &rawContents); err != nil {
 				return fmt.Errorf("decode Pi session assistant content %q: %w", value.ID, err)
 			}
-			for _, content := range contents {
+			for _, rawContent := range rawContents {
+				if err := rejectNonCanonicalJSONFields(rawContent, "type", "id"); err != nil {
+					return fmt.Errorf("decode Pi session assistant content %q: %w", value.ID, err)
+				}
+				var content struct {
+					Type string `json:"type"`
+					ID   string `json:"id"`
+				}
+				if err := json.Unmarshal(rawContent, &content); err != nil {
+					return fmt.Errorf("decode Pi session assistant content %q: %w", value.ID, err)
+				}
 				if content.Type == "toolCall" {
 					if content.ID == "" {
 						return fmt.Errorf("Pi session assistant entry %q has a tool call without identity", value.ID)
@@ -1154,6 +1231,10 @@ func (w *rpcWriter) validate(line []byte) {
 		Data       json.RawMessage `json:"data"`
 	}
 	if _, err := decodeExactJSON(line); err != nil {
+		w.addError(fmt.Errorf("malformed Pi RPC JSON on line %d: %w", w.lineNumber, err))
+		return
+	}
+	if err := rejectNonCanonicalJSONFields(line, "type", "id", "command", "method", "toolCallId", "attempt", "success", "data", "error"); err != nil {
 		w.addError(fmt.Errorf("malformed Pi RPC JSON on line %d: %w", w.lineNumber, err))
 		return
 	}

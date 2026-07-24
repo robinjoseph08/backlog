@@ -192,8 +192,10 @@ func TestProcessRPCValidationFailsClosed(t *testing.T) {
 		{"truncated", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}`, "truncated Pi RPC JSON"},
 		{"duplicate response", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n`, "duplicated Pi RPC prompt response"},
 		{"mismatched response", `{"id":"wrong","type":"response","command":"prompt","success":true}\n`, "mismatched Pi RPC response"},
-		{"case-variant response identity", `{"id":"wrong","ID":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n`, "duplicate key"},
-		{"Unicode response success alias", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":false,"\u017Fuccess":true}\n`, "duplicate key"},
+		{"case-variant response identity", `{"id":"wrong","ID":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n`, "non-canonical key"},
+		{"lone case-variant response identity", `{"ID":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n`, "non-canonical key"},
+		{"Unicode response success alias", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":false,"\u017Fuccess":true}\n`, "non-canonical key"},
+		{"lone Unicode response success alias", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","\u017Fuccess":true}\n`, "non-canonical key"},
 		{"wrong response command", `{"id":"backlog-afk-prompt","type":"response","command":"abort","success":true}\n`, "mismatched Pi RPC response"},
 		{"missing response success", `{"id":"backlog-afk-prompt","type":"response","command":"prompt"}\n`, "Pi RPC prompt was rejected"},
 		{"rejected response", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":false}\n`, "Pi RPC prompt was rejected"},
@@ -654,6 +656,8 @@ IFS= read -r state
 printf '%s\n' '{"id":"backlog-suspend-state","type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":`+strings.ReplaceAll(strconv.Quote(sessionFile), `'`, `\'`)+`,"sessionId":"backlog-run-50"}}'
 IFS= read -r get_entries
 printf '%s\n' '{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":`+entriesJSON+`,"leafId":"result"}}'
+IFS= read -r final_state
+printf '%s\n' '{"id":"backlog-suspend-final-state","type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":`+strings.ReplaceAll(strconv.Quote(sessionFile), `'`, `\'`)+`,"sessionId":"backlog-run-50"}}'
 while IFS= read -r ignored; do :; done
 `)
 	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(
@@ -679,6 +683,54 @@ while IFS= read -r ignored; do :; done
 	if result := process.CloseContext(context.Background(), nil); !result.GroupExited || result.Err != nil {
 		t.Fatalf("close = %#v", result)
 	}
+}
+
+func TestProcessSuspendRejectsTrailingProtocolFailureBeforeFinalBarrier(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	worktree := filepath.Join(root, "worktree")
+	sessionDir := filepath.Join(root, "sessions")
+	sessionFile := filepath.Join(sessionDir, "session.jsonl")
+	started := filepath.Join(root, "started")
+	if err := os.MkdirAll(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	header := `{"type":"session","id":"backlog-run-53","cwd":` + strconv.Quote(worktree) + `}`
+	entry := `{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"work"}}`
+	stateData := `{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(sessionFile) + `,"sessionId":"backlog-run-53"}`
+	pi := fakePi(t, `
+IFS= read -r prompt
+touch `+shellQuote(started)+`
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
+IFS= read -r abort
+printf '%s\n' `+shellQuote(header)+` `+shellQuote(entry)+` > `+shellQuote(sessionFile)+`
+printf '%s\n' '{"id":"backlog-suspend-abort","type":"response","command":"abort","success":true}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+IFS= read -r state
+printf '%s\n' `+shellQuote(`{"id":"backlog-suspend-state","type":"response","command":"get_state","success":true,"data":`+stateData+`}`)+`
+IFS= read -r entries
+printf '%s\n' `+shellQuote(`{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[`+entry+`],"leafId":"leaf"}}`)+`
+IFS= read -r final_state
+printf '%s\n' 'not-json' `+shellQuote(`{"id":"backlog-suspend-final-state","type":"response","command":"get_state","success":true,"data":`+stateData+`}`)+`
+while IFS= read -r ignored; do :; done
+`)
+	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(
+		context.Background(), request(53, "run-53", worktree, sessionDir),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatal(err)
+	}
+	waitForPath(t, started)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = process.Suspend(ctx, ContinuationRequest{SessionID: "backlog-run-53", SessionDir: sessionDir, Worktree: worktree})
+	if err == nil || !strings.Contains(err.Error(), "malformed Pi RPC JSON") {
+		t.Fatalf("trailing protocol failure = %v", err)
+	}
+	_ = process.Close()
 }
 
 func TestProcessSuspendRequiresCorrelatedAbortResponseAndCompleteToolTail(t *testing.T) {
@@ -766,12 +818,20 @@ func TestProcessSuspendRejectsIncompleteIdleStateAndWrongSession(t *testing.T) {
 		}, settleEvent: `{"type":"agent_settled"}`, want: "does not match"},
 		{name: "case-variant session identity", stateData: func(path string) string {
 			return `{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(path) + `,"sessionId":"another-session","SessionID":"backlog-run-52"}`
-		}, settleEvent: `{"type":"agent_settled"}`, want: "duplicate key"},
+		}, settleEvent: `{"type":"agent_settled"}`, want: "non-canonical key"},
+		{name: "lone case-variant session identity", stateData: func(path string) string {
+			return `{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(path) + `,"SessionID":"backlog-run-52"}`
+		}, settleEvent: `{"type":"agent_settled"}`, want: "non-canonical key"},
 		{name: "case-variant leaf identity", stateData: func(path string) string {
 			return `{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(path) + `,"sessionId":"backlog-run-52"}`
 		}, entriesData: func(entry string) string {
 			return `{"entries":[` + entry + `],"leafId":"wrong","LeafID":"user"}`
-		}, settleEvent: `{"type":"agent_settled"}`, want: "duplicate key"},
+		}, settleEvent: `{"type":"agent_settled"}`, want: "non-canonical key"},
+		{name: "lone case-variant leaf identity", stateData: func(path string) string {
+			return `{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(path) + `,"sessionId":"backlog-run-52"}`
+		}, entriesData: func(entry string) string {
+			return `{"entries":[` + entry + `],"LeafID":"user"}`
+		}, settleEvent: `{"type":"agent_settled"}`, want: "non-canonical key"},
 		{name: "missing settlement", stateData: func(path string) string {
 			return `{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(path) + `,"sessionId":"backlog-run-52"}`
 		}, want: "deadline exceeded"},
@@ -881,6 +941,16 @@ func TestVerifySessionBoundaryRejectsPathIdentityAndEntryMismatches(t *testing.T
 	if len(syncCalls) != 2 || syncCalls[0] != sessionFile || syncCalls[1] != sessionDir {
 		t.Fatalf("sync calls = %v, want file then directory", syncCalls)
 	}
+	caseDistinctContent := `{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":{"type":"data","Type":"value"}}}`
+	if err := os.WriteFile(sessionFile, []byte(header+"\n"+caseDistinctContent+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifyAndSyncSession(sessionFile, expected, []json.RawMessage{json.RawMessage(caseDistinctContent)}, "leaf", syncFile); err != nil {
+		t.Fatalf("case-distinct opaque content: %v", err)
+	}
+	if err := os.WriteFile(sessionFile, []byte(header+"\n"+diskEntry+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := verifyAndSyncSession(sessionFile, expected, []json.RawMessage{json.RawMessage(strings.Replace(diskEntry, "9007199254740992", "9007199254740993", 1))}, "leaf", syncFile); err == nil || !strings.Contains(err.Error(), "not synchronized") {
 		t.Fatalf("large-number mismatch error = %v", err)
 	}
@@ -892,7 +962,7 @@ func TestVerifySessionBoundaryRejectsPathIdentityAndEntryMismatches(t *testing.T
 	if err := os.WriteFile(sessionFile, []byte(caseVariantHeader+"\n"+diskEntry+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := verifyAndSyncSession(sessionFile, expected, []json.RawMessage{json.RawMessage(diskEntry)}, "leaf", syncFile); err == nil || !strings.Contains(err.Error(), "duplicate key") {
+	if _, err := verifyAndSyncSession(sessionFile, expected, []json.RawMessage{json.RawMessage(diskEntry)}, "leaf", syncFile); err == nil || !strings.Contains(err.Error(), "non-canonical key") {
 		t.Fatalf("case-variant header error = %v", err)
 	}
 	if err := os.WriteFile(sessionFile, []byte(header+"\n"+diskEntry+"\n"), 0o600); err != nil {
@@ -971,16 +1041,43 @@ func TestVerifyContinuationRejectsCaseVariantIdentityAliases(t *testing.T) {
 		name    string
 		header  string
 		entries string
+		want    string
 	}{
 		{
 			name:    "session header",
 			header:  `{"type":"other","Type":"session","id":"wrong","ID":"session-1","cwd":"wrong","CWD":` + strconv.Quote(worktree) + `}`,
 			entries: `{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"continue"}}`,
+			want:    "non-canonical key",
+		},
+		{
+			name:    "lone session header alias",
+			header:  `{"Type":"session","ID":"session-1","CWD":` + strconv.Quote(worktree) + `}`,
+			entries: `{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"continue"}}`,
+			want:    "non-canonical key",
 		},
 		{
 			name:    "durable leaf",
 			header:  `{"type":"session","id":"session-1","cwd":` + strconv.Quote(worktree) + `}`,
 			entries: `{"type":"message","id":"wrong","ID":"leaf","parentId":null,"message":{"role":"user","content":"continue"}}`,
+			want:    "non-canonical key",
+		},
+		{
+			name:    "lone durable leaf alias",
+			header:  `{"type":"session","id":"session-1","cwd":` + strconv.Quote(worktree) + `}`,
+			entries: `{"type":"message","ID":"leaf","parentId":null,"message":{"role":"user","content":"continue"}}`,
+			want:    "non-canonical key",
+		},
+		{
+			name:    "missing entry type",
+			header:  `{"type":"session","id":"session-1","cwd":` + strconv.Quote(worktree) + `}`,
+			entries: `{"id":"leaf","parentId":null}`,
+			want:    "identity and type",
+		},
+		{
+			name:    "null message metadata",
+			header:  `{"type":"session","id":"session-1","cwd":` + strconv.Quote(worktree) + `}`,
+			entries: `{"type":"message","id":"leaf","parentId":null,"message":null}`,
+			want:    "no message metadata",
 		},
 	}
 	for _, test := range tests {
@@ -994,8 +1091,8 @@ func TestVerifyContinuationRejectsCaseVariantIdentityAliases(t *testing.T) {
 				SessionID: "session-1", SessionFile: sessionFile, Worktree: worktree,
 				LeafID: "leaf", EntryCount: 1, SHA256: hex.EncodeToString(hash[:]),
 			}
-			if err := VerifyContinuation(expected, continuation); err == nil || !strings.Contains(err.Error(), "duplicate key") {
-				t.Fatalf("case-variant identity error = %v", err)
+			if err := VerifyContinuation(expected, continuation); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("continuation metadata error = %v, want %q", err, test.want)
 			}
 		})
 	}

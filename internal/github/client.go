@@ -484,6 +484,12 @@ func (c Client) jsonCommand(ctx context.Context, target any, args ...string) err
 	return nil
 }
 
+var canonicalGitHubJSONFields = []string{
+	"nameWithOwner", "name", "defaultBranchRef", "number", "title", "createdAt", "url", "body", "state",
+	"created_at", "html_url", "labels", "mergedAt", "autoMergeRequest", "isDraft", "headRefName",
+	"login", "headRepositoryOwner", "headRepository",
+}
+
 func rejectDuplicateJSONFields(output []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(output))
 	if err := consumeJSONValue(decoder); err != nil {
@@ -522,6 +528,11 @@ func consumeJSONValue(decoder *json.Decoder) error {
 			for existing := range fields {
 				if strings.EqualFold(existing, field) {
 					return fmt.Errorf("duplicate JSON field %q", field)
+				}
+			}
+			for _, canonical := range canonicalGitHubJSONFields {
+				if field != canonical && strings.EqualFold(field, canonical) {
+					return fmt.Errorf("non-canonical JSON field %q", field)
 				}
 			}
 			fields[field] = struct{}{}

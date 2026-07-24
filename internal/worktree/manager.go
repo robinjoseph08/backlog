@@ -69,6 +69,9 @@ func (m Manager) Verify(ctx context.Context, assignment Assignment) error {
 	if assignment.Path == "" || assignment.Branch == "" {
 		return fmt.Errorf("worktree assignment is incomplete")
 	}
+	if err := rejectSymlinkedWorktreePath(m.WorktreesDir, assignment.Path); err != nil {
+		return err
+	}
 	info, err := os.Lstat(assignment.Path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -122,6 +125,34 @@ func (m Manager) Verify(ctx context.Context, assignment Assignment) error {
 	}
 	if branch != assignment.Branch {
 		return fmt.Errorf("worktree branch %q does not match expected branch %q", branch, assignment.Branch)
+	}
+	return nil
+}
+
+func rejectSymlinkedWorktreePath(worktreesDir, worktreePath string) error {
+	relative, err := filepath.Rel(worktreesDir, worktreePath)
+	if err != nil || relative == "." || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return nil
+	}
+	current := filepath.Clean(worktreesDir)
+	components := append([]string{""}, strings.Split(relative, string(filepath.Separator))...)
+	for index, component := range components {
+		if component != "" {
+			current = filepath.Join(current, component)
+		}
+		if index == len(components)-1 {
+			break
+		}
+		info, err := os.Lstat(current)
+		if err != nil {
+			return fmt.Errorf("inspect worktree path component %q: %w", current, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("worktree path component %q is a symlink", current)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("worktree path component %q is not a directory", current)
+		}
 	}
 	return nil
 }
