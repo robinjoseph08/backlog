@@ -75,10 +75,11 @@ type Runner struct {
 	Output    io.Writer
 	Signals   <-chan os.Signal
 
-	Now         func() time.Time
-	NewRunID    func(issue int) string
-	PIDAlive    func(pid int) bool
-	PIDIdentity func(context.Context, int) (string, error)
+	Now               func() time.Time
+	NewRunID          func(issue int) string
+	PIDAlive          func(pid int) bool
+	ProcessGroupAlive func(pid int) (bool, error)
+	PIDIdentity       func(context.Context, int) (string, error)
 
 	suspensionExit       atomic.Int32
 	suspensionFailed     atomic.Bool
@@ -537,6 +538,9 @@ func (r *Runner) validate() error {
 	if r.PIDAlive == nil {
 		r.PIDAlive = pidAlive
 	}
+	if r.ProcessGroupAlive == nil {
+		r.ProcessGroupAlive = processGroupAlive
+	}
 	if r.PIDIdentity == nil {
 		r.PIDIdentity = pidIdentity
 	}
@@ -718,6 +722,7 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 	changed := false
 	for _, lease := range append([]scheduler.Lease(nil), current.Leases...) {
 		run := findRun(current.Runs, lease.RunID)
+		recoverableContinuation := false
 		if run.Issue == 0 || run.Issue != lease.Issue {
 			return fmt.Errorf("active Lease %q has an invalid Run reference", lease.LeaseID)
 		}
@@ -755,6 +760,25 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 				}
 				continue
 			}
+			if run.Continuation != nil {
+				if run.PID <= 0 {
+					r.needsHuman(current, run.Issue, "persisted continuation has no Worker PID for process-group absence verification")
+					changed = true
+					continue
+				}
+				groupAlive, err := r.ProcessGroupAlive(run.PID)
+				if err != nil {
+					r.needsHumanWithLiveWorker(current, run.Issue, fmt.Sprintf("verify recovered Worker process-group absence: %v", err))
+					changed = true
+					continue
+				}
+				if groupAlive {
+					r.needsHumanWithLiveWorker(current, run.Issue, "recovered Worker leader is absent but its process group may still be live; Worker retained for intervention")
+					changed = true
+					continue
+				}
+				recoverableContinuation = true
+			}
 		case scheduler.StatusWaitingForMerge, scheduler.StatusSuspended:
 			// Always verify waiting and suspended Runs without making retained
 			// continuation state eligible for normal admission.
@@ -783,6 +807,17 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 		}
 		allowWaiting := run.Status == scheduler.StatusWaitingForMerge || run.Status == scheduler.StatusRunning || run.Status == scheduler.StatusSuspended
 		if run.Status == scheduler.StatusSuspended && !outcome.Merged && !(outcome.PRFound && outcome.AutoMergeArmed) {
+			continue
+		}
+		if recoverableContinuation && !outcome.Merged && !outcome.PRFound {
+			transitionStatus(&run, scheduler.StatusSuspended)
+			run.PID = 0
+			run.ProcessIdentity = ""
+			run.Error = ""
+			run.UpdatedAt = r.Now().UTC()
+			replaceRun(current, run)
+			r.logf("recovered suspended Run for issue #%d from its persisted continuation", run.Issue)
+			changed = true
 			continue
 		}
 		if err := r.applyOutcome(ctx, current, run, outcome, allowWaiting, true); err != nil {
@@ -1335,4 +1370,19 @@ func pidAlive(pid int) bool {
 	}
 	err = process.Signal(syscall.Signal(0))
 	return err == nil || errors.Is(err, os.ErrPermission)
+}
+
+func processGroupAlive(pid int) (bool, error) {
+	if pid <= 0 {
+		return false, fmt.Errorf("invalid process-group leader pid %d", pid)
+	}
+	err := syscall.Kill(-pid, syscall.Signal(0))
+	switch {
+	case err == nil, errors.Is(err, syscall.EPERM):
+		return true, nil
+	case errors.Is(err, syscall.ESRCH):
+		return false, nil
+	default:
+		return false, err
+	}
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"reflect"
 	"strings"
@@ -1679,6 +1680,70 @@ func TestRunnerDoesNotPersistBoundaryAfterMarkerWriteFails(t *testing.T) {
 	}
 }
 
+func TestRunnerRecoversPersistedContinuationAfterFinalSuspensionSaveFails(t *testing.T) {
+	const issue = 76
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: issue, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 7}
+	signals := make(chan os.Signal, 1)
+	runner := testRunner(github, workers, store, 1)
+	runner.Signals = signals
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, issue)
+	signals <- syscall.SIGTERM
+	if err := <-done; !isSignalExit(err, 143) || !strings.Contains(err.Error(), "persist suspended") {
+		t.Fatalf("run: %v, want final suspension persistence failure with signal exit 143", err)
+	}
+	durable := store.LoadValue()
+	if durable.Runs[0].Status != scheduler.StatusRunning || durable.Runs[0].Continuation == nil || durable.Runs[0].PID == 0 {
+		t.Fatalf("durable crash-window state = %#v", durable)
+	}
+
+	restarted := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+	restarted.Output = io.Discard
+	restarted.PIDAlive = func(int) bool { return false }
+	restarted.ProcessGroupAlive = func(int) (bool, error) { return false, nil }
+	current := store.LoadValue()
+	if err := restarted.reconcile(context.Background(), &current, map[int]WorkerProcess{}); err != nil {
+		t.Fatalf("reconcile restart: %v", err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusSuspended || got.Runs[0].PID != 0 || got.Runs[0].ProcessIdentity != "" || got.Runs[0].Continuation == nil || len(got.Leases) != 1 {
+		t.Fatalf("recovered continuation = %#v", got)
+	}
+}
+
+func TestRunnerFailsClosedWhenRecoveredContinuationProcessGroupMayBeLive(t *testing.T) {
+	const issue = 77
+	continuation := &scheduler.ContinuationBoundary{
+		SessionID: "backlog-run-77", SessionFile: "/tmp/sessions/run-77/session.jsonl", Worktree: "/tmp/run-77",
+		LeafID: "leaf", EntryCount: 1, SHA256: "hash", VerifiedAt: time.Now(),
+	}
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion,
+		Runs: []scheduler.Run{{
+			Issue: issue, RunID: "run-77", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModeRPC,
+			PID: 1077, ProcessIdentity: "identity-1077", Branch: "agent/issue-77-run-77", Worktree: "/tmp/run-77",
+			Continuation: continuation,
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "run-77", Issue: issue, RunID: "run-77"}},
+	}}
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+	runner.Output = io.Discard
+	runner.PIDAlive = func(int) bool { return false }
+	runner.ProcessGroupAlive = func(int) (bool, error) { return true, nil }
+	current := store.LoadValue()
+	if err := runner.reconcile(context.Background(), &current, map[int]WorkerProcess{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID != 1077 || got.Runs[0].Continuation == nil || len(got.Leases) != 1 {
+		t.Fatalf("uncertain recovered process group = %#v", got)
+	}
+}
+
 func TestRunnerSuspensionRequestBoundsCommittedWorkerPreparation(t *testing.T) {
 	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 47, CreatedAt: time.Now()}}}
 	workers := newFakeWorkers()
@@ -2167,15 +2232,16 @@ func (w *diagnosticWriter) String() string {
 
 func testRunner(github *fakeGitHub, workers *fakeWorkers, store *memoryStore, maxWorkers int) *Runner {
 	return &Runner{
-		Config:      Config{Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: maxWorkers, PollInterval: 5 * time.Millisecond, SessionsDir: "/tmp/backlog-sessions"},
-		GitHub:      github,
-		Store:       store,
-		Worktrees:   &fakeWorktrees{},
-		Workers:     workers,
-		Now:         func() time.Time { return time.Date(2026, 7, 2, 3, 4, 5, 0, time.UTC) },
-		NewRunID:    func(issue int) string { return fmt.Sprintf("run-%d", issue) },
-		PIDAlive:    func(int) bool { return true },
-		PIDIdentity: func(_ context.Context, pid int) (string, error) { return fmt.Sprintf("identity-%d", pid), nil },
+		Config:            Config{Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: maxWorkers, PollInterval: 5 * time.Millisecond, SessionsDir: "/tmp/backlog-sessions"},
+		GitHub:            github,
+		Store:             store,
+		Worktrees:         &fakeWorktrees{},
+		Workers:           workers,
+		Now:               func() time.Time { return time.Date(2026, 7, 2, 3, 4, 5, 0, time.UTC) },
+		NewRunID:          func(issue int) string { return fmt.Sprintf("run-%d", issue) },
+		PIDAlive:          func(int) bool { return true },
+		ProcessGroupAlive: func(int) (bool, error) { return false, nil },
+		PIDIdentity:       func(_ context.Context, pid int) (string, error) { return fmt.Sprintf("identity-%d", pid), nil },
 	}
 }
 
