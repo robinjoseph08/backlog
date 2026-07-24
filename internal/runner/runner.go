@@ -78,7 +78,7 @@ type Runner struct {
 	Now         func() time.Time
 	NewRunID    func(issue int) string
 	PIDAlive    func(pid int) bool
-	PIDIdentity func(pid int) (string, error)
+	PIDIdentity func(context.Context, int) (string, error)
 
 	suspensionExit       atomic.Int32
 	suspensionFailed     atomic.Bool
@@ -625,7 +625,7 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 		r.failRun(current, candidate.Number, fmt.Sprintf("start Pi worker: %v", err))
 		return nil, r.saveAfterFailure(*current, candidate.Number)
 	}
-	identity, err := r.PIDIdentity(process.PID())
+	identity, err := r.PIDIdentity(operationCtx, process.PID())
 	if err != nil {
 		_ = process.Abort()
 		_ = process.Close()
@@ -729,7 +729,7 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 			continue
 		case scheduler.StatusRunning:
 			if run.PID > 0 && r.PIDAlive(run.PID) {
-				identity, err := r.PIDIdentity(run.PID)
+				identity, err := r.PIDIdentity(ctx, run.PID)
 				if err != nil || identity != run.ProcessIdentity {
 					detail := "identity changed"
 					if err != nil {
@@ -956,7 +956,9 @@ func (r *Runner) authorizeSuspensionKill(runID string, process WorkerProcess) fu
 		if !r.PIDAlive(run.PID) {
 			return errors.New("recorded Worker PID is not live before force stop")
 		}
-		identity, err := r.PIDIdentity(run.PID)
+		identityCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		identity, err := r.PIDIdentity(identityCtx, run.PID)
 		if err != nil {
 			return fmt.Errorf("recheck Worker identity before force stop: %w", err)
 		}
@@ -980,13 +982,16 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 	r.logf("Suspension: establishing continuation boundaries for %s; one %s deadline; next SIGINT will force stop remaining verified Worker groups", workerSummary(len(local)), r.Config.SuspensionTimeout)
 
 	workerCount := len(local)
+	var forceStopRemaining atomic.Int64
+	forceStopRemaining.Store(int64(workerCount))
 	go func() {
 		<-ctx.Done()
+		remaining := workerSummary(int(forceStopRemaining.Load()))
 		switch {
 		case r.forceStopRequested.Load():
-			r.logf("Force stop: additional signal accepted; force stopping %s after identity revalidation; next SIGINT will repeat the force-stop request", workerSummary(workerCount))
+			r.logf("Force stop: additional signal accepted; requesting force stop for %s; each identity will be revalidated before signaling; next SIGINT will repeat the force-stop request", remaining)
 		case errors.Is(ctx.Err(), context.DeadlineExceeded):
-			r.logf("Force stop: suspension deadline expired; force stopping %s after identity revalidation; next SIGINT will repeat the force-stop request", workerSummary(workerCount))
+			r.logf("Force stop: suspension deadline expired; requesting force stop for %s; each identity will be revalidated before signaling; next SIGINT will repeat the force-stop request", remaining)
 		}
 	}()
 	boundaries := make(chan suspensionBoundaryResult, workerCount)
@@ -999,7 +1004,7 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 				boundaries <- suspensionBoundaryResult{issue: issue, err: errors.New("Run state and live Worker PID no longer match")}
 				return
 			}
-			identity, err := r.PIDIdentity(run.PID)
+			identity, err := r.PIDIdentity(ctx, run.PID)
 			if err != nil || identity != run.ProcessIdentity {
 				if err == nil {
 					err = fmt.Errorf("process identity changed from %q to %q", run.ProcessIdentity, identity)
@@ -1021,10 +1026,11 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 	clean := !r.suspensionFailed.Load()
 	closeProcess := func(issue int, process WorkerProcess) {
 		go func() {
-			closeResults <- suspensionCloseResult{
-				issue:  issue,
-				result: process.CloseContext(ctx, r.authorizeSuspensionKill(runIDs[issue], process)),
+			result := process.CloseContext(ctx, r.authorizeSuspensionKill(runIDs[issue], process))
+			if result.GroupExited && !result.ForceStopped {
+				forceStopRemaining.Add(-1)
 			}
+			closeResults <- suspensionCloseResult{issue: issue, result: result}
 		}()
 	}
 	for completed := 0; completed < workerCount; completed++ {
@@ -1302,12 +1308,12 @@ func defaultRunID(issue int) string {
 	return fmt.Sprintf("%s-%d", time.Now().UTC().Format("20060102T150405.000000000"), issue)
 }
 
-func pidIdentity(pid int) (string, error) {
+func pidIdentity(ctx context.Context, pid int) (string, error) {
 	if pid <= 0 {
 		return "", fmt.Errorf("invalid pid %d", pid)
 	}
 	// #nosec G204: pid is validated as positive and passed as a single argument.
-	command := exec.Command("ps", "-p", fmt.Sprint(pid), "-o", "lstart=")
+	command := exec.CommandContext(ctx, "ps", "-p", fmt.Sprint(pid), "-o", "lstart=")
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("inspect pid %d start time: %w", pid, err)

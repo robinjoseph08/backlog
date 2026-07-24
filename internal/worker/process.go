@@ -451,9 +451,11 @@ func (p *Process) forceStop(authorizeKill func() error, triggerErr error) Result
 	if err := authorizeKill(); err != nil {
 		return unauthorized(fmt.Errorf("authorize Worker force stop: %w", err))
 	}
-	if err := p.kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		return unauthorized(fmt.Errorf("force stop Worker process group: %w", err))
+	killErr := p.kill()
+	if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+		return unauthorized(fmt.Errorf("force stop Worker process group: %w", killErr))
 	}
+	forceStopped := killErr == nil
 
 	select {
 	case <-p.exitDone:
@@ -470,10 +472,16 @@ func (p *Process) forceStop(authorizeKill func() error, triggerErr error) Result
 
 	result := p.exitResult()
 	result.GroupExited = true
-	result.ForceStopped = true
-	// A SIGKILL exit and the context trigger are expected after an authorized
-	// force stop. Protocol, log cleanup, and input-close failures remain errors.
-	result.Err = errors.Join(result.StreamErr, result.cleanupErr, p.closeInputErr)
+	result.ForceStopped = forceStopped
+	if forceStopped {
+		// A SIGKILL exit and the context trigger are expected after an authorized
+		// force stop. Protocol, log cleanup, and input-close failures remain errors.
+		result.Err = errors.Join(result.StreamErr, result.cleanupErr, p.closeInputErr)
+	} else {
+		// The leader exited between authorization and signaling. Preserve its
+		// actual exit result instead of claiming that SIGKILL caused the exit.
+		result.Err = errors.Join(result.Err, p.closeInputErr)
+	}
 	return result
 }
 

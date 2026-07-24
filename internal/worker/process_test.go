@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -427,10 +428,13 @@ wait "$child"
 		t.Fatalf("release: %v", err)
 	}
 	var childData []byte
-	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+	for deadline := time.Now().Add(5 * time.Second); ; {
 		childData, _ = os.ReadFile(childPIDPath)
 		if len(strings.TrimSpace(string(childData))) > 0 {
 			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Worker descendant PID was not written to %s", childPIDPath)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -550,6 +554,41 @@ while :; do sleep 1; done
 	}
 	if result := process.Close(); !result.GroupExited {
 		t.Fatalf("cleanup close = %#v", result)
+	}
+}
+
+func TestCloseContextPreservesNaturalExitBetweenAuthorizationAndSignal(t *testing.T) {
+	root := t.TempDir()
+	pi := fakePi(t, `
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+trap 'exit 7' TERM
+while :; do sleep 1; done
+`)
+	process, err := (Supervisor{
+		Executable: pi, LogsDir: filepath.Join(root, "logs"), TerminationGrace: 50 * time.Millisecond,
+	}).Start(context.Background(), request(18, "run-18", root, filepath.Join(root, "sessions", "run-18")))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if result := process.Wait(); result.Err != nil || !result.Settled {
+		t.Fatalf("wait = %#v", result)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result := process.CloseContext(ctx, func() error {
+		if err := syscall.Kill(-process.PID(), syscall.SIGTERM); err != nil {
+			return fmt.Errorf("stop Worker before force signal: %w", err)
+		}
+		<-process.exitDone
+		return nil
+	})
+	if !result.GroupExited || result.ForceStopped || result.Err == nil || !strings.Contains(result.Err.Error(), "exit status 7") {
+		t.Fatalf("natural exit during force stop = %#v", result)
 	}
 }
 

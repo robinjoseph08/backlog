@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -1475,7 +1476,17 @@ func TestRunnerThirdSIGINTAndTimeoutUseTheSameVerifiedForceStopPath(t *testing.T
 				signals <- os.Interrupt
 			},
 			timeout: 5 * time.Second, exitCode: 130, immediate: true,
-			forceLog: "Force stop: additional signal accepted; force stopping 1 Worker after identity revalidation; next SIGINT will repeat the force-stop request",
+			forceLog: "Force stop: additional signal accepted; requesting force stop for 1 Worker; each identity will be revalidated before signaling; next SIGINT will repeat the force-stop request",
+		},
+		{
+			name: "three queued SIGINTs",
+			trigger: func(signals chan os.Signal, _ <-chan int) {
+				signals <- os.Interrupt
+				signals <- os.Interrupt
+				signals <- os.Interrupt
+			},
+			timeout: 5 * time.Second, exitCode: 130, immediate: true,
+			forceLog: "Force stop: additional signal accepted; requesting force stop for 1 Worker; each identity will be revalidated before signaling; next SIGINT will repeat the force-stop request",
 		},
 		{
 			name: "SIGTERM followed by force SIGINT",
@@ -1485,7 +1496,7 @@ func TestRunnerThirdSIGINTAndTimeoutUseTheSameVerifiedForceStopPath(t *testing.T
 				signals <- os.Interrupt
 			},
 			timeout: 5 * time.Second, exitCode: 143, immediate: true,
-			forceLog: "Force stop: additional signal accepted; force stopping 1 Worker after identity revalidation; next SIGINT will repeat the force-stop request",
+			forceLog: "Force stop: additional signal accepted; requesting force stop for 1 Worker; each identity will be revalidated before signaling; next SIGINT will repeat the force-stop request",
 		},
 		{
 			name: "suspension timeout",
@@ -1493,7 +1504,7 @@ func TestRunnerThirdSIGINTAndTimeoutUseTheSameVerifiedForceStopPath(t *testing.T
 				signals <- syscall.SIGTERM
 			},
 			timeout: 30 * time.Millisecond, exitCode: 143,
-			forceLog: "Force stop: suspension deadline expired; force stopping 1 Worker after identity revalidation; next SIGINT will repeat the force-stop request",
+			forceLog: "Force stop: suspension deadline expired; requesting force stop for 1 Worker; each identity will be revalidated before signaling; next SIGINT will repeat the force-stop request",
 		},
 	}
 	for index, test := range tests {
@@ -1519,7 +1530,7 @@ func TestRunnerThirdSIGINTAndTimeoutUseTheSameVerifiedForceStopPath(t *testing.T
 				livenessChecks++
 				return true
 			}
-			runner.PIDIdentity = func(pid int) (string, error) {
+			runner.PIDIdentity = func(_ context.Context, pid int) (string, error) {
 				processCheckMu.Lock()
 				defer processCheckMu.Unlock()
 				identityChecks++
@@ -1596,13 +1607,14 @@ func TestRunnerForceEscalationPreservesDurableTerminalOutcomes(t *testing.T) {
 			if err := store.Save(persisted); err != nil {
 				t.Fatalf("persist concurrent outcome: %v", err)
 			}
+			expected := store.LoadValue()
 			signals <- os.Interrupt
 			if err := <-done; !isSignalExit(err, 130) {
 				t.Fatalf("run: %v, want signal exit 130", err)
 			}
 			got := store.LoadValue()
-			if got.Runs[0].Status != status {
-				t.Fatalf("terminal status = %q, want %q", got.Runs[0].Status, status)
+			if !reflect.DeepEqual(got, expected) {
+				t.Fatalf("terminal state changed during escalation:\n got: %#v\nwant: %#v", got, expected)
 			}
 			if got := workers.authorizedForceStopCount(); got != 0 {
 				t.Fatalf("authorized force stops = %d, want 0 for terminal Run", got)
@@ -1625,7 +1637,7 @@ func TestRunnerForceEscalationCleansBeforePersistingNewMergedOutcome(t *testing.
 	runner := testRunner(github, workers, store, 1)
 	runner.Config.SuspensionTimeout = 5 * time.Second
 	runner.Signals = signals
-	worktrees := &liveContextWorktrees{}
+	worktrees := &liveContextWorktrees{store: store, runID: fmt.Sprintf("run-%d", issue)}
 	runner.Worktrees = worktrees
 
 	done := make(chan error, 1)
@@ -1769,8 +1781,10 @@ func TestRunnerPipelinesHealthyWorkerWhileAnotherBoundaryTimesOut(t *testing.T) 
 	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
 	signals := make(chan os.Signal, 1)
 	runner := testRunner(github, workers, store, 2)
-	runner.Config.SuspensionTimeout = 40 * time.Millisecond
+	runner.Config.SuspensionTimeout = 200 * time.Millisecond
 	runner.Signals = signals
+	output := newSynchronizedOutput()
+	runner.Output = output
 
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
@@ -1779,6 +1793,7 @@ func TestRunnerPipelinesHealthyWorkerWhileAnotherBoundaryTimesOut(t *testing.T) 
 	if err := <-done; err == nil || !strings.Contains(err.Error(), "require human") {
 		t.Fatalf("run: %v, want one failed-closed suspension", err)
 	}
+	output.waitFor(t, "Force stop: suspension deadline expired; requesting force stop for 1 Worker; each identity will be revalidated before signaling")
 	got := store.LoadValue()
 	statuses := map[int]scheduler.Status{}
 	for _, run := range got.Runs {
@@ -1862,7 +1877,7 @@ func TestRunnerRechecksWorkerIdentityImmediatelyBeforeTimeoutForceStop(t *testin
 	runner := testRunner(github, workers, store, 1)
 	var identityMu sync.Mutex
 	identityChecks := 0
-	runner.PIDIdentity = func(pid int) (string, error) {
+	runner.PIDIdentity = func(_ context.Context, pid int) (string, error) {
 		identityMu.Lock()
 		defer identityMu.Unlock()
 		identityChecks++
@@ -1884,6 +1899,85 @@ func TestRunnerRechecksWorkerIdentityImmediatelyBeforeTimeoutForceStop(t *testin
 	got := store.LoadValue()
 	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID == 0 || len(got.Leases) != 1 {
 		t.Fatalf("Run after force-stop identity mismatch = %#v", got)
+	}
+}
+
+func TestRunnerBoundsImmediatePreSignalIdentityRevalidation(t *testing.T) {
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 74, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	workers.authorizeClose = true
+	workers.waitForForce = true
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	signals := make(chan os.Signal, 1)
+	runner := testRunner(github, workers, store, 1)
+	runner.Config.SuspensionTimeout = 20 * time.Millisecond
+	var identityMu sync.Mutex
+	identityChecks := 0
+	runner.PIDIdentity = func(ctx context.Context, pid int) (string, error) {
+		identityMu.Lock()
+		identityChecks++
+		check := identityChecks
+		identityMu.Unlock()
+		if check >= 3 {
+			<-ctx.Done()
+			return "", ctx.Err()
+		}
+		return fmt.Sprintf("identity-%d", pid), nil
+	}
+	runner.Signals = signals
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 74)
+	started := time.Now()
+	signals <- syscall.SIGTERM
+	err := <-done
+	if !isSignalExit(err, 143) || !strings.Contains(err.Error(), "require human") {
+		t.Fatalf("run: %v, want bounded failed-closed signal exit 143", err)
+	}
+	if elapsed := time.Since(started); elapsed > 1500*time.Millisecond {
+		t.Fatalf("identity revalidation was not bounded: %s", elapsed)
+	}
+	if got := workers.authorizedForceStopCount(); got != 0 {
+		t.Fatalf("authorized force stops = %d, want 0", got)
+	}
+}
+
+func TestRunnerRefusesForceStopWhenDurablePIDChanges(t *testing.T) {
+	const issue = 75
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: issue, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	workers.authorizeClose = true
+	workers.waitForForce = true
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	signals := make(chan os.Signal, 3)
+	runner := testRunner(github, workers, store, 1)
+	runner.Config.SuspensionTimeout = 5 * time.Second
+	runner.Signals = signals
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, issue)
+	signals <- os.Interrupt
+	signals <- os.Interrupt
+	<-workers.closeContextStarted
+	persisted := store.LoadValue()
+	persisted.Runs[0].PID++
+	persisted.Runs[0].ProcessIdentity = fmt.Sprintf("identity-%d", persisted.Runs[0].PID)
+	if err := store.Save(persisted); err != nil {
+		t.Fatalf("persist changed Worker PID: %v", err)
+	}
+	signals <- os.Interrupt
+	err := <-done
+	if !isSignalExit(err, 130) || !strings.Contains(err.Error(), "require human") {
+		t.Fatalf("run: %v, want failed-closed signal exit 130", err)
+	}
+	if got := workers.authorizedForceStopCount(); got != 0 {
+		t.Fatalf("authorized force stops = %d, want 0 for durable PID mismatch", got)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID == 0 || len(got.Leases) != 1 {
+		t.Fatalf("Run after durable PID mismatch = %#v", got)
 	}
 }
 
@@ -1921,7 +2015,7 @@ func TestRunnerDoesNotAbortBeforeIdentityAuthorizedCloseAfterBoundaryFailure(t *
 	runner := testRunner(github, workers, store, 1)
 	var identityMu sync.Mutex
 	identityChecks := 0
-	runner.PIDIdentity = func(pid int) (string, error) {
+	runner.PIDIdentity = func(_ context.Context, pid int) (string, error) {
 		identityMu.Lock()
 		defer identityMu.Unlock()
 		identityChecks++
@@ -2081,7 +2175,7 @@ func testRunner(github *fakeGitHub, workers *fakeWorkers, store *memoryStore, ma
 		Now:         func() time.Time { return time.Date(2026, 7, 2, 3, 4, 5, 0, time.UTC) },
 		NewRunID:    func(issue int) string { return fmt.Sprintf("run-%d", issue) },
 		PIDAlive:    func(int) bool { return true },
-		PIDIdentity: func(pid int) (string, error) { return fmt.Sprintf("identity-%d", pid), nil },
+		PIDIdentity: func(_ context.Context, pid int) (string, error) { return fmt.Sprintf("identity-%d", pid), nil },
 	}
 }
 
@@ -2264,11 +2358,20 @@ type blockingCleanupWorktrees struct {
 
 type liveContextWorktrees struct {
 	fakeWorktrees
+	store *memoryStore
+	runID string
 }
 
 func (w *liveContextWorktrees) Cleanup(ctx context.Context, assignment worktree.Assignment) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("cleanup started with canceled context: %w", err)
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		return errors.New("cleanup context has no deadline")
+	}
+	persisted := w.store.LoadValue()
+	if run := findRun(persisted.Runs, w.runID); run.Status != scheduler.StatusRunning {
+		return fmt.Errorf("merged outcome became durable before cleanup: %#v", run)
 	}
 	return w.fakeWorktrees.Cleanup(ctx, assignment)
 }
@@ -2576,7 +2679,10 @@ func (w *synchronizedOutput) waitFor(t *testing.T, text string) {
 		select {
 		case <-w.changed:
 		case <-deadline:
-			t.Fatalf("output did not contain %q", text)
+			w.mu.Lock()
+			output := w.content.String()
+			w.mu.Unlock()
+			t.Fatalf("output did not contain %q:\n%s", text, output)
 		}
 	}
 }
