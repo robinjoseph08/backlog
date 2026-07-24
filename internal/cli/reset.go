@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,12 +29,16 @@ import (
 func resetCommand(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("reset", flag.ContinueOnError)
 	flags.SetOutput(stderr)
+	flags.Usage = func() {
+		fmt.Fprintln(stderr, "Usage: backlog reset <issue-number> --dry-run [flags]")
+		flags.PrintDefaults()
+	}
 	repoDir := flags.String("repo-dir", ".", "Git repository associated with the Run")
 	stateDir := flags.String("state-dir", "", "runner state directory")
 	gitExecutable := flags.String("git", "git", "git executable")
 	ghExecutable := flags.String("gh", "gh", "gh executable")
 	dryRun := flags.Bool("dry-run", false, "print the current Reset Plan without mutation")
-	_ = flags.Bool("yes", false, "confirm a mutating Reset (not used by --dry-run)")
+	_ = flags.Bool("yes", false, "accepted for dry-run compatibility; has no effect")
 	for _, arg := range args {
 		if arg == "-h" || arg == "--help" {
 			return flags.Parse([]string{arg})
@@ -105,6 +110,13 @@ func resetCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if current.DefaultBranch == "" || current.DefaultBranch != repository.DefaultBranch {
 		return fmt.Errorf("Run state default branch %q does not match repository default branch %q", current.DefaultBranch, repository.DefaultBranch)
 	}
+	originRepository, err := inspectOriginRepository(ctx, *gitExecutable, repositoryRoot)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(originRepository, repository.Slug) {
+		return fmt.Errorf("Git origin belongs to %q, not repository %q", originRepository, repository.Slug)
+	}
 	if err := validateOwnedPaths(run, resolvedState, repositoryRoot, repository.DefaultBranch); err != nil {
 		return err
 	}
@@ -117,7 +129,7 @@ func resetCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if err != nil {
 		return err
 	}
-	localBranch, localWorktree, err := inspectLocalResources(ctx, *gitExecutable, repositoryRoot, run)
+	localBranch, localWorktree, err := inspectLocalResources(ctx, *gitExecutable, repositoryRoot, commonDirectory, run)
 	if err != nil {
 		return err
 	}
@@ -310,6 +322,51 @@ func validateOwnedPaths(run scheduler.Run, stateDir, repositoryRoot, defaultBran
 	return nil
 }
 
+func inspectOriginRepository(ctx context.Context, gitExecutable, repositoryRoot string) (string, error) {
+	output, exit, err := runGitInspection(ctx, gitExecutable, repositoryRoot, "remote", "get-url", "origin")
+	if err != nil {
+		return "", fmt.Errorf("inspect Git origin: %w", err)
+	}
+	if exit != 0 {
+		return "", fmt.Errorf("inspect Git origin: git exited %d; identity is unknown", exit)
+	}
+	remote := strings.TrimSpace(string(output))
+	if strings.Contains(remote, "\n") {
+		return "", errors.New("inspect Git origin: git returned multiple URLs")
+	}
+	host, repository, ok := parseGitRemote(remote)
+	if !ok || !strings.EqualFold(host, "github.com") {
+		return "", fmt.Errorf("inspect Git origin: unsupported or unknown GitHub URL %q", remote)
+	}
+	return repository, nil
+}
+
+func parseGitRemote(remote string) (string, string, bool) {
+	var host, path string
+	if !strings.Contains(remote, "://") {
+		userHost, value, found := strings.Cut(remote, ":")
+		if !found || strings.Contains(userHost, "/") {
+			return "", "", false
+		}
+		host = userHost
+		if _, value, found := strings.Cut(host, "@"); found {
+			host = value
+		}
+		path = value
+	} else {
+		parsed, err := url.Parse(remote)
+		if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "ssh") || parsed.Hostname() == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return "", "", false
+		}
+		host, path = parsed.Hostname(), parsed.Path
+	}
+	parts := strings.Split(strings.Trim(strings.TrimSuffix(path, ".git"), "/"), "/")
+	if host == "" || len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return host, parts[0] + "/" + parts[1], true
+}
+
 func inspectRemoteBranch(ctx context.Context, gitExecutable, repositoryRoot, branch string) (reset.Branch, error) {
 	if branch == "" {
 		return reset.Branch{}, nil
@@ -332,7 +389,7 @@ func inspectRemoteBranch(ctx context.Context, gitExecutable, repositoryRoot, bra
 	return reset.Branch{Name: branch, Commit: fields[0], Present: true}, nil
 }
 
-func inspectLocalResources(ctx context.Context, gitExecutable, repositoryRoot string, run scheduler.Run) (reset.Branch, reset.Worktree, error) {
+func inspectLocalResources(ctx context.Context, gitExecutable, repositoryRoot, commonDirectory string, run scheduler.Run) (reset.Branch, reset.Worktree, error) {
 	if run.Branch == "" {
 		return reset.Branch{}, reset.Worktree{}, nil
 	}
@@ -397,7 +454,39 @@ func inspectLocalResources(ctx context.Context, gitExecutable, repositoryRoot st
 	if !local.Present || local.Commit != registered.Commit {
 		return reset.Branch{}, reset.Worktree{}, fmt.Errorf("worktree %s commit does not match owned local branch", run.Worktree)
 	}
+	if err := verifyRegisteredWorktree(ctx, gitExecutable, run, commonDirectory, registered.Commit); err != nil {
+		return reset.Branch{}, reset.Worktree{}, err
+	}
 	return local, reset.Worktree{Path: run.Worktree, Branch: run.Branch, Commit: registered.Commit, Present: true}, nil
+}
+
+func verifyRegisteredWorktree(ctx context.Context, gitExecutable string, run scheduler.Run, commonDirectory, commit string) error {
+	checks := []struct {
+		args []string
+		want string
+	}{
+		{args: []string{"rev-parse", "--show-toplevel"}, want: canonicalPath(run.Worktree)},
+		{args: []string{"rev-parse", "--path-format=absolute", "--git-common-dir"}, want: canonicalPath(commonDirectory)},
+		{args: []string{"symbolic-ref", "--quiet", "HEAD"}, want: "refs/heads/" + run.Branch},
+		{args: []string{"rev-parse", "--verify", "HEAD"}, want: commit},
+	}
+	for _, check := range checks {
+		output, exit, err := runGitInspection(ctx, gitExecutable, run.Worktree, check.args...)
+		if err != nil || exit != 0 {
+			if err == nil {
+				err = fmt.Errorf("git exited %d", exit)
+			}
+			return fmt.Errorf("verify worktree %s identity: %w", run.Worktree, err)
+		}
+		got := strings.TrimSpace(string(output))
+		if check.args[1] == "--show-toplevel" || check.args[1] == "--path-format=absolute" {
+			got = canonicalPath(got)
+		}
+		if got != check.want {
+			return fmt.Errorf("worktree %s has mismatched Git identity", run.Worktree)
+		}
+	}
+	return nil
 }
 
 type gitWorktree struct {

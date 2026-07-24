@@ -113,7 +113,15 @@ backlog status
 backlog status --json
 ```
 
-Allow a failed or `needs-human` issue to be scheduled again:
+Inspect the exact actions required to Reset an incomplete Run:
+
+```sh
+backlog reset 123 --dry-run
+```
+
+Reset dry-run holds the repository coordination lock while it inspects the Run, Lease, Worker, GitHub issue and pull requests, remote and local branches, worktree, and Pi session. It prints only actions still required. It refuses live or uncertain Workers, merged work, unknown resource state, unexplained issue closure, and human workflow labels. It never prompts, writes, or requires `--yes`; passing `--yes` has no effect.
+
+Mutating Reset is intentionally not available yet. Until it replaces Retry, allow a failed or `needs-human` issue to be scheduled again with:
 
 ```sh
 backlog retry 123

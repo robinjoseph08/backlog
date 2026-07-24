@@ -38,23 +38,69 @@ func TestBuildTailorsOrderedResetActions(t *testing.T) {
 }
 
 func TestBuildOmitsAlreadySatisfiedActionsForEveryManagedLabelCombination(t *testing.T) {
-	for _, labels := range [][]string{{}, {"in-progress"}, {"ready-for-agent"}, {"in-progress", "ready-for-agent"}} {
-		t.Run(strings.Join(labels, "+"), func(t *testing.T) {
-			plan, err := Build(minimalSnapshot(labels))
+	tests := []struct {
+		name   string
+		labels []string
+		want   []string
+	}{
+		{name: "neither", want: []string{
+			"add issue label ready-for-agent to https://github.com/acme/widgets/issues/42",
+			"mark Run run-42 reset and release Lease lease-42",
+		}},
+		{name: "in progress", labels: []string{"in-progress"}, want: []string{
+			"remove issue label in-progress from https://github.com/acme/widgets/issues/42",
+			"add issue label ready-for-agent to https://github.com/acme/widgets/issues/42",
+			"mark Run run-42 reset and release Lease lease-42",
+		}},
+		{name: "ready", labels: []string{"ready-for-agent"}, want: []string{
+			"mark Run run-42 reset and release Lease lease-42",
+		}},
+		{name: "both", labels: []string{"in-progress", "ready-for-agent"}, want: []string{
+			"remove issue label in-progress from https://github.com/acme/widgets/issues/42",
+			"mark Run run-42 reset and release Lease lease-42",
+		}},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			plan, err := Build(minimalSnapshot(test.labels))
 			if err != nil {
 				t.Fatal(err)
 			}
-			joined := strings.Join(plan.Actions, "\n")
-			if strings.Contains(joined, "pull request") || strings.Contains(joined, "branch") || strings.Contains(joined, "worktree") || strings.Contains(joined, "Pi session") {
-				t.Fatalf("already absent action included: %q", joined)
+			if strings.Join(plan.Actions, "\n") != strings.Join(test.want, "\n") {
+				t.Fatalf("actions = %q, want %q", plan.Actions, test.want)
 			}
-			if strings.Contains(joined, "spec") {
-				t.Fatalf("unrelated label became an action: %q", joined)
+		})
+	}
+}
+
+func TestBuildPlansEverySafeRunStatus(t *testing.T) {
+	statuses := []scheduler.Status{
+		scheduler.StatusClaimed,
+		scheduler.StatusWorktreeReady,
+		scheduler.StatusRunning,
+		scheduler.StatusWaitingForMerge,
+		scheduler.StatusFailed,
+		scheduler.StatusNeedsHuman,
+		scheduler.StatusSuspended,
+	}
+	for _, status := range statuses {
+		t.Run(string(status), func(t *testing.T) {
+			snapshot := minimalSnapshot([]string{"ready-for-agent"})
+			snapshot.Run.Status = status
+			if _, err := Build(snapshot); err != nil {
+				t.Fatalf("safe stopped Run status %s was refused: %v", status, err)
 			}
-			wantRemove := contains(labels, "in-progress")
-			wantAdd := !contains(labels, "ready-for-agent")
-			if strings.Contains(joined, "remove issue label in-progress") != wantRemove || strings.Contains(joined, "add issue label ready-for-agent") != wantAdd {
-				t.Fatalf("labels %v produced %q", labels, joined)
+		})
+	}
+}
+
+func TestBuildRefusesEveryHumanWorkflowLabel(t *testing.T) {
+	for _, label := range []string{"needs-triage", "needs-info", "ready-for-human", "wontfix", "WONTFIX"} {
+		t.Run(label, func(t *testing.T) {
+			snapshot := minimalSnapshot([]string{label})
+			if _, err := Build(snapshot); err == nil {
+				t.Fatalf("human workflow label %q was plannable", label)
 			}
 		})
 	}
@@ -100,13 +146,4 @@ func minimalSnapshot(labels []string) Snapshot {
 		Lease: scheduler.Lease{LeaseID: "lease-42", Issue: 42, RunID: "run-42"},
 		Issue: Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", Open: true, Labels: append(append([]string{}, labels...), "spec")},
 	}
-}
-
-func contains(values []string, value string) bool {
-	for _, candidate := range values {
-		if candidate == value {
-			return true
-		}
-	}
-	return false
 }

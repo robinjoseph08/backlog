@@ -274,9 +274,16 @@ func (c Client) ResetResources(ctx context.Context, repo string, issueNumber int
 			NameWithOwner string `json:"nameWithOwner"`
 		} `json:"headRepository"`
 	}
-	if err := c.jsonCommand(ctx, &pulls, "pr", "list", "--repo", repo, "--state", "all", "--head", branch, "--limit", "1000",
+	var pullsJSON json.RawMessage
+	if err := c.jsonCommand(ctx, &pullsJSON, "pr", "list", "--repo", repo, "--state", "all", "--head", branch, "--limit", "1000",
 		"--json", "number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository"); err != nil {
 		return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull requests: %w", err)
+	}
+	if len(pullsJSON) == 0 || string(pullsJSON) == "null" || json.Unmarshal(pullsJSON, &pulls) != nil {
+		return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull requests: gh returned an unknown pull request list")
+	}
+	if len(pulls) == 1000 {
+		return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull requests: result reached the inspection limit; completeness is unknown")
 	}
 	resultPulls := make([]ResetPullRequest, 0, len(pulls))
 	for _, pull := range pulls {
@@ -310,7 +317,7 @@ func (c Client) ResetResources(ctx context.Context, repo string, issueNumber int
 
 func resourceURLMatches(rawURL, repo, resource string, number int) bool {
 	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "github.com") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return false
 	}
 	expectedPath := fmt.Sprintf("/%s/%s/%d", repo, resource, number)

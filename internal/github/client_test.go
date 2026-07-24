@@ -164,6 +164,30 @@ func TestClientResetInspectionRefusesSameOwnerForkAndUnknownFields(t *testing.T)
 			want:  "unknown labels",
 		},
 		{
+			name:  "mismatched issue number",
+			issue: `{"number":41,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[]}`,
+			pull:  `[]`,
+			want:  "identity/state",
+		},
+		{
+			name:  "issue URL on wrong host",
+			issue: `{"number":42,"url":"https://example.test/acme/widgets/issues/42","state":"OPEN","labels":[]}`,
+			pull:  `[]`,
+			want:  "identity/state",
+		},
+		{
+			name:  "unknown issue state",
+			issue: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"UNKNOWN","labels":[]}`,
+			pull:  `[]`,
+			want:  "identity/state",
+		},
+		{
+			name:  "null pull request list",
+			issue: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[]}`,
+			pull:  `null`,
+			want:  "unknown pull request list",
+		},
+		{
 			name:  "missing auto merge",
 			issue: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[]}`,
 			pull:  `[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"OPEN","mergedAt":null,"isDraft":false,"headRefName":"agent/issue-42-run","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]`,
@@ -192,6 +216,30 @@ esac`)
 				t.Fatalf("error = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestClientResetInspectionRefusesTruncatedPullRequestList(t *testing.T) {
+	t.Parallel()
+
+	gh := fakeGH(t, `
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[]}' ;;
+  "pr list "*)
+    printf '['
+    i=1
+    while [ "$i" -le 1000 ]; do
+      if [ "$i" -gt 1 ]; then printf ','; fi
+      printf '{}'
+      i=$((i + 1))
+    done
+    printf ']\n' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+	_, _, err := (Client{Executable: gh}).ResetResources(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
+	if err == nil || !strings.Contains(err.Error(), "inspection limit") {
+		t.Fatalf("error = %v", err)
 	}
 }
 
