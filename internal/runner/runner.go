@@ -681,15 +681,6 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("verify GitHub Completion before Resume: %v", err))
 	}
 	if outcome.Merged || (outcome.PRFound && outcome.AutoMergeArmed) {
-		if outcome.Merged {
-			assignment := worktree.Assignment{Path: run.Worktree, Branch: run.Branch}
-			if err := r.Worktrees.Verify(operationCtx, assignment); err != nil {
-				if operationCtx.Err() != nil {
-					return nil, operationCtx.Err()
-				}
-				return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("verify retained branch and worktree before Completion cleanup: %v", err))
-			}
-		}
 		if err := r.applyOutcome(operationCtx, current, run, outcome, true, true); err != nil {
 			return nil, err
 		}
@@ -921,12 +912,13 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 		case scheduler.StatusRunning:
 			if run.PID > 0 && r.PIDAlive(run.PID) {
 				identity, err := r.PIDIdentity(run.PID)
-				if err != nil || identity != run.ProcessIdentity {
-					detail := "identity changed"
-					if err != nil {
-						detail = err.Error()
-					}
-					r.needsHuman(current, run.Issue, fmt.Sprintf("recorded worker PID no longer matches its process identity: %s", detail))
+				if err != nil {
+					r.needsHumanWithLiveWorker(current, run.Issue, fmt.Sprintf("recorded worker process identity is uncertain: %v", err))
+					changed = true
+					continue
+				}
+				if identity != run.ProcessIdentity {
+					r.needsHuman(current, run.Issue, "recorded worker PID no longer matches its process identity: identity changed")
 					changed = true
 					continue
 				}
@@ -1051,7 +1043,7 @@ func (r *Runner) applyOutcome(ctx context.Context, current *state.State, run sch
 		if cleanupMerged {
 			assignment := worktree.Assignment{Path: run.Worktree, Branch: run.Branch}
 			if assignment.Path != "" && assignment.Branch != "" {
-				if err := r.Worktrees.Cleanup(ctx, assignment); err != nil {
+				if err := r.verifyAndCleanupWorktree(ctx, assignment); err != nil {
 					if ctx.Err() != nil {
 						return ctx.Err()
 					}
@@ -1119,6 +1111,15 @@ func (r *Runner) finalizeSettledWorker(ctx context.Context, current *state.State
 		}
 	}
 	return nil
+}
+
+func (r *Runner) verifyAndCleanupWorktree(ctx context.Context, assignment worktree.Assignment) error {
+	if r.Worktrees.Exists(assignment) {
+		if err := r.Worktrees.Verify(ctx, assignment); err != nil {
+			return fmt.Errorf("verify retained worktree before cleanup: %w", err)
+		}
+	}
+	return r.Worktrees.Cleanup(ctx, assignment)
 }
 
 func (r *Runner) retainProvisionalCompletion(current *state.State, run *scheduler.Run, message string) {

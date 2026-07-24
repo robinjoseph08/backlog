@@ -1294,6 +1294,48 @@ func TestRunnerOverAgeRecoveredWorkerRetainsCapacity(t *testing.T) {
 	}
 }
 
+func TestRunnerUncertainRecoveredWorkerIdentityRetainsCapacity(t *testing.T) {
+	t.Parallel()
+
+	live := scheduler.Run{
+		Issue: 3, RunID: "uncertain-live", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModeRPC,
+		PID: 1235, ProcessIdentity: "identity-1235", Branch: "agent/issue-3-uncertain-live", Worktree: "/tmp/uncertain-live",
+		SessionID: "backlog-uncertain-live", SessionDir: "/state/sessions/uncertain-live", StartedAt: time.Now(),
+	}
+	suspended := resumableRun(t, 4, "resume-4")
+	github := &fakeGitHub{}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
+		Runs: []scheduler.Run{live, suspended}, Leases: []scheduler.Lease{
+			{LeaseID: "lease-3", Issue: 3, RunID: live.RunID},
+			{LeaseID: "lease-4", Issue: 4, RunID: suspended.RunID},
+		},
+	}}
+	runner := testRunner(github, workers, store, 1)
+	runner.PIDAlive = func(pid int) bool { return pid == 1235 }
+	runner.PIDIdentity = func(int) (string, error) { return "", errors.New("identity inspection unavailable") }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	waitForPersistedRun(t, store, 3, func(run scheduler.Run) bool {
+		return run.Status == scheduler.StatusNeedsHuman && run.PID == 1235
+	})
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	got := store.LoadValue()
+	if uncertain := findActiveRun(&got, 3); uncertain.Status != scheduler.StatusNeedsHuman || uncertain.PID != 1235 || !strings.Contains(uncertain.Error, "identity is uncertain") {
+		t.Fatalf("uncertain live Worker = %#v", uncertain)
+	}
+	if resumed := findActiveRun(&got, 4); resumed.Status != scheduler.StatusSuspended || workers.wasStarted(4) {
+		t.Fatalf("capacity-blocked suspended Run = %#v, starts=%v", resumed, workers.startedSnapshot())
+	}
+}
+
 func TestRunnerReconcilesClaimedRunWithoutLookingUpAnEmptyBranch(t *testing.T) {
 	t.Parallel()
 
@@ -1494,12 +1536,7 @@ func TestRunnerRefusesCompletionCleanupForChangedResumedWorktree(t *testing.T) {
 	t.Parallel()
 
 	run := resumableRun(t, 66, "resume-66")
-	calls := 0
 	github := &fakeGitHub{completionFunc: func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
-		calls++
-		if calls == 1 {
-			return ghadapter.CompletionOutcome{}, nil
-		}
 		return mergedOutcome(66), nil
 	}}
 	workers := newFakeWorkers()
