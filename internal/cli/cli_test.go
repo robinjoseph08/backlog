@@ -164,7 +164,15 @@ func TestStatusPrintsMachineReadableState(t *testing.T) {
 		t.Fatalf("git init: %v\n%s", err, output)
 	}
 	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
-	if err := store.Save(state.State{Version: state.CurrentVersion, Repo: "acme/widgets"}); err != nil {
+	if err := store.Save(state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets",
+		Runs: []scheduler.Run{{
+			Issue: 26, IssueTitle: "Observable context", IssueURL: "https://github.com/acme/widgets/issues/26",
+			RunID: "run-26", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModeRPC,
+			SessionID: "backlog-run-26", SessionDir: "/sessions/run-26",
+			LogPath: "/logs/run-26.jsonl", StderrPath: "/logs/run-26.stderr.log",
+		}},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer
@@ -175,8 +183,13 @@ func TestStatusPrintsMachineReadableState(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
 		t.Fatalf("status JSON: %v", err)
 	}
-	if got.Repo != "acme/widgets" {
-		t.Fatalf("repo = %q", got.Repo)
+	if got.Repo != "acme/widgets" || len(got.Runs) != 1 {
+		t.Fatalf("status state = %#v", got)
+	}
+	run := got.Runs[0]
+	if run.Issue != 26 || run.IssueTitle != "Observable context" || run.IssueURL != "https://github.com/acme/widgets/issues/26" ||
+		run.LogPath != "/logs/run-26.jsonl" || run.StderrPath != "/logs/run-26.stderr.log" {
+		t.Fatalf("status Run metadata = %#v", run)
 	}
 }
 
