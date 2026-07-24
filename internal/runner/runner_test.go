@@ -1533,6 +1533,45 @@ func TestRunnerThirdSIGINTExpeditesSettledWorkerCloseThroughVerifiedForceStop(t 
 	}
 }
 
+func TestRunnerThirdSIGINTBoundsSettledWorkerCleanupAndPreservesMergedOutcome(t *testing.T) {
+	const issue = 80
+	github := &fakeGitHub{
+		candidates:  []scheduler.Candidate{{Number: issue, CreatedAt: time.Now()}},
+		completions: map[int]ghadapter.CompletionOutcome{issue: mergedOutcome(issue)},
+	}
+	workers := newFakeWorkers()
+	workers.authorizeClose = true
+	workers.blockSettledClose = true
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	signals := make(chan os.Signal, 3)
+	runner := testRunner(github, workers, store, 1)
+	runner.Config.SuspensionTimeout = 100 * time.Millisecond
+	runner.Signals = signals
+	cleanupStarted := make(chan struct{})
+	runner.Worktrees = &blockingCleanupWorktrees{cleanupStarted: cleanupStarted}
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, issue)
+	workers.complete(issue, worker.Result{ExitCode: 0})
+	<-workers.settledCloseStarted
+	started := time.Now()
+	signals <- os.Interrupt
+	signals <- os.Interrupt
+	signals <- os.Interrupt
+	<-cleanupStarted
+	if err := <-done; !isSignalExit(err, 130) {
+		t.Fatalf("run: %v, want bounded signal exit 130", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("settled Worker cleanup was not bounded by suspension deadline: %s", elapsed)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusMerged || got.Runs[0].CompletedAt == nil || len(got.Leases) != 0 {
+		t.Fatalf("merged outcome after bounded cleanup failure = %#v", got)
+	}
+}
+
 func TestRunnerThirdSIGINTAndTimeoutUseTheSameVerifiedForceStopPath(t *testing.T) {
 	tests := []struct {
 		name      string

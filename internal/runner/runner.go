@@ -362,6 +362,13 @@ func (r *Runner) Run(ctx context.Context) error {
 			if !closed.GroupExited && r.suspensionExit.Load() != 0 {
 				continue
 			}
+			if closed.ForceStopped && r.suspensionExit.Load() != 0 {
+				if err := r.finalizeForceStoppedSettledWorker(&current, runID, closed.Err); err != nil {
+					r.suspensionFailed.Store(true)
+					r.logf("Force stop: durable terminal outcome preserved, but post-stop cleanup failed: %v", err)
+				}
+				continue
+			}
 			if err := r.finalizeSettledWorker(ctx, &current, runID, closed.Err, completion.result.Settled); err != nil {
 				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after an RPC finalization error; worktree retained")
 				return errors.Join(err, shutdownErr)
@@ -968,6 +975,35 @@ func (r *Runner) applyOutcome(ctx context.Context, current *state.State, run sch
 		run.Error = "worker stopped without creating a pull request"
 	}
 	replaceRun(current, run)
+	return nil
+}
+
+func (r *Runner) finalizeForceStoppedSettledWorker(current *state.State, runID string, closeErr error) error {
+	if closeErr != nil {
+		return fmt.Errorf("force close settled Worker: %w", closeErr)
+	}
+	run := findRun(current.Runs, runID)
+	if run.RunID == "" {
+		return fmt.Errorf("finalize unknown force-stopped Run %q", runID)
+	}
+	if run.Status != scheduler.StatusMerged {
+		return nil
+	}
+	assignment := worktree.Assignment{Path: run.Worktree, Branch: run.Branch}
+	if assignment.Path == "" || assignment.Branch == "" {
+		return nil
+	}
+	r.suspensionMu.Lock()
+	deadline := r.suspensionDeadline
+	r.suspensionMu.Unlock()
+	if deadline.IsZero() {
+		deadline = time.Now().Add(r.Config.SuspensionTimeout)
+	}
+	cleanupCtx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	if err := r.Worktrees.Cleanup(cleanupCtx, assignment); err != nil {
+		return fmt.Errorf("cleanup force-stopped issue #%d worktree: %w", run.Issue, err)
+	}
 	return nil
 }
 
