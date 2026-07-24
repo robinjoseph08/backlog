@@ -1,0 +1,35 @@
+[tools]
+go = "1.23.12"
+"github:golangci/golangci-lint" = "2.12.2"
+
+[tasks.build]
+description = "Build the backlog CLI"
+run = '''
+rm -f backlog
+go build -o backlog ./cmd/backlog
+test -x backlog
+'''
+
+[tasks.test]
+description = "Run the test suite"
+run = "go test ./..."
+
+[tasks.test-race]
+description = "Run the test suite with the race detector"
+run = "go test -race ./..."
+
+[tasks.lint]
+description = "Run Go linting"
+run = "golangci-lint run"
+
+[tasks.check]
+description = "Run fast validation checks before pushing"
+run = [
+  { task = "lint" },
+  { task = "test" },
+  { task = "build" },
+]
+
+[tasks.ci]
+description = "Run the complete CI validation suite"
+depends = ["check", "test-race"]

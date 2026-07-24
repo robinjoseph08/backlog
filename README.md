@@ -7,7 +7,7 @@ Each issue receives its own lease, Git branch, Git worktree, Pi process, named P
 ## Requirements
 
 - A Unix-like system with `/bin/sh` and POSIX process groups
-- Go 1.23 or newer to build
+- [mise](https://mise.jdx.dev/) for tool installation and project tasks
 - `git`
 - GitHub CLI `gh`, authenticated for the target repository
 - Pi 0.80.4 or newer with the global `afk` skill available
@@ -18,14 +18,17 @@ The runner uses GitHub's versioned issue dependency endpoint. A dependency looku
 
 ## Build
 
+Install the pinned tool versions and build the CLI:
+
 ```sh
-go build -o backlog ./cmd/backlog
+mise install
+mise run build
 ```
 
 Or install it on your Go binary path:
 
 ```sh
-go install ./cmd/backlog
+mise exec -- go install ./cmd/backlog
 ```
 
 ## Run
@@ -126,11 +129,19 @@ Non-signal context cancellation retains the immediate failure shutdown behavior.
 
 ## Validation
 
+Run the fast lint, test, and build checks:
+
 ```sh
-go test ./...
-go test -race ./...
-go vet ./...
+mise run check
 ```
+
+Run the complete CI suite, including the race detector:
+
+```sh
+mise run ci
+```
+
+Individual tasks are available through `mise tasks ls`. GitHub Actions runs the complete validation suite for pull requests and pushes to `master`.
 
 Tests use temporary state and fake `gh`, `git`, and `pi` executables. They do not modify real GitHub issues, branches, or pull requests.
 

@@ -1879,9 +1879,9 @@ func (w *diagnosticWriter) String() string {
 	return w.text.String()
 }
 
-func testRunner(github *fakeGitHub, workers *fakeWorkers, store *memoryStore, max int) *Runner {
+func testRunner(github *fakeGitHub, workers *fakeWorkers, store *memoryStore, maxWorkers int) *Runner {
 	return &Runner{
-		Config:      Config{Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: max, PollInterval: 5 * time.Millisecond, SessionsDir: "/tmp/backlog-sessions"},
+		Config:      Config{Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: maxWorkers, PollInterval: 5 * time.Millisecond, SessionsDir: "/tmp/backlog-sessions"},
 		GitHub:      github,
 		Store:       store,
 		Worktrees:   &fakeWorktrees{},

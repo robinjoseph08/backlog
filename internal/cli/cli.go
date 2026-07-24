@@ -147,7 +147,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 	if err != nil {
 		return err
 	}
-	defer lock.Release()
+	defer func() { _ = lock.Release() }()
 	if err := bindStateDirectory(commonDirectory, resolvedStateDir); err != nil {
 		return err
 	}
@@ -253,7 +253,7 @@ func statusCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 		if err != nil {
 			return fmt.Errorf("migrate state for status: %w", err)
 		}
-		defer lock.Release()
+		defer func() { _ = lock.Release() }()
 		if err := bindStateDirectory(commonDirectory, resolved); err != nil {
 			return err
 		}
@@ -325,7 +325,7 @@ func retryCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if err != nil {
 		return err
 	}
-	defer lock.Release()
+	defer func() { _ = lock.Release() }()
 	if err := bindStateDirectory(commonDirectory, resolved); err != nil {
 		return err
 	}
