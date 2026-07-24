@@ -70,6 +70,7 @@ type Run struct {
 	Continuation    *ContinuationBoundary `json:"continuation,omitempty"`
 	LogPath         string                `json:"logPath,omitempty"`
 	StderrPath      string                `json:"stderrPath,omitempty"`
+	WorkerLogOpen   bool                  `json:"workerLogOpen,omitempty"`
 	PullRequest     string                `json:"pullRequest,omitempty"`
 	Error           string                `json:"error,omitempty"`
 	StartedAt       time.Time             `json:"startedAt"`

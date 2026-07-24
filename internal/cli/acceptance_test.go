@@ -390,6 +390,156 @@ while :; do sleep 1; done
 	}
 }
 
+func TestCompiledExecutableFollowsRunnerConcurrentlyAndCtrlCIsPassive(t *testing.T) {
+	root := t.TempDir()
+	repository := filepath.Join(root, "repo")
+	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, output)
+	}
+	binary := buildExecutable(t, root)
+	stateDir := filepath.Join(root, "state")
+	statePath := filepath.Join(stateDir, "state.json")
+	workerStarted := filepath.Join(root, "worker-started")
+	finishWorker := filepath.Join(root, "finish-worker")
+	closedMarker := filepath.Join(root, "issue-closed")
+
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef")
+    printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
+    if test -f `+quote(closedMarker)+`; then printf '%s\n' '[]'; else printf '%s\n' '[{"number":27,"title":"Follow me","createdAt":"2026-01-01T00:00:00Z","url":"https://example.test/issues/27"}]'; fi ;;
+  "issue view 27 --repo acme/widgets --json number,title,body,state,url,createdAt")
+    printf '%s\n' '{"number":27,"title":"Follow me","body":"","state":"OPEN","url":"https://example.test/issues/27","createdAt":"2026-01-01T00:00:00Z"}' ;;
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/27/comments?per_page=100 --paginate --slurp"|\
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/27/dependencies/blocked_by?per_page=100 --paginate --slurp")
+    printf '%s\n' '[[]]' ;;
+  "pr list --repo acme/widgets --state all --head agent/issue-27-"*" --json number,url,state,mergedAt,autoMergeRequest,isDraft")
+    printf '%s\n' '[{"number":27,"url":"https://example.test/pull/27","state":"MERGED","mergedAt":"2026-07-27T00:00:00Z"}]' ;;
+  "issue view 27 --repo acme/widgets --json state,title,url")
+    touch `+quote(closedMarker)+`
+    printf '%s\n' '{"state":"CLOSED","title":"Follow me","url":"https://example.test/issues/27"}' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	git := writeExecutable(t, `#!/bin/sh
+set -eu
+if [ "$3" = "rev-parse" ] && [ "$4" = "--show-toplevel" ]; then printf '%s\n' `+quote(repository)+`; exit 0; fi
+if [ "$3" = "rev-parse" ] && [ "$4" = "--git-common-dir" ]; then printf '%s\n' `+quote(filepath.Join(repository, ".git"))+`; exit 0; fi
+if [ "$3" = "worktree" ] && [ "$4" = "add" ]; then mkdir -p "$7"; exit 0; fi
+if [ "$3" = "worktree" ] && [ "$4" = "remove" ]; then rm -rf "$6"; exit 0; fi
+exit 0
+`)
+	pi := writeExecutable(t, `#!/bin/sh
+set -eu
+IFS= read -r prompt
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
+touch `+quote(workerStarted)+`
+while [ ! -f `+quote(finishWorker)+` ]; do sleep 0.01; done
+printf '%s\n' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+while IFS= read -r ignored; do :; done
+`)
+
+	runnerCommand := exec.Command(binary, "run", "--repo-dir", repository, "--state-dir", stateDir,
+		"--max-workers", "1", "--poll", "5ms", "--gh", gh, "--git", git, "--pi", pi)
+	var runnerOutput bytes.Buffer
+	runnerCommand.Stdout = &runnerOutput
+	runnerCommand.Stderr = &runnerOutput
+	if err := runnerCommand.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if runnerCommand.ProcessState == nil {
+			_ = runnerCommand.Process.Kill()
+			_ = runnerCommand.Wait()
+		}
+	}()
+	waitForFile(t, workerStarted)
+	active, err := (state.FileStore{Path: statePath}).Load()
+	if err != nil || len(active.Runs) != 1 || active.Runs[0].Status != scheduler.StatusRunning {
+		t.Fatalf("active state = %#v, err = %v", active, err)
+	}
+	run := active.Runs[0]
+	workerPID := run.PID
+
+	firstFollower := exec.Command(binary, "follow", run.RunID, "--raw", "--repo-dir", repository, "--state-dir", stateDir)
+	firstStdout, err := firstFollower.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var firstStderr bytes.Buffer
+	firstFollower.Stderr = &firstStderr
+	if err := firstFollower.Start(); err != nil {
+		t.Fatal(err)
+	}
+	firstLines := make(chan string, 10)
+	go func() {
+		scanner := bufio.NewScanner(firstStdout)
+		for scanner.Scan() {
+			firstLines <- scanner.Text()
+		}
+		close(firstLines)
+	}()
+	select {
+	case line := <-firstLines:
+		if line != `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}` {
+			t.Fatalf("first followed record = %q", line)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("follower did not emit the active Worker's existing JSONL")
+	}
+	if err := firstFollower.Process.Signal(os.Interrupt); err != nil {
+		t.Fatalf("interrupt follower: %v", err)
+	}
+	if err := firstFollower.Wait(); err != nil {
+		t.Fatalf("interrupted follower: %v, stderr = %q", err, firstStderr.String())
+	}
+	stillActive, err := (state.FileStore{Path: statePath}).Load()
+	if err != nil || len(stillActive.Runs) != 1 || stillActive.Runs[0].Status != scheduler.StatusRunning || stillActive.Runs[0].PID != workerPID {
+		t.Fatalf("Ctrl-C changed the active Run or Worker: state = %#v, err = %v", stillActive, err)
+	}
+	if err := runnerCommand.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("runner stopped after follower Ctrl-C: %v", err)
+	}
+
+	secondFollower := exec.Command(binary, "follow", run.RunID, "--raw", "--repo-dir", repository, "--state-dir", stateDir)
+	var secondOutput bytes.Buffer
+	secondFollower.Stdout = &secondOutput
+	secondFollower.Stderr = &secondOutput
+	if err := secondFollower.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(finishWorker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runnerCommand.Wait(); err != nil {
+		t.Fatalf("runner completion: %v\n%s", err, runnerOutput.String())
+	}
+	if strings.Contains(runnerOutput.String(), "Drain:") || strings.Contains(runnerOutput.String(), "Suspension:") {
+		t.Fatalf("follower Ctrl-C affected Runner lifecycle:\n%s", runnerOutput.String())
+	}
+	if err := secondFollower.Wait(); err != nil {
+		t.Fatalf("terminal follower: %v\n%s", err, secondOutput.String())
+	}
+	final, err := (state.FileStore{Path: statePath}).Load()
+	if err != nil || len(final.Runs) != 1 || final.Runs[0].Status != scheduler.StatusMerged || len(final.Leases) != 0 {
+		t.Fatalf("final state = %#v, err = %v", final, err)
+	}
+	want := strings.Join([]string{
+		`{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}`,
+		`{"type":"agent_start"}`,
+		`{"type":"turn_start"}`,
+		`{"type":"turn_end"}`,
+		`{"type":"agent_end"}`,
+		`{"type":"agent_settled"}`,
+		"",
+	}, "\n")
+	if got := secondOutput.String(); got != want {
+		t.Fatalf("followed JSONL = %q, want %q", got, want)
+	}
+}
+
 func buildExecutable(t *testing.T, root string) string {
 	t.Helper()
 	binary := filepath.Join(root, "backlog")

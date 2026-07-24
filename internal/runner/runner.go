@@ -325,7 +325,11 @@ func (r *Runner) Run(ctx context.Context) error {
 				completion.result.ExitCode = closed.ExitCode
 				completion.result.Err = errors.Join(completion.result.Err, closed.Err)
 			}
-			runID := findActiveRun(&current, completion.issue).RunID
+			completedRun := findActiveRun(&current, completion.issue)
+			runID := completedRun.RunID
+			if closedBeforeReconciliation && workerLogIsClosed(closed) {
+				markWorkerLogClosed(&current, runID)
+			}
 			startedDraining, err := r.handleWorkerCompletionWhileObservingSignals(operationCtx, &current, completion, signalEvents, len(localWorkers))
 			draining = startedDraining || draining
 			if err != nil && operationCtx.Err() != nil && r.suspensionExit.Load() != 0 {
@@ -353,6 +357,46 @@ func (r *Runner) Run(ctx context.Context) error {
 				var closeDraining bool
 				closed, closeDraining = r.closeSettledWhileObservingSignals(process, runID, signalEvents, len(localWorkers))
 				draining = closeDraining || draining
+				if workerLogIsClosed(closed) {
+					markWorkerLogClosed(&current, runID)
+					if err := r.Store.Save(current); err != nil {
+						markerErr := fmt.Errorf("persist closed Worker log for Run %s: %w", runID, err)
+						var completedShutdownErr error
+						groupExited := closed.GroupExited
+						if !groupExited {
+							if abortErr := process.Abort(); abortErr != nil && !errors.Is(abortErr, os.ErrProcessDone) {
+								completedShutdownErr = errors.Join(completedShutdownErr, fmt.Errorf("abort completed issue #%d Worker: %w", completion.issue, abortErr))
+							}
+							reclosed := process.Close()
+							groupExited = reclosed.GroupExited
+							if reclosed.Err != nil && !errors.Is(reclosed.Err, context.Canceled) {
+								completedShutdownErr = errors.Join(completedShutdownErr, fmt.Errorf("close completed issue #%d Worker: %w", completion.issue, reclosed.Err))
+							}
+							if !groupExited {
+								completedShutdownErr = errors.Join(completedShutdownErr, fmt.Errorf("completed issue #%d Worker process group did not exit", completion.issue))
+							}
+						}
+						completedFailure := errors.Join(closed.Err, completedShutdownErr)
+						if completion.result.Settled {
+							if completedFailure == nil {
+								completedShutdownErr = errors.Join(completedShutdownErr, r.finalizeSettledWorker(ctx, &current, runID, nil, true))
+							} else {
+								completed := findRun(current.Runs, runID)
+								if completed.Status == scheduler.StatusMerged || completed.Status == scheduler.StatusWaitingForMerge {
+									r.retainProvisionalCompletion(&current, &completed, fmt.Sprintf("Pi RPC stream or process-group shutdown failed after settlement: %v", completedFailure))
+									if !groupExited {
+										completed.PID = completedRun.PID
+										completed.ProcessIdentity = completedRun.ProcessIdentity
+										replaceRun(&current, completed)
+									}
+								}
+							}
+						}
+						delete(localWorkers, completion.issue)
+						shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after Worker log closure persistence failed; worktree retained")
+						return errors.Join(markerErr, completedShutdownErr, shutdownErr)
+					}
+				}
 			}
 			if closedBeforeReconciliation || closed.GroupExited {
 				delete(localWorkers, completion.issue)
@@ -576,6 +620,12 @@ func (r *Runner) initializeState(current *state.State) error {
 	}
 	current.DefaultBranch = r.Config.DefaultBranch
 	current.MaxConcurrentIssues = r.Config.MaxConcurrentIssues
+	// The CLI holds the exclusive repository scheduling lock before Run starts.
+	// Any persisted open marker therefore belongs to a previous Runner whose
+	// in-process Worker log writer is already closed.
+	for index := range current.Runs {
+		current.Runs[index].WorkerLogOpen = false
+	}
 	return nil
 }
 
@@ -653,6 +703,7 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 	run = findActiveRun(current, candidate.Number)
 	run.LogPath = logPath
 	run.StderrPath = stderrPath
+	run.WorkerLogOpen = true
 	run.UpdatedAt = r.Now().UTC()
 	replaceRun(current, run)
 	if err := r.Store.Save(*current); err != nil {
@@ -1065,12 +1116,16 @@ func (r *Runner) retainProvisionalCompletion(current *state.State, run *schedule
 func (r *Runner) failAfterWorkerStart(current *state.State, issue int, process WorkerProcess, message string) error {
 	abortErr := process.Abort()
 	closed := process.Close()
+	run := findActiveRun(current, issue)
+	if workerLogIsClosed(closed) {
+		markWorkerLogClosed(current, run.RunID)
+	}
 	if closed.GroupExited {
 		r.failRun(current, issue, message)
 		return r.saveAfterFailure(*current, issue)
 	}
 
-	run := findActiveRun(current, issue)
+	run = findActiveRun(current, issue)
 	run.PID = process.PID()
 	replaceRun(current, run)
 	cleanupErr := errors.Join(
@@ -1083,6 +1138,19 @@ func (r *Runner) failAfterWorkerStart(current *state.State, issue int, process W
 		fmt.Errorf("stop Worker for issue #%d after startup failure: %w", issue, cleanupErr),
 		r.saveAfterFailure(*current, issue),
 	)
+}
+
+func workerLogIsClosed(result worker.Result) bool {
+	return result.LogClosed || result.GroupExited
+}
+
+func markWorkerLogClosed(current *state.State, runID string) {
+	run := findRun(current.Runs, runID)
+	if run.RunID == "" {
+		return
+	}
+	run.WorkerLogOpen = false
+	replaceRun(current, run)
 }
 
 func (r *Runner) failRun(current *state.State, issue int, message string) {
@@ -1317,6 +1385,14 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 			if !closed.result.GroupExited || closed.result.Err != nil {
 				clean = false
 			}
+			if workerLogIsClosed(closed.result) {
+				run.WorkerLogOpen = false
+				replaceRun(current, run)
+				if err := r.Store.Save(*current); err != nil {
+					clean = false
+					persistenceErrors = append(persistenceErrors, fmt.Errorf("persist closed Worker log for issue #%d: %w", closed.issue, err))
+				}
+			}
 			r.logf("Suspension: %s remaining", workerSummary(len(local)))
 			continue
 		}
@@ -1342,6 +1418,9 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 			run.UpdatedAt = r.Now().UTC()
 			replaceRun(current, run)
 		} else {
+			if workerLogIsClosed(closed.result) {
+				run.WorkerLogOpen = false
+			}
 			if outcome, exists := verifiedOutcomes[closed.issue]; exists && failureReasons[closed.issue] == "" {
 				if err := r.applyOutcome(ctx, current, run, outcome, true, false); err != nil {
 					clean = false
@@ -1424,6 +1503,10 @@ func (r *Runner) shutdownOwned(
 		completion := <-completions
 		if process := local[completion.issue]; process != nil {
 			closed := process.Close()
+			run := findActiveRun(current, completion.issue)
+			if workerLogIsClosed(closed) {
+				markWorkerLogClosed(current, run.RunID)
+			}
 			if closed.Err != nil && !errors.Is(closed.Err, context.Canceled) {
 				shutdownErrors = append(shutdownErrors, fmt.Errorf("close issue #%d worker: %w", completion.issue, closed.Err))
 			}

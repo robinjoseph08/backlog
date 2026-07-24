@@ -42,6 +42,10 @@ func MainWithSignals(ctx context.Context, args []string, stdout, stderr io.Write
 		commandCtx, stop := cancelContextOnSignal(ctx, signals)
 		defer stop()
 		err = statusCommand(commandCtx, args[1:], stdout, stderr)
+	case "follow":
+		commandCtx, stop := cancelContextOnSignal(ctx, signals)
+		defer stop()
+		err = followCommand(commandCtx, args[1:], stdout, stderr)
 	case "reset":
 		commandCtx, stop := cancelContextOnSignal(ctx, signals)
 		defer stop()
@@ -532,6 +536,7 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "Usage:")
 	fmt.Fprintln(writer, "  backlog run [flags]")
 	fmt.Fprintln(writer, "  backlog status [flags]")
+	fmt.Fprintln(writer, "  backlog follow <run-id> --raw [flags]")
 	fmt.Fprintln(writer, "  backlog reset <issue-number> [--dry-run | --yes] [flags]")
 	fmt.Fprintln(writer, "  backlog retry <issue-number> [--dry-run | --yes] [flags]  (deprecated alias)")
 }

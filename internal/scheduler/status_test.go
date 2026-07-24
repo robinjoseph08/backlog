@@ -27,6 +27,31 @@ func TestRequiresLeaseCoversEveryStatus(t *testing.T) {
 	}
 }
 
+func TestIsTerminalCoversEveryStatus(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		status Status
+		want   bool
+	}{
+		{StatusClaimed, false},
+		{StatusWorktreeReady, false},
+		{StatusRunning, false},
+		{StatusWaitingForMerge, false},
+		{StatusSuspended, false},
+		{StatusResetting, false},
+		{StatusReset, true},
+		{StatusMerged, true},
+		{StatusFailed, true},
+		{StatusNeedsHuman, true},
+	}
+	for _, test := range tests {
+		if got := IsTerminal(test.status); got != test.want {
+			t.Errorf("IsTerminal(%q) = %t, want %t", test.status, got, test.want)
+		}
+	}
+}
+
 func TestRunStateTransitionsAreExplicit(t *testing.T) {
 	t.Parallel()
 

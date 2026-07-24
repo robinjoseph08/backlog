@@ -316,6 +316,13 @@ func TestFileStoreRejectsInvalidRunAndLeaseReferences(t *testing.T) {
 			value: State{Version: CurrentVersion, Runs: []scheduler.Run{{Issue: 1, RunID: "run", Status: scheduler.StatusFailed, WorkerMode: "future"}}},
 			want:  "unknown worker mode",
 		},
+		{
+			name: "open Worker log without path",
+			value: State{Version: CurrentVersion, Runs: []scheduler.Run{{
+				Issue: 1, RunID: "run", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, WorkerLogOpen: true,
+			}}},
+			want: "open Worker log but no log path",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

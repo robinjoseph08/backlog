@@ -799,6 +799,7 @@ func (e resetExecutor) finalize(ctx context.Context, verified reset.Plan) error 
 	for index := range current.Runs {
 		if current.Runs[index].RunID == run.RunID {
 			current.Runs[index].Status = scheduler.StatusReset
+			current.Runs[index].WorkerLogOpen = false
 			current.Runs[index].UpdatedAt = now
 			current.Runs[index].CompletedAt = &now
 			break
