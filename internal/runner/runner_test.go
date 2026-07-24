@@ -2180,6 +2180,30 @@ func TestRunnerReconcilesSuspendedMergedOpenIssueAsNeedsHuman(t *testing.T) {
 	}
 }
 
+func TestRunnerRefusesSuspendedCompletionWhileOldWorkerAbsenceIsUnproven(t *testing.T) {
+	t.Parallel()
+
+	run := resumableRun(t, 26, "unsafe-suspended-26")
+	run.PID = 999999
+	run.ProcessIdentity = "999999:old"
+	github := &fakeGitHub{completions: map[int]ghadapter.CompletionOutcome{26: mergedOutcome(26)}}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: "lease-26", Issue: 26, RunID: run.RunID}},
+	}}
+	runner := testRunner(github, workers, store, 1)
+	worktrees := runner.Worktrees.(*fakeWorktrees)
+
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID != 999999 || !strings.Contains(got.Runs[0].Error, "absence is not proven") || len(got.Leases) != 1 || worktrees.cleanupCount() != 0 {
+		t.Fatalf("unsafe suspended Completion = %#v, cleanup=%d", got, worktrees.cleanupCount())
+	}
+}
+
 func TestRunnerReconcilesMergedRunWithoutLaunchingDuplicate(t *testing.T) {
 	t.Parallel()
 

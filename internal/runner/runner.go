@@ -1147,6 +1147,11 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 			changed = true
 			continue
 		}
+		if run.Status == scheduler.StatusSuspended && (run.PID != 0 || run.ProcessIdentity != "") {
+			r.needsHumanWithLiveWorker(current, run.Issue, "old Worker absence is not proven before applying GitHub Completion")
+			changed = true
+			continue
+		}
 		allowWaiting := run.Status == scheduler.StatusWaitingForMerge || run.Status == scheduler.StatusRunning || run.Status == scheduler.StatusSuspended
 		if run.Status == scheduler.StatusRunning && run.WorkerMode == scheduler.WorkerModeRPC && (run.SessionID == "" || run.SessionDir == "") && !outcome.Merged && !outcome.PRFound {
 			r.needsHuman(current, run.Issue, "recovered RPC Run has missing durable session identity or storage")
@@ -1156,11 +1161,6 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 		recoverableMarker := run.Status == scheduler.StatusRunning && run.WorkerMode == scheduler.WorkerModeRPC && run.Continuation != nil
 		if (run.Status == scheduler.StatusSuspended || recoverableMarker) && !outcome.Merged && !outcome.PRFound {
 			if run.Status == scheduler.StatusSuspended {
-				if run.PID != 0 || run.ProcessIdentity != "" {
-					r.needsHumanWithLiveWorker(current, run.Issue, "old Worker absence is not proven before Resume")
-					changed = true
-					continue
-				}
 				if err := verifyContinuationArtifacts(run); err != nil {
 					r.needsHuman(current, run.Issue, err.Error())
 					changed = true
