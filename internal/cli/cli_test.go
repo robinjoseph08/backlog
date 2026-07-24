@@ -386,6 +386,15 @@ func TestCommandHelpExitsSuccessfully(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
+	if exit := Main(context.Background(), []string{"follow", "--help"}, &stdout, &stderr); exit != 0 {
+		t.Fatalf("follow help exit = %d, stderr = %q", exit, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "raw") || strings.Contains(stderr.String(), "requires a Run ID") {
+		t.Fatalf("follow help = %q", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
 	if exit := Main(context.Background(), []string{"reset", "--help"}, &stdout, &stderr); exit != 0 {
 		t.Fatalf("reset help exit = %d, stderr = %q", exit, stderr.String())
 	}
@@ -410,7 +419,7 @@ func TestUserFacingUsageUsesBacklogName(t *testing.T) {
 	if exit := Main(context.Background(), []string{"help"}, &stdout, &stderr); exit != 0 {
 		t.Fatalf("help exit = %d", exit)
 	}
-	if !strings.Contains(stdout.String(), "backlog run") || strings.Contains(stdout.String(), "pi-backlog-runner") {
+	if !strings.Contains(stdout.String(), "backlog run") || !strings.Contains(stdout.String(), "backlog follow <run-id> --raw") || strings.Contains(stdout.String(), "pi-backlog-runner") {
 		t.Fatalf("help = %q", stdout.String())
 	}
 
