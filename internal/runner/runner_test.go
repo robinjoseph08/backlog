@@ -135,12 +135,19 @@ func TestRunnerClosesWorkerAndRetainsLeaseWhenCompletionSaveFails(t *testing.T) 
 
 	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 12, CreatedAt: time.Now()}}}
 	workers := newFakeWorkers()
+	workerReleased := make(chan struct{})
+	workers.onRelease = func(int) { close(workerReleased) }
 	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
 	runner := testRunner(github, workers, store, 1)
 	worktrees := runner.Worktrees.(*fakeWorktrees)
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 12)
+	select {
+	case <-workerReleased:
+	case <-time.After(time.Second):
+		t.Fatal("Worker was not released after its identity became durable")
+	}
 	github.setCompletion(12, mergedOutcome(12))
 	store.failNext()
 	workers.complete(12, worker.Result{ExitCode: 0})
@@ -909,9 +916,10 @@ func TestRunnerWatchRetriesCandidateDiscoveryWithoutActiveRun(t *testing.T) {
 	t.Parallel()
 
 	pollInterval := 40 * time.Millisecond
+	transientErr := errors.New("GitHub unavailable")
 	github := &fakeGitHub{
 		candidateResults: []candidateResult{
-			{err: errors.New("GitHub unavailable")},
+			{err: transientErr},
 			{candidates: []scheduler.Candidate{{Number: 7, CreatedAt: time.Now()}}},
 		},
 		candidateChanged: make(chan struct{}, 4),
@@ -921,6 +929,8 @@ func TestRunnerWatchRetriesCandidateDiscoveryWithoutActiveRun(t *testing.T) {
 	runner := testRunner(github, workers, store, 1)
 	runner.Config.PollInterval = pollInterval
 	runner.Config.Watch = true
+	output := newDiagnosticWriter(transientErr.Error())
+	runner.Output = output
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(ctx) }()
@@ -929,6 +939,9 @@ func TestRunnerWatchRetriesCandidateDiscoveryWithoutActiveRun(t *testing.T) {
 	calls := github.candidateCallSnapshot()
 	if elapsed := calls[1].Sub(calls[0]); elapsed < pollInterval {
 		t.Fatalf("idle candidate discovery retried after %s, want no sooner than %s", elapsed, pollInterval)
+	}
+	if text := output.String(); !strings.Contains(text, transientErr.Error()) {
+		t.Fatalf("runner output = %q, want candidate discovery diagnostic", text)
 	}
 	workers.complete(7, worker.Result{ExitCode: 1, Err: errors.New("failed")})
 	workers.waitForNoRunningWorkers(t)
@@ -980,6 +993,42 @@ func TestRunnerRetriesInitialCandidateDiscoveryAndResumesAdmission(t *testing.T)
 		t.Fatalf("runner output = %q, want both candidate discovery diagnostics", text)
 	}
 
+	workers.complete(7, worker.Result{ExitCode: 1, Err: errors.New("failed")})
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+}
+
+func TestRunnerWaitsPollIntervalAfterCandidateDiscoveryFailureReturns(t *testing.T) {
+	t.Parallel()
+
+	pollInterval := 40 * time.Millisecond
+	failureReturned := make(chan time.Time, 1)
+	calls := 0
+	github := &fakeGitHub{
+		candidateChanged: make(chan struct{}, 2),
+		candidatesFunc: func(context.Context) ([]scheduler.Candidate, error) {
+			calls++
+			if calls == 1 {
+				time.Sleep(pollInterval + 20*time.Millisecond)
+				failureReturned <- time.Now()
+				return nil, errors.New("list candidates: slow timeout")
+			}
+			return []scheduler.Candidate{{Number: 7, CreatedAt: time.Now()}}, nil
+		},
+	}
+	workers := newFakeWorkers()
+	runner := testRunner(github, workers, &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+	runner.Config.PollInterval = pollInterval
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 7)
+
+	candidateCalls := github.candidateCallSnapshot()
+	if elapsed := candidateCalls[1].Sub(<-failureReturned); elapsed < pollInterval {
+		t.Fatalf("candidate discovery retry happened %s after failure returned, want no sooner than %s", elapsed, pollInterval)
+	}
 	workers.complete(7, worker.Result{ExitCode: 1, Err: errors.New("failed")})
 	if err := <-done; err != nil {
 		t.Fatalf("run: %v", err)
