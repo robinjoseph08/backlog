@@ -111,6 +111,12 @@ func (c Client) candidate(ctx context.Context, repo string, number int) (schedul
 	if !strings.EqualFold(issue.State, "open") {
 		return scheduler.Candidate{}, fmt.Errorf("candidate is no longer open")
 	}
+	if issue.Number != number || issue.Number <= 0 {
+		return scheduler.Candidate{}, fmt.Errorf("candidate identity mismatch: requested #%d, received #%d", number, issue.Number)
+	}
+	if strings.TrimSpace(issue.Title) == "" || strings.TrimSpace(issue.URL) == "" || issue.CreatedAt.IsZero() {
+		return scheduler.Candidate{}, errors.New("candidate omitted required title, URL, or creation time")
+	}
 
 	blockers, err := c.nativeBlockers(ctx, repo, number)
 	if err != nil {

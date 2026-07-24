@@ -710,8 +710,9 @@ func TestCompiledExecutableMigratesV1StatusAndReconcilesStartup(t *testing.T) {
 	if upgraded.Version != state.CurrentVersion || len(upgraded.Runs) != 2 || len(upgraded.Leases) != 1 {
 		t.Fatalf("upgraded status = %#v", upgraded)
 	}
-	if upgraded.Leases[0].RunID != "legacy-running" || upgraded.Runs[0].WorkerMode != scheduler.WorkerModePrint || upgraded.Runs[1].WorkerMode != scheduler.WorkerModePrint {
-		t.Fatalf("upgraded worker and Lease metadata = %#v / %#v", upgraded.Runs, upgraded.Leases)
+	if upgraded.Leases[0].RunID != "legacy-running" || upgraded.Runs[0].WorkerMode != scheduler.WorkerModePrint || upgraded.Runs[1].WorkerMode != scheduler.WorkerModePrint ||
+		upgraded.Runs[0].IssueTitle != "" || upgraded.Runs[0].IssueURL != "" || upgraded.Runs[1].IssueTitle != "" || upgraded.Runs[1].IssueURL != "" {
+		t.Fatalf("upgraded worker, Lease, and issue snapshot metadata = %#v / %#v", upgraded.Runs, upgraded.Leases)
 	}
 	persistedAfterStatus, err := os.ReadFile(statePath)
 	if err != nil {
@@ -760,13 +761,15 @@ esac
 	if len(final.Runs) != 2 || len(final.Leases) != 0 {
 		t.Fatalf("reconciled Runs/Leases = %#v/%#v", final.Runs, final.Leases)
 	}
-	if final.Runs[0].RunID != "old-merged" || final.Runs[0].Error != "retained merged diagnostic" {
-		t.Fatalf("existing merged history changed: %#v", final.Runs[0])
+	if final.Runs[0].RunID != "old-merged" || final.Runs[0].Error != "retained merged diagnostic" ||
+		final.Runs[0].IssueTitle != "" || final.Runs[0].IssueURL != "" {
+		t.Fatalf("existing merged history changed or was backfilled: %#v", final.Runs[0])
 	}
 	reconciled := final.Runs[1]
 	if reconciled.RunID != "legacy-running" || reconciled.Status != scheduler.StatusMerged || reconciled.WorkerMode != scheduler.WorkerModePrint ||
 		reconciled.Branch != "agent/issue-42-legacy-running" || reconciled.Worktree != worktreePath || reconciled.SessionName != "afk #42" ||
-		reconciled.LogPath != "/retained/legacy.jsonl" || reconciled.StderrPath != "/retained/legacy.stderr.log" || reconciled.PullRequest != "https://example.test/pull/42" {
+		reconciled.LogPath != "/retained/legacy.jsonl" || reconciled.StderrPath != "/retained/legacy.stderr.log" || reconciled.PullRequest != "https://example.test/pull/42" ||
+		reconciled.IssueTitle != "" || reconciled.IssueURL != "" {
 		t.Fatalf("startup reconciliation lost migrated artifacts: %#v", reconciled)
 	}
 }

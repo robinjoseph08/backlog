@@ -202,8 +202,13 @@ func TestStatusPrintsIssueTitlesAndFallsBackToIssueNumbers(t *testing.T) {
 		Version: state.CurrentVersion,
 		Runs: []scheduler.Run{
 			{Issue: 26, IssueTitle: "Show observable Run context in status", RunID: "new", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModeRPC, SessionID: "backlog-new", SessionDir: "/sessions/new"},
-			{Issue: 7, RunID: "old", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint},
+			{
+				Issue: 7, RunID: "old-active", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModeRPC,
+				SessionID: "backlog-old-active", SessionDir: "/sessions/old-active", PID: 700,
+				ProcessIdentity: "identity-700", StartedAt: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
+			},
 		},
+		Leases: []scheduler.Lease{{LeaseID: "old-active", Issue: 7, RunID: "old-active"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -214,8 +219,8 @@ func TestStatusPrintsIssueTitlesAndFallsBackToIssueNumbers(t *testing.T) {
 	if !strings.Contains(stdout.String(), "#26  Show observable Run context in status") {
 		t.Fatalf("stdout = %q, want snapshotted issue title", stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "#7  merged") {
-		t.Fatalf("stdout = %q, want old Run issue-number fallback", stdout.String())
+	if !strings.Contains(stdout.String(), "#7  running") {
+		t.Fatalf("stdout = %q, want old active Run issue-number fallback", stdout.String())
 	}
 }
 

@@ -648,10 +648,7 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 	}
 	logPath, stderrPath := process.LogPaths()
 	if logPath == "" || stderrPath == "" {
-		_ = process.Abort()
-		_ = process.Close()
-		r.failRun(current, candidate.Number, "record Pi worker logs: Worker omitted a JSONL or standard-error log identity")
-		return nil, r.saveAfterFailure(*current, candidate.Number)
+		return nil, r.failAfterWorkerStart(current, candidate.Number, process, "record Pi worker logs: Worker omitted a JSONL or standard-error log identity")
 	}
 	run = findActiveRun(current, candidate.Number)
 	run.LogPath = logPath
@@ -659,21 +656,15 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 	run.UpdatedAt = r.Now().UTC()
 	replaceRun(current, run)
 	if err := r.Store.Save(*current); err != nil {
-		_ = process.Abort()
-		_ = process.Close()
-		r.failRun(current, candidate.Number, fmt.Sprintf("persist Pi worker logs before identity inspection: %v", err))
-		persistErr := r.Store.Save(*current)
+		failureErr := r.failAfterWorkerStart(current, candidate.Number, process, fmt.Sprintf("persist Pi worker logs before identity inspection: %v", err))
 		return nil, errors.Join(
 			fmt.Errorf("persist worker logs for issue #%d before identity inspection: %w", candidate.Number, err),
-			persistErr,
+			failureErr,
 		)
 	}
 	identity, err := r.PIDIdentity(operationCtx, process.PID())
 	if err != nil {
-		_ = process.Abort()
-		_ = process.Close()
-		r.failRun(current, candidate.Number, fmt.Sprintf("record Pi worker identity: %v", err))
-		return nil, r.saveAfterFailure(*current, candidate.Number)
+		return nil, r.failAfterWorkerStart(current, candidate.Number, process, fmt.Sprintf("record Pi worker identity: %v", err))
 	}
 	run = findActiveRun(current, candidate.Number)
 	transitionStatus(&run, scheduler.StatusRunning)
@@ -682,20 +673,14 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 	run.UpdatedAt = r.Now().UTC()
 	replaceRun(current, run)
 	if err := r.Store.Save(*current); err != nil {
-		_ = process.Abort()
-		_ = process.Close()
-		r.failRun(current, candidate.Number, fmt.Sprintf("persist worker identity before release: %v", err))
-		persistErr := r.Store.Save(*current)
+		failureErr := r.failAfterWorkerStart(current, candidate.Number, process, fmt.Sprintf("persist worker identity before release: %v", err))
 		return nil, errors.Join(
 			fmt.Errorf("persist worker for issue #%d before release: %w", candidate.Number, err),
-			persistErr,
+			failureErr,
 		)
 	}
 	if err := process.Release(); err != nil {
-		_ = process.Abort()
-		_ = process.Close()
-		r.failRun(current, candidate.Number, fmt.Sprintf("release Pi worker: %v", err))
-		return nil, r.saveAfterFailure(*current, candidate.Number)
+		return nil, r.failAfterWorkerStart(current, candidate.Number, process, fmt.Sprintf("release Pi worker: %v", err))
 	}
 	r.logf("started issue #%d in %s (pid %d)", candidate.Number, assignment.Path, process.PID())
 	return process, nil
@@ -1075,6 +1060,29 @@ func (r *Runner) retainProvisionalCompletion(current *state.State, run *schedule
 		current.Leases = append(current.Leases, scheduler.Lease{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID})
 	}
 	r.logf("issue #%d needs human attention: %s", run.Issue, message)
+}
+
+func (r *Runner) failAfterWorkerStart(current *state.State, issue int, process WorkerProcess, message string) error {
+	abortErr := process.Abort()
+	closed := process.Close()
+	if closed.GroupExited {
+		r.failRun(current, issue, message)
+		return r.saveAfterFailure(*current, issue)
+	}
+
+	run := findActiveRun(current, issue)
+	run.PID = process.PID()
+	replaceRun(current, run)
+	cleanupErr := errors.Join(
+		errors.New("Worker process-group exit was not verified after startup failed"),
+		abortErr,
+		closed.Err,
+	)
+	r.needsHumanWithLiveWorker(current, issue, fmt.Sprintf("%s; stop Worker after startup failure: %v", message, cleanupErr))
+	return errors.Join(
+		fmt.Errorf("stop Worker for issue #%d after startup failure: %w", issue, cleanupErr),
+		r.saveAfterFailure(*current, issue),
+	)
 }
 
 func (r *Runner) failRun(current *state.State, issue int, message string) {
