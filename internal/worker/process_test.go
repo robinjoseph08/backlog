@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -426,10 +428,13 @@ wait "$child"
 		t.Fatalf("release: %v", err)
 	}
 	var childData []byte
-	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+	for deadline := time.Now().Add(5 * time.Second); ; {
 		childData, _ = os.ReadFile(childPIDPath)
 		if len(strings.TrimSpace(string(childData))) > 0 {
 			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Worker descendant PID was not written to %s", childPIDPath)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -452,6 +457,172 @@ wait "$child"
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("descendant pid %d survived process-group escalation; leader exit code %d", childPID, result.ExitCode)
+}
+
+func TestCloseWithForceContextBypassesSettledWorkerGrace(t *testing.T) {
+	root := t.TempDir()
+	pi := fakePi(t, `
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+trap '' TERM
+while :; do sleep 1; done
+`)
+	process, err := (Supervisor{
+		Executable: pi, LogsDir: filepath.Join(root, "logs"), TerminationGrace: 5 * time.Second,
+	}).Start(context.Background(), request(19, "run-19", root, filepath.Join(root, "sessions", "run-19")))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if result := process.Wait(); result.Err != nil || !result.Settled {
+		t.Fatalf("wait = %#v", result)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	started := time.Now()
+	result := process.CloseWithForceContext(ctx, func() error { return nil })
+	if !result.GroupExited || !result.ForceStopped || result.Err != nil {
+		t.Fatalf("force close settled Worker = %#v", result)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("force context did not bypass settled Worker grace: %s", elapsed)
+	}
+}
+
+func TestCloseContextForceStopsWorkerDescendantButNotUnrelatedProcess(t *testing.T) {
+	root := t.TempDir()
+	childPIDPath := filepath.Join(root, "child.pid")
+	pi := fakePi(t, `
+IFS= read -r command
+sh -c 'trap "" TERM; while :; do sleep 1; done' &
+printf '%s\n' "$!" > `+shellQuote(childPIDPath)+`
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+trap '' TERM
+while :; do sleep 1; done
+`)
+	process, err := (Supervisor{
+		Executable: pi, LogsDir: filepath.Join(root, "logs"), TerminationGrace: 100 * time.Millisecond,
+	}).Start(context.Background(), request(16, "run-16", root, filepath.Join(root, "sessions", "run-16")))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if result := process.Wait(); result.Err != nil || !result.Settled {
+		t.Fatalf("wait = %#v", result)
+	}
+	for deadline := time.Now().Add(time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(childPIDPath); err == nil {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("wait for Worker descendant: %v", err)
+		}
+	}
+
+	unrelated := exec.Command("sleep", "10")
+	unrelated.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := unrelated.Start(); err != nil {
+		t.Fatalf("start unrelated process: %v", err)
+	}
+	defer func() {
+		_ = syscall.Kill(-unrelated.Process.Pid, syscall.SIGKILL)
+		_ = unrelated.Wait()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	result := process.CloseContext(ctx, func() error { return nil })
+	if !result.GroupExited || !result.ForceStopped || result.Err != nil {
+		t.Fatalf("force close = %#v", result)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("force close took %s", elapsed)
+	}
+	if err := syscall.Kill(-process.PID(), syscall.Signal(0)); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("Worker process group survived force stop: %v", err)
+	}
+	if err := unrelated.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("unrelated process was signaled: %v", err)
+	}
+}
+
+func TestCloseContextDoesNotSignalWhenAuthorizationCannotVerifyIdentity(t *testing.T) {
+	root := t.TempDir()
+	pi := fakePi(t, `
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+trap '' TERM
+while :; do sleep 1; done
+`)
+	process, err := (Supervisor{
+		Executable: pi, LogsDir: filepath.Join(root, "logs"), TerminationGrace: 50 * time.Millisecond,
+	}).Start(context.Background(), request(17, "run-17", root, filepath.Join(root, "sessions", "run-17")))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if result := process.Wait(); result.Err != nil || !result.Settled {
+		t.Fatalf("wait = %#v", result)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	result := process.CloseContext(ctx, func() error { return errors.New("process-start identity changed") })
+	if result.GroupExited || result.ForceStopped || result.Err == nil || !strings.Contains(result.Err.Error(), "process-start identity changed") {
+		t.Fatalf("unauthorized close = %#v", result)
+	}
+	if err := syscall.Kill(-process.PID(), syscall.Signal(0)); err != nil {
+		t.Fatalf("identity-mismatched process was signaled: %v", err)
+	}
+
+	if err := syscall.Kill(-process.PID(), syscall.SIGKILL); err != nil {
+		t.Fatalf("clean up Worker process group: %v", err)
+	}
+	if result := process.Close(); !result.GroupExited {
+		t.Fatalf("cleanup close = %#v", result)
+	}
+}
+
+func TestCloseContextPreservesNaturalExitBetweenAuthorizationAndSignal(t *testing.T) {
+	root := t.TempDir()
+	pi := fakePi(t, `
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+trap 'exit 7' TERM
+while :; do sleep 1; done
+`)
+	process, err := (Supervisor{
+		Executable: pi, LogsDir: filepath.Join(root, "logs"), TerminationGrace: 50 * time.Millisecond,
+	}).Start(context.Background(), request(18, "run-18", root, filepath.Join(root, "sessions", "run-18")))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if result := process.Wait(); result.Err != nil || !result.Settled {
+		t.Fatalf("wait = %#v", result)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result := process.CloseContext(ctx, func() error {
+		if err := syscall.Kill(-process.PID(), syscall.SIGTERM); err != nil {
+			return fmt.Errorf("stop Worker before force signal: %w", err)
+		}
+		<-process.exitDone
+		return nil
+	})
+	if !result.GroupExited || result.ForceStopped || result.Err == nil || !strings.Contains(result.Err.Error(), "exit status 7") {
+		t.Fatalf("natural exit during force stop = %#v", result)
+	}
 }
 
 func TestProcessSuspendVerifiesAndSyncsContinuationBoundary(t *testing.T) {
