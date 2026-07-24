@@ -385,6 +385,13 @@ func (p *Process) Wait() Result {
 // Close closes RPC input and waits for the Worker process and its entire
 // process group to exit. Callers persist the reconciled Run before invoking Close.
 func (p *Process) Close() Result {
+	return p.CloseWithForceContext(context.Background(), nil)
+}
+
+// CloseWithForceContext performs ordinary settled-Worker cleanup unless ctx is
+// canceled first. Cancellation uses the same authorized SIGKILL path as
+// suspension escalation, allowing a third signal to bypass graceful cleanup.
+func (p *Process) CloseWithForceContext(ctx context.Context, authorizeKill func() error) Result {
 	p.closeInputOnce.Do(func() {
 		p.stdinMu.Lock()
 		p.closeInputErr = p.stdin.Close()
@@ -395,6 +402,8 @@ func (p *Process) Close() Result {
 	defer grace.Stop()
 	select {
 	case <-p.exitDone:
+	case <-ctx.Done():
+		return p.forceStop(authorizeKill, ctx.Err())
 	case <-grace.C:
 		gracefulErr = errors.New("Pi RPC process did not exit after input closed")
 		if err := p.terminate(); err != nil && !errors.Is(err, os.ErrProcessDone) {

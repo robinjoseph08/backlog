@@ -58,6 +58,7 @@ type WorkerProcess interface {
 	Suspend(context.Context, worker.ContinuationRequest) (worker.Continuation, error)
 	Wait() worker.Result
 	Close() worker.Result
+	CloseWithForceContext(context.Context, func() error) worker.Result
 	CloseContext(context.Context, func() error) worker.Result
 }
 
@@ -348,11 +349,18 @@ func (r *Runner) Run(ctx context.Context) error {
 			// Reconciliation and its durable state write happen while the idle RPC
 			// process is still alive. EOF is sent only after that write succeeds.
 			if !closedBeforeReconciliation {
-				closed = process.Close()
+				var closeDraining bool
+				closed, closeDraining = r.closeSettledWhileObservingSignals(process, runID, signalEvents, len(localWorkers))
+				draining = closeDraining || draining
 			}
-			delete(localWorkers, completion.issue)
+			if closedBeforeReconciliation || closed.GroupExited {
+				delete(localWorkers, completion.issue)
+			}
 			if draining && len(localWorkers) > 0 {
 				r.logf("Drain: %s remaining; next SIGINT will be recorded as a suspension request", workerSummary(len(localWorkers)))
+			}
+			if !closed.GroupExited && r.suspensionExit.Load() != 0 {
+				continue
 			}
 			if err := r.finalizeSettledWorker(ctx, &current, runID, closed.Err, completion.result.Settled); err != nil {
 				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after an RPC finalization error; worktree retained")
@@ -676,6 +684,88 @@ func (r *Runner) handleWorkerCompletionWhileObservingSignals(ctx context.Context
 	}
 }
 
+func (r *Runner) closeSettledWhileObservingSignals(process WorkerProcess, runID string, signalEvents <-chan signalEvent, workers int) (worker.Result, bool) {
+	forceCtx, cancelForce := context.WithCancel(context.Background())
+	defer cancelForce()
+	closed := make(chan worker.Result, 1)
+	go func() {
+		closed <- process.CloseWithForceContext(forceCtx, r.authorizeSettledKill(runID, process))
+	}()
+
+	draining := false
+	var deadlineTimer *time.Timer
+	var deadline <-chan time.Time
+	startDeadline := func() {
+		if deadline != nil || r.suspensionExit.Load() == 0 {
+			return
+		}
+		r.suspensionMu.Lock()
+		suspensionDeadline := r.suspensionDeadline
+		r.suspensionMu.Unlock()
+		delay := time.Until(suspensionDeadline)
+		if delay < 0 {
+			delay = 0
+		}
+		deadlineTimer = time.NewTimer(delay)
+		deadline = deadlineTimer.C
+	}
+	defer func() {
+		if deadlineTimer != nil {
+			deadlineTimer.Stop()
+		}
+	}()
+	startDeadline()
+	if r.forceStopRequested.Load() {
+		r.logf("Force stop: requesting force stop for %s after settlement; identity will be revalidated before signaling", workerSummary(workers))
+		cancelForce()
+	}
+
+	for {
+		select {
+		case result := <-closed:
+			return result, draining
+		case event := <-signalEvents:
+			draining = r.handleSignal(event, workers) || draining
+			startDeadline()
+			if event.forceStop {
+				r.logf("Force stop: additional signal accepted; requesting force stop for %s after settlement; identity will be revalidated before signaling", workerSummary(workers))
+				cancelForce()
+			}
+		case <-deadline:
+			deadline = nil
+			r.logf("Force stop: suspension deadline expired; requesting force stop for %s after settlement; identity will be revalidated before signaling", workerSummary(workers))
+			cancelForce()
+		}
+	}
+}
+
+func (r *Runner) authorizeSettledKill(runID string, process WorkerProcess) func() error {
+	return func() error {
+		persisted, err := r.Store.Load()
+		if err != nil {
+			return fmt.Errorf("reload settled Run before force stopping Worker: %w", err)
+		}
+		run := findRun(persisted.Runs, runID)
+		active := findActiveRun(&persisted, run.Issue)
+		if run.RunID == "" || active.RunID != "" && active.RunID != runID || run.Status == scheduler.StatusRunning {
+			return errors.New("durable settled Run state no longer authorizes Worker force stop")
+		}
+		if !r.PIDAlive(process.PID()) {
+			return errors.New("settled Worker PID is not live before force stop")
+		}
+		identityCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		identity, err := r.PIDIdentity(identityCtx, process.PID())
+		if err != nil {
+			return fmt.Errorf("recheck settled Worker identity before force stop: %w", err)
+		}
+		if identity != run.ProcessIdentity {
+			return fmt.Errorf("settled Worker identity changed from %q to %q before force stop", run.ProcessIdentity, identity)
+		}
+		return nil
+	}
+}
+
 func (r *Runner) handleWorkerCompletion(ctx context.Context, current *state.State, completion workerCompletion) error {
 	run := findActiveRun(current, completion.issue)
 	if run.Issue == 0 {
@@ -735,6 +825,9 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 		case scheduler.StatusRunning:
 			if run.PID > 0 && r.PIDAlive(run.PID) {
 				identity, err := r.PIDIdentity(ctx, run.PID)
+				if err != nil && ctx.Err() != nil {
+					return ctx.Err()
+				}
 				if err != nil || identity != run.ProcessIdentity {
 					detail := "identity changed"
 					if err != nil {
@@ -809,7 +902,7 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 		if run.Status == scheduler.StatusSuspended && !outcome.Merged && !(outcome.PRFound && outcome.AutoMergeArmed) {
 			continue
 		}
-		if recoverableContinuation && !outcome.Merged && !outcome.PRFound {
+		if recoverableContinuation && !outcome.Merged && !(outcome.PRFound && outcome.AutoMergeArmed) {
 			transitionStatus(&run, scheduler.StatusSuspended)
 			run.PID = 0
 			run.ProcessIdentity = ""

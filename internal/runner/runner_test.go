@@ -1249,6 +1249,41 @@ func TestRunnerDoesNotTrustRecoveredPIDIndefinitely(t *testing.T) {
 	}
 }
 
+func TestRunnerDrainCancellationDoesNotEraseRecoveredWorkerPID(t *testing.T) {
+	const issue = 78
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs: []scheduler.Run{{
+			Issue: issue, RunID: "run-78", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModeRPC,
+			PID: 1078, ProcessIdentity: "identity-1078", Branch: "agent/issue-78-run-78", Worktree: "/tmp/run-78",
+			StartedAt: time.Now(),
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "run-78", Issue: issue, RunID: "run-78"}},
+	}}
+	signals := make(chan os.Signal, 1)
+	identityStarted := make(chan struct{})
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+	runner.Signals = signals
+	runner.PIDAlive = func(int) bool { return true }
+	runner.PIDIdentity = func(ctx context.Context, _ int) (string, error) {
+		close(identityStarted)
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	<-identityStarted
+	signals <- os.Interrupt
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusRunning || got.Runs[0].PID != 1078 || got.Runs[0].ProcessIdentity != "identity-1078" || len(got.Leases) != 1 {
+		t.Fatalf("recovered Worker changed during Drain cancellation = %#v", got)
+	}
+}
+
 func TestRunnerReconcilesClaimedRunWithoutLookingUpAnEmptyBranch(t *testing.T) {
 	t.Parallel()
 
@@ -1456,6 +1491,45 @@ func TestRunnerSuspendsOnSecondSIGINTAfterPersistingBoundary(t *testing.T) {
 	}
 	if len(got.Leases) != 1 || run.Branch == "" || run.Worktree == "" || run.SessionID == "" {
 		t.Fatalf("retained Run artifacts/Lease = %#v/%#v", run, got.Leases)
+	}
+}
+
+func TestRunnerThirdSIGINTExpeditesSettledWorkerCloseThroughVerifiedForceStop(t *testing.T) {
+	const issue = 79
+	github := &fakeGitHub{
+		candidates:  []scheduler.Candidate{{Number: issue, CreatedAt: time.Now()}},
+		completions: map[int]ghadapter.CompletionOutcome{issue: mergedOutcome(issue)},
+	}
+	workers := newFakeWorkers()
+	workers.authorizeClose = true
+	workers.blockSettledClose = true
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	signals := make(chan os.Signal, 3)
+	runner := testRunner(github, workers, store, 1)
+	runner.Config.SuspensionTimeout = 5 * time.Second
+	runner.Signals = signals
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, issue)
+	workers.complete(issue, worker.Result{ExitCode: 0})
+	<-workers.settledCloseStarted
+	started := time.Now()
+	signals <- os.Interrupt
+	signals <- os.Interrupt
+	signals <- os.Interrupt
+	if err := <-done; !isSignalExit(err, 130) {
+		t.Fatalf("run: %v, want signal exit 130", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("third SIGINT did not expedite settled Worker close: %s", elapsed)
+	}
+	if got := workers.authorizedForceStopCount(); got != 1 {
+		t.Fatalf("authorized force stops = %d, want 1", got)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusMerged || got.Runs[0].CompletedAt == nil || len(got.Leases) != 0 {
+		t.Fatalf("settled terminal outcome after force close = %#v", got)
 	}
 }
 
@@ -1701,7 +1775,10 @@ func TestRunnerRecoversPersistedContinuationAfterFinalSuspensionSaveFails(t *tes
 		t.Fatalf("durable crash-window state = %#v", durable)
 	}
 
-	restarted := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+	recoveryGitHub := &fakeGitHub{completions: map[int]ghadapter.CompletionOutcome{
+		issue: {PRFound: true, PullRequest: "https://example.test/pr/76"},
+	}}
+	restarted := testRunner(recoveryGitHub, newFakeWorkers(), store, 1)
 	restarted.Output = io.Discard
 	restarted.PIDAlive = func(int) bool { return false }
 	restarted.ProcessGroupAlive = func(int) (bool, error) { return false, nil }
@@ -2519,6 +2596,32 @@ func (p *fakeProcess) Close() worker.Result {
 	p.closeOnce.Do(func() { p.owner.finished(p.issue) })
 	return p.closeResult
 }
+func (p *fakeProcess) CloseWithForceContext(ctx context.Context, authorizeKill func() error) worker.Result {
+	p.owner.mu.Lock()
+	blockSettledClose := p.owner.blockSettledClose
+	settledCloseStarted := p.owner.settledCloseStarted
+	authorizeClose := p.owner.authorizeClose
+	p.owner.mu.Unlock()
+	if !blockSettledClose {
+		result := p.Close()
+		result.GroupExited = true
+		return result
+	}
+	settledCloseStarted <- p.issue
+	<-ctx.Done()
+	result := p.Close()
+	if authorizeClose {
+		if err := authorizeKill(); err != nil {
+			result.Err = err
+			return result
+		}
+		p.owner.recordAuthorizedForceStop()
+		result.ForceStopped = true
+	}
+	result.GroupExited = true
+	return result
+}
+
 func (p *fakeProcess) CloseContext(ctx context.Context, authorizeKill func() error) worker.Result {
 	p.owner.mu.Lock()
 	onClose := p.owner.onCloseContext
@@ -2561,17 +2664,19 @@ type fakeWorkers struct {
 	onCloseContext       func(int) error
 	authorizeClose       bool
 	waitForForce         bool
+	blockSettledClose    bool
 	authorizedForceStops int
 	abortCount           int
 	suspendFunc          func(context.Context, int, worker.ContinuationRequest) (worker.Continuation, error)
 	startChanged         chan struct{}
 	closeContextStarted  chan int
+	settledCloseStarted  chan int
 }
 
 func newFakeWorkers() *fakeWorkers {
 	return &fakeWorkers{
 		processes: make(map[int]*fakeProcess), startChanged: make(chan struct{}, 20),
-		closeContextStarted: make(chan int, 20),
+		closeContextStarted: make(chan int, 20), settledCloseStarted: make(chan int, 20),
 	}
 }
 func (w *fakeWorkers) Start(_ context.Context, request worker.Request) (WorkerProcess, error) {

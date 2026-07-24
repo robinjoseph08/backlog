@@ -459,6 +459,39 @@ wait "$child"
 	t.Fatalf("descendant pid %d survived process-group escalation; leader exit code %d", childPID, result.ExitCode)
 }
 
+func TestCloseWithForceContextBypassesSettledWorkerGrace(t *testing.T) {
+	root := t.TempDir()
+	pi := fakePi(t, `
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+trap '' TERM
+while :; do sleep 1; done
+`)
+	process, err := (Supervisor{
+		Executable: pi, LogsDir: filepath.Join(root, "logs"), TerminationGrace: 5 * time.Second,
+	}).Start(context.Background(), request(19, "run-19", root, filepath.Join(root, "sessions", "run-19")))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if result := process.Wait(); result.Err != nil || !result.Settled {
+		t.Fatalf("wait = %#v", result)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	started := time.Now()
+	result := process.CloseWithForceContext(ctx, func() error { return nil })
+	if !result.GroupExited || !result.ForceStopped || result.Err != nil {
+		t.Fatalf("force close settled Worker = %#v", result)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("force context did not bypass settled Worker grace: %s", elapsed)
+	}
+}
+
 func TestCloseContextForceStopsWorkerDescendantButNotUnrelatedProcess(t *testing.T) {
 	root := t.TempDir()
 	childPIDPath := filepath.Join(root, "child.pid")
