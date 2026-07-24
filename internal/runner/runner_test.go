@@ -199,7 +199,9 @@ func TestRunnerShutsDownOtherWorkersWhenLogClosureSaveFails(t *testing.T) {
 		{Number: 13, CreatedAt: time.Now().Add(time.Second)},
 	}}
 	workers := newFakeWorkers()
-	workers.startupCloseResult = worker.Result{LogClosed: true, GroupExited: true}
+	workers.startupCloseResult = worker.Result{LogClosed: true}
+	workers.settledCloseLeavesGroup = true
+	workers.abortClosesProcessGroup = true
 	// Startup writes once, then each Worker writes its Lease, planned and
 	// prepared worktree, log paths, and process identity. The completed Run is
 	// save 12 and its log closure marker is save 13.
@@ -220,8 +222,8 @@ func TestRunnerShutsDownOtherWorkersWhenLogClosureSaveFails(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Runner did not shut down after Worker log closure persistence failed")
 	}
-	if got := workers.abortedCount(); got != 1 {
-		t.Fatalf("aborted Workers = %d, want the other owned Worker aborted", got)
+	if got := workers.abortedCount(); got != 2 {
+		t.Fatalf("aborted Workers = %d, want completed and other owned Workers aborted", got)
 	}
 	if got := workers.runningCount(); got != 0 {
 		t.Fatalf("running Workers = %d, want all Workers closed", got)
@@ -2889,7 +2891,13 @@ func (p *fakeProcess) Release() error {
 	return releaseErr
 }
 func (p *fakeProcess) Abort() error {
-	p.owner.recordAbort()
+	p.owner.mu.Lock()
+	p.owner.abortCount++
+	if p.owner.abortClosesProcessGroup {
+		p.closeResult.LogClosed = true
+		p.closeResult.GroupExited = true
+	}
+	p.owner.mu.Unlock()
 	select {
 	case p.done <- worker.Result{ExitCode: -1, Err: context.Canceled}:
 	default:
@@ -2922,12 +2930,15 @@ func (p *fakeProcess) Close() worker.Result {
 func (p *fakeProcess) CloseWithForceContext(ctx context.Context, authorizeKill func() error) worker.Result {
 	p.owner.mu.Lock()
 	blockSettledClose := p.owner.blockSettledClose
+	settledCloseLeavesGroup := p.owner.settledCloseLeavesGroup
 	settledCloseStarted := p.owner.settledCloseStarted
 	authorizeClose := p.owner.authorizeClose
 	p.owner.mu.Unlock()
 	if !blockSettledClose {
 		result := p.Close()
-		result.GroupExited = true
+		if !settledCloseLeavesGroup {
+			result.GroupExited = true
+		}
 		return result
 	}
 	settledCloseStarted <- p.issue
@@ -2976,27 +2987,29 @@ func (p *fakeProcess) CloseContext(ctx context.Context, authorizeKill func() err
 }
 
 type fakeWorkers struct {
-	mu                   sync.Mutex
-	started              []int
-	processes            map[int]*fakeProcess
-	running              int
-	maximum              int
-	releases             int
-	recoveredReleases    int
-	onRelease            func(int)
-	onCloseContext       func(int) error
-	authorizeClose       bool
-	waitForForce         bool
-	blockSettledClose    bool
-	authorizedForceStops int
-	abortCount           int
-	omitLogPaths         bool
-	releaseErr           error
-	startupCloseResult   worker.Result
-	suspendFunc          func(context.Context, int, worker.ContinuationRequest) (worker.Continuation, error)
-	startChanged         chan struct{}
-	closeContextStarted  chan int
-	settledCloseStarted  chan int
+	mu                      sync.Mutex
+	started                 []int
+	processes               map[int]*fakeProcess
+	running                 int
+	maximum                 int
+	releases                int
+	recoveredReleases       int
+	onRelease               func(int)
+	onCloseContext          func(int) error
+	authorizeClose          bool
+	waitForForce            bool
+	blockSettledClose       bool
+	settledCloseLeavesGroup bool
+	abortClosesProcessGroup bool
+	authorizedForceStops    int
+	abortCount              int
+	omitLogPaths            bool
+	releaseErr              error
+	startupCloseResult      worker.Result
+	suspendFunc             func(context.Context, int, worker.ContinuationRequest) (worker.Continuation, error)
+	startChanged            chan struct{}
+	closeContextStarted     chan int
+	settledCloseStarted     chan int
 }
 
 func newFakeWorkers() *fakeWorkers {
@@ -3023,11 +3036,6 @@ func (w *fakeWorkers) Release(string) error {
 	defer w.mu.Unlock()
 	w.recoveredReleases++
 	return nil
-}
-func (w *fakeWorkers) recordAbort() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.abortCount++
 }
 func (w *fakeWorkers) recordAuthorizedForceStop() {
 	w.mu.Lock()
