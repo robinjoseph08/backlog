@@ -889,6 +889,35 @@ func TestResetRepeatsOnlyAfterVerifyingOldLeaseAbsent(t *testing.T) {
 	}
 }
 
+func TestResetRepairsManagedLabelDriftForAlreadyResetRun(t *testing.T) {
+	fixture := newArtifactFreeResetFixture(t, []string{"ready-for-agent", "spec"})
+	var stdout, stderr bytes.Buffer
+	if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit != 0 {
+		t.Fatalf("initial exit = %d, stderr = %q", exit, stderr.String())
+	}
+	if err := os.WriteFile(fixture.githubState, []byte(`{"labels":["in-progress","spec"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if exit := Main(ctx, fixture.args("reset", "--yes"), &stdout, &stderr); exit != 0 {
+		t.Fatalf("repair exit = %d, stderr = %q", exit, stderr.String())
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusReset || len(current.Leases) != 0 || strings.Join(fixture.labels(t), ",") != "ready-for-agent,spec" {
+		t.Fatalf("repaired state = %#v, labels = %v", current, fixture.labels(t))
+	}
+	if strings.Contains(stdout.String(), "mark Run run-42 resetting") {
+		t.Fatalf("already reset Run planned an invalid transition: %q", stdout.String())
+	}
+}
+
 func TestRetryMatchesResetNonMutationPaths(t *testing.T) {
 	for _, test := range []struct {
 		name  string

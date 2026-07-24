@@ -444,7 +444,7 @@ func (e resetExecutor) apply(ctx context.Context, approved reset.Plan) error {
 			}
 			continue
 		}
-		if needsProgress && plan.Snapshot.Run.Status != scheduler.StatusResetting && plan.Snapshot.Run.Status != scheduler.StatusWaitingForMerge {
+		if needsProgress && plan.Snapshot.Run.Status != scheduler.StatusResetting && plan.Snapshot.Run.Status != scheduler.StatusWaitingForMerge && plan.Snapshot.Run.Status != scheduler.StatusReset {
 			if err := e.markResetting(); err != nil {
 				return err
 			}
