@@ -2,7 +2,9 @@ package github
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -685,16 +687,44 @@ esac`)
 	}
 }
 
+func TestMain(m *testing.M) {
+	if filepath.Base(os.Args[0]) == "gh" {
+		os.Exit(runFakeGH())
+	}
+	os.Exit(m.Run())
+}
+
+func runFakeGH() int {
+	scriptPath := filepath.Join(filepath.Dir(os.Args[0]), "gh-script")
+	args := append([]string{scriptPath}, os.Args[1:]...)
+	cmd := exec.Command("/bin/sh", args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return exitErr.ExitCode()
+		}
+		_, _ = fmt.Fprintln(os.Stderr, err)
+		return 127
+	}
+	return 0
+}
+
 func fakeGH(t *testing.T, body string) string {
 	t.Helper()
 	dir := t.TempDir()
-	path := filepath.Join(dir, "gh")
-	stagedPath := filepath.Join(dir, ".gh-staged")
+	scriptPath := filepath.Join(dir, "gh-script")
 	script := "#!/bin/sh\nset -eu\n" + body + "\n"
-	if err := os.WriteFile(stagedPath, []byte(script), 0o700); err != nil {
+	if err := os.WriteFile(scriptPath, []byte(script), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(stagedPath, path); err != nil {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "gh")
+	if err := os.Symlink(executable, path); err != nil {
 		t.Fatal(err)
 	}
 	return path
