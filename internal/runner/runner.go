@@ -190,7 +190,6 @@ func (r *Runner) Run(ctx context.Context) error {
 	defer poll.Stop()
 	var candidateRetryTimer *time.Timer
 	var candidateRetry <-chan time.Time
-	var candidateErr error
 	defer func() {
 		if candidateRetryTimer != nil {
 			candidateRetryTimer.Stop()
@@ -225,11 +224,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				if ctx.Err() != nil {
 					continue
 				}
-				candidateErr = fmt.Errorf("reconcile GitHub backlog: %w", err)
-				if unfinishedRunCount(&current) == 0 && !r.Config.Watch {
-					return candidateErr
-				}
-				r.logf("candidate discovery failed; admission paused; retry due in %s if supervision continues: %v", r.Config.PollInterval, err)
+				r.logf("candidate discovery failed; admission paused; retry due in %s: %v", r.Config.PollInterval, err)
 				if candidateRetryTimer == nil {
 					candidateRetryTimer = time.NewTimer(r.Config.PollInterval)
 				} else {
@@ -237,7 +232,6 @@ func (r *Runner) Run(ctx context.Context) error {
 				}
 				candidateRetry = candidateRetryTimer.C
 			} else {
-				candidateErr = nil
 				plan := scheduler.Plan(scheduler.Snapshot{Candidates: candidates, Runs: current.Runs, Leases: current.Leases}, r.Config.MaxConcurrentIssues)
 				startedWorker := false
 				for _, candidate := range plan.Starts {
@@ -338,9 +332,6 @@ func (r *Runner) Run(ctx context.Context) error {
 				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after an RPC finalization error; worktree retained")
 				return errors.Join(err, shutdownErr)
 			}
-			if !draining && candidateErr != nil && unfinishedRunCount(&current) == 0 && !r.Config.Watch {
-				return candidateErr
-			}
 		case <-candidateRetry:
 			candidateRetry = nil
 		case <-poll.C:
@@ -358,9 +349,6 @@ func (r *Runner) Run(ctx context.Context) error {
 					return shutdownErr
 				}
 				return errors.Join(err, shutdownErr)
-			}
-			if candidateErr != nil && unfinishedRunCount(&current) == 0 && !r.Config.Watch {
-				return candidateErr
 			}
 		case <-ctx.Done():
 			continue

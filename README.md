@@ -50,9 +50,9 @@ Useful options:
 
 The concurrency limit counts top-level issues. Each AFK worker may itself launch implementation and review subagents.
 
-The foreground runner exits when there are no active workers and no currently eligible candidates. Blocked candidates do not keep it alive unless `--watch` is set.
+After a complete Candidate snapshot succeeds, the foreground runner exits when no unfinished leased Run remains and no eligible Candidate starts a Worker. Blocked Candidates do not keep it alive unless `--watch` is set.
 
-Candidate discovery fails closed for admission. If a discovery pass fails, the runner creates no Leases from that pass, continues supervising existing Workers, and schedules the next retry after `--poll`. With `--watch`, it also retries while no Run is active. Without `--watch`, it reports the discovery error once no unfinished leased Run remains, even if that happens before the scheduled retry.
+Candidate discovery fails closed for admission. If a discovery pass fails, the runner creates no Leases from that pass, reports the underlying GitHub error, continues supervising existing Workers, and retries after `--poll` in every runner state. This includes initial startup and idle non-watch invocations. A later successful snapshot restores normal admission or one-shot exit behavior.
 
 ## Herdr integration
 
