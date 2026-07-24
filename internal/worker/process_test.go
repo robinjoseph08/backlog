@@ -598,8 +598,8 @@ func TestCloseContextPreservesNaturalExitBetweenAuthorizationAndSignal(t *testin
 	root := t.TempDir()
 	pi := fakePi(t, `
 IFS= read -r command
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 trap 'exit 7' TERM
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 while :; do sleep 1; done
 `)
 	process, err := (Supervisor{
