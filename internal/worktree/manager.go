@@ -22,7 +22,7 @@ type Manager struct {
 	WorktreesDir  string
 	DefaultBranch string
 
-	fetchRetryDelay func(attempt int) time.Duration
+	fetchRetryWait func(context.Context, time.Duration) error
 }
 
 const fetchMaxAttempts = 3
@@ -126,11 +126,11 @@ func (m Manager) fetchBase(ctx context.Context) error {
 		if attempt == fetchMaxAttempts {
 			break
 		}
-		delay := defaultFetchRetryDelay(attempt)
-		if m.fetchRetryDelay != nil {
-			delay = m.fetchRetryDelay(attempt)
+		wait := waitForFetchAttempt
+		if m.fetchRetryWait != nil {
+			wait = m.fetchRetryWait
 		}
-		if err := waitForFetchAttempt(ctx, delay); err != nil {
+		if err := wait(ctx, defaultFetchRetryDelay(attempt)); err != nil {
 			return err
 		}
 	}
