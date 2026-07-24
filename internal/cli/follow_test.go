@@ -113,6 +113,81 @@ func TestFollowRawStreamsAppendedCompleteRecordsWithoutLosingPartialRecord(t *te
 	}
 }
 
+func TestFollowRawDrainsRecordsAppendedAfterTerminalStateBeforeWorkerExit(t *testing.T) {
+	directory := t.TempDir()
+	logPath := filepath.Join(directory, "terminal-race.jsonl")
+	if err := os.WriteFile(logPath, []byte("before-terminal\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := state.FileStore{Path: filepath.Join(directory, "state.json")}
+	run := scheduler.Run{
+		Issue: 4, RunID: "terminal-race", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint,
+		PID: 444, ProcessIdentity: "444:start", StartedAt: time.Now(), LogPath: logPath,
+	}
+	if err := store.Save(state.State{
+		Version: state.CurrentVersion, Runs: []scheduler.Run{run},
+		Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	workerExitObserved := make(chan struct{})
+	probeReached := make(chan struct{})
+	var probeOnce sync.Once
+	probe := func(selected scheduler.Run) (bool, error) {
+		if selected.RunID != run.RunID {
+			return false, errors.New("unexpected Run")
+		}
+		select {
+		case <-workerExitObserved:
+			return false, nil
+		default:
+			probeOnce.Do(func() { close(probeReached) })
+			return true, nil
+		}
+	}
+	var output synchronizedBuffer
+	done := make(chan error, 1)
+	go func() {
+		done <- followRawWithProcessProbe(context.Background(), store, run.RunID, &output, 5*time.Millisecond, probe)
+	}()
+	waitForBuffer(t, &output, "before-terminal\n")
+
+	run.Status = scheduler.StatusMerged
+	if err := store.Save(state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{run}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-probeReached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("follower did not wait for terminal Worker's process group")
+	}
+	log, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(log, "after-terminal\n"); err != nil {
+		log.Close()
+		t.Fatal(err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	close(workerExitObserved)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("follower did not exit after Worker process-group exit")
+	}
+	if got, want := output.String(), "before-terminal\nafter-terminal\n"; got != want {
+		t.Fatalf("raw output = %q, want %q", got, want)
+	}
+}
+
 func TestFollowRawWaitsForActiveRunLogPath(t *testing.T) {
 	directory := t.TempDir()
 	store := state.FileStore{Path: filepath.Join(directory, "state.json")}

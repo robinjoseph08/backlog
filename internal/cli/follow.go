@@ -81,6 +81,17 @@ func followFlagTakesValue(name string) bool {
 }
 
 func followRaw(ctx context.Context, source followStateSource, runID string, output io.Writer, pollInterval time.Duration) error {
+	return followRawWithProcessProbe(ctx, source, runID, output, pollInterval, followRunProcessGroupActive)
+}
+
+func followRawWithProcessProbe(
+	ctx context.Context,
+	source followStateSource,
+	runID string,
+	output io.Writer,
+	pollInterval time.Duration,
+	processGroupActive func(scheduler.Run) (bool, error),
+) error {
 	selected, err := loadFollowRun(source, runID)
 	if err != nil {
 		return err
@@ -118,15 +129,38 @@ func followRaw(ctx context.Context, source followStateSource, runID string, outp
 			return fmt.Errorf("Run %q Worker log changed from %q to %q", runID, logPath, selected.LogPath)
 		}
 		if scheduler.IsTerminal(selected.Status) {
-			if err := stream.emitAvailable(); err != nil {
-				return fmt.Errorf("finish following Run %q Worker log %q: %w", runID, logPath, err)
+			active, err := processGroupActive(selected)
+			if err != nil {
+				return fmt.Errorf("follow Run %q: verify Worker process-group exit: %w", runID, err)
 			}
-			return nil
+			if !active {
+				if err := stream.emitAvailable(); err != nil {
+					return fmt.Errorf("finish following Run %q Worker log %q: %w", runID, logPath, err)
+				}
+				return nil
+			}
 		}
 		if !waitToFollow(ctx, pollInterval) {
 			return nil
 		}
 	}
+}
+
+func followRunProcessGroupActive(run scheduler.Run) (bool, error) {
+	pid := run.PID
+	if pid == 0 && run.ProcessIdentity != "" {
+		var err error
+		pid, err = processIdentityPID(run.ProcessIdentity)
+		if err != nil {
+			return false, fmt.Errorf("read recorded Worker identity: %w", err)
+		}
+	}
+	if pid <= 0 {
+		return false, nil
+	}
+	// POSIX signal 0 performs only existence and permission checks. It does not
+	// deliver a signal to the Worker process group.
+	return signalZero(-pid)
 }
 
 func loadFollowRun(source followStateSource, runID string) (scheduler.Run, error) {
