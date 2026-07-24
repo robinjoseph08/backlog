@@ -257,6 +257,139 @@ while IFS= read -r ignored; do :; done
 	}
 }
 
+func TestCompiledExecutableThirdSIGINTForceStopsOnlyItsWorkerGroup(t *testing.T) {
+	root := t.TempDir()
+	repository := filepath.Join(root, "repo")
+	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, output)
+	}
+	binary := buildExecutable(t, root)
+	stateDir := filepath.Join(root, "state")
+	statePath := filepath.Join(stateDir, "state.json")
+	workerStarted := filepath.Join(root, "worker-started")
+	abortReceived := filepath.Join(root, "abort-received")
+	workerPIDPath := filepath.Join(root, "worker.pid")
+
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef")
+    printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
+    printf '%s\n' '[{"number":33,"title":"Hung Worker","createdAt":"2026-01-01T00:00:00Z","url":"https://example.test/issues/33"}]' ;;
+  "issue view 33 --repo acme/widgets --json number,title,body,state,url,createdAt")
+    printf '%s\n' '{"number":33,"title":"Hung Worker","body":"","state":"OPEN","url":"https://example.test/issues/33","createdAt":"2026-01-01T00:00:00Z"}' ;;
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/33/comments?per_page=100 --paginate --slurp"|\
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/33/dependencies/blocked_by?per_page=100 --paginate --slurp")
+    printf '%s\n' '[[]]' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	git := writeExecutable(t, `#!/bin/sh
+set -eu
+if [ "$3" = "rev-parse" ] && [ "$4" = "--show-toplevel" ]; then printf '%s\n' `+quote(repository)+`; exit 0; fi
+if [ "$3" = "rev-parse" ] && [ "$4" = "--git-common-dir" ]; then printf '%s\n' `+quote(filepath.Join(repository, ".git"))+`; exit 0; fi
+if [ "$3" = "worktree" ] && [ "$4" = "add" ]; then mkdir -p "$7"; exit 0; fi
+exit 0
+`)
+	pi := writeExecutable(t, `#!/bin/sh
+set -eu
+printf '%s\n' "$$" > `+quote(workerPIDPath)+`
+IFS= read -r prompt
+sh -c 'trap "" TERM; while :; do sleep 1; done' &
+touch `+quote(workerStarted)+`
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
+IFS= read -r abort
+touch `+quote(abortReceived)+`
+trap '' TERM
+while :; do sleep 1; done
+`)
+
+	unrelated := exec.Command("sleep", "30")
+	unrelated.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := unrelated.Start(); err != nil {
+		t.Fatalf("start unrelated process: %v", err)
+	}
+	defer func() {
+		_ = syscall.Kill(-unrelated.Process.Pid, syscall.SIGKILL)
+		_ = unrelated.Wait()
+	}()
+
+	command := exec.Command(binary, "run", "--repo-dir", repository, "--state-dir", stateDir,
+		"--max-workers", "1", "--poll", "5ms", "--gh", gh, "--git", git, "--pi", pi)
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	lines := make(chan string, 100)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+		close(lines)
+	}()
+	waitForFile(t, workerStarted)
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		t.Fatalf("send first SIGINT: %v", err)
+	}
+	for {
+		line, ok := <-lines
+		if !ok {
+			t.Fatalf("process exited before Drain: %s", stderr.String())
+		}
+		if strings.Contains(line, "Drain: admission stopped") {
+			break
+		}
+	}
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		t.Fatalf("send second SIGINT: %v", err)
+	}
+	waitForFile(t, abortReceived)
+	started := time.Now()
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		t.Fatalf("send third SIGINT: %v", err)
+	}
+	if err := command.Wait(); err != nil {
+		var exitError *exec.ExitError
+		if !errors.As(err, &exitError) || exitError.ExitCode() != 130 {
+			t.Fatalf("compiled third-SIGINT run: %v, stderr = %q", err, stderr.String())
+		}
+	} else {
+		t.Fatal("compiled third-SIGINT run exited zero, want 130")
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("third SIGINT did not bypass the 60-second deadline: %s", elapsed)
+	}
+
+	current, err := (state.FileStore{Path: statePath}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.Runs) != 1 || current.Runs[0].Status != scheduler.StatusNeedsHuman || current.Runs[0].Continuation != nil || current.Runs[0].PID != 0 || len(current.Leases) != 1 {
+		t.Fatalf("persisted state after force stop = %#v", current)
+	}
+	pidData, err := os.ReadFile(workerPIDPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workerPID int
+	if _, err := fmt.Sscan(strings.TrimSpace(string(pidData)), &workerPID); err != nil {
+		t.Fatalf("parse Worker PID: %v", err)
+	}
+	if err := syscall.Kill(-workerPID, syscall.Signal(0)); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("Worker process group survived third SIGINT: %v", err)
+	}
+	if err := unrelated.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("unrelated process was signaled: %v", err)
+	}
+}
+
 func buildExecutable(t *testing.T, root string) string {
 	t.Helper()
 	binary := filepath.Join(root, "backlog")
