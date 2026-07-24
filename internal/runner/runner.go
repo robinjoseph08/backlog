@@ -794,6 +794,9 @@ func verifyContinuationArtifacts(run scheduler.Run) error {
 		return errors.New("continuation artifacts are incomplete before Resume")
 	}
 	boundary := run.Continuation
+	if boundary.VerifiedAt.IsZero() {
+		return errors.New("continuation verification timestamp is missing before Resume")
+	}
 	if err := worker.VerifyContinuation(worker.ContinuationRequest{
 		SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree,
 	}, worker.Continuation{
@@ -1001,13 +1004,7 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 				}
 			}
 			if recoverableMarker {
-				boundary := run.Continuation
-				if err := worker.VerifyContinuation(worker.ContinuationRequest{
-					SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree,
-				}, worker.Continuation{
-					SessionID: boundary.SessionID, SessionFile: boundary.SessionFile, Worktree: boundary.Worktree,
-					LeafID: boundary.LeafID, EntryCount: boundary.EntryCount, SHA256: boundary.SHA256,
-				}); err != nil {
+				if err := verifyContinuationArtifacts(run); err != nil {
 					r.needsHuman(current, run.Issue, fmt.Sprintf("verify persisted Pi continuation after interrupted suspension: %v", err))
 					changed = true
 					continue

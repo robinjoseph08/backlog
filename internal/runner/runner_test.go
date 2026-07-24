@@ -1712,6 +1712,53 @@ func TestRunnerClassifiesMalformedPersistedRunningContinuationAsNeedsHuman(t *te
 	}
 }
 
+func TestRunnerClassifiesMissingContinuationVerificationTimeAsNeedsHuman(t *testing.T) {
+	t.Parallel()
+
+	for index, status := range []scheduler.Status{scheduler.StatusSuspended, scheduler.StatusRunning} {
+		status := status
+		t.Run(string(status), func(t *testing.T) {
+			root := t.TempDir()
+			issue := 72 + index
+			run := resumableRun(t, issue, fmt.Sprintf("missing-time-%d", issue))
+			run.Status = status
+			run.Continuation.VerifiedAt = time.Time{}
+			if status == scheduler.StatusRunning {
+				run.PID = 999999
+				run.ProcessIdentity = "999999:old"
+			}
+			persisted := state.State{
+				Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
+				Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: fmt.Sprintf("lease-%d", issue), Issue: issue, RunID: run.RunID}},
+			}
+			encoded, err := json.Marshal(persisted)
+			if err != nil {
+				t.Fatal(err)
+			}
+			statePath := filepath.Join(root, "state.json")
+			if err := os.WriteFile(statePath, encoded, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			workers := newFakeWorkers()
+			runner := &Runner{
+				Config: Config{Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1, PollInterval: 5 * time.Millisecond, SessionsDir: filepath.Join(root, "sessions")},
+				GitHub: &fakeGitHub{}, Store: state.FileStore{Path: statePath}, Worktrees: &fakeWorktrees{}, Workers: workers,
+				PIDAlive: func(int) bool { return false }, ProcessGroupAlive: func(int) (bool, error) { return false, nil },
+			}
+			if err := runner.Run(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			got, err := (state.FileStore{Path: statePath}).Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Runs[0].Status != scheduler.StatusNeedsHuman || !strings.Contains(got.Runs[0].Error, "timestamp") || len(got.Leases) != 1 || workers.wasStarted(issue) {
+				t.Fatalf("missing verification timestamp = %#v", got)
+			}
+		})
+	}
+}
+
 func TestRunnerClassifiesPersistedRunningRPCWithMissingSessionIdentityAsNeedsHuman(t *testing.T) {
 	t.Parallel()
 
