@@ -159,16 +159,25 @@ func Build(snapshot Snapshot) (Plan, error) {
 	if _, present := labels["ready-for-agent"]; !present {
 		plan.Actions = append(plan.Actions, fmt.Sprintf("add issue label ready-for-agent to %s", snapshot.Issue.URL))
 	}
-	plan.Actions = append(plan.Actions, fmt.Sprintf("mark Run %s reset and release Lease %s", snapshot.Run.RunID, snapshot.Lease.LeaseID))
+	if snapshot.Run.Status != scheduler.StatusReset {
+		plan.Actions = append(plan.Actions, fmt.Sprintf("mark Run %s reset and release Lease %s", snapshot.Run.RunID, snapshot.Lease.LeaseID))
+	}
 	return plan, nil
 }
 
 func validateIdentity(snapshot Snapshot) error {
 	run, lease, issue := snapshot.Run, snapshot.Lease, snapshot.Issue
-	if run.Issue <= 0 || run.RunID == "" || lease.LeaseID == "" || issue.URL == "" {
-		return fmt.Errorf("Reset Run, Lease, or issue identity is incomplete")
+	if run.Issue <= 0 || run.RunID == "" || issue.URL == "" {
+		return fmt.Errorf("Reset Run or issue identity is incomplete")
 	}
-	if lease.Issue != run.Issue || lease.RunID != run.RunID || issue.Number != run.Issue {
+	if issue.Number != run.Issue {
+		return fmt.Errorf("Run %s and issue identity do not match", run.RunID)
+	}
+	if run.Status == scheduler.StatusReset {
+		if lease.LeaseID != "" || lease.Issue != 0 || lease.RunID != "" {
+			return fmt.Errorf("reset Run %s still has an active Lease", run.RunID)
+		}
+	} else if lease.LeaseID == "" || lease.Issue != run.Issue || lease.RunID != run.RunID {
 		return fmt.Errorf("Run %s, Lease %s, and issue identity do not match", run.RunID, lease.LeaseID)
 	}
 	if err := validateBranch(snapshot.RemoteBranch, run.Branch, "remote"); err != nil {

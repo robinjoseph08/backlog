@@ -13,6 +13,8 @@ const (
 	StatusRunning         Status = "running"
 	StatusWaitingForMerge Status = "waiting-for-merge"
 	StatusSuspended       Status = "suspended"
+	StatusResetting       Status = "resetting"
+	StatusReset           Status = "reset"
 	StatusMerged          Status = "merged"
 	StatusFailed          Status = "failed"
 	StatusNeedsHuman      Status = "needs-human"

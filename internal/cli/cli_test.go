@@ -120,75 +120,6 @@ while IFS= read -r ignored; do :; done
 	}
 }
 
-func TestRetryRemovesOnlyInterventionRequiredLease(t *testing.T) {
-	t.Parallel()
-
-	stateDir := t.TempDir()
-	repository := filepath.Join(t.TempDir(), "repo")
-	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
-		t.Fatalf("git init: %v\n%s", err, output)
-	}
-	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
-	if err := store.Save(state.State{
-		Version: state.CurrentVersion,
-		Runs: []scheduler.Run{{
-			Issue: 42, RunID: "old", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, Worktree: "/retained",
-		}},
-		Leases: []scheduler.Lease{{LeaseID: "old", Issue: 42, RunID: "old"}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	var stdout, stderr bytes.Buffer
-	if exit := Main(context.Background(), []string{"retry", "42", "--repo-dir", repository, "--state-dir", stateDir}, &stdout, &stderr); exit != 0 {
-		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
-	}
-	got, err := store.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got.Runs) != 1 || len(got.Leases) != 0 {
-		t.Fatalf("Runs/Leases = %#v/%#v, want history retained and Lease removed", got.Runs, got.Leases)
-	}
-	if !strings.Contains(stdout.String(), "retained") {
-		t.Fatalf("stdout = %q, want retained-worktree notice", stdout.String())
-	}
-}
-
-func TestRetryRefusesRunWithRetainedLiveWorkerIdentity(t *testing.T) {
-	t.Parallel()
-
-	stateDir := t.TempDir()
-	repository := filepath.Join(t.TempDir(), "repo")
-	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
-		t.Fatalf("git init: %v\n%s", err, output)
-	}
-	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
-	if err := store.Save(state.State{
-		Version: state.CurrentVersion,
-		Runs: []scheduler.Run{{
-			Issue: 43, RunID: "live", Status: scheduler.StatusNeedsHuman, WorkerMode: scheduler.WorkerModePrint,
-			PID: 4321, ProcessIdentity: "identity-4321",
-		}},
-		Leases: []scheduler.Lease{{LeaseID: "live", Issue: 43, RunID: "live"}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	var stdout, stderr bytes.Buffer
-	if exit := Main(context.Background(), []string{"retry", "43", "--repo-dir", repository, "--state-dir", stateDir}, &stdout, &stderr); exit == 0 {
-		t.Fatalf("retry succeeded, stdout = %q", stdout.String())
-	}
-	if !strings.Contains(stderr.String(), "verify process-group exit") {
-		t.Fatalf("stderr = %q", stderr.String())
-	}
-	got, err := store.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got.Leases) != 1 {
-		t.Fatalf("Leases = %#v, want retained Lease", got.Leases)
-	}
-}
-
 func TestStatusPrintsIssueTitlesAndFallsBackToIssueNumbers(t *testing.T) {
 	t.Parallel()
 
@@ -487,12 +418,13 @@ func TestUserFacingUsageUsesBacklogName(t *testing.T) {
 	if exit := Main(context.Background(), []string{"retry"}, &stdout, &stderr); exit != 1 {
 		t.Fatalf("retry exit = %d, want 1", exit)
 	}
-	if !strings.Contains(stderr.String(), "usage: backlog retry") || strings.Contains(stderr.String(), "pi-backlog-runner") {
+	if !strings.Contains(stderr.String(), "Warning: backlog retry is deprecated") ||
+		!strings.Contains(stderr.String(), "usage: backlog reset") || strings.Contains(stderr.String(), "pi-backlog-runner") {
 		t.Fatalf("retry error = %q", stderr.String())
 	}
 }
 
-func TestSplitRetryArgumentsAcceptsFlagsBeforeIssue(t *testing.T) {
+func TestSplitResetArgumentsAcceptsFlagsBeforeIssue(t *testing.T) {
 	t.Parallel()
 
 	for _, args := range [][]string{
@@ -500,8 +432,9 @@ func TestSplitRetryArgumentsAcceptsFlagsBeforeIssue(t *testing.T) {
 		{"--repo-dir=/tmp/repo", "123"},
 		{"--state-dir=/tmp/state", "123"},
 		{"--git=/tmp/git", "123"},
+		{"--gh=/tmp/gh", "123"},
 	} {
-		issue, flags, err := splitRetryArguments(args)
+		issue, flags, err := splitResetArguments(args)
 		if err != nil {
 			t.Fatalf("split %q: %v", args, err)
 		}

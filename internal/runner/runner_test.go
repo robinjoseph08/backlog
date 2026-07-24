@@ -1454,6 +1454,29 @@ func TestRunnerDrainCancellationDoesNotEraseRecoveredWorkerPID(t *testing.T) {
 	}
 }
 
+func TestRunnerLeavesResettingRunForResetReconciliation(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{}
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs:   []scheduler.Run{{Issue: 1, RunID: "resetting", Status: scheduler.StatusResetting, WorkerMode: scheduler.WorkerModePrint}},
+		Leases: []scheduler.Lease{{LeaseID: "resetting", Issue: 1, RunID: "resetting"}},
+	}}
+	runner := testRunner(github, newFakeWorkers(), store, 1)
+	current := store.LoadValue()
+	if err := runner.reconcile(context.Background(), &current, map[int]WorkerProcess{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusResetting || len(got.Leases) != 1 {
+		t.Fatalf("resetting Run changed during runner reconciliation: %#v", got)
+	}
+	if branches := github.completionBranchSnapshot(); len(branches) != 0 {
+		t.Fatalf("resetting Run triggered GitHub completion lookup: %q", branches)
+	}
+}
+
 func TestRunnerReconcilesClaimedRunWithoutLookingUpAnEmptyBranch(t *testing.T) {
 	t.Parallel()
 

@@ -83,6 +83,7 @@ func TestBuildPlansEverySafeRunStatus(t *testing.T) {
 		scheduler.StatusFailed,
 		scheduler.StatusNeedsHuman,
 		scheduler.StatusSuspended,
+		scheduler.StatusResetting,
 	}
 	for _, status := range statuses {
 		t.Run(string(status), func(t *testing.T) {
@@ -92,6 +93,24 @@ func TestBuildPlansEverySafeRunStatus(t *testing.T) {
 				t.Fatalf("safe stopped Run status %s was refused: %v", status, err)
 			}
 		})
+	}
+}
+
+func TestBuildAlreadyResetRequiresNoLeaseOrFinalAction(t *testing.T) {
+	snapshot := minimalSnapshot([]string{"ready-for-agent"})
+	snapshot.Run.Status = scheduler.StatusReset
+	snapshot.Lease = scheduler.Lease{}
+	plan, err := Build(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Actions) != 0 {
+		t.Fatalf("already reset actions = %q", plan.Actions)
+	}
+
+	snapshot.Lease = scheduler.Lease{LeaseID: "old", Issue: 42, RunID: "run-42"}
+	if _, err := Build(snapshot); err == nil || !strings.Contains(err.Error(), "still has an active Lease") {
+		t.Fatalf("old Lease error = %v", err)
 	}
 }
 

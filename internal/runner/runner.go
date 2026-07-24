@@ -836,7 +836,7 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 			continue
 		}
 		switch run.Status {
-		case scheduler.StatusMerged, scheduler.StatusFailed, scheduler.StatusNeedsHuman:
+		case scheduler.StatusMerged, scheduler.StatusFailed, scheduler.StatusNeedsHuman, scheduler.StatusResetting, scheduler.StatusReset:
 			continue
 		case scheduler.StatusRunning:
 			if run.PID > 0 && r.PIDAlive(run.PID) {
@@ -854,7 +854,7 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 					continue
 				}
 				if r.Now().Sub(run.StartedAt) > r.Config.MaxWorkerAge {
-					r.needsHuman(current, run.Issue, "recorded worker exceeded the maximum age; verify process identity before retrying")
+					r.needsHuman(current, run.Issue, "recorded worker exceeded the maximum age; verify process identity before Reset")
 					changed = true
 					continue
 				}
@@ -1223,7 +1223,7 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 	closeProcess := func(issue int, process WorkerProcess) {
 		go func() {
 			result := process.CloseContext(ctx, r.authorizeSuspensionKill(runIDs[issue], process))
-			if result.GroupExited && !result.ForceStopped {
+			if result.GroupExited && !result.ForceStopped && ctx.Err() == nil {
 				forceStopRemaining.Add(-1)
 			}
 			closeResults <- suspensionCloseResult{issue: issue, result: result}
