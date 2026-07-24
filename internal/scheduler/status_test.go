@@ -49,6 +49,7 @@ func TestRunStateTransitionsAreExplicit(t *testing.T) {
 		{StatusWaitingForMerge, StatusWaitingForMerge},
 		{StatusWaitingForMerge, StatusMerged},
 		{StatusWaitingForMerge, StatusNeedsHuman},
+		{StatusWaitingForMerge, StatusResetting},
 		{StatusSuspended, StatusRunning},
 		{StatusSuspended, StatusWaitingForMerge},
 		{StatusSuspended, StatusMerged},

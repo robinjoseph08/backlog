@@ -18,6 +18,7 @@ import (
 	"time"
 
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
+	"github.com/robinjoseph08/backlog/internal/reset"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 )
@@ -185,8 +186,10 @@ case "$*" in
   "repo view --json nameWithOwner,defaultBranchRef") printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
   "issue view 42 --repo acme/widgets --json number,url,state,labels")
     printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"},{"name":"spec"}]}' ;;
-  "pr list --repo acme/widgets --state all --head `+branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
-    printf '%s\n' '[{"number":99,"url":"https://github.com/acme/widgets/pull/99","state":"OPEN","mergedAt":null,"autoMergeRequest":{"mergeMethod":"SQUASH"},"isDraft":false,"headRefName":"`+branch+`","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+  "pr list --repo acme/widgets --state all --head `+branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    printf '%s\n' '[{"number":99,"url":"https://github.com/acme/widgets/pull/99","state":"OPEN","mergedAt":null,"autoMergeRequest":{"mergeMethod":"SQUASH"},"isDraft":false,"headRefName":"`+branch+`","headRefOid":"`+strings.TrimSpace(gitOutput(t, repository, "rev-parse", "refs/remotes/origin/"+branch))+`","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/99/comments?per_page=100 --paginate --slurp")
+    printf '%s\n' '[[]]' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
 `)
@@ -208,15 +211,17 @@ esac
 	}
 	planOutput := string(output)
 	wantActions := "Required actions:\n" +
-		"  1. disable auto-merge for pull request #99 (https://github.com/acme/widgets/pull/99)\n" +
-		"  2. close unmerged pull request #99 (https://github.com/acme/widgets/pull/99)\n" +
-		"  3. delete remote branch " + branch + " at " + strings.TrimSpace(gitOutput(t, repository, "rev-parse", "refs/remotes/origin/"+branch)) + "\n" +
-		"  4. remove local worktree " + worktreePath + " for " + branch + " at " + strings.TrimSpace(gitOutput(t, repository, "rev-parse", branch)) + "\n" +
-		"  5. delete local branch " + branch + " at " + strings.TrimSpace(gitOutput(t, repository, "rev-parse", branch)) + "\n" +
-		"  6. retire Pi session " + sessionID + " in " + sessionDir + "\n" +
-		"  7. remove issue label in-progress from https://github.com/acme/widgets/issues/42\n" +
-		"  8. add issue label ready-for-agent to https://github.com/acme/widgets/issues/42\n" +
-		"  9. mark Run " + runID + " reset and release Lease lease-rich\n" +
+		"  1. mark Run " + runID + " resetting while retaining Lease lease-rich\n" +
+		"  2. disable auto-merge for pull request #99 (https://github.com/acme/widgets/pull/99)\n" +
+		"  3. explain Reset on pull request #99 (https://github.com/acme/widgets/pull/99)\n" +
+		"  4. close unmerged pull request #99 (https://github.com/acme/widgets/pull/99)\n" +
+		"  5. delete remote branch " + branch + " at " + strings.TrimSpace(gitOutput(t, repository, "rev-parse", "refs/remotes/origin/"+branch)) + "\n" +
+		"  6. remove local worktree " + worktreePath + " for " + branch + " at " + strings.TrimSpace(gitOutput(t, repository, "rev-parse", branch)) + "\n" +
+		"  7. delete local branch " + branch + " at " + strings.TrimSpace(gitOutput(t, repository, "rev-parse", branch)) + "\n" +
+		"  8. retire Pi session " + sessionID + " in " + sessionDir + "\n" +
+		"  9. remove issue label in-progress from https://github.com/acme/widgets/issues/42\n" +
+		"  10. add issue label ready-for-agent to https://github.com/acme/widgets/issues/42\n" +
+		"  11. mark Run " + runID + " reset and release Lease lease-rich\n" +
 		"Dry-run: no changes made.\n"
 	if !strings.Contains(planOutput, wantActions) {
 		t.Fatalf("actions block =\n%s\nwant block =\n%s", planOutput, wantActions)
@@ -233,7 +238,7 @@ esac
 
 	mutation := exec.Command(binary, "reset", "42", "--yes", "--repo-dir", repository, "--state-dir", stateDir, "--git", git, "--gh", gh)
 	mutationOutput, mutationErr := mutation.CombinedOutput()
-	if mutationErr == nil || !strings.Contains(string(mutationOutput), "currently requires all pull request, branch, worktree, and Pi session artifacts to be absent") {
+	if mutationErr == nil || !strings.Contains(string(mutationOutput), "requires the owned local branch, worktree, and Pi session to be absent") {
 		t.Fatalf("artifact-bearing mutation error = %v, output = %q", mutationErr, mutationOutput)
 	}
 	if fileDigest(t, statePath) != beforeState || fileDigest(t, sessionPath) != beforeSession || fileDigest(t, githubState) != beforeGitHub ||
@@ -346,7 +351,7 @@ func TestInspectLocalResourcesRefusesUnknownAndReplacedWorktrees(t *testing.T) {
 	unknownGit := writeExecutable(t, `#!/bin/sh
 set -eu
 case "$*" in
-  *" show-ref --verify --hash refs/heads/agent/issue-4-run-4") exit 2 ;;
+  *" for-each-ref --format=%(objectname) refs/heads/agent/issue-4-run-4") exit 2 ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
 esac
 `)
@@ -884,6 +889,35 @@ func TestResetRepeatsOnlyAfterVerifyingOldLeaseAbsent(t *testing.T) {
 	}
 }
 
+func TestResetRepairsManagedLabelDriftForAlreadyResetRun(t *testing.T) {
+	fixture := newArtifactFreeResetFixture(t, []string{"ready-for-agent", "spec"})
+	var stdout, stderr bytes.Buffer
+	if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit != 0 {
+		t.Fatalf("initial exit = %d, stderr = %q", exit, stderr.String())
+	}
+	if err := os.WriteFile(fixture.githubState, []byte(`{"labels":["in-progress","spec"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if exit := Main(ctx, fixture.args("reset", "--yes"), &stdout, &stderr); exit != 0 {
+		t.Fatalf("repair exit = %d, stderr = %q", exit, stderr.String())
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusReset || len(current.Leases) != 0 || strings.Join(fixture.labels(t), ",") != "ready-for-agent,spec" {
+		t.Fatalf("repaired state = %#v, labels = %v", current, fixture.labels(t))
+	}
+	if strings.Contains(stdout.String(), "mark Run run-42 resetting") {
+		t.Fatalf("already reset Run planned an invalid transition: %q", stdout.String())
+	}
+}
+
 func TestRetryMatchesResetNonMutationPaths(t *testing.T) {
 	for _, test := range []struct {
 		name  string
@@ -1227,6 +1261,554 @@ esac
 	}
 }
 
+type githubArtifactResetFixture struct {
+	artifactFreeResetFixture
+	branch      string
+	remote      string
+	githubCalls string
+}
+
+func newGitHubArtifactResetFixture(t *testing.T, status scheduler.Status, failClose, mergeOnDisable, advanceOnClose bool) githubArtifactResetFixture {
+	t.Helper()
+	root := t.TempDir()
+	repository := filepath.Join(root, "repo")
+	remote := filepath.Join(root, "remote.git")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", "-b", "main", repository)
+	runGit(t, repository, "config", "user.name", "Reset Test")
+	runGit(t, repository, "config", "user.email", "reset@example.test")
+	if err := os.WriteFile(filepath.Join(repository, "tracked"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repository, "add", "tracked")
+	runGit(t, repository, "commit", "-m", "base")
+	runGit(t, repository, "remote", "add", "origin", remote)
+	runGit(t, repository, "push", "-u", "origin", "main")
+
+	runID := "run-github"
+	branch := "agent/issue-42-" + runID
+	runGit(t, repository, "checkout", "-b", branch)
+	if err := os.WriteFile(filepath.Join(repository, "owned"), []byte("owned\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repository, "add", "owned")
+	runGit(t, repository, "commit", "-m", "owned")
+	head := strings.TrimSpace(gitOutput(t, repository, "rev-parse", "HEAD"))
+	runGit(t, repository, "push", "origin", branch)
+	runGit(t, repository, "checkout", "main")
+	runGit(t, repository, "branch", "-D", branch)
+
+	stateDir := filepath.Join(root, "state")
+	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
+	if err := store.Save(state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
+		Runs: []scheduler.Run{{
+			Issue: 42, RunID: runID, Status: status, WorkerMode: scheduler.WorkerModePrint,
+			Branch: branch, Worktree: filepath.Join(stateDir, "worktrees", "issue-42-"+runID),
+			PullRequest: "https://github.com/acme/widgets/pull/99",
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "lease-github", Issue: 42, RunID: runID}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	githubState := filepath.Join(root, "github.json")
+	encoded := fmt.Sprintf(`{"pr":"OPEN","merged":false,"auto":true,"comments":[],"head":%q,"labels":["ready-for-agent"],"failClose":%t,"failAction":"","noopAction":"","mergeOnDisable":%t,"advanceOnClose":%t}`, head, failClose, mergeOnDisable, advanceOnClose)
+	if err := os.WriteFile(githubState, []byte(encoded), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	calls := filepath.Join(root, "github-calls")
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+state=`+quote(githubState)+`
+calls=`+quote(calls)+`
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef")
+    printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    labels=$(jq -c '[.labels[] | {name:.}]' "$state")
+    printf '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":%s}\n' "$labels" ;;
+  "pr list --repo acme/widgets --state all --head `+branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    jq -c --arg branch `+quote(branch)+` '[{number:99,url:"https://github.com/acme/widgets/pull/99",state:.pr,mergedAt:(if .merged then "2026-01-01T00:00:00Z" else null end),autoMergeRequest:(if .auto then {mergeMethod:"SQUASH"} else null end),isDraft:false,headRefName:$branch,headRefOid:.head,headRepositoryOwner:{login:"acme"},headRepository:{nameWithOwner:"acme/widgets"}}]' "$state" ;;
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/99/comments?per_page=100 --paginate --slurp")
+    jq -c '[.comments | map({body:.})]' "$state" ;;
+  "pr merge 99 --repo acme/widgets --disable-auto")
+    printf '%s\n' disable >> "$calls"
+    if [ "$(jq -r .failAction "$state")" = disable ]; then
+      temporary="$state.tmp"
+      jq '.failAction=""' "$state" > "$temporary"
+      mv "$temporary" "$state"
+      echo 'temporary disable failure' >&2
+      exit 1
+    fi
+    if [ "$(jq -r .noopAction "$state")" = disable ]; then exit 0; fi
+    temporary="$state.tmp"
+    jq 'if .mergeOnDisable then .auto=false | .pr="MERGED" | .merged=true else .auto=false end' "$state" > "$temporary"
+    mv "$temporary" "$state" ;;
+  pr\ comment\ 99\ --repo\ acme/widgets\ --body\ *)
+    printf '%s\n' comment >> "$calls"
+    if [ "$(jq -r .failAction "$state")" = comment ]; then
+      temporary="$state.tmp"
+      jq '.failAction=""' "$state" > "$temporary"
+      mv "$temporary" "$state"
+      echo 'temporary comment failure' >&2
+      exit 1
+    fi
+    if [ "$(jq -r .noopAction "$state")" = comment ]; then exit 0; fi
+    body=''
+    for value in "$@"; do body=$value; done
+    temporary="$state.tmp"
+    jq --arg body "$body" '.comments += [$body]' "$state" > "$temporary"
+    mv "$temporary" "$state" ;;
+  "pr close 99 --repo acme/widgets")
+    printf '%s\n' close >> "$calls"
+    if [ "$(jq -r .failAction "$state")" = close ]; then
+      temporary="$state.tmp"
+      jq '.failAction=""' "$state" > "$temporary"
+      mv "$temporary" "$state"
+      echo 'temporary close failure' >&2
+      exit 1
+    fi
+    if [ "$(jq -r .noopAction "$state")" = close ]; then exit 0; fi
+    if [ "$(jq -r .failClose "$state")" = true ]; then
+      temporary="$state.tmp"
+      jq '.failClose=false' "$state" > "$temporary"
+      mv "$temporary" "$state"
+      echo 'temporary close failure' >&2
+      exit 1
+    fi
+    if [ "$(jq -r .advanceOnClose "$state")" = true ]; then
+      git -C `+quote(repository)+` commit --allow-empty -m race >/dev/null
+      git -C `+quote(repository)+` push --force origin HEAD:refs/heads/`+branch+` >/dev/null 2>&1
+      replacement=$(git -C `+quote(repository)+` rev-parse HEAD)
+      temporary="$state.tmp"
+      jq --arg replacement "$replacement" '.head=$replacement | .advanceOnClose=false' "$state" > "$temporary"
+      mv "$temporary" "$state"
+    fi
+    temporary="$state.tmp"
+    jq '.pr="CLOSED"' "$state" > "$temporary"
+    mv "$temporary" "$state" ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	return githubArtifactResetFixture{
+		artifactFreeResetFixture: artifactFreeResetFixture{
+			repository: repository, stateDir: stateDir, store: store, githubState: githubState,
+			git: githubGit(t), gh: gh,
+		},
+		branch: branch, remote: remote, githubCalls: calls,
+	}
+}
+
+func (f githubArtifactResetFixture) githubStateValue(t *testing.T) struct {
+	PR       string   `json:"pr"`
+	Merged   bool     `json:"merged"`
+	Auto     bool     `json:"auto"`
+	Comments []string `json:"comments"`
+} {
+	t.Helper()
+	var value struct {
+		PR       string   `json:"pr"`
+		Merged   bool     `json:"merged"`
+		Auto     bool     `json:"auto"`
+		Comments []string `json:"comments"`
+	}
+	data, err := os.ReadFile(f.githubState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &value); err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func (f githubArtifactResetFixture) updateGitHubState(t *testing.T, filter string) {
+	t.Helper()
+	command := exec.Command("jq", filter, f.githubState)
+	output, err := command.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporary := f.githubState + ".tmp"
+	if err := os.WriteFile(temporary, output, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(temporary, f.githubState); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResetRerunsOnlyRemainingGitHubArtifactActionsAfterPartialFailure(t *testing.T) {
+	t.Parallel()
+	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusFailed, true, false, false)
+
+	var stdout, stderr bytes.Buffer
+	if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit == 0 || !strings.Contains(stderr.String(), "temporary close failure") {
+		t.Fatalf("first exit = %d, stderr = %q", exit, stderr.String())
+	}
+	partial, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	github := fixture.githubStateValue(t)
+	if partial.Runs[0].Status != scheduler.StatusResetting || len(partial.Leases) != 1 || github.PR != "OPEN" || github.Auto || len(github.Comments) != 1 {
+		t.Fatalf("partial state = %#v, GitHub = %#v", partial, github)
+	}
+	comment := github.Comments[0]
+	if !strings.Contains(comment, resetCommentMarker("run-github")) || !strings.Contains(comment, "Run run-github") ||
+		!strings.Contains(comment, "issue #42") || !strings.Contains(comment, "being closed as part of abandoning") {
+		t.Fatalf("Reset explanation = %q", comment)
+	}
+	if branch, err := inspectRemoteBranch(context.Background(), fixture.git, fixture.repository, fixture.branch); err != nil || !branch.Present {
+		t.Fatalf("remote branch after partial failure = %#v, %v", branch, err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit != 0 {
+		t.Fatalf("rerun exit = %d, stderr = %q", exit, stderr.String())
+	}
+	if strings.Contains(stdout.String(), "disable auto-merge") || strings.Contains(stdout.String(), "explain Reset") {
+		t.Fatalf("rerun planned completed actions: %q", stdout.String())
+	}
+	final, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	github = fixture.githubStateValue(t)
+	if final.Runs[0].Status != scheduler.StatusReset || len(final.Leases) != 0 || github.PR != "CLOSED" || github.Merged || github.Auto {
+		t.Fatalf("final state = %#v, GitHub = %#v", final, github)
+	}
+	if branch, err := inspectRemoteBranch(context.Background(), fixture.git, fixture.repository, fixture.branch); err != nil || branch.Present {
+		t.Fatalf("final remote branch = %#v, %v", branch, err)
+	}
+	calls, err := os.ReadFile(fixture.githubCalls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(calls); strings.Count(got, "disable\n") != 1 || strings.Count(got, "comment\n") != 1 || strings.Count(got, "close\n") != 2 {
+		t.Fatalf("GitHub calls = %q", got)
+	}
+}
+
+func TestResetRerunsAfterEveryRemainingGitHubArtifactFailure(t *testing.T) {
+	for _, action := range []string{"disable", "comment", "branch"} {
+		t.Run(action, func(t *testing.T) {
+			fixture := newGitHubArtifactResetFixture(t, scheduler.StatusFailed, false, false, false)
+			if action == "branch" {
+				underlyingGit := fixture.git
+				failed := filepath.Join(t.TempDir(), "failed")
+				fixture.git = writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  *" push origin --force-with-lease="*)
+    if [ ! -e `+quote(failed)+` ]; then
+      touch `+quote(failed)+`
+      echo 'temporary branch deletion failure' >&2
+      exit 1
+    fi ;;
+esac
+exec `+quote(underlyingGit)+` "$@"
+`)
+			} else {
+				fixture.updateGitHubState(t, `.failAction="`+action+`"`)
+			}
+
+			var stdout, stderr bytes.Buffer
+			if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit == 0 || !strings.Contains(stderr.String(), "temporary") {
+				t.Fatalf("first exit = %d, stderr = %q", exit, stderr.String())
+			}
+			partial, err := fixture.store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if partial.Runs[0].Status != scheduler.StatusResetting || len(partial.Leases) != 1 {
+				t.Fatalf("partial failure released ownership: %#v", partial)
+			}
+
+			stdout.Reset()
+			stderr.Reset()
+			if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit != 0 {
+				t.Fatalf("rerun exit = %d, stderr = %q", exit, stderr.String())
+			}
+			final, err := fixture.store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if final.Runs[0].Status != scheduler.StatusReset || len(final.Leases) != 0 {
+				t.Fatalf("rerun final state = %#v", final)
+			}
+			calls, err := os.ReadFile(fixture.githubCalls)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := string(calls)
+			switch action {
+			case "disable":
+				if strings.Count(got, "disable\n") != 2 || strings.Count(got, "comment\n") != 1 || strings.Count(got, "close\n") != 1 {
+					t.Fatalf("GitHub calls = %q", got)
+				}
+			case "comment":
+				if strings.Count(got, "disable\n") != 1 || strings.Count(got, "comment\n") != 2 || strings.Count(got, "close\n") != 1 {
+					t.Fatalf("GitHub calls = %q", got)
+				}
+			case "branch":
+				if got != "disable\ncomment\nclose\n" || strings.Contains(stdout.String(), "pull request") {
+					t.Fatalf("GitHub calls = %q, rerun plan = %q", got, stdout.String())
+				}
+			}
+		})
+	}
+}
+
+func TestResetRejectsSuccessfulGitHubArtifactCommandsWithoutPostconditions(t *testing.T) {
+	for _, action := range []string{"disable", "comment", "close", "branch"} {
+		t.Run(action, func(t *testing.T) {
+			fixture := newGitHubArtifactResetFixture(t, scheduler.StatusFailed, false, false, false)
+			if action == "branch" {
+				underlyingGit := fixture.git
+				fixture.git = writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  *" push origin --force-with-lease="*) exit 0 ;;
+esac
+exec `+quote(underlyingGit)+` "$@"
+`)
+			} else {
+				fixture.updateGitHubState(t, `.noopAction="`+action+`"`)
+			}
+
+			wantError := map[string]string{
+				"disable": "freshly verified open, unmerged, and auto-merge unarmed",
+				"comment": "did not satisfy its verified postcondition",
+				"close":   "freshly verified closed and unmerged",
+				"branch":  "still present after deletion",
+			}[action]
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			var stdout, stderr bytes.Buffer
+			if exit := Main(ctx, fixture.args("reset", "--yes"), &stdout, &stderr); exit == 0 || !strings.Contains(stderr.String(), wantError) {
+				t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+			}
+			current, err := fixture.store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if current.Runs[0].Status != scheduler.StatusResetting || len(current.Leases) != 1 {
+				t.Fatalf("missing postcondition released ownership: %#v", current)
+			}
+			calls, err := os.ReadFile(fixture.githubCalls)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantCalls := map[string]string{
+				"disable": "disable\n",
+				"comment": "disable\ncomment\n",
+				"close":   "disable\ncomment\nclose\n",
+				"branch":  "disable\ncomment\nclose\n",
+			}[action]
+			if string(calls) != wantCalls {
+				t.Fatalf("GitHub calls = %q, want %q", calls, wantCalls)
+			}
+		})
+	}
+}
+
+func TestResetWaitingForMergeResumesFromAlreadyDisarmedOrClosedPullRequest(t *testing.T) {
+	for _, closed := range []bool{false, true} {
+		name := "open"
+		if closed {
+			name = "closed"
+		}
+		t.Run(name, func(t *testing.T) {
+			fixture := newGitHubArtifactResetFixture(t, scheduler.StatusWaitingForMerge, false, false, false)
+			filter := `.auto=false`
+			if closed {
+				filter += ` | .pr="CLOSED"`
+			}
+			fixture.updateGitHubState(t, filter)
+
+			var stdout, stderr bytes.Buffer
+			if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit != 0 {
+				t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+			}
+			current, err := fixture.store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if current.Runs[0].Status != scheduler.StatusReset || len(current.Leases) != 0 {
+				t.Fatalf("final state = %#v", current)
+			}
+			calls, err := os.ReadFile(fixture.githubCalls)
+			if closed {
+				if !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("closed pull request caused GitHub mutation: %v", err)
+				}
+			} else if err != nil || string(calls) != "comment\nclose\n" {
+				t.Fatalf("already-disarmed GitHub calls = %q, %v", calls, err)
+			}
+		})
+	}
+}
+
+func TestResetRejectsInitialPullRequestAndRemoteCommitMismatch(t *testing.T) {
+	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusFailed, false, false, false)
+	fixture.updateGitHubState(t, `.head="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"`)
+
+	var stdout, stderr bytes.Buffer
+	if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit == 0 || !strings.Contains(stderr.String(), "does not match owned remote branch") {
+		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusFailed || len(current.Leases) != 1 {
+		t.Fatalf("identity mismatch changed ownership: %#v", current)
+	}
+	if _, err := os.Stat(fixture.githubCalls); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("identity mismatch caused mutation: %v", err)
+	}
+}
+
+func TestResetWaitingForMergeDisablesAutoMergeBeforeResetting(t *testing.T) {
+	t.Parallel()
+	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusWaitingForMerge, false, false, false)
+	autoMergeArmedWhenResetting := true
+	store := &recordingResetStore{resetStateStore: fixture.store}
+	store.onSave = func(current state.State) {
+		if current.Runs[0].Status == scheduler.StatusResetting {
+			autoMergeArmedWhenResetting = fixture.githubStateValue(t).Auto
+		}
+	}
+	commonDirectory, err := gitCommonDirectory(context.Background(), fixture.git, fixture.repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := resetExecutor{
+		store: store, github: ghadapter.Client{Executable: fixture.gh, Dir: fixture.repository}, issue: 42,
+		repositoryRoot: fixture.repository, commonDirectory: commonDirectory, stateDirectory: fixture.stateDir, gitExecutable: fixture.git,
+	}
+	approved, err := executor.inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.apply(context.Background(), approved); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.saves) < 2 || store.saves[0].Runs[0].Status != scheduler.StatusResetting || autoMergeArmedWhenResetting {
+		t.Fatalf("persisted states = %#v, auto-merge armed when resetting = %t", store.saves, autoMergeArmedWhenResetting)
+	}
+	github := fixture.githubStateValue(t)
+	if github.Auto || github.Merged || github.PR != "CLOSED" {
+		t.Fatalf("final GitHub state = %#v", github)
+	}
+	calls, err := os.ReadFile(fixture.githubCalls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(calls), "disable\ncomment\nclose\n") {
+		t.Fatalf("GitHub action order = %q", calls)
+	}
+}
+
+func TestResetWaitingForMergeAbortsMergedRaceBeforeResetting(t *testing.T) {
+	t.Parallel()
+	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusWaitingForMerge, false, true, false)
+	var stdout, stderr bytes.Buffer
+	if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit == 0 || !strings.Contains(stderr.String(), "merged") {
+		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusWaitingForMerge || len(current.Leases) != 1 {
+		t.Fatalf("merge race released or advanced ownership: %#v", current)
+	}
+	calls, err := os.ReadFile(fixture.githubCalls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(calls) != "disable\n" {
+		t.Fatalf("actions after merge race = %q", calls)
+	}
+}
+
+func TestResetAcceptsAlreadyClosedPullRequestAndAbsentOwnedRemoteBranch(t *testing.T) {
+	t.Parallel()
+	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusFailed, false, false, false)
+	temporary := fixture.githubState + ".tmp"
+	command := exec.Command("jq", `.pr="CLOSED" | .auto=false`, fixture.githubState)
+	output, err := command.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(temporary, output, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(temporary, fixture.githubState); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, fixture.repository, "push", "origin", "--delete", fixture.branch)
+
+	var stdout, stderr bytes.Buffer
+	if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit != 0 {
+		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusReset || len(current.Leases) != 0 {
+		t.Fatalf("final state = %#v", current)
+	}
+	if _, err := os.Stat(fixture.githubCalls); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("idempotent GitHub state caused a mutation: %v", err)
+	}
+}
+
+func TestDeleteRemoteBranchUsesExpectedCommitLease(t *testing.T) {
+	t.Parallel()
+	calls := filepath.Join(t.TempDir(), "calls")
+	git := writeExecutable(t, "#!/bin/sh\nprintf '%s\\n' \"$*\" > "+quote(calls)+"\n")
+	branch := reset.Branch{Name: "agent/issue-42-run", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Present: true}
+	if err := deleteRemoteBranch(context.Background(), git, t.TempDir(), branch); err != nil {
+		t.Fatal(err)
+	}
+	call, err := os.ReadFile(calls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(call), "--force-with-lease=refs/heads/agent/issue-42-run:"+branch.Commit+" :refs/heads/agent/issue-42-run") {
+		t.Fatalf("git call = %q", call)
+	}
+
+	failingGit := writeExecutable(t, "#!/bin/sh\necho stale lease >&2\nexit 1\n")
+	if err := deleteRemoteBranch(context.Background(), failingGit, t.TempDir(), branch); err == nil || !strings.Contains(err.Error(), "expected commit") || !strings.Contains(err.Error(), "stale lease") {
+		t.Fatalf("conditional deletion error = %v", err)
+	}
+}
+
+func TestResetAbortsBranchCommitRaceWithLeaseRetained(t *testing.T) {
+	t.Parallel()
+	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusFailed, false, false, true)
+	var stdout, stderr bytes.Buffer
+	if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit == 0 || !strings.Contains(stderr.String(), "expected commit identity changed") {
+		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusResetting || len(current.Leases) != 1 {
+		t.Fatalf("branch race released ownership: %#v", current)
+	}
+	if branch, err := inspectRemoteBranch(context.Background(), fixture.git, fixture.repository, fixture.branch); err != nil || !branch.Present {
+		t.Fatalf("raced remote branch was deleted: %#v, %v", branch, err)
+	}
+}
+
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(data []byte) (int, error) {
@@ -1246,11 +1828,15 @@ func (w *failOnTextWriter) Write(data []byte) (int, error) {
 
 type recordingResetStore struct {
 	resetStateStore
-	saves []state.State
+	saves  []state.State
+	onSave func(state.State)
 }
 
 func (s *recordingResetStore) Save(current state.State) error {
 	s.saves = append(s.saves, current)
+	if s.onSave != nil {
+		s.onSave(current)
+	}
 	return s.resetStateStore.Save(current)
 }
 

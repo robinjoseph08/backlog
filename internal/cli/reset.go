@@ -110,10 +110,10 @@ func resetCommandWithInput(ctx context.Context, args []string, stdin io.Reader, 
 		fmt.Fprintln(stdout, "Dry-run: no changes made.")
 		return output.Err()
 	}
-	if err := validateArtifactFreeMutation(plan); err != nil {
+	if err := validateOwnedGitHubMutation(plan); err != nil {
 		return err
 	}
-	if err := validateResetMutationStatus(plan.Snapshot.Run.Status); err != nil {
+	if err := validateResetMutationStatus(plan); err != nil {
 		return err
 	}
 
@@ -122,10 +122,10 @@ func resetCommandWithInput(ctx context.Context, args []string, stdin io.Reader, 
 		if err != nil {
 			return err
 		}
-		if err := validateArtifactFreeMutation(fresh); err != nil {
+		if err := validateOwnedGitHubMutation(fresh); err != nil {
 			return err
 		}
-		if err := validateResetMutationStatus(fresh.Snapshot.Run.Status); err != nil {
+		if err := validateResetMutationStatus(fresh); err != nil {
 			return err
 		}
 		if !resetPlansEqual(plan, fresh) {
@@ -151,10 +151,10 @@ func resetCommandWithInput(ctx context.Context, args []string, stdin io.Reader, 
 			if err != nil {
 				return err
 			}
-			if err := validateArtifactFreeMutation(fresh); err != nil {
+			if err := validateOwnedGitHubMutation(fresh); err != nil {
 				return err
 			}
-			if err := validateResetMutationStatus(fresh.Snapshot.Run.Status); err != nil {
+			if err := validateResetMutationStatus(fresh); err != nil {
 				return err
 			}
 			if resetPlansEqual(plan, fresh) {
@@ -322,30 +322,77 @@ func (e resetExecutor) inspect(ctx context.Context) (reset.Plan, error) {
 		WorkerSummary: absentWorkerSummary(run),
 	}
 	for _, pull := range pullResources {
+		commented := false
+		for _, comment := range pull.Comments {
+			if comment == resetComment(run) {
+				commented = true
+				break
+			}
+		}
 		snapshot.PullRequests = append(snapshot.PullRequests, reset.PullRequest{
-			Number: pull.Number, URL: pull.URL, State: reset.PullRequestState(pull.State), AutoMergeArmed: pull.AutoMergeArmed,
+			Number: pull.Number, URL: pull.URL, Branch: pull.Branch, Commit: pull.Commit,
+			State: reset.PullRequestState(pull.State), AutoMergeArmed: pull.AutoMergeArmed, ResetCommented: commented,
 		})
+	}
+	if err := validateInspectedGitHubIdentity(snapshot); err != nil {
+		return reset.Plan{}, err
 	}
 	return reset.Build(snapshot)
 }
 
-func validateArtifactFreeMutation(plan reset.Plan) error {
-	snapshot := plan.Snapshot
-	if len(snapshot.PullRequests) != 0 || snapshot.RemoteBranch.Present || snapshot.LocalBranch.Present || snapshot.Worktree.Present || snapshot.Session.Present {
-		return errors.New("mutating Reset currently requires all pull request, branch, worktree, and Pi session artifacts to be absent; inspect remaining actions with --dry-run")
+func validateInspectedGitHubIdentity(snapshot reset.Snapshot) error {
+	if !snapshot.RemoteBranch.Present {
+		return nil
+	}
+	for _, pull := range snapshot.PullRequests {
+		if pull.State == reset.PullRequestOpen && pull.Commit != snapshot.RemoteBranch.Commit {
+			return fmt.Errorf("pull request #%d expected commit %s does not match owned remote branch %s at %s", pull.Number, pull.Commit, snapshot.RemoteBranch.Name, snapshot.RemoteBranch.Commit)
+		}
 	}
 	return nil
 }
 
-func validateResetMutationStatus(status scheduler.Status) error {
+func validateOwnedGitHubMutation(plan reset.Plan) error {
+	snapshot := plan.Snapshot
+	if snapshot.LocalBranch.Present || snapshot.Worktree.Present || snapshot.Session.Present {
+		return errors.New("mutating Reset currently requires the owned local branch, worktree, and Pi session to be absent; inspect remaining actions with --dry-run")
+	}
+	if snapshot.Run.Status == scheduler.StatusReset {
+		if err := verifyOwnedGitHubFinalState(snapshot); err != nil {
+			return fmt.Errorf("historical reset Run has incomplete GitHub final state: %w", err)
+		}
+	}
+	return nil
+}
+
+func validateResetMutationStatus(plan reset.Plan) error {
+	status := plan.Snapshot.Run.Status
 	switch status {
 	case scheduler.StatusClaimed, scheduler.StatusWorktreeReady, scheduler.StatusRunning,
 		scheduler.StatusFailed, scheduler.StatusSuspended, scheduler.StatusNeedsHuman,
 		scheduler.StatusResetting, scheduler.StatusReset:
 		return nil
+	case scheduler.StatusWaitingForMerge:
+		if plan.Snapshot.Run.PullRequest == "" {
+			return errors.New("waiting-for-merge Run has no recorded pull request")
+		}
+		for _, pull := range plan.Snapshot.PullRequests {
+			if pull.URL == plan.Snapshot.Run.PullRequest {
+				return nil
+			}
+		}
+		return fmt.Errorf("waiting-for-merge Run pull request %s was not freshly verified", plan.Snapshot.Run.PullRequest)
 	default:
 		return fmt.Errorf("Run status %s is not eligible for Reset", status)
 	}
+}
+
+func resetCommentMarker(runID string) string {
+	return "<!-- backlog-reset:" + runID + " -->"
+}
+
+func resetComment(run scheduler.Run) string {
+	return fmt.Sprintf("%s\nBacklog is resetting Run %s for issue #%d. This pull request is being closed as part of abandoning the incomplete Run.", resetCommentMarker(run.RunID), run.RunID, run.Issue)
 }
 
 func resetPlansEqual(left, right reset.Plan) bool {
@@ -360,20 +407,14 @@ func (e resetExecutor) apply(ctx context.Context, approved reset.Plan) error {
 	if err != nil {
 		return err
 	}
-	if err := validateArtifactFreeMutation(plan); err != nil {
+	if err := validateOwnedGitHubMutation(plan); err != nil {
 		return err
 	}
-	if err := validateResetMutationStatus(plan.Snapshot.Run.Status); err != nil {
+	if err := validateResetMutationStatus(plan); err != nil {
 		return err
 	}
 	if !resetPlansEqual(approved, plan) {
 		return errors.New("Reset Plan changed after confirmation; rerun Reset to review the current plan")
-	}
-	labels := normalizedLabelSet(plan.Snapshot.Issue.Labels)
-	if (labels["in-progress"] || !labels["ready-for-agent"]) && plan.Snapshot.Run.Status != scheduler.StatusResetting {
-		if err := e.markResetting(); err != nil {
-			return err
-		}
 	}
 
 	for {
@@ -381,27 +422,139 @@ func (e resetExecutor) apply(ctx context.Context, approved reset.Plan) error {
 		if err != nil {
 			return err
 		}
-		if err := validateArtifactFreeMutation(plan); err != nil {
+		if err := validateOwnedGitHubMutation(plan); err != nil {
 			return err
 		}
-		if err := validateResetMutationStatus(plan.Snapshot.Run.Status); err != nil {
+		if err := validateResetMutationStatus(plan); err != nil {
 			return err
 		}
-		labels = normalizedLabelSet(plan.Snapshot.Issue.Labels)
+		if err := verifyGitHubIdentityContinuity(approved.Snapshot, plan.Snapshot); err != nil {
+			return err
+		}
+
+		pull, hasOpenPull := reset.NextPullRequestForReset(plan.Snapshot)
+		labels := normalizedLabelSet(plan.Snapshot.Issue.Labels)
+		needsProgress := hasOpenPull || plan.Snapshot.RemoteBranch.Present || labels["in-progress"] || !labels["ready-for-agent"]
+		if plan.Snapshot.Run.Status == scheduler.StatusWaitingForMerge && (!hasOpenPull || !pull.AutoMergeArmed) {
+			if err := verifyWaitingForMergeDisarmed(plan); err != nil {
+				return err
+			}
+			if err := e.markResetting(); err != nil {
+				return err
+			}
+			continue
+		}
+		if needsProgress && plan.Snapshot.Run.Status != scheduler.StatusResetting && plan.Snapshot.Run.Status != scheduler.StatusWaitingForMerge && plan.Snapshot.Run.Status != scheduler.StatusReset {
+			if err := e.markResetting(); err != nil {
+				return err
+			}
+			continue
+		}
+
 		switch {
-		case labels["in-progress"]:
-			before, err := e.inspect(ctx)
+		case hasOpenPull && pull.AutoMergeArmed:
+			before, err := e.revalidatePlan(ctx, plan, approved, "disabling pull request auto-merge")
 			if err != nil {
 				return err
 			}
-			if err := validateArtifactFreeMutation(before); err != nil {
+			pull, _ = pullRequestByNumber(before.Snapshot.PullRequests, pull.Number)
+			repository, err := e.repositorySlug()
+			if err != nil {
 				return err
 			}
-			if !resetPlansEqual(plan, before) {
-				return errors.New("Reset Plan changed immediately before removing issue label in-progress")
+			if err := e.github.DisablePullRequestAutoMerge(ctx, repository, pull.Number); err != nil {
+				return fmt.Errorf("disable auto-merge for pull request #%d: %w", pull.Number, err)
 			}
-			if !normalizedLabelSet(before.Snapshot.Issue.Labels)["in-progress"] {
-				continue
+			after, err := e.inspect(ctx)
+			if err != nil {
+				return err
+			}
+			if err := verifyGitHubIdentityContinuity(approved.Snapshot, after.Snapshot); err != nil {
+				return err
+			}
+			updated, found := pullRequestByNumber(after.Snapshot.PullRequests, pull.Number)
+			if !found || updated.State != reset.PullRequestOpen || updated.AutoMergeArmed {
+				return fmt.Errorf("pull request #%d was not freshly verified open, unmerged, and auto-merge unarmed", pull.Number)
+			}
+			if before.Snapshot.Run.Status == scheduler.StatusWaitingForMerge {
+				if err := e.markResetting(); err != nil {
+					return err
+				}
+			}
+		case hasOpenPull && !pull.ResetCommented:
+			before, err := e.revalidatePlan(ctx, plan, approved, "commenting on pull request")
+			if err != nil {
+				return err
+			}
+			pull, _ = pullRequestByNumber(before.Snapshot.PullRequests, pull.Number)
+			if pull.AutoMergeArmed {
+				return fmt.Errorf("pull request #%d auto-merge was rearmed before the Reset explanation", pull.Number)
+			}
+			repository, err := e.repositorySlug()
+			if err != nil {
+				return err
+			}
+			if err := e.github.CommentOnPullRequest(ctx, repository, pull.Number, resetComment(before.Snapshot.Run)); err != nil {
+				return fmt.Errorf("explain Reset on pull request #%d: %w", pull.Number, err)
+			}
+			after, err := e.inspect(ctx)
+			if err != nil {
+				return err
+			}
+			if err := verifyGitHubIdentityContinuity(approved.Snapshot, after.Snapshot); err != nil {
+				return err
+			}
+			updated, found := pullRequestByNumber(after.Snapshot.PullRequests, pull.Number)
+			if !found || updated.State != reset.PullRequestOpen || updated.AutoMergeArmed || !updated.ResetCommented {
+				return fmt.Errorf("pull request #%d Reset explanation did not satisfy its verified postcondition", pull.Number)
+			}
+		case hasOpenPull:
+			before, err := e.revalidatePlan(ctx, plan, approved, "closing pull request")
+			if err != nil {
+				return err
+			}
+			pull, _ = pullRequestByNumber(before.Snapshot.PullRequests, pull.Number)
+			if pull.AutoMergeArmed || !pull.ResetCommented {
+				return fmt.Errorf("pull request #%d is not ready for safe closure", pull.Number)
+			}
+			repository, err := e.repositorySlug()
+			if err != nil {
+				return err
+			}
+			if err := e.github.ClosePullRequest(ctx, repository, pull.Number); err != nil {
+				return fmt.Errorf("close unmerged pull request #%d: %w", pull.Number, err)
+			}
+			after, err := e.inspect(ctx)
+			if err != nil {
+				return err
+			}
+			if err := verifyGitHubIdentityContinuity(approved.Snapshot, after.Snapshot); err != nil {
+				return err
+			}
+			updated, found := pullRequestByNumber(after.Snapshot.PullRequests, pull.Number)
+			if !found || updated.State != reset.PullRequestClosed || updated.AutoMergeArmed {
+				return fmt.Errorf("pull request #%d was not freshly verified closed and unmerged with auto-merge unarmed", pull.Number)
+			}
+		case plan.Snapshot.RemoteBranch.Present:
+			before, err := e.revalidatePlan(ctx, plan, approved, "deleting remote branch")
+			if err != nil {
+				return err
+			}
+			branch := before.Snapshot.RemoteBranch
+			if err := deleteRemoteBranch(ctx, e.gitExecutable, e.repositoryRoot, branch); err != nil {
+				return err
+			}
+			after, err := e.inspect(ctx)
+			if err != nil {
+				return err
+			}
+			if after.Snapshot.RemoteBranch.Present {
+				return fmt.Errorf("owned remote branch %s is still present after deletion", branch.Name)
+			}
+		case labels["in-progress"]:
+			before, err := e.revalidatePlan(ctx, plan, approved, "removing issue label in-progress")
+			if err != nil {
+				return err
 			}
 			repository, err := e.repositorySlug()
 			if err != nil {
@@ -418,18 +571,9 @@ func (e resetExecutor) apply(ctx context.Context, approved reset.Plan) error {
 				return err
 			}
 		case !labels["ready-for-agent"]:
-			before, err := e.inspect(ctx)
+			before, err := e.revalidatePlan(ctx, plan, approved, "adding issue label ready-for-agent")
 			if err != nil {
 				return err
-			}
-			if err := validateArtifactFreeMutation(before); err != nil {
-				return err
-			}
-			if !resetPlansEqual(plan, before) {
-				return errors.New("Reset Plan changed immediately before adding issue label ready-for-agent")
-			}
-			if normalizedLabelSet(before.Snapshot.Issue.Labels)["ready-for-agent"] {
-				continue
 			}
 			repository, err := e.repositorySlug()
 			if err != nil {
@@ -449,6 +593,96 @@ func (e resetExecutor) apply(ctx context.Context, approved reset.Plan) error {
 			return e.finalize(ctx, plan)
 		}
 	}
+}
+
+func (e resetExecutor) revalidatePlan(ctx context.Context, current, approved reset.Plan, action string) (reset.Plan, error) {
+	fresh, err := e.inspect(ctx)
+	if err != nil {
+		return reset.Plan{}, err
+	}
+	if err := validateOwnedGitHubMutation(fresh); err != nil {
+		return reset.Plan{}, err
+	}
+	if err := validateResetMutationStatus(fresh); err != nil {
+		return reset.Plan{}, err
+	}
+	if err := verifyGitHubIdentityContinuity(approved.Snapshot, fresh.Snapshot); err != nil {
+		return reset.Plan{}, err
+	}
+	if !resetPlansEqual(current, fresh) {
+		return reset.Plan{}, fmt.Errorf("Reset Plan changed immediately before %s", action)
+	}
+	return fresh, nil
+}
+
+func verifyGitHubIdentityContinuity(expected, actual reset.Snapshot) error {
+	if expected.Run.RunID != actual.Run.RunID || expected.Lease != actual.Lease {
+		return fmt.Errorf("Run or Lease identity changed while resetting GitHub artifacts")
+	}
+	expectedPulls := make(map[int]reset.PullRequest, len(expected.PullRequests))
+	for _, pull := range expected.PullRequests {
+		expectedPulls[pull.Number] = pull
+	}
+	if len(expectedPulls) != len(actual.PullRequests) {
+		return errors.New("pull request identity set changed while resetting GitHub artifacts")
+	}
+	for _, pull := range actual.PullRequests {
+		owned, found := expectedPulls[pull.Number]
+		if !found || pull.URL != owned.URL || pull.Branch != owned.Branch || pull.Commit != owned.Commit {
+			return fmt.Errorf("pull request #%d branch or expected commit identity changed while resetting", pull.Number)
+		}
+	}
+	if actual.RemoteBranch.Present {
+		if !expected.RemoteBranch.Present || actual.RemoteBranch.Name != expected.RemoteBranch.Name || actual.RemoteBranch.Commit != expected.RemoteBranch.Commit {
+			return fmt.Errorf("owned remote branch identity changed while resetting Run %s", expected.Run.RunID)
+		}
+	} else if actual.RemoteBranch.Name != expected.RemoteBranch.Name {
+		return fmt.Errorf("owned remote branch name changed while resetting Run %s", expected.Run.RunID)
+	}
+	return nil
+}
+
+func pullRequestByNumber(pulls []reset.PullRequest, number int) (reset.PullRequest, bool) {
+	for _, pull := range pulls {
+		if pull.Number == number {
+			return pull, true
+		}
+	}
+	return reset.PullRequest{}, false
+}
+
+func verifyWaitingForMergeDisarmed(plan reset.Plan) error {
+	pull, found := pullRequestByURL(plan.Snapshot.PullRequests, plan.Snapshot.Run.PullRequest)
+	if !found || pull.State == reset.PullRequestMerged || pull.AutoMergeArmed {
+		return errors.New("waiting-for-merge Run was not freshly verified unmerged with auto-merge unarmed")
+	}
+	return nil
+}
+
+func pullRequestByURL(pulls []reset.PullRequest, target string) (reset.PullRequest, bool) {
+	for _, pull := range pulls {
+		if pull.URL == target {
+			return pull, true
+		}
+	}
+	return reset.PullRequest{}, false
+}
+
+func deleteRemoteBranch(ctx context.Context, gitExecutable, repositoryRoot string, branch reset.Branch) error {
+	ref := "refs/heads/" + branch.Name
+	lease := "--force-with-lease=" + ref + ":" + branch.Commit
+	output, exit, err := runGitInspection(ctx, gitExecutable, repositoryRoot, "push", "origin", lease, ":"+ref)
+	if err != nil {
+		return fmt.Errorf("delete owned remote branch %s at %s: %w", branch.Name, branch.Commit, err)
+	}
+	if exit != 0 {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			message = fmt.Sprintf("git exited %d", exit)
+		}
+		return fmt.Errorf("delete owned remote branch %s at expected commit %s: %s", branch.Name, branch.Commit, message)
+	}
+	return nil
 }
 
 func normalizedLabelSet(labels []string) map[string]bool {
@@ -535,7 +769,10 @@ func (e resetExecutor) finalize(ctx context.Context, verified reset.Plan) error 
 	if labels["in-progress"] || !labels["ready-for-agent"] {
 		return errors.New("managed issue label postconditions were not verified")
 	}
-	if err := validateArtifactFreeMutation(verified); err != nil {
+	if err := validateOwnedGitHubMutation(verified); err != nil {
+		return err
+	}
+	if err := verifyOwnedGitHubFinalState(verified.Snapshot); err != nil {
 		return err
 	}
 	current, _, err := e.store.Preview()
@@ -581,6 +818,18 @@ func (e resetExecutor) finalize(ctx context.Context, verified reset.Plan) error 
 		return fmt.Errorf("verify finalized Reset state: %w", err)
 	}
 	return verifyResetFinalState(persisted, run.RunID)
+}
+
+func verifyOwnedGitHubFinalState(snapshot reset.Snapshot) error {
+	for _, pull := range snapshot.PullRequests {
+		if pull.State != reset.PullRequestClosed || pull.AutoMergeArmed {
+			return fmt.Errorf("pull request #%d final state is not verified closed, unmerged, and auto-merge unarmed", pull.Number)
+		}
+	}
+	if snapshot.RemoteBranch.Present {
+		return fmt.Errorf("owned remote branch %s remains present at %s", snapshot.RemoteBranch.Name, snapshot.RemoteBranch.Commit)
+	}
+	return nil
 }
 
 func verifyResetFinalState(current state.State, runID string) error {
@@ -869,19 +1118,20 @@ func inspectLocalResources(ctx context.Context, gitExecutable, repositoryRoot, c
 		return reset.Branch{}, reset.Worktree{}, nil
 	}
 	ref := "refs/heads/" + run.Branch
-	output, exit, err := runGitInspection(ctx, gitExecutable, repositoryRoot, "show-ref", "--verify", "--hash", ref)
+	output, exit, err := runGitInspection(ctx, gitExecutable, repositoryRoot, "for-each-ref", "--format=%(objectname)", ref)
 	if err != nil {
 		return reset.Branch{}, reset.Worktree{}, fmt.Errorf("inspect local branch %s: %w", run.Branch, err)
 	}
+	if exit != 0 {
+		return reset.Branch{}, reset.Worktree{}, fmt.Errorf("inspect local branch %s: git exited %d with unknown output", run.Branch, exit)
+	}
 	local := reset.Branch{Name: run.Branch}
-	if exit == 0 {
-		commit := strings.TrimSpace(string(output))
-		if !validObjectID(commit) {
+	commit := strings.TrimSpace(string(output))
+	if commit != "" {
+		if strings.Contains(commit, "\n") || !validObjectID(commit) {
 			return reset.Branch{}, reset.Worktree{}, fmt.Errorf("inspect local branch %s: unknown object identity", run.Branch)
 		}
 		local.Commit, local.Present = commit, true
-	} else if exit != 1 || len(bytes.TrimSpace(output)) != 0 {
-		return reset.Branch{}, reset.Worktree{}, fmt.Errorf("inspect local branch %s: git exited %d with unknown output", run.Branch, exit)
 	}
 
 	output, exit, err = runGitInspection(ctx, gitExecutable, repositoryRoot, "worktree", "list", "--porcelain", "-z")
@@ -1162,7 +1412,7 @@ func printResetPlan(writer io.Writer, plan reset.Plan) {
 			if pull.AutoMergeArmed {
 				autoMerge = "armed"
 			}
-			fmt.Fprintf(writer, "Pull request: #%d %s (%s; auto-merge %s)\n", pull.Number, pull.URL, pull.State, autoMerge)
+			fmt.Fprintf(writer, "Pull request: #%d %s (%s; %s at %s; auto-merge %s)\n", pull.Number, pull.URL, pull.State, pull.Branch, pull.Commit, autoMerge)
 		}
 	}
 	fmt.Fprintln(writer, "Required actions:")
