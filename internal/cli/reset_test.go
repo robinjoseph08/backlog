@@ -427,6 +427,34 @@ func TestResetDryRunRefusesLiveWorker(t *testing.T) {
 	}
 }
 
+func TestResetInspectionAcceptsRetainedIdentityAfterWorkerExit(t *testing.T) {
+	t.Parallel()
+
+	worker := exec.Command("sleep", "10")
+	if err := worker.Start(); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := resetPIDIdentity(worker.Process.Pid)
+	if err != nil {
+		_ = worker.Process.Kill()
+		_ = worker.Wait()
+		t.Fatal(err)
+	}
+	if err := worker.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.Wait(); err == nil {
+		t.Fatal("killed Worker exited successfully")
+	}
+	run := scheduler.Run{Issue: 1, RunID: "stopped", ProcessIdentity: identity}
+	if err := inspectWorkerAbsent(run); err != nil {
+		t.Fatalf("retained stopped Worker identity was refused: %v", err)
+	}
+	if summary := absentWorkerSummary(run); !strings.Contains(summary, fmt.Sprint(worker.Process.Pid)) {
+		t.Fatalf("summary = %q", summary)
+	}
+}
+
 func TestResetCommandRefusesLiveWorkerBeforeGitHubInspection(t *testing.T) {
 	t.Parallel()
 

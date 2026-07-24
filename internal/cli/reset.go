@@ -230,22 +230,27 @@ func resetRun(current state.State, issue int) (scheduler.Run, scheduler.Lease, e
 }
 
 func inspectWorkerAbsent(run scheduler.Run) error {
-	if run.PID == 0 {
-		if run.ProcessIdentity != "" {
-			return fmt.Errorf("Run %s has uncertain Worker identity without a recorded PID", run.RunID)
+	pid := run.PID
+	if pid == 0 {
+		if run.ProcessIdentity == "" {
+			return nil
 		}
-		return nil
+		var err error
+		pid, err = processIdentityPID(run.ProcessIdentity)
+		if err != nil {
+			return fmt.Errorf("Run %s has uncertain retained Worker identity: %w", run.RunID, err)
+		}
 	}
-	if run.PID < 0 || run.ProcessIdentity == "" {
+	if pid < 0 || run.ProcessIdentity == "" {
 		return fmt.Errorf("Run %s has incomplete Worker identity", run.RunID)
 	}
-	processAlive, err := signalZero(run.PID)
+	processAlive, err := signalZero(pid)
 	if err != nil {
-		return fmt.Errorf("verify Worker PID %d: %w", run.PID, err)
+		return fmt.Errorf("verify Worker PID %d: %w", pid, err)
 	}
-	groupAlive, err := signalZero(-run.PID)
+	groupAlive, err := signalZero(-pid)
 	if err != nil {
-		return fmt.Errorf("verify Worker process group %d: %w", run.PID, err)
+		return fmt.Errorf("verify Worker process group %d: %w", pid, err)
 	}
 	if !processAlive && !groupAlive {
 		return nil
@@ -253,21 +258,34 @@ func inspectWorkerAbsent(run scheduler.Run) error {
 	if !processAlive || !groupAlive {
 		return fmt.Errorf("Worker PID/process-group liveness is uncertain for Run %s", run.RunID)
 	}
-	identity, err := resetPIDIdentity(run.PID)
+	identity, err := resetPIDIdentity(pid)
 	if err != nil {
 		return fmt.Errorf("verify live Worker identity: %w", err)
 	}
 	if identity != run.ProcessIdentity {
-		return fmt.Errorf("Worker PID %d is live with uncertain identity %q instead of %q", run.PID, identity, run.ProcessIdentity)
+		return fmt.Errorf("Worker PID %d is live with uncertain identity %q instead of %q", pid, identity, run.ProcessIdentity)
 	}
-	return fmt.Errorf("Worker for Run %s is live at PID %d", run.RunID, run.PID)
+	return fmt.Errorf("Worker for Run %s is live at PID %d", run.RunID, pid)
+}
+
+func processIdentityPID(identity string) (int, error) {
+	value, started, found := strings.Cut(identity, ":")
+	pid, err := strconv.Atoi(value)
+	if !found || err != nil || pid <= 0 || strings.TrimSpace(started) == "" {
+		return 0, errors.New("invalid process identity")
+	}
+	return pid, nil
 }
 
 func absentWorkerSummary(run scheduler.Run) string {
-	if run.PID == 0 {
+	pid := run.PID
+	if pid == 0 && run.ProcessIdentity != "" {
+		pid, _ = processIdentityPID(run.ProcessIdentity)
+	}
+	if pid == 0 {
 		return "absent (no recorded PID)"
 	}
-	return fmt.Sprintf("absent (recorded PID and process group %d)", run.PID)
+	return fmt.Sprintf("absent (recorded PID and process group %d)", pid)
 }
 
 func signalZero(pid int) (bool, error) {
