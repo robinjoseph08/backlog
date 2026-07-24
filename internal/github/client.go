@@ -349,8 +349,14 @@ func (c Client) resetPullRequestComments(ctx context.Context, repo string, numbe
 	if len(pagesJSON) == 0 || string(pagesJSON) == "null" || json.Unmarshal(pagesJSON, &pages) != nil {
 		return nil, errors.New("gh returned an unknown comment list")
 	}
+	if len(pages) == 0 {
+		return nil, errors.New("gh returned an unknown comment list")
+	}
 	var comments []string
 	for _, page := range pages {
+		if page == nil {
+			return nil, errors.New("gh returned an unknown comment page")
+		}
 		for _, comment := range page {
 			if comment.Body == nil {
 				return nil, errors.New("gh returned a comment without a body")
@@ -370,7 +376,7 @@ func validCommitOID(value string) bool {
 			return false
 		}
 	}
-	return true
+	return strings.Trim(value, "0") != ""
 }
 
 func resourceURLMatches(rawURL, repo, resource string, number int) bool {

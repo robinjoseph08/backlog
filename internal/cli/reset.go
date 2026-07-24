@@ -392,7 +392,7 @@ func resetCommentMarker(runID string) string {
 }
 
 func resetComment(run scheduler.Run) string {
-	return fmt.Sprintf("%s\nBacklog is resetting Run %s for issue #%d. This pull request is being closed because the incomplete Run was abandoned.", resetCommentMarker(run.RunID), run.RunID, run.Issue)
+	return fmt.Sprintf("%s\nBacklog is resetting Run %s for issue #%d. This pull request is being closed as part of abandoning the incomplete Run.", resetCommentMarker(run.RunID), run.RunID, run.Issue)
 }
 
 func resetPlansEqual(left, right reset.Plan) bool {

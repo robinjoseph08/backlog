@@ -161,7 +161,7 @@ case "$*" in
   "pr list --repo acme/widgets --state all --head agent/issue-42-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
     printf '%s\n' '[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"OPEN","mergedAt":null,"autoMergeRequest":{"mergeMethod":"SQUASH"},"isDraft":false,"headRefName":"agent/issue-42-run","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/100/comments?per_page=100 --paginate --slurp")
-    printf '%s\n' '[[{"body":"existing comment"}]]' ;;
+    printf '%s\n' '[[],[{"body":"existing comment"}]]' ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
 esac`)
 	issue, pulls, err := (Client{Executable: gh}).ResetResources(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
@@ -208,6 +208,12 @@ func TestClientResetInspectionRefusesSameOwnerForkAndUnknownFields(t *testing.T)
 			name:  "same owner fork",
 			issue: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[]}`,
 			pull:  `[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"OPEN","mergedAt":null,"autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-42-run","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/fork"}}]`,
+			want:  "mismatched",
+		},
+		{
+			name:  "null head commit",
+			issue: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[]}`,
+			pull:  `[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"OPEN","mergedAt":null,"autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-42-run","headRefOid":"0000000000000000000000000000000000000000","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]`,
 			want:  "mismatched",
 		},
 		{
@@ -286,6 +292,8 @@ func TestClientResetInspectionRefusesUnknownCommentState(t *testing.T) {
 		comments string
 	}{
 		{name: "null list", comments: `null`},
+		{name: "missing pages", comments: `[]`},
+		{name: "null page", comments: `[null]`},
 		{name: "missing body", comments: `[[{}]]`},
 	} {
 		test := test

@@ -22,6 +22,7 @@ func TestBuildTailorsOrderedResetActions(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{
+		"mark Run run-42 resetting while retaining Lease lease-42",
 		"disable auto-merge for pull request #7 (https://github.com/acme/widgets/pull/7)",
 		"explain Reset on pull request #7 (https://github.com/acme/widgets/pull/7)",
 		"close unmerged pull request #7 (https://github.com/acme/widgets/pull/7)",
@@ -54,6 +55,7 @@ func TestBuildOrdersWaitingForMergeRecordedPullRequestBeforeOtherBranchPullReque
 	}
 	want := []string{
 		"disable auto-merge for pull request #8 (https://github.com/acme/widgets/pull/8)",
+		"mark Run run-42 resetting while retaining Lease lease-42",
 		"disable auto-merge for pull request #7 (https://github.com/acme/widgets/pull/7)",
 		"explain Reset on pull request #7 (https://github.com/acme/widgets/pull/7)",
 		"close unmerged pull request #7 (https://github.com/acme/widgets/pull/7)",
@@ -73,10 +75,12 @@ func TestBuildOmitsAlreadySatisfiedActionsForEveryManagedLabelCombination(t *tes
 		want   []string
 	}{
 		{name: "neither", want: []string{
+			"mark Run run-42 resetting while retaining Lease lease-42",
 			"add issue label ready-for-agent to https://github.com/acme/widgets/issues/42",
 			"mark Run run-42 reset and release Lease lease-42",
 		}},
 		{name: "in progress", labels: []string{"in-progress"}, want: []string{
+			"mark Run run-42 resetting while retaining Lease lease-42",
 			"remove issue label in-progress from https://github.com/acme/widgets/issues/42",
 			"add issue label ready-for-agent to https://github.com/acme/widgets/issues/42",
 			"mark Run run-42 reset and release Lease lease-42",
@@ -85,6 +89,7 @@ func TestBuildOmitsAlreadySatisfiedActionsForEveryManagedLabelCombination(t *tes
 			"mark Run run-42 reset and release Lease lease-42",
 		}},
 		{name: "both", labels: []string{"in-progress", "ready-for-agent"}, want: []string{
+			"mark Run run-42 resetting while retaining Lease lease-42",
 			"remove issue label in-progress from https://github.com/acme/widgets/issues/42",
 			"mark Run run-42 reset and release Lease lease-42",
 		}},

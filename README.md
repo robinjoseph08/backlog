@@ -12,7 +12,7 @@ Each issue receives its own lease, Git branch, Git worktree, Pi process, named P
 - GitHub CLI `gh`, authenticated for the target repository
 - Pi 0.80.4 or newer with the global `afk` skill available
 - A Git remote named `origin`
-- GitHub API access with Issues write permission
+- GitHub API access with Issues and pull requests write permission, plus authenticated Git push access to delete owned remote branches
 
 The runner uses GitHub's versioned issue dependency endpoint. A dependency lookup failure stops scheduling rather than treating the issue as unblocked.
 
@@ -128,7 +128,7 @@ backlog reset 123
 backlog reset 123 --yes
 ```
 
-Interactive confirmation defaults to no. Reset rechecks pull request identity, merge and auto-merge state, branch name, and expected commit before each GitHub mutation. It disables auto-merge, explains the Reset on the pull request before closing it, and conditionally deletes the owned remote branch at its verified commit. Verified partial progress leaves the Run `resetting` with its Lease held, so a rerun performs only remaining actions. After restoring managed issue labels while preserving unrelated labels, Reset verifies every postcondition, then atomically marks the historical Run `reset` and releases its Lease. It does not create a replacement Run. Runs with remaining local artifacts can be inspected with `--dry-run`, but mutating Reset refuses them until local artifact retirement is implemented.
+Interactive confirmation defaults to no. Reset rechecks pull request identity, merge and auto-merge state, branch name, and expected commit before each GitHub mutation. For each open pull request that Reset closes, it disables auto-merge when needed and posts an explanation before closure. It conditionally deletes the owned remote branch at its verified commit. Verified partial progress leaves the Run `resetting` with its Lease held, so a rerun performs only remaining actions. After restoring managed issue labels while preserving unrelated labels, Reset verifies every postcondition, then atomically marks the historical Run `reset` and releases its Lease. It does not create a replacement Run. Runs with remaining local artifacts can be inspected with `--dry-run`, but mutating Reset refuses them until local artifact retirement is implemented.
 
 `retry` is a deprecated alias for the same Reset path, flags, output, mutations, and exit statuses. It adds a deprecation warning:
 

@@ -137,9 +137,24 @@ func Build(snapshot Snapshot) (Plan, error) {
 	plan := Plan{Snapshot: snapshot}
 	planning := snapshot
 	planning.PullRequests = pullRequests
+	hasOpenPullRequest := false
+	for _, pull := range pullRequests {
+		if pull.State == PullRequestOpen {
+			hasOpenPullRequest = true
+			break
+		}
+	}
+	_, hasInProgress := labels["in-progress"]
+	_, hasReadyForAgent := labels["ready-for-agent"]
+	needsProgress := hasOpenPullRequest || snapshot.RemoteBranch.Present || hasInProgress || !hasReadyForAgent
+	if needsProgress && planning.Run.Status != scheduler.StatusResetting && planning.Run.Status != scheduler.StatusWaitingForMerge && planning.Run.Status != scheduler.StatusReset {
+		plan.Actions = append(plan.Actions, fmt.Sprintf("mark Run %s resetting while retaining Lease %s", snapshot.Run.RunID, snapshot.Lease.LeaseID))
+		planning.Run.Status = scheduler.StatusResetting
+	}
 	for {
 		pull, found := NextPullRequestForReset(planning)
 		if planning.Run.Status == scheduler.StatusWaitingForMerge && (!found || !pull.AutoMergeArmed) {
+			plan.Actions = append(plan.Actions, fmt.Sprintf("mark Run %s resetting while retaining Lease %s", snapshot.Run.RunID, snapshot.Lease.LeaseID))
 			planning.Run.Status = scheduler.StatusResetting
 			continue
 		}
@@ -155,6 +170,7 @@ func Build(snapshot Snapshot) (Plan, error) {
 				plan.Actions = append(plan.Actions, fmt.Sprintf("disable auto-merge for pull request #%d (%s)", pull.Number, pull.URL))
 				planning.PullRequests[index].AutoMergeArmed = false
 				if planning.Run.Status == scheduler.StatusWaitingForMerge {
+					plan.Actions = append(plan.Actions, fmt.Sprintf("mark Run %s resetting while retaining Lease %s", snapshot.Run.RunID, snapshot.Lease.LeaseID))
 					planning.Run.Status = scheduler.StatusResetting
 				}
 			case !pull.ResetCommented:
