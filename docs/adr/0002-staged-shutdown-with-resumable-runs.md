@@ -9,8 +9,8 @@ Backlog will separate runner shutdown from Run termination so routine maintenanc
 ## Consequences
 
 - `agent_settled` is the normal Worker completion trigger, not process exit. Backlog reconciles GitHub, persists the resulting Run state, closes the idle RPC process, and waits for its process group to exit.
-- The first `SIGINT` starts Drain. The Drain transition and Lease admission are serialized so no Lease can commit after Drain is accepted, while every already leased Run may continue.
-- Drain reconciles each settled Worker once and exits when no Worker remains. A Run waiting for merge does not keep Drain alive, but its persisted state and Lease remain intact for a later runner to reconcile.
+- The first `SIGINT` starts Drain. The Drain transition and Lease admission are serialized so no Lease can commit after Drain is accepted, while every Run whose Lease was committed by this runner may continue.
+- Drain reconciles each settled Owned Worker once and exits when no Owned Worker remains. A Run waiting for merge does not keep Drain alive, but its persisted state and Lease remain intact for a later runner to reconcile.
 - The second `SIGINT` starts suspension with one 60-second wall-clock deadline shared by all remaining Workers. Before acting, Backlog rechecks the Run state and the PID and process-start identity so a concurrently completed Run is reconciled rather than suspended.
 - An RPC `abort` response alone is not a continuation boundary. Backlog must also observe `agent_settled`, verify through `get_state` that streaming, compaction, and queued messages are idle, validate the exact session ID, path, durable leaf, and complete tool-result tail, and sync the session file.
 - Backlog persists the verified continuation boundary before closing the RPC process. After the process group exits, it atomically records the Run as suspended without a live PID. A crash between those steps is recoverable from the persisted boundary.

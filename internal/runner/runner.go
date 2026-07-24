@@ -60,6 +60,7 @@ type WorkerProcess interface {
 	Suspend(context.Context, worker.ContinuationRequest) (worker.Continuation, error)
 	Wait() worker.Result
 	Close() worker.Result
+	CloseWithForceContext(context.Context, func() error) worker.Result
 	CloseContext(context.Context, func() error) worker.Result
 }
 
@@ -80,14 +81,17 @@ type Runner struct {
 	Now               func() time.Time
 	NewRunID          func(issue int) string
 	PIDAlive          func(pid int) bool
-	PIDIdentity       func(pid int) (string, error)
 	ProcessGroupAlive func(pid int) (bool, error)
+	PIDIdentity       func(context.Context, int) (string, error)
 	Lstat             func(string) (os.FileInfo, error)
 
-	suspensionExit     atomic.Int32
-	suspensionFailed   atomic.Bool
-	suspensionMu       sync.Mutex
-	suspensionDeadline time.Time
+	suspensionExit       atomic.Int32
+	suspensionFailed     atomic.Bool
+	forceStopRequested   atomic.Bool
+	suspensionMu         sync.Mutex
+	suspensionDeadline   time.Time
+	suspensionCancel     context.CancelFunc
+	suspensionEventReady chan struct{}
 }
 
 type workerCompletion struct {
@@ -100,13 +104,22 @@ type workerStart struct {
 	err     error
 }
 
-// SignalExit requests the conventional shell exit status for a clean bounded
-// suspension without treating the signal as an implementation failure.
+// SignalExit requests the conventional shell exit status for suspension or
+// force stopping initiated by a signal. Cause records any Run that had to fail
+// closed without changing the signal-derived process status.
 type SignalExit struct {
-	Code int
+	Code  int
+	Cause error
 }
 
-func (e *SignalExit) Error() string { return fmt.Sprintf("signal shutdown (%d)", e.Code) }
+func (e *SignalExit) Error() string {
+	if e.Cause != nil {
+		return fmt.Sprintf("signal shutdown (%d): %v", e.Code, e.Cause)
+	}
+	return fmt.Sprintf("signal shutdown (%d)", e.Code)
+}
+
+func (e *SignalExit) Unwrap() error { return e.Cause }
 
 // admissionGate serializes the in-memory Drain transition with the complete
 // durable Lease write. Once stop returns, no later commit can call Store.Save.
@@ -141,6 +154,7 @@ func (g *admissionGate) stopped() bool {
 type signalEvent struct {
 	signal     os.Signal
 	firstDrain bool
+	forceStop  bool
 }
 
 func (r *Runner) Run(ctx context.Context) error {
@@ -158,6 +172,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	admissionCtx, cancelAdmission := context.WithCancel(ctx)
 	defer cancelAdmission()
 	admission := &admissionGate{}
+	r.suspensionEventReady = make(chan struct{})
 	signalCtx, stopSignals := context.WithCancel(context.Background())
 	defer stopSignals()
 	signalEvents := r.observeSignals(signalCtx, admission, cancelAdmission, cancelOperations)
@@ -209,7 +224,18 @@ func (r *Runner) Run(ctx context.Context) error {
 		default:
 		}
 		if code := int(r.suspensionExit.Load()); code != 0 {
-			return r.suspendOwned(&current, localWorkers, code)
+			// requestSuspension changes the stage before publishing its event so
+			// blocked operations are canceled promptly. Wait for publication and
+			// report all queued stage changes before entering suspension.
+			<-r.suspensionEventReady
+			for {
+				select {
+				case event := <-signalEvents:
+					r.handleSignal(event, len(localWorkers))
+				default:
+					return r.suspendOwned(&current, localWorkers, code)
+				}
+			}
 		}
 		if ctx.Err() != nil {
 			return r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped; worker was terminated and its worktree was retained")
@@ -360,11 +386,25 @@ func (r *Runner) Run(ctx context.Context) error {
 			// Reconciliation and its durable state write happen while the idle RPC
 			// process is still alive. EOF is sent only after that write succeeds.
 			if !closedBeforeReconciliation {
-				closed = process.Close()
+				var closeDraining bool
+				closed, closeDraining = r.closeSettledWhileObservingSignals(process, runID, signalEvents, len(localWorkers))
+				draining = closeDraining || draining
 			}
-			delete(localWorkers, completion.issue)
+			if closedBeforeReconciliation || closed.GroupExited {
+				delete(localWorkers, completion.issue)
+			}
 			if draining && len(localWorkers) > 0 {
 				r.logf("Drain: %s remaining; next SIGINT will be recorded as a suspension request", workerSummary(len(localWorkers)))
+			}
+			if !closed.GroupExited && r.suspensionExit.Load() != 0 {
+				continue
+			}
+			if closed.ForceStopped && r.suspensionExit.Load() != 0 {
+				if err := r.finalizeForceStoppedSettledWorker(&current, runID, closed.Err); err != nil {
+					r.suspensionFailed.Store(true)
+					r.logf("Force stop: durable terminal outcome preserved, but post-stop cleanup failed: %v", err)
+				}
+				continue
 			}
 			if err := r.finalizeSettledWorker(ctx, &current, runID, closed.Err, completion.result.Settled); err != nil {
 				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after an RPC finalization error; worktree retained")
@@ -410,13 +450,20 @@ func (r *Runner) observeSignals(ctx context.Context, admission *admissionGate, c
 				if first {
 					cancelAdmission()
 				}
+				startedSuspension := false
+				forceStop := false
 				if signal == syscall.SIGTERM {
-					r.requestSuspension(143, cancelOperations)
+					startedSuspension = r.requestSuspension(143, cancelOperations)
+					forceStop = !startedSuspension
 				} else if !first {
-					r.requestSuspension(130, cancelOperations)
+					startedSuspension = r.requestSuspension(130, cancelOperations)
+					forceStop = !startedSuspension
 				}
 				select {
-				case events <- signalEvent{signal: signal, firstDrain: first}:
+				case events <- signalEvent{signal: signal, firstDrain: first, forceStop: forceStop}:
+					if startedSuspension {
+						close(r.suspensionEventReady)
+					}
 				case <-ctx.Done():
 					return
 				}
@@ -428,28 +475,43 @@ func (r *Runner) observeSignals(ctx context.Context, admission *admissionGate, c
 	return events
 }
 
-func (r *Runner) requestSuspension(exitCode int32, cancelOperations context.CancelFunc) {
+func (r *Runner) requestSuspension(exitCode int32, cancelOperations context.CancelFunc) bool {
 	r.suspensionMu.Lock()
 	defer r.suspensionMu.Unlock()
 	if r.suspensionExit.Load() != 0 {
-		return
+		// A signal received while suspension is already active requests the
+		// same force-stop path used when its shared deadline expires.
+		r.forceStopRequested.Store(true)
+		if r.suspensionCancel != nil {
+			r.suspensionCancel()
+		}
+		return false
 	}
 	r.suspensionDeadline = time.Now().Add(r.Config.SuspensionTimeout)
 	r.suspensionExit.Store(exitCode)
 	cancelOperations()
+	return true
 }
 
 func (r *Runner) suspensionContext() (context.Context, context.CancelFunc) {
 	r.suspensionMu.Lock()
+	defer r.suspensionMu.Unlock()
 	deadline := r.suspensionDeadline
-	r.suspensionMu.Unlock()
 	if deadline.IsZero() {
 		deadline = time.Now().Add(r.Config.SuspensionTimeout)
 	}
-	return context.WithDeadline(context.Background(), deadline)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	r.suspensionCancel = cancel
+	if r.forceStopRequested.Load() {
+		cancel()
+	}
+	return ctx, cancel
 }
 
 func (r *Runner) handleSignal(event signalEvent, workers int) bool {
+	if event.forceStop {
+		return true
+	}
 	if event.signal == syscall.SIGTERM {
 		r.logf("Suspension: SIGTERM accepted; %s share one %s deadline", workerSummary(workers), r.Config.SuspensionTimeout)
 		return true
@@ -545,6 +607,9 @@ func (r *Runner) validate() error {
 	if r.PIDAlive == nil {
 		r.PIDAlive = pidAlive
 	}
+	if r.ProcessGroupAlive == nil {
+		r.ProcessGroupAlive = processGroupAlive
+	}
 	if r.PIDIdentity == nil {
 		r.PIDIdentity = pidIdentity
 	}
@@ -639,7 +704,7 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 		r.failRun(current, candidate.Number, fmt.Sprintf("start Pi worker: %v", err))
 		return nil, r.saveAfterFailure(*current, candidate.Number)
 	}
-	identity, err := r.PIDIdentity(process.PID())
+	identity, err := r.PIDIdentity(operationCtx, process.PID())
 	if err != nil {
 		_ = process.Abort()
 		_ = process.Close()
@@ -737,7 +802,7 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 		replaceRun(current, run)
 		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("start replacement Pi Worker: %v", err))
 	}
-	identity, err := r.PIDIdentity(process.PID())
+	identity, err := r.PIDIdentity(operationCtx, process.PID())
 	if err != nil {
 		_ = process.Abort()
 		closed := process.Close()
@@ -861,6 +926,88 @@ func (r *Runner) handleWorkerCompletionWhileObservingSignals(ctx context.Context
 	}
 }
 
+func (r *Runner) closeSettledWhileObservingSignals(process WorkerProcess, runID string, signalEvents <-chan signalEvent, workers int) (worker.Result, bool) {
+	forceCtx, cancelForce := context.WithCancel(context.Background())
+	defer cancelForce()
+	closed := make(chan worker.Result, 1)
+	go func() {
+		closed <- process.CloseWithForceContext(forceCtx, r.authorizeSettledKill(runID, process))
+	}()
+
+	draining := false
+	var deadlineTimer *time.Timer
+	var deadline <-chan time.Time
+	startDeadline := func() {
+		if deadline != nil || r.suspensionExit.Load() == 0 {
+			return
+		}
+		r.suspensionMu.Lock()
+		suspensionDeadline := r.suspensionDeadline
+		r.suspensionMu.Unlock()
+		delay := time.Until(suspensionDeadline)
+		if delay < 0 {
+			delay = 0
+		}
+		deadlineTimer = time.NewTimer(delay)
+		deadline = deadlineTimer.C
+	}
+	defer func() {
+		if deadlineTimer != nil {
+			deadlineTimer.Stop()
+		}
+	}()
+	startDeadline()
+	if r.forceStopRequested.Load() {
+		r.logf("Force stop: requesting force stop for %s after settlement; identity will be revalidated before signaling", workerSummary(workers))
+		cancelForce()
+	}
+
+	for {
+		select {
+		case result := <-closed:
+			return result, draining
+		case event := <-signalEvents:
+			draining = r.handleSignal(event, workers) || draining
+			startDeadline()
+			if event.forceStop {
+				r.logf("Force stop: additional signal accepted; requesting force stop for %s after settlement; identity will be revalidated before signaling", workerSummary(workers))
+				cancelForce()
+			}
+		case <-deadline:
+			deadline = nil
+			r.logf("Force stop: suspension deadline expired; requesting force stop for %s after settlement; identity will be revalidated before signaling", workerSummary(workers))
+			cancelForce()
+		}
+	}
+}
+
+func (r *Runner) authorizeSettledKill(runID string, process WorkerProcess) func() error {
+	return func() error {
+		persisted, err := r.Store.Load()
+		if err != nil {
+			return fmt.Errorf("reload settled Run before force stopping Worker: %w", err)
+		}
+		run := findRun(persisted.Runs, runID)
+		active := findActiveRun(&persisted, run.Issue)
+		if run.RunID == "" || active.RunID != "" && active.RunID != runID || run.Status == scheduler.StatusRunning {
+			return errors.New("durable settled Run state no longer authorizes Worker force stop")
+		}
+		if !r.PIDAlive(process.PID()) {
+			return errors.New("settled Worker PID is not live before force stop")
+		}
+		identityCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		identity, err := r.PIDIdentity(identityCtx, process.PID())
+		if err != nil {
+			return fmt.Errorf("recheck settled Worker identity before force stop: %w", err)
+		}
+		if identity != run.ProcessIdentity {
+			return fmt.Errorf("settled Worker identity changed from %q to %q before force stop", run.ProcessIdentity, identity)
+		}
+		return nil
+	}
+}
+
 func (r *Runner) handleWorkerCompletion(ctx context.Context, current *state.State, completion workerCompletion) error {
 	run := findActiveRun(current, completion.issue)
 	if run.Issue == 0 {
@@ -918,7 +1065,10 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 			continue
 		case scheduler.StatusRunning:
 			if run.PID > 0 && r.PIDAlive(run.PID) {
-				identity, err := r.PIDIdentity(run.PID)
+				identity, err := r.PIDIdentity(ctx, run.PID)
+				if err != nil && ctx.Err() != nil {
+					return ctx.Err()
+				}
 				if err != nil {
 					r.needsHumanWithLiveWorker(current, run.Issue, fmt.Sprintf("recorded worker process identity is uncertain: %v", err))
 					changed = true
@@ -945,16 +1095,23 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 				}
 				continue
 			}
-			groupAlive, err := r.ProcessGroupAlive(run.PID)
-			if err != nil {
-				r.needsHumanWithLiveWorker(current, run.Issue, fmt.Sprintf("old Worker process-group absence is uncertain: %v", err))
-				changed = true
-				continue
-			}
-			if groupAlive {
-				r.needsHumanWithLiveWorker(current, run.Issue, "old Worker process group remains alive after its leader exited")
-				changed = true
-				continue
+			if run.Continuation != nil {
+				if run.PID <= 0 {
+					r.needsHuman(current, run.Issue, "persisted continuation has no Worker PID for process-group absence verification")
+					changed = true
+					continue
+				}
+				groupAlive, err := r.ProcessGroupAlive(run.PID)
+				if err != nil {
+					r.needsHumanWithLiveWorker(current, run.Issue, fmt.Sprintf("recovered Worker process-group absence is uncertain: %v", err))
+					changed = true
+					continue
+				}
+				if groupAlive {
+					r.needsHumanWithLiveWorker(current, run.Issue, "recovered Worker leader is absent but its process group may still be live; Worker retained for intervention")
+					changed = true
+					continue
+				}
 			}
 		case scheduler.StatusWaitingForMerge, scheduler.StatusSuspended:
 			// Always verify waiting and suspended Runs without making retained
@@ -1081,6 +1238,35 @@ func (r *Runner) applyOutcome(ctx context.Context, current *state.State, run sch
 	return nil
 }
 
+func (r *Runner) finalizeForceStoppedSettledWorker(current *state.State, runID string, closeErr error) error {
+	if closeErr != nil {
+		return fmt.Errorf("force close settled Worker: %w", closeErr)
+	}
+	run := findRun(current.Runs, runID)
+	if run.RunID == "" {
+		return fmt.Errorf("finalize unknown force-stopped Run %q", runID)
+	}
+	if run.Status != scheduler.StatusMerged {
+		return nil
+	}
+	assignment := worktree.Assignment{Path: run.Worktree, Branch: run.Branch}
+	if assignment.Path == "" || assignment.Branch == "" {
+		return nil
+	}
+	r.suspensionMu.Lock()
+	deadline := r.suspensionDeadline
+	r.suspensionMu.Unlock()
+	if deadline.IsZero() {
+		deadline = time.Now().Add(r.Config.SuspensionTimeout)
+	}
+	cleanupCtx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	if err := r.Worktrees.Cleanup(cleanupCtx, assignment); err != nil {
+		return fmt.Errorf("cleanup force-stopped issue #%d worktree: %w", run.Issue, err)
+	}
+	return nil
+}
+
 func (r *Runner) finalizeSettledWorker(ctx context.Context, current *state.State, runID string, closeErr error, settled bool) error {
 	if !settled {
 		return nil
@@ -1202,10 +1388,16 @@ func (r *Runner) authorizeSuspensionKill(runID string, process WorkerProcess) fu
 			return fmt.Errorf("reload Run before force stopping Worker: %w", err)
 		}
 		run := findRun(persisted.Runs, runID)
-		if run.RunID == "" || run.Status != scheduler.StatusRunning || run.PID != process.PID() || !r.PIDAlive(run.PID) {
-			return errors.New("durable Run state and live Worker PID no longer match before force stop")
+		active := findActiveRun(&persisted, run.Issue)
+		if run.RunID == "" || active.RunID != runID || run.Status != scheduler.StatusRunning || run.PID != process.PID() {
+			return errors.New("durable active Run state and Worker PID no longer match before force stop")
 		}
-		identity, err := r.PIDIdentity(run.PID)
+		if !r.PIDAlive(run.PID) {
+			return errors.New("recorded Worker PID is not live before force stop")
+		}
+		identityCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		identity, err := r.PIDIdentity(identityCtx, run.PID)
 		if err != nil {
 			return fmt.Errorf("recheck Worker identity before force stop: %w", err)
 		}
@@ -1219,16 +1411,28 @@ func (r *Runner) authorizeSuspensionKill(runID string, process WorkerProcess) fu
 func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess, exitCode int) error {
 	if len(local) == 0 {
 		if r.suspensionFailed.Load() {
-			return errors.New("suspension could not establish a continuation boundary for every admitted Run")
+			return &SignalExit{Code: exitCode, Cause: errors.New("suspension could not establish a continuation boundary for every admitted Run")}
 		}
 		r.logf("Suspension complete: 0 Workers remaining")
 		return &SignalExit{Code: exitCode}
 	}
 	ctx, cancel := r.suspensionContext()
 	defer cancel()
-	r.logf("Suspension: establishing continuation boundaries for %s; one %s deadline", workerSummary(len(local)), r.Config.SuspensionTimeout)
+	r.logf("Suspension: establishing continuation boundaries for %s; one %s deadline; next SIGINT will force stop remaining verified Worker groups", workerSummary(len(local)), r.Config.SuspensionTimeout)
 
 	workerCount := len(local)
+	var forceStopRemaining atomic.Int64
+	forceStopRemaining.Store(int64(workerCount))
+	go func() {
+		<-ctx.Done()
+		remaining := workerSummary(int(forceStopRemaining.Load()))
+		switch {
+		case r.forceStopRequested.Load():
+			r.logf("Force stop: additional signal accepted; requesting force stop for %s; each identity will be revalidated before signaling; next SIGINT will repeat the force-stop request", remaining)
+		case errors.Is(ctx.Err(), context.DeadlineExceeded):
+			r.logf("Force stop: suspension deadline expired; requesting force stop for %s; each identity will be revalidated before signaling; next SIGINT will repeat the force-stop request", remaining)
+		}
+	}()
 	boundaries := make(chan suspensionBoundaryResult, workerCount)
 	runIDs := make(map[int]string, workerCount)
 	for issue, process := range local {
@@ -1239,7 +1443,7 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 				boundaries <- suspensionBoundaryResult{issue: issue, err: errors.New("Run state and live Worker PID no longer match")}
 				return
 			}
-			identity, err := r.PIDIdentity(run.PID)
+			identity, err := r.PIDIdentity(ctx, run.PID)
 			if err != nil || identity != run.ProcessIdentity {
 				if err == nil {
 					err = fmt.Errorf("process identity changed from %q to %q", run.ProcessIdentity, identity)
@@ -1261,10 +1465,11 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 	clean := !r.suspensionFailed.Load()
 	closeProcess := func(issue int, process WorkerProcess) {
 		go func() {
-			closeResults <- suspensionCloseResult{
-				issue:  issue,
-				result: process.CloseContext(ctx, r.authorizeSuspensionKill(runIDs[issue], process)),
+			result := process.CloseContext(ctx, r.authorizeSuspensionKill(runIDs[issue], process))
+			if result.GroupExited && !result.ForceStopped {
+				forceStopRemaining.Add(-1)
 			}
+			closeResults <- suspensionCloseResult{issue: issue, result: result}
 		}()
 	}
 	for completed := 0; completed < workerCount; completed++ {
@@ -1325,7 +1530,40 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 	var persistenceErrors []error
 	for completed := 0; completed < workerCount; completed++ {
 		closed := <-closeResults
+		if closed.result.GroupExited {
+			delete(local, closed.issue)
+		}
+
+		// Reload after CloseContext's immediate pre-signal check. A concurrently
+		// persisted terminal outcome is authoritative and must not be replaced by
+		// stale in-memory suspension state.
+		persisted, err := r.Store.Load()
+		if err != nil {
+			clean = false
+			persistenceErrors = append(persistenceErrors, fmt.Errorf("reload issue #%d after Worker close: %w", closed.issue, err))
+			r.logf("Suspension: %s remaining", workerSummary(len(local)))
+			continue
+		}
+		*current = persisted
 		run := findRun(current.Runs, runIDs[closed.issue])
+		if run.RunID == "" {
+			clean = false
+			persistenceErrors = append(persistenceErrors, fmt.Errorf("reload issue #%d after Worker close: Run %q disappeared", closed.issue, runIDs[closed.issue]))
+			r.logf("Suspension: %s remaining", workerSummary(len(local)))
+			continue
+		}
+
+		if run.Status != scheduler.StatusRunning {
+			// Merged, waiting-for-merge, cleanly suspended, and other durable
+			// outcomes win over force escalation. Authorization already refused
+			// to signal a process for a non-running Run.
+			if !closed.result.GroupExited || closed.result.Err != nil {
+				clean = false
+			}
+			r.logf("Suspension: %s remaining", workerSummary(len(local)))
+			continue
+		}
+
 		if closed.result.GroupExited && closed.result.Err != nil {
 			clean = false
 			reason := fmt.Sprintf("close RPC Worker after continuation verification: %v", closed.result.Err)
@@ -1336,20 +1574,16 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 		}
 		if !closed.result.GroupExited {
 			clean = false
-			message := "Worker process-group exit was not verified before the suspension deadline"
+			message := "Worker process-group exit was not verified before force escalation"
 			if closed.result.Err != nil {
 				message += ": " + closed.result.Err.Error()
 			}
-			wasCompletion := run.Status == scheduler.StatusMerged || run.Status == scheduler.StatusWaitingForMerge
 			run.PID = local[closed.issue].PID()
 			run.Status = scheduler.StatusNeedsHuman
 			run.CompletedAt = nil
 			run.Error = message
 			run.UpdatedAt = r.Now().UTC()
 			replaceRun(current, run)
-			if wasCompletion && findActiveRun(current, run.Issue).RunID == "" {
-				current.Leases = append(current.Leases, scheduler.Lease{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID})
-			}
 		} else {
 			if outcome, exists := verifiedOutcomes[closed.issue]; exists && failureReasons[closed.issue] == "" {
 				if err := r.applyOutcome(ctx, current, run, outcome, true, false); err != nil {
@@ -1365,39 +1599,52 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 				run.Status = scheduler.StatusNeedsHuman
 				run.CompletedAt = nil
 				run.Error = reason
+			} else if run.Status == scheduler.StatusRunning && run.Continuation == nil {
+				clean = false
+				run.Status = scheduler.StatusNeedsHuman
+				run.CompletedAt = nil
+				run.Error = "Worker exited without a persisted continuation marker"
 			} else if run.Status == scheduler.StatusRunning {
 				transitionStatus(&run, scheduler.StatusSuspended)
 				run.Error = ""
 			}
 			replaceRun(current, run)
 		}
-		if closed.result.GroupExited {
-			delete(local, closed.issue)
-		}
-		if err := r.Store.Save(*current); err != nil {
-			clean = false
-			persistenceErrors = append(persistenceErrors, fmt.Errorf("persist suspended issue #%d: %w", closed.issue, err))
-		} else if closed.result.GroupExited && run.Status == scheduler.StatusMerged {
-			if err := r.finalizeSettledWorker(ctx, current, run.RunID, nil, true); err != nil {
+		if closed.result.GroupExited && run.Status == scheduler.StatusMerged {
+			// Force escalation cancels the shared suspension context. Cleanup gets
+			// a fresh bounded context and completes before merged state becomes
+			// durable, so cancellation cannot overwrite a terminal outcome.
+			cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), r.Config.SuspensionTimeout)
+			err := r.finalizeSettledWorker(cleanupCtx, current, run.RunID, nil, true)
+			cancelCleanup()
+			if err != nil {
 				clean = false
 				persistenceErrors = append(persistenceErrors, err)
 			} else if findRun(current.Runs, run.RunID).Status != scheduler.StatusMerged {
 				clean = false
 			}
 		}
+		if err := r.Store.Save(*current); err != nil {
+			clean = false
+			persistenceErrors = append(persistenceErrors, fmt.Errorf("persist suspended issue #%d: %w", closed.issue, err))
+		}
 		r.logf("Suspension: %s remaining", workerSummary(len(local)))
 	}
+
+	var cause error
 	if len(persistenceErrors) != 0 {
-		return errors.Join(persistenceErrors...)
+		cause = errors.Join(persistenceErrors...)
+	} else if !clean && len(local) != 0 {
+		cause = fmt.Errorf("suspension could not verify or stop %s; one or more Runs require human verification", workerSummary(len(local)))
+	} else if !clean {
+		cause = errors.New("suspension stopped all Workers but one or more Runs require human verification")
 	}
-	if !clean {
-		if len(local) != 0 {
-			return fmt.Errorf("suspension could not verify or stop %s; one or more Runs require human verification", workerSummary(len(local)))
-		}
-		return errors.New("suspension stopped all Workers but one or more Runs require human verification")
+	if cause == nil {
+		r.logf("Suspension complete: 0 Workers remaining")
+	} else {
+		r.logf("Suspension incomplete: %v", cause)
 	}
-	r.logf("Suspension complete: 0 Workers remaining")
-	return &SignalExit{Code: exitCode}
+	return &SignalExit{Code: exitCode, Cause: cause}
 }
 
 func (r *Runner) shutdownOwned(
@@ -1521,12 +1768,12 @@ func defaultRunID(issue int) string {
 	return fmt.Sprintf("%s-%d", time.Now().UTC().Format("20060102T150405.000000000"), issue)
 }
 
-func pidIdentity(pid int) (string, error) {
+func pidIdentity(ctx context.Context, pid int) (string, error) {
 	if pid <= 0 {
 		return "", fmt.Errorf("invalid pid %d", pid)
 	}
 	// #nosec G204: pid is validated as positive and passed as a single argument.
-	command := exec.Command("ps", "-p", fmt.Sprint(pid), "-o", "lstart=")
+	command := exec.CommandContext(ctx, "ps", "-p", fmt.Sprint(pid), "-o", "lstart=")
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("inspect pid %d start time: %w", pid, err)
@@ -1552,14 +1799,15 @@ func pidAlive(pid int) bool {
 
 func processGroupAlive(pid int) (bool, error) {
 	if pid <= 0 {
-		return false, nil
+		return false, fmt.Errorf("invalid process-group leader pid %d", pid)
 	}
-	err := syscall.Kill(-pid, 0)
-	if err == nil || errors.Is(err, syscall.EPERM) {
+	err := syscall.Kill(-pid, syscall.Signal(0))
+	switch {
+	case err == nil, errors.Is(err, syscall.EPERM):
 		return true, nil
-	}
-	if errors.Is(err, syscall.ESRCH) {
+	case errors.Is(err, syscall.ESRCH):
 		return false, nil
+	default:
+		return false, err
 	}
-	return false, err
 }

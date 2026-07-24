@@ -52,13 +52,15 @@ type Continuation struct {
 }
 
 type Result struct {
-	ExitCode    int
-	GroupExited bool
-	LogPath     string
-	StderrPath  string
-	Settled     bool
-	StreamErr   error
-	Err         error
+	ExitCode     int
+	GroupExited  bool
+	ForceStopped bool
+	LogPath      string
+	StderrPath   string
+	Settled      bool
+	StreamErr    error
+	cleanupErr   error
+	Err          error
 }
 
 type Supervisor struct {
@@ -404,6 +406,13 @@ func (p *Process) Wait() Result {
 // Close closes RPC input and waits for the Worker process and its entire
 // process group to exit. Callers persist the reconciled Run before invoking Close.
 func (p *Process) Close() Result {
+	return p.CloseWithForceContext(context.Background(), nil)
+}
+
+// CloseWithForceContext performs ordinary settled-Worker cleanup unless ctx is
+// canceled first. Cancellation uses the same authorized SIGKILL path as
+// suspension escalation, allowing a third signal to bypass graceful cleanup.
+func (p *Process) CloseWithForceContext(ctx context.Context, authorizeKill func() error) Result {
 	p.closeInputOnce.Do(func() {
 		p.stdinMu.Lock()
 		p.closeInputErr = p.stdin.Close()
@@ -414,6 +423,8 @@ func (p *Process) Close() Result {
 	defer grace.Stop()
 	select {
 	case <-p.exitDone:
+	case <-ctx.Done():
+		return p.forceStop(authorizeKill, ctx.Err())
 	case <-grace.C:
 		gracefulErr = errors.New("Pi RPC process did not exit after input closed")
 		if err := p.terminate(); err != nil && !errors.Is(err, os.ErrProcessDone) {
@@ -429,45 +440,76 @@ func (p *Process) Close() Result {
 }
 
 // CloseContext closes RPC input and proves process-group exit within ctx. If
-// the deadline expires, authorizeKill must revalidate the durable process
-// identity immediately before CloseContext force stops the process group.
+// ctx expires or is canceled, authorizeKill must revalidate the durable Run,
+// liveness, PID, and process-start identity immediately before CloseContext
+// force stops the process group. Deadline and signal cancellation therefore
+// execute the same force-stop path.
 func (p *Process) CloseContext(ctx context.Context, authorizeKill func() error) Result {
 	p.closeInputOnce.Do(func() {
 		p.stdinMu.Lock()
 		p.closeInputErr = p.stdin.Close()
 		p.stdinMu.Unlock()
 	})
+
 	select {
 	case <-p.exitDone:
+		if err := waitForProcessGroupExitContext(ctx, p.PID()); err == nil {
+			result := p.exitResult()
+			result.GroupExited = true
+			result.Err = errors.Join(result.Err, p.closeInputErr)
+			return result
+		} else if ctx.Err() == nil {
+			result := p.exitResult()
+			result.Err = errors.Join(result.Err, p.closeInputErr, err)
+			return result
+		}
 	case <-ctx.Done():
-		if authorizeKill == nil {
-			result := p.exitResult()
-			result.Err = errors.Join(result.Err, p.closeInputErr, ctx.Err(), errors.New("Worker process-group exit was not verified; force stop was not authorized"))
-			return result
-		}
-		if err := authorizeKill(); err != nil {
-			result := p.exitResult()
-			result.Err = errors.Join(result.Err, p.closeInputErr, ctx.Err(), fmt.Errorf("authorize Worker force stop: %w", err))
-			return result
-		}
-		if err := p.kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			result := p.exitResult()
-			result.Err = errors.Join(result.Err, p.closeInputErr, ctx.Err(), fmt.Errorf("force stop Worker process group: %w", err))
-			return result
-		}
-		select {
-		case <-p.exitDone:
-		default:
-			result := p.exitResult()
-			result.Err = errors.Join(result.Err, p.closeInputErr, ctx.Err(), errors.New("Worker process-group exit was not verified"))
-			return result
-		}
 	}
+
+	return p.forceStop(authorizeKill, ctx.Err())
+}
+
+func (p *Process) forceStop(authorizeKill func() error, triggerErr error) Result {
+	unauthorized := func(err error) Result {
+		result := p.exitResult()
+		result.Err = errors.Join(result.Err, p.closeInputErr, triggerErr, err)
+		return result
+	}
+	if authorizeKill == nil {
+		return unauthorized(errors.New("Worker process-group exit was not verified; force stop was not authorized"))
+	}
+	if err := authorizeKill(); err != nil {
+		return unauthorized(fmt.Errorf("authorize Worker force stop: %w", err))
+	}
+	killErr := p.kill()
+	if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+		return unauthorized(fmt.Errorf("force stop Worker process group: %w", killErr))
+	}
+	forceStopped := killErr == nil
+
+	select {
+	case <-p.exitDone:
+	case <-time.After(p.processGroupGrace):
+		return unauthorized(errors.New("Worker process did not exit after force stop"))
+	}
+	exited, err := waitForProcessGroup(p.PID(), p.processGroupGrace)
+	if err != nil {
+		return unauthorized(err)
+	}
+	if !exited {
+		return unauthorized(fmt.Errorf("Worker process group %d survived force stop", p.PID()))
+	}
+
 	result := p.exitResult()
-	if err := waitForProcessGroupExitContext(ctx, p.PID()); err != nil {
-		result.Err = errors.Join(result.Err, p.closeInputErr, err)
+	result.GroupExited = true
+	result.ForceStopped = forceStopped
+	if forceStopped {
+		// A SIGKILL exit and the context trigger are expected after an authorized
+		// force stop. Protocol, log cleanup, and input-close failures remain errors.
+		result.Err = errors.Join(result.StreamErr, result.cleanupErr, p.closeInputErr)
 	} else {
-		result.GroupExited = true
+		// The leader exited between authorization and signaling. Preserve its
+		// actual exit result instead of claiming that SIGKILL caused the exit.
 		result.Err = errors.Join(result.Err, p.closeInputErr)
 	}
 	return result
@@ -506,7 +548,7 @@ func (p *Process) reap() {
 	p.result = Result{
 		ExitCode: exitCode, LogPath: p.logPath, StderrPath: p.stderrPath,
 		Settled:   p.events.Settled() && streamErr == nil,
-		StreamErr: streamErr, Err: errors.Join(waitErr, streamErr, closeErr),
+		StreamErr: streamErr, cleanupErr: closeErr, Err: errors.Join(waitErr, streamErr, closeErr),
 	}
 	p.resultMu.Unlock()
 	close(p.exitDone)
