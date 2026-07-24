@@ -191,6 +191,52 @@ func TestRunnerClosesWorkerAndRetainsLeaseWhenCompletionSaveFails(t *testing.T) 
 	}
 }
 
+func TestRunnerShutsDownOtherWorkersWhenLogClosureSaveFails(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{candidates: []scheduler.Candidate{
+		{Number: 12, CreatedAt: time.Now()},
+		{Number: 13, CreatedAt: time.Now().Add(time.Second)},
+	}}
+	workers := newFakeWorkers()
+	workers.startupCloseResult = worker.Result{LogClosed: true, GroupExited: true}
+	// Startup writes once, then each Worker writes its Lease, planned and
+	// prepared worktree, log paths, and process identity. The completed Run is
+	// save 12 and its log closure marker is save 13.
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 13}
+	runner := testRunner(github, workers, store, 2)
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+
+	workers.waitForStarts(t, 12, 13)
+	github.setCompletion(12, mergedOutcome(12))
+	workers.complete(12, worker.Result{ExitCode: 0})
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "persist closed Worker log") {
+			t.Fatalf("run error = %v, want Worker log closure persistence failure", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Runner did not shut down after Worker log closure persistence failed")
+	}
+	if got := workers.abortedCount(); got != 1 {
+		t.Fatalf("aborted Workers = %d, want the other owned Worker aborted", got)
+	}
+	if got := workers.runningCount(); got != 0 {
+		t.Fatalf("running Workers = %d, want all Workers closed", got)
+	}
+	got := store.LoadValue()
+	merged := findRun(got.Runs, "run-12")
+	failed := findRun(got.Runs, "run-13")
+	if merged.Status != scheduler.StatusMerged || merged.WorkerLogOpen {
+		t.Fatalf("completed Run after closure save failure = %#v", merged)
+	}
+	if failed.Status != scheduler.StatusFailed || failed.WorkerLogOpen || !strings.Contains(failed.Error, "log closure persistence failed") {
+		t.Fatalf("other Run after closure save failure = %#v", failed)
+	}
+}
+
 func TestRunnerFailsClosedWhenRPCOutputBreaksAfterSettlement(t *testing.T) {
 	t.Parallel()
 

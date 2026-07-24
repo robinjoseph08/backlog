@@ -359,7 +359,23 @@ func (r *Runner) Run(ctx context.Context) error {
 				if workerLogIsClosed(closed) {
 					markWorkerLogClosed(&current, runID)
 					if err := r.Store.Save(current); err != nil {
-						return fmt.Errorf("persist closed Worker log for Run %s: %w", runID, err)
+						markerErr := fmt.Errorf("persist closed Worker log for Run %s: %w", runID, err)
+						var completedShutdownErr error
+						if !closed.GroupExited {
+							if abortErr := process.Abort(); abortErr != nil && !errors.Is(abortErr, os.ErrProcessDone) {
+								completedShutdownErr = errors.Join(completedShutdownErr, fmt.Errorf("abort completed issue #%d Worker: %w", completion.issue, abortErr))
+							}
+							reclosed := process.Close()
+							if reclosed.Err != nil && !errors.Is(reclosed.Err, context.Canceled) {
+								completedShutdownErr = errors.Join(completedShutdownErr, fmt.Errorf("close completed issue #%d Worker: %w", completion.issue, reclosed.Err))
+							}
+							if !reclosed.GroupExited {
+								completedShutdownErr = errors.Join(completedShutdownErr, fmt.Errorf("completed issue #%d Worker process group did not exit", completion.issue))
+							}
+						}
+						delete(localWorkers, completion.issue)
+						shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after Worker log closure persistence failed; worktree retained")
+						return errors.Join(markerErr, completedShutdownErr, shutdownErr)
 					}
 				}
 			}
