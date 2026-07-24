@@ -154,8 +154,8 @@ case "$*" in
   "repo view --json nameWithOwner,defaultBranchRef") printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
   "issue view 42 --repo acme/widgets --json number,url,state,labels")
     printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"},{"name":"spec"}]}' ;;
-  "pr list --repo acme/widgets --state all --head `+branch+` --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner")
-    printf '%s\n' '[{"number":99,"url":"https://github.com/acme/widgets/pull/99","state":"OPEN","mergedAt":null,"autoMergeRequest":{"mergeMethod":"SQUASH"},"isDraft":false,"headRefName":"`+branch+`","headRepositoryOwner":{"login":"acme"}}]' ;;
+  "pr list --repo acme/widgets --state all --head `+branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+    printf '%s\n' '[{"number":99,"url":"https://github.com/acme/widgets/pull/99","state":"OPEN","mergedAt":null,"autoMergeRequest":{"mergeMethod":"SQUASH"},"isDraft":false,"headRefName":"`+branch+`","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
 `)

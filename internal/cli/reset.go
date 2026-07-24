@@ -69,16 +69,16 @@ func resetCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if err != nil {
 		return err
 	}
-	resolvedState, err := repositoryStateDirectory(commonDirectory, repositoryRoot, *stateDir)
-	if err != nil {
-		return err
-	}
 	lock, err := acquireResetReadLock(commonDirectory)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = lock.Release() }()
 
+	resolvedState, err := repositoryStateDirectory(commonDirectory, repositoryRoot, *stateDir)
+	if err != nil {
+		return err
+	}
 	current, migrationRequired, err := (state.FileStore{Path: filepath.Join(resolvedState, "state.json")}).Preview()
 	if err != nil {
 		return err
