@@ -381,8 +381,12 @@ func fakeGH(t *testing.T, body string) string {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "gh")
+	stagedPath := filepath.Join(dir, ".gh-staged")
 	script := "#!/bin/sh\nset -eu\n" + body + "\n"
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+	if err := os.WriteFile(stagedPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(stagedPath, path); err != nil {
 		t.Fatal(err)
 	}
 	return path
