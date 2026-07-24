@@ -12,14 +12,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
 	"github.com/robinjoseph08/backlog/internal/herdr"
 	"github.com/robinjoseph08/backlog/internal/runner"
-	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 	"github.com/robinjoseph08/backlog/internal/worker"
 	"github.com/robinjoseph08/backlog/internal/worktree"
@@ -51,7 +49,8 @@ func MainWithSignals(ctx context.Context, args []string, stdout, stderr io.Write
 	case "retry":
 		commandCtx, stop := cancelContextOnSignal(ctx, signals)
 		defer stop()
-		err = retryCommand(commandCtx, args[1:], stdout, stderr)
+		fmt.Fprintln(stderr, "Warning: backlog retry is deprecated; use backlog reset.")
+		err = resetCommand(commandCtx, args[1:], stdout, stderr)
 	case "help", "--help", "-h":
 		printUsage(stdout)
 		return 0
@@ -286,126 +285,6 @@ func statusCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 		fmt.Fprintln(stdout)
 	}
 	return nil
-}
-
-func retryCommand(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("retry", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	repoDir := flags.String("repo-dir", ".", "Git repository associated with the runner")
-	stateDir := flags.String("state-dir", "", "runner state directory")
-	gitExecutable := flags.String("git", "git", "git executable used to identify the repository root")
-	for _, arg := range args {
-		if arg == "-h" || arg == "--help" {
-			return flags.Parse([]string{arg})
-		}
-	}
-	issueArg, flagArgs, err := splitRetryArguments(args)
-	if err != nil {
-		return err
-	}
-	if err := flags.Parse(flagArgs); err != nil {
-		return err
-	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected retry arguments: %s", strings.Join(flags.Args(), " "))
-	}
-	issue, err := strconv.Atoi(issueArg)
-	if err != nil || issue <= 0 {
-		return fmt.Errorf("invalid issue number %q", issueArg)
-	}
-	absoluteRepo, err := filepath.Abs(*repoDir)
-	if err != nil {
-		return err
-	}
-	repositoryRoot, err := gitRepositoryRoot(ctx, *gitExecutable, absoluteRepo)
-	if err != nil {
-		return err
-	}
-	commonDirectory, err := gitCommonDirectory(ctx, *gitExecutable, repositoryRoot)
-	if err != nil {
-		return err
-	}
-	resolved, err := repositoryStateDirectory(commonDirectory, repositoryRoot, *stateDir)
-	if err != nil {
-		return err
-	}
-	lock, err := acquireRepositoryLock(commonDirectory)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = lock.Release() }()
-	if err := bindStateDirectory(commonDirectory, resolved); err != nil {
-		return err
-	}
-	store := state.FileStore{Path: filepath.Join(resolved, "state.json")}
-	current, err := store.Load()
-	if err != nil {
-		return err
-	}
-	leaseIndex := -1
-	var selected scheduler.Run
-	for index, lease := range current.Leases {
-		if lease.Issue != issue {
-			continue
-		}
-		leaseIndex = index
-		for _, run := range current.Runs {
-			if run.RunID == lease.RunID && run.Issue == lease.Issue {
-				selected = run
-				break
-			}
-		}
-		break
-	}
-	if leaseIndex < 0 {
-		return fmt.Errorf("issue #%d has no intervention-required Run with an active Lease", issue)
-	}
-	if selected.RunID == "" {
-		return fmt.Errorf("active Lease for issue #%d has an invalid Run reference", issue)
-	}
-	if selected.Status != scheduler.StatusFailed && selected.Status != scheduler.StatusNeedsHuman {
-		return fmt.Errorf("issue #%d is %s; only failed or needs-human runs can be retried", issue, selected.Status)
-	}
-	if selected.PID > 0 {
-		return fmt.Errorf("issue #%d retains live Worker identity pid %d; verify process-group exit before retrying", issue, selected.PID)
-	}
-	current.Leases = append(current.Leases[:leaseIndex], current.Leases[leaseIndex+1:]...)
-	retained := selected.Worktree
-	if err := store.Save(current); err != nil {
-		return err
-	}
-	if retained != "" {
-		fmt.Fprintf(stdout, "Issue #%d can be scheduled again; retained prior worktree at %s\n", issue, retained)
-	} else {
-		fmt.Fprintf(stdout, "Issue #%d can be scheduled again\n", issue)
-	}
-	return nil
-}
-
-func splitRetryArguments(args []string) (string, []string, error) {
-	if len(args) == 0 {
-		return "", nil, errors.New("usage: backlog retry <issue-number> [flags]")
-	}
-	if !strings.HasPrefix(args[0], "-") {
-		return args[0], args[1:], nil
-	}
-	// Standard flag parsing supports flags before the issue number.
-	for index, value := range args {
-		if !strings.HasPrefix(value, "-") && (index == 0 || !flagTakesValue(args[index-1])) {
-			remaining := append([]string{}, args[:index]...)
-			remaining = append(remaining, args[index+1:]...)
-			return value, remaining, nil
-		}
-	}
-	return "", nil, errors.New("retry requires an issue number")
-}
-
-func flagTakesValue(name string) bool {
-	if strings.Contains(name, "=") {
-		return false
-	}
-	name = strings.TrimLeft(name, "-")
-	return name == "repo-dir" || name == "state-dir" || name == "git"
 }
 
 func resolveStateFromFlags(ctx context.Context, repoDir, stateDir, gitExecutable string) (string, string, error) {
@@ -653,6 +532,6 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "Usage:")
 	fmt.Fprintln(writer, "  backlog run [flags]")
 	fmt.Fprintln(writer, "  backlog status [flags]")
-	fmt.Fprintln(writer, "  backlog reset <issue-number> --dry-run [flags]")
-	fmt.Fprintln(writer, "  backlog retry <issue-number> [flags]")
+	fmt.Fprintln(writer, "  backlog reset <issue-number> [--dry-run | --yes] [flags]")
+	fmt.Fprintln(writer, "  backlog retry <issue-number> [--dry-run | --yes] [flags]  (deprecated alias)")
 }

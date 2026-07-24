@@ -18,19 +18,25 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
 	"github.com/robinjoseph08/backlog/internal/reset"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 	"github.com/robinjoseph08/backlog/internal/worktree"
+	"golang.org/x/term"
 )
 
 func resetCommand(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	return resetCommandWithInput(ctx, args, os.Stdin, inputIsInteractive(os.Stdin), stdout, stderr)
+}
+
+func resetCommandWithInput(ctx context.Context, args []string, stdin io.Reader, interactive bool, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("reset", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "Usage: backlog reset <issue-number> --dry-run [flags]")
+		fmt.Fprintln(stderr, "Usage: backlog reset <issue-number> [flags]")
 		flags.PrintDefaults()
 	}
 	repoDir := flags.String("repo-dir", ".", "Git repository associated with the Run")
@@ -38,7 +44,7 @@ func resetCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	gitExecutable := flags.String("git", "git", "git executable")
 	ghExecutable := flags.String("gh", "gh", "gh executable")
 	dryRun := flags.Bool("dry-run", false, "print the current Reset Plan without mutation")
-	_ = flags.Bool("yes", false, "accepted for dry-run compatibility; has no effect")
+	yes := flags.Bool("yes", false, "confirm Reset without an interactive prompt")
 	for _, arg := range args {
 		if arg == "-h" || arg == "--help" {
 			return flags.Parse([]string{arg})
@@ -58,8 +64,8 @@ func resetCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if err != nil || issueNumber <= 0 {
 		return fmt.Errorf("invalid issue number %q", issueArg)
 	}
-	if !*dryRun {
-		return errors.New("mutating Reset is not available yet; inspect with --dry-run")
+	if !*dryRun && !*yes && !interactive {
+		return errors.New("non-interactive Reset requires --yes")
 	}
 
 	absoluteRepo, err := filepath.Abs(*repoDir)
@@ -84,60 +90,171 @@ func resetCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if err != nil {
 		return err
 	}
-	current, migrationRequired, err := (state.FileStore{Path: filepath.Join(resolvedState, "state.json")}).Preview()
+	executor := resetExecutor{
+		store:  state.FileStore{Path: filepath.Join(resolvedState, "state.json")},
+		github: ghadapter.Client{Executable: *ghExecutable, Dir: repositoryRoot},
+		issue:  issueNumber, repositoryRoot: repositoryRoot, commonDirectory: commonDirectory,
+		stateDirectory: resolvedState, gitExecutable: *gitExecutable,
+	}
+	plan, err := executor.inspect(ctx)
 	if err != nil {
 		return err
 	}
-	if migrationRequired {
-		return errors.New("runner state requires migration; dry-run refuses to write the migration")
+	printResetPlan(stdout, plan)
+	if *dryRun {
+		fmt.Fprintln(stdout, "Dry-run: no changes made.")
+		return nil
 	}
-	run, lease, err := resetRun(current, issueNumber)
+	if err := validateArtifactFreeMutation(plan); err != nil {
+		return err
+	}
+	if err := validateResetMutationStatus(plan.Snapshot.Run.Status); err != nil {
+		return err
+	}
+
+	if *yes {
+		fresh, err := executor.inspect(ctx)
+		if err != nil {
+			return err
+		}
+		if err := validateArtifactFreeMutation(fresh); err != nil {
+			return err
+		}
+		if err := validateResetMutationStatus(fresh.Snapshot.Run.Status); err != nil {
+			return err
+		}
+		if !resetPlansEqual(plan, fresh) {
+			fmt.Fprintln(stdout, "Reset Plan changed after confirmation; using the current plan:")
+			printResetPlan(stdout, fresh)
+		}
+		plan = fresh
+	} else {
+		reader := bufio.NewReader(stdin)
+		for {
+			confirmed, err := confirmReset(reader, stdout)
+			if err != nil {
+				return err
+			}
+			if !confirmed {
+				fmt.Fprintln(stdout, "Reset cancelled; no changes made.")
+				return nil
+			}
+			fresh, err := executor.inspect(ctx)
+			if err != nil {
+				return err
+			}
+			if err := validateArtifactFreeMutation(fresh); err != nil {
+				return err
+			}
+			if err := validateResetMutationStatus(fresh.Snapshot.Run.Status); err != nil {
+				return err
+			}
+			if resetPlansEqual(plan, fresh) {
+				plan = fresh
+				break
+			}
+			fmt.Fprintln(stdout, "Reset Plan changed after confirmation; confirm the current plan again:")
+			printResetPlan(stdout, fresh)
+			plan = fresh
+		}
+	}
+
+	if err := ensureResetStateBinding(commonDirectory, resolvedState); err != nil {
+		return err
+	}
+	if err := executor.apply(ctx); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "Reset complete for issue #%d. No replacement Run was created.\n", issueNumber)
+	return nil
+}
+
+func ensureResetStateBinding(commonDirectory, stateDirectory string) error {
+	_, exists, err := readStateDirectoryBinding(commonDirectory)
 	if err != nil {
 		return err
+	}
+	if exists {
+		return nil
+	}
+	return bindStateDirectory(commonDirectory, stateDirectory)
+}
+
+func inputIsInteractive(file *os.File) bool {
+	return term.IsTerminal(int(file.Fd()))
+}
+
+func confirmReset(reader *bufio.Reader, stdout io.Writer) (bool, error) {
+	fmt.Fprint(stdout, "Proceed with Reset? [y/N] ")
+	line, err := reader.ReadString('\n')
+	if errors.Is(err, io.EOF) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read Reset confirmation: %w", err)
+	}
+	answer := strings.ToLower(strings.TrimSpace(line))
+	return answer == "y" || answer == "yes", nil
+}
+
+type resetExecutor struct {
+	store           state.FileStore
+	github          ghadapter.Client
+	issue           int
+	repositoryRoot  string
+	commonDirectory string
+	stateDirectory  string
+	gitExecutable   string
+}
+
+func (e resetExecutor) inspect(ctx context.Context) (reset.Plan, error) {
+	current, _, err := e.store.Preview()
+	if err != nil {
+		return reset.Plan{}, err
+	}
+	run, lease, err := resetRun(current, e.issue)
+	if err != nil {
+		return reset.Plan{}, err
 	}
 	if err := inspectWorkerAbsent(run); err != nil {
-		return err
+		return reset.Plan{}, err
 	}
-
-	github := ghadapter.Client{Executable: *ghExecutable, Dir: repositoryRoot}
-	repository, err := github.Repository(ctx)
+	repository, err := e.github.Repository(ctx)
 	if err != nil {
-		return err
+		return reset.Plan{}, err
 	}
 	if current.Repo == "" || current.Repo != repository.Slug {
-		return fmt.Errorf("Run state belongs to %q, not repository %q", current.Repo, repository.Slug)
+		return reset.Plan{}, fmt.Errorf("Run state belongs to %q, not repository %q", current.Repo, repository.Slug)
 	}
 	if current.DefaultBranch == "" || current.DefaultBranch != repository.DefaultBranch {
-		return fmt.Errorf("Run state default branch %q does not match repository default branch %q", current.DefaultBranch, repository.DefaultBranch)
+		return reset.Plan{}, fmt.Errorf("Run state default branch %q does not match repository default branch %q", current.DefaultBranch, repository.DefaultBranch)
 	}
-	originRepository, err := inspectOriginRepository(ctx, *gitExecutable, repositoryRoot)
+	originRepository, err := inspectOriginRepository(ctx, e.gitExecutable, e.repositoryRoot)
 	if err != nil {
-		return err
+		return reset.Plan{}, err
 	}
 	if !strings.EqualFold(originRepository, repository.Slug) {
-		return fmt.Errorf("Git origin belongs to %q, not repository %q", originRepository, repository.Slug)
+		return reset.Plan{}, fmt.Errorf("Git origin belongs to %q, not repository %q", originRepository, repository.Slug)
 	}
-	if err := validateOwnedPaths(run, resolvedState, repositoryRoot, repository.DefaultBranch); err != nil {
-		return err
+	if err := validateOwnedPaths(run, e.stateDirectory, e.repositoryRoot, repository.DefaultBranch); err != nil {
+		return reset.Plan{}, err
 	}
-
-	issueResource, pullResources, err := github.ResetResources(ctx, repository.Slug, issueNumber, run.Branch)
+	issueResource, pullResources, err := e.github.ResetResources(ctx, repository.Slug, e.issue, run.Branch)
 	if err != nil {
-		return err
+		return reset.Plan{}, err
 	}
-	remoteBranch, err := inspectRemoteBranch(ctx, *gitExecutable, repositoryRoot, run.Branch)
+	remoteBranch, err := inspectRemoteBranch(ctx, e.gitExecutable, e.repositoryRoot, run.Branch)
 	if err != nil {
-		return err
+		return reset.Plan{}, err
 	}
-	localBranch, localWorktree, err := inspectLocalResources(ctx, *gitExecutable, repositoryRoot, commonDirectory, run)
+	localBranch, localWorktree, err := inspectLocalResources(ctx, e.gitExecutable, e.repositoryRoot, e.commonDirectory, run)
 	if err != nil {
-		return err
+		return reset.Plan{}, err
 	}
 	session, err := inspectSession(run)
 	if err != nil {
-		return err
+		return reset.Plan{}, err
 	}
-
 	snapshot := reset.Snapshot{
 		Run: run, Lease: lease,
 		Issue:        reset.Issue{Number: issueResource.Number, URL: issueResource.URL, Open: issueResource.State == "open", Labels: issueResource.Labels},
@@ -149,18 +266,233 @@ func resetCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 			Number: pull.Number, URL: pull.URL, State: reset.PullRequestState(pull.State), AutoMergeArmed: pull.AutoMergeArmed,
 		})
 	}
-	plan, err := reset.Build(snapshot)
+	return reset.Build(snapshot)
+}
+
+func validateArtifactFreeMutation(plan reset.Plan) error {
+	snapshot := plan.Snapshot
+	if len(snapshot.PullRequests) != 0 || snapshot.RemoteBranch.Present || snapshot.LocalBranch.Present || snapshot.Worktree.Present || snapshot.Session.Present {
+		return errors.New("mutating Reset currently requires all pull request, branch, worktree, and Pi session artifacts to be absent; inspect remaining actions with --dry-run")
+	}
+	return nil
+}
+
+func validateResetMutationStatus(status scheduler.Status) error {
+	switch status {
+	case scheduler.StatusFailed, scheduler.StatusSuspended, scheduler.StatusNeedsHuman, scheduler.StatusResetting, scheduler.StatusReset:
+		return nil
+	default:
+		return fmt.Errorf("Run status %s is not eligible for Reset", status)
+	}
+}
+
+func resetPlansEqual(left, right reset.Plan) bool {
+	var leftText, rightText bytes.Buffer
+	printResetPlan(&leftText, left)
+	printResetPlan(&rightText, right)
+	return leftText.String() == rightText.String()
+}
+
+func (e resetExecutor) apply(ctx context.Context) error {
+	for {
+		plan, err := e.inspect(ctx)
+		if err != nil {
+			return err
+		}
+		if err := validateArtifactFreeMutation(plan); err != nil {
+			return err
+		}
+		if err := validateResetMutationStatus(plan.Snapshot.Run.Status); err != nil {
+			return err
+		}
+		labels := normalizedLabelSet(plan.Snapshot.Issue.Labels)
+		switch {
+		case labels["in-progress"]:
+			if err := e.markResetting(); err != nil {
+				return err
+			}
+			before, err := e.inspect(ctx)
+			if err != nil {
+				return err
+			}
+			if err := validateArtifactFreeMutation(before); err != nil {
+				return err
+			}
+			if !normalizedLabelSet(before.Snapshot.Issue.Labels)["in-progress"] {
+				continue
+			}
+			repository, err := e.repositorySlug()
+			if err != nil {
+				return err
+			}
+			if err := e.github.RemoveIssueLabel(ctx, repository, e.issue, "in-progress"); err != nil {
+				return fmt.Errorf("remove issue label in-progress: %w", err)
+			}
+			after, err := e.inspect(ctx)
+			if err != nil {
+				return err
+			}
+			if normalizedLabelSet(after.Snapshot.Issue.Labels)["in-progress"] {
+				return errors.New("remove issue label in-progress did not satisfy its verified postcondition")
+			}
+		case !labels["ready-for-agent"]:
+			if err := e.markResetting(); err != nil {
+				return err
+			}
+			before, err := e.inspect(ctx)
+			if err != nil {
+				return err
+			}
+			if err := validateArtifactFreeMutation(before); err != nil {
+				return err
+			}
+			if normalizedLabelSet(before.Snapshot.Issue.Labels)["ready-for-agent"] {
+				continue
+			}
+			repository, err := e.repositorySlug()
+			if err != nil {
+				return err
+			}
+			if err := e.github.AddIssueLabel(ctx, repository, e.issue, "ready-for-agent"); err != nil {
+				return fmt.Errorf("add issue label ready-for-agent: %w", err)
+			}
+			after, err := e.inspect(ctx)
+			if err != nil {
+				return err
+			}
+			if !normalizedLabelSet(after.Snapshot.Issue.Labels)["ready-for-agent"] {
+				return errors.New("add issue label ready-for-agent did not satisfy its verified postcondition")
+			}
+		default:
+			return e.finalize(plan)
+		}
+	}
+}
+
+func normalizedLabelSet(labels []string) map[string]bool {
+	result := make(map[string]bool, len(labels))
+	for _, label := range labels {
+		result[strings.ToLower(label)] = true
+	}
+	return result
+}
+
+func (e resetExecutor) repositorySlug() (string, error) {
+	current, _, err := e.store.Preview()
+	if err != nil {
+		return "", err
+	}
+	if current.Repo == "" {
+		return "", errors.New("Run state has no repository identity")
+	}
+	return current.Repo, nil
+}
+
+func (e resetExecutor) markResetting() error {
+	current, _, err := e.store.Preview()
 	if err != nil {
 		return err
 	}
-	printResetPlan(stdout, plan)
-	fmt.Fprintln(stdout, "Dry-run: no changes made.")
+	run, lease, err := resetRun(current, e.issue)
+	if err != nil {
+		return err
+	}
+	if run.Status == scheduler.StatusReset || run.Status == scheduler.StatusResetting {
+		return nil
+	}
+	if !scheduler.CanTransition(run.Status, scheduler.StatusResetting) {
+		return fmt.Errorf("Run status %s cannot transition to resetting", run.Status)
+	}
+	for index := range current.Runs {
+		if current.Runs[index].RunID == run.RunID {
+			current.Runs[index].Status = scheduler.StatusResetting
+			current.Runs[index].UpdatedAt = time.Now().UTC()
+			break
+		}
+	}
+	if lease.LeaseID == "" {
+		return fmt.Errorf("Run %s has no active Lease while entering resetting", run.RunID)
+	}
+	return e.store.Save(current)
+}
+
+func (e resetExecutor) finalize(verified reset.Plan) error {
+	labels := normalizedLabelSet(verified.Snapshot.Issue.Labels)
+	if labels["in-progress"] || !labels["ready-for-agent"] {
+		return errors.New("managed issue label postconditions were not verified")
+	}
+	if err := validateArtifactFreeMutation(verified); err != nil {
+		return err
+	}
+	current, _, err := e.store.Preview()
+	if err != nil {
+		return err
+	}
+	run, lease, err := resetRun(current, e.issue)
+	if err != nil {
+		return err
+	}
+	if run.RunID != verified.Snapshot.Run.RunID {
+		return fmt.Errorf("active Run changed from %s to %s before finalization", verified.Snapshot.Run.RunID, run.RunID)
+	}
+	if run.Status == scheduler.StatusReset {
+		return verifyResetFinalState(current, run.RunID)
+	}
+	if lease != verified.Snapshot.Lease {
+		return fmt.Errorf("Lease for Run %s changed before finalization", run.RunID)
+	}
+	if !scheduler.CanTransition(run.Status, scheduler.StatusReset) {
+		return fmt.Errorf("Run status %s cannot transition to reset", run.Status)
+	}
+	now := time.Now().UTC()
+	for index := range current.Runs {
+		if current.Runs[index].RunID == run.RunID {
+			current.Runs[index].Status = scheduler.StatusReset
+			current.Runs[index].UpdatedAt = now
+			current.Runs[index].CompletedAt = &now
+			break
+		}
+	}
+	for index := range current.Leases {
+		if current.Leases[index] == lease {
+			current.Leases = append(current.Leases[:index], current.Leases[index+1:]...)
+			break
+		}
+	}
+	if err := e.store.Save(current); err != nil {
+		return fmt.Errorf("atomically mark Run reset and release Lease: %w", err)
+	}
+	persisted, _, err := e.store.Preview()
+	if err != nil {
+		return fmt.Errorf("verify finalized Reset state: %w", err)
+	}
+	return verifyResetFinalState(persisted, run.RunID)
+}
+
+func verifyResetFinalState(current state.State, runID string) error {
+	found := false
+	for _, run := range current.Runs {
+		if run.RunID == runID {
+			found = true
+			if run.Status != scheduler.StatusReset {
+				return fmt.Errorf("Run %s final status is %s, not reset", runID, run.Status)
+			}
+		}
+	}
+	if !found {
+		return fmt.Errorf("historical Run %s is absent after Reset", runID)
+	}
+	for _, lease := range current.Leases {
+		if lease.RunID == runID {
+			return fmt.Errorf("old Lease %s for reset Run %s is still active", lease.LeaseID, runID)
+		}
+	}
 	return nil
 }
 
 func splitResetArguments(args []string) (string, []string, error) {
 	if len(args) == 0 {
-		return "", nil, errors.New("usage: backlog reset <issue-number> --dry-run [flags]")
+		return "", nil, errors.New("usage: backlog reset <issue-number> [flags]")
 	}
 	if !strings.HasPrefix(args[0], "-") {
 		return args[0], args[1:], nil
@@ -226,7 +558,18 @@ func resetRun(current state.State, issue int) (scheduler.Run, scheduler.Lease, e
 		}
 		return scheduler.Run{}, scheduler.Lease{}, fmt.Errorf("Lease %s for issue #%d has an invalid Run reference", lease.LeaseID, issue)
 	}
-	return scheduler.Run{}, scheduler.Lease{}, fmt.Errorf("issue #%d has no active Lease to Reset", issue)
+	for index := len(current.Runs) - 1; index >= 0; index-- {
+		run := current.Runs[index]
+		if run.Issue == issue && run.Status == scheduler.StatusReset {
+			for _, lease := range current.Leases {
+				if lease.RunID == run.RunID {
+					return scheduler.Run{}, scheduler.Lease{}, fmt.Errorf("reset Run %s still has old Lease %s", run.RunID, lease.LeaseID)
+				}
+			}
+			return run, scheduler.Lease{}, nil
+		}
+	}
+	return scheduler.Run{}, scheduler.Lease{}, fmt.Errorf("issue #%d has no active Lease or historical reset Run", issue)
 }
 
 func inspectWorkerAbsent(run scheduler.Run) error {
@@ -672,7 +1015,11 @@ func printResetPlan(writer io.Writer, plan reset.Plan) {
 	snapshot := plan.Snapshot
 	fmt.Fprintf(writer, "Reset Plan for issue #%d\n", snapshot.Run.Issue)
 	fmt.Fprintf(writer, "Run: %s (%s)\n", snapshot.Run.RunID, snapshot.Run.Status)
-	fmt.Fprintf(writer, "Lease: %s\n", snapshot.Lease.LeaseID)
+	if snapshot.Lease.LeaseID == "" {
+		fmt.Fprintln(writer, "Lease: absent (Run already reset)")
+	} else {
+		fmt.Fprintf(writer, "Lease: %s\n", snapshot.Lease.LeaseID)
+	}
 	fmt.Fprintf(writer, "Issue: %s (open; labels: %s)\n", snapshot.Issue.URL, formatLabels(snapshot.Issue.Labels))
 	fmt.Fprintf(writer, "Worker: %s\n", snapshot.WorkerSummary)
 	printBranchResource(writer, "Remote branch", snapshot.RemoteBranch)
@@ -705,6 +1052,9 @@ func printResetPlan(writer io.Writer, plan reset.Plan) {
 		}
 	}
 	fmt.Fprintln(writer, "Required actions:")
+	if len(plan.Actions) == 0 {
+		fmt.Fprintln(writer, "  None.")
+	}
 	for index, action := range plan.Actions {
 		fmt.Fprintf(writer, "  %d. %s\n", index+1, action)
 	}

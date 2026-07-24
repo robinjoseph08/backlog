@@ -119,15 +119,22 @@ Inspect the exact actions required to Reset an incomplete Run:
 backlog reset 123 --dry-run
 ```
 
-Reset dry-run holds the repository coordination lock while it inspects the Run, Lease, Worker, GitHub issue and pull requests, remote and local branches, worktree, and Pi session. It prints only actions still required. It refuses live or uncertain Workers, merged work, unknown resource state, unexplained issue closure, and human workflow labels. It never prompts, writes, or requires `--yes`; passing `--yes` has no effect.
+Reset dry-run holds the repository coordination lock while it inspects the Run, Lease, Worker, GitHub issue and pull requests, remote and local branches, worktree, and Pi session. It prints only actions still required. It refuses live or uncertain Workers, merged work, unknown resource state, unexplained issue closure, and human workflow labels. It never prompts or writes, and it does not require `--yes`.
 
-Mutating Reset is intentionally not available yet. Until it replaces Retry, allow a failed or `needs-human` issue to be scheduled again with:
+Mutating Reset currently supports eligible Runs whose pull requests, branches, worktrees, and Pi sessions are already absent. Run it interactively to review and confirm the plan, or pass `--yes` for non-interactive use:
 
 ```sh
-backlog retry 123
+backlog reset 123
+backlog reset 123 --yes
 ```
 
-Retry removes the active Lease but preserves the historical Run and prior worktree for diagnosis. The next attempt receives a new Run identity, branch, and worktree.
+Interactive confirmation defaults to no. Reset rechecks the plan after confirmation, restores the managed issue labels while preserving unrelated labels, verifies every postcondition, then atomically marks the historical Run `reset` and releases its Lease. It does not create a replacement Run. Runs with remaining artifacts can be inspected with `--dry-run`, but mutating Reset refuses them until artifact retirement is implemented.
+
+`retry` is a deprecated alias for the same Reset path, flags, output, mutations, and exit statuses. It adds a deprecation warning:
+
+```sh
+backlog retry 123 --yes
+```
 
 ## Shutdown
 

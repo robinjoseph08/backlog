@@ -358,6 +358,16 @@ func resetAutoMergeState(raw json.RawMessage, isDraft *bool) (bool, error) {
 	return !*isDraft, nil
 }
 
+// AddIssueLabel adds one managed label without replacing unrelated labels.
+func (c Client) AddIssueLabel(ctx context.Context, repo string, issue int, label string) error {
+	return c.command(ctx, "issue", "edit", fmt.Sprint(issue), "--repo", repo, "--add-label", label)
+}
+
+// RemoveIssueLabel removes one managed label without replacing unrelated labels.
+func (c Client) RemoveIssueLabel(ctx context.Context, repo string, issue int, label string) error {
+	return c.command(ctx, "issue", "edit", fmt.Sprint(issue), "--repo", repo, "--remove-label", label)
+}
+
 func (c Client) Completion(ctx context.Context, repo string, issue int, branch string) (CompletionOutcome, error) {
 	var pulls []struct {
 		Number           int             `json:"number"`
@@ -388,6 +398,24 @@ func (c Client) Completion(ctx context.Context, repo string, issue int, branch s
 	}
 	outcome.IssueClosed = strings.EqualFold(issueState.State, "closed")
 	return outcome, nil
+}
+
+func (c Client) command(ctx context.Context, args ...string) error {
+	executable := c.Executable
+	if executable == "" {
+		executable = "gh"
+	}
+	command := exec.CommandContext(ctx, executable, args...)
+	command.Dir = c.Dir
+	output, err := command.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	message := strings.TrimSpace(string(output))
+	if message != "" {
+		return fmt.Errorf("gh %s: %s", strings.Join(args, " "), message)
+	}
+	return fmt.Errorf("gh %s: %w", strings.Join(args, " "), err)
 }
 
 func (c Client) jsonCommand(ctx context.Context, target any, args ...string) error {
