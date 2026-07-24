@@ -806,6 +806,9 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 	if err != nil {
 		_ = process.Abort()
 		closed := process.Close()
+		if operationCtx.Err() != nil {
+			r.suspensionFailed.Store(true)
+		}
 		run = findActiveRun(current, run.Issue)
 		run.ResumePending = false
 		if !closed.GroupExited {
@@ -1261,8 +1264,14 @@ func (r *Runner) finalizeForceStoppedSettledWorker(current *state.State, runID s
 	}
 	cleanupCtx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
-	if err := r.Worktrees.Cleanup(cleanupCtx, assignment); err != nil {
-		return fmt.Errorf("cleanup force-stopped issue #%d worktree: %w", run.Issue, err)
+	var cleanupErr error
+	if run.Continuation != nil {
+		cleanupErr = r.verifyAndCleanupWorktree(cleanupCtx, assignment)
+	} else {
+		cleanupErr = r.Worktrees.Cleanup(cleanupCtx, assignment)
+	}
+	if cleanupErr != nil {
+		return fmt.Errorf("cleanup force-stopped issue #%d worktree: %w", run.Issue, cleanupErr)
 	}
 	return nil
 }
@@ -1291,10 +1300,16 @@ func (r *Runner) finalizeSettledWorker(ctx context.Context, current *state.State
 	if assignment.Path == "" || assignment.Branch == "" {
 		return nil
 	}
-	if err := r.Worktrees.Cleanup(ctx, assignment); err != nil {
-		r.retainProvisionalCompletion(current, &run, fmt.Sprintf("completion verified but worktree cleanup failed: %v", err))
+	var cleanupErr error
+	if run.Continuation != nil {
+		cleanupErr = r.verifyAndCleanupWorktree(ctx, assignment)
+	} else {
+		cleanupErr = r.Worktrees.Cleanup(ctx, assignment)
+	}
+	if cleanupErr != nil {
+		r.retainProvisionalCompletion(current, &run, fmt.Sprintf("completion verified but worktree cleanup failed: %v", cleanupErr))
 		if saveErr := r.Store.Save(*current); saveErr != nil {
-			return errors.Join(fmt.Errorf("cleanup issue #%d worktree: %w", run.Issue, err), fmt.Errorf("persist retained completion: %w", saveErr))
+			return errors.Join(fmt.Errorf("cleanup issue #%d worktree: %w", run.Issue, cleanupErr), fmt.Errorf("persist retained completion: %w", saveErr))
 		}
 	}
 	return nil

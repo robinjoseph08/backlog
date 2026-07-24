@@ -1626,6 +1626,46 @@ func TestRunnerRefusesCompletionCleanupWhenWorktreeInspectionIsUncertain(t *test
 	}
 }
 
+func TestRunnerVerifiesResumedWorktreeBeforeSettledCleanup(t *testing.T) {
+	t.Parallel()
+
+	run := resumableRun(t, 68, "settled-68")
+	run.Status = scheduler.StatusMerged
+	now := time.Now()
+	run.CompletedAt = &now
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{run}}}
+	worktrees := &fakeWorktrees{verifyErr: errors.New("worktree changed after Resume")}
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+	runner.Worktrees = worktrees
+	runner.Output = io.Discard
+	current := store.LoadValue()
+
+	if err := runner.finalizeSettledWorker(context.Background(), &current, run.RunID, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusNeedsHuman || !strings.Contains(got.Runs[0].Error, "changed after Resume") || len(got.Leases) != 1 || worktrees.cleanupCount() != 0 {
+		t.Fatalf("settled resumed cleanup = %#v, cleanup=%d", got, worktrees.cleanupCount())
+	}
+}
+
+func TestRunnerVerifiesResumedWorktreeBeforeForceStoppedCleanup(t *testing.T) {
+	t.Parallel()
+
+	run := resumableRun(t, 69, "force-settled-69")
+	run.Status = scheduler.StatusMerged
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{run}}}
+	worktrees := &fakeWorktrees{verifyErr: errors.New("worktree changed after Resume")}
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+	runner.Worktrees = worktrees
+	current := store.LoadValue()
+
+	err := runner.finalizeForceStoppedSettledWorker(&current, run.RunID, nil)
+	if err == nil || !strings.Contains(err.Error(), "changed after Resume") || worktrees.cleanupCount() != 0 {
+		t.Fatalf("force-stopped resumed cleanup error = %v, cleanup=%d", err, worktrees.cleanupCount())
+	}
+}
+
 func TestRunnerRecoversPersistedContinuationMarkerBeforeFinalSuspendedState(t *testing.T) {
 	t.Parallel()
 
@@ -2024,6 +2064,37 @@ func TestRunnerFailsClosedWhenReplacementWorkerCannotLaunchSafely(t *testing.T) 
 				t.Fatalf("unsafe replacement launch = %#v", got)
 			}
 		})
+	}
+}
+
+func TestRunnerInterruptedReplacementIdentityMarksSuspensionIncomplete(t *testing.T) {
+	t.Parallel()
+
+	run := resumableRun(t, 89, "interrupted-89")
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: "lease-89", Issue: 89, RunID: run.RunID}},
+	}}
+	runner := testRunner(&fakeGitHub{}, workers, store, 1)
+	runner.Output = io.Discard
+	operationCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	runner.PIDIdentity = func(ctx context.Context, _ int) (string, error) { return "", ctx.Err() }
+	current := store.LoadValue()
+
+	process, err := runner.resume(context.Background(), operationCtx, &current, run)
+	if err != nil || process != nil {
+		t.Fatalf("interrupted Resume = %#v, %v", process, err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID == 0 || len(got.Leases) != 1 || !runner.suspensionFailed.Load() {
+		t.Fatalf("interrupted replacement identity = %#v", got)
+	}
+	err = runner.suspendOwned(&current, map[int]WorkerProcess{}, 143)
+	var signalExit *SignalExit
+	if !errors.As(err, &signalExit) || signalExit.Cause == nil {
+		t.Fatalf("suspension result = %v, want incomplete SignalExit", err)
 	}
 }
 
