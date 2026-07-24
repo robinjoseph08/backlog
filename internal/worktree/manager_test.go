@@ -144,16 +144,15 @@ func TestManagerCancelsFetchBackoff(t *testing.T) {
 
 	root := t.TempDir()
 	logPath := filepath.Join(root, "git.log")
-	delayStarted := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	manager := Manager{
 		GitExecutable: failingGit(t, logPath),
 		RepositoryDir: filepath.Join(root, "repo"),
 		WorktreesDir:  filepath.Join(root, "worktrees"),
 		DefaultBranch: "trunk",
-		fetchRetryDelay: func(attempt int) time.Duration {
-			if attempt == 1 {
-				close(delayStarted)
-			}
+		fetchRetryDelay: func(int) time.Duration {
+			cancel()
 			return time.Hour
 		},
 	}
@@ -161,26 +160,10 @@ func TestManagerCancelsFetchBackoff(t *testing.T) {
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- manager.Prepare(ctx, assignment) }()
-	select {
-	case <-delayStarted:
-	case err := <-done:
-		t.Fatalf("prepare exited before fetch backoff: %v", err)
-	case <-time.After(time.Second):
-		t.Fatal("prepare did not enter fetch backoff")
-	}
-	cancel()
 
-	select {
-	case err := <-done:
-		if err == nil || !strings.Contains(err.Error(), context.Canceled.Error()) {
-			t.Fatalf("prepare error = %v, want context cancellation", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("prepare did not stop during fetch backoff")
+	err = manager.Prepare(ctx, assignment)
+	if err == nil || !strings.Contains(err.Error(), context.Canceled.Error()) {
+		t.Fatalf("prepare error = %v, want context cancellation", err)
 	}
 	logData, readErr := os.ReadFile(logPath)
 	if readErr != nil {
