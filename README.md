@@ -119,7 +119,7 @@ Follow one Run's raw Worker JSONL without acquiring scheduling ownership or comm
 backlog follow <run-id> --raw
 ```
 
-Follow writes existing complete records verbatim, waits for an unterminated record to receive its newline, and streams newly completed records in order. It exits after a terminal Run reaches `merged`, `failed`, `needs-human`, or `reset` and all complete records are emitted. Ctrl-C only detaches the follower. A missing Run or unavailable Worker log is reported for the requested Run without changing runner state.
+Follow writes existing complete records verbatim, waits for an unterminated record to receive its newline, and streams newly completed records in order. It exits after a terminal Run reaches `merged`, `failed`, `needs-human`, or `reset`, the Runner records the Worker log as closed, and all complete records are emitted. Historical terminal Runs without a log-open marker are treated as already closed. Ctrl-C only detaches the follower. A missing Run or unavailable Worker log is reported for the requested Run without changing runner state.
 
 Inspect the exact actions required to Reset an incomplete Run:
 

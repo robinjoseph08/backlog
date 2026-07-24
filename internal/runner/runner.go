@@ -326,6 +326,9 @@ func (r *Runner) Run(ctx context.Context) error {
 				completion.result.Err = errors.Join(completion.result.Err, closed.Err)
 			}
 			runID := findActiveRun(&current, completion.issue).RunID
+			if closedBeforeReconciliation && workerLogIsClosed(closed) {
+				markWorkerLogClosed(&current, runID)
+			}
 			startedDraining, err := r.handleWorkerCompletionWhileObservingSignals(operationCtx, &current, completion, signalEvents, len(localWorkers))
 			draining = startedDraining || draining
 			if err != nil && operationCtx.Err() != nil && r.suspensionExit.Load() != 0 {
@@ -353,6 +356,12 @@ func (r *Runner) Run(ctx context.Context) error {
 				var closeDraining bool
 				closed, closeDraining = r.closeSettledWhileObservingSignals(process, runID, signalEvents, len(localWorkers))
 				draining = closeDraining || draining
+				if workerLogIsClosed(closed) {
+					markWorkerLogClosed(&current, runID)
+					if err := r.Store.Save(current); err != nil {
+						return fmt.Errorf("persist closed Worker log for Run %s: %w", runID, err)
+					}
+				}
 			}
 			if closedBeforeReconciliation || closed.GroupExited {
 				delete(localWorkers, completion.issue)
@@ -653,6 +662,7 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 	run = findActiveRun(current, candidate.Number)
 	run.LogPath = logPath
 	run.StderrPath = stderrPath
+	run.WorkerLogOpen = true
 	run.UpdatedAt = r.Now().UTC()
 	replaceRun(current, run)
 	if err := r.Store.Save(*current); err != nil {
@@ -1065,12 +1075,16 @@ func (r *Runner) retainProvisionalCompletion(current *state.State, run *schedule
 func (r *Runner) failAfterWorkerStart(current *state.State, issue int, process WorkerProcess, message string) error {
 	abortErr := process.Abort()
 	closed := process.Close()
+	run := findActiveRun(current, issue)
+	if workerLogIsClosed(closed) {
+		markWorkerLogClosed(current, run.RunID)
+	}
 	if closed.GroupExited {
 		r.failRun(current, issue, message)
 		return r.saveAfterFailure(*current, issue)
 	}
 
-	run := findActiveRun(current, issue)
+	run = findActiveRun(current, issue)
 	run.PID = process.PID()
 	replaceRun(current, run)
 	cleanupErr := errors.Join(
@@ -1083,6 +1097,19 @@ func (r *Runner) failAfterWorkerStart(current *state.State, issue int, process W
 		fmt.Errorf("stop Worker for issue #%d after startup failure: %w", issue, cleanupErr),
 		r.saveAfterFailure(*current, issue),
 	)
+}
+
+func workerLogIsClosed(result worker.Result) bool {
+	return result.LogClosed || result.GroupExited
+}
+
+func markWorkerLogClosed(current *state.State, runID string) {
+	run := findRun(current.Runs, runID)
+	if run.RunID == "" {
+		return
+	}
+	run.WorkerLogOpen = false
+	replaceRun(current, run)
 }
 
 func (r *Runner) failRun(current *state.State, issue int, message string) {
@@ -1317,6 +1344,14 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 			if !closed.result.GroupExited || closed.result.Err != nil {
 				clean = false
 			}
+			if workerLogIsClosed(closed.result) {
+				run.WorkerLogOpen = false
+				replaceRun(current, run)
+				if err := r.Store.Save(*current); err != nil {
+					clean = false
+					persistenceErrors = append(persistenceErrors, fmt.Errorf("persist closed Worker log for issue #%d: %w", closed.issue, err))
+				}
+			}
 			r.logf("Suspension: %s remaining", workerSummary(len(local)))
 			continue
 		}
@@ -1342,6 +1377,9 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 			run.UpdatedAt = r.Now().UTC()
 			replaceRun(current, run)
 		} else {
+			if workerLogIsClosed(closed.result) {
+				run.WorkerLogOpen = false
+			}
 			if outcome, exists := verifiedOutcomes[closed.issue]; exists && failureReasons[closed.issue] == "" {
 				if err := r.applyOutcome(ctx, current, run, outcome, true, false); err != nil {
 					clean = false
@@ -1424,6 +1462,10 @@ func (r *Runner) shutdownOwned(
 		completion := <-completions
 		if process := local[completion.issue]; process != nil {
 			closed := process.Close()
+			run := findActiveRun(current, completion.issue)
+			if workerLogIsClosed(closed) {
+				markWorkerLogClosed(current, run.RunID)
+			}
 			if closed.Err != nil && !errors.Is(closed.Err, context.Canceled) {
 				shutdownErrors = append(shutdownErrors, fmt.Errorf("close issue #%d worker: %w", completion.issue, closed.Err))
 			}

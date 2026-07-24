@@ -100,7 +100,7 @@ echo 'diagnostic' >&2
 		t.Fatalf("Pi was not alive at settlement: %v", err)
 	}
 	result := process.Close()
-	if result.Err != nil || result.ExitCode != 0 {
+	if result.Err != nil || result.ExitCode != 0 || !result.LogClosed {
 		t.Fatalf("close = %#v", result)
 	}
 

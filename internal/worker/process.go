@@ -53,6 +53,7 @@ type Result struct {
 	ExitCode     int
 	GroupExited  bool
 	ForceStopped bool
+	LogClosed    bool
 	LogPath      string
 	StderrPath   string
 	Settled      bool
@@ -531,7 +532,7 @@ func (p *Process) reap() {
 	}
 	p.resultMu.Lock()
 	p.result = Result{
-		ExitCode: exitCode, LogPath: p.logPath, StderrPath: p.stderrPath,
+		ExitCode: exitCode, LogClosed: true, LogPath: p.logPath, StderrPath: p.stderrPath,
 		Settled:   p.events.Settled() && streamErr == nil,
 		StreamErr: streamErr, cleanupErr: closeErr, Err: errors.Join(waitErr, streamErr, closeErr),
 	}

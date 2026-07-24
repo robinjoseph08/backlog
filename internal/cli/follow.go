@@ -25,6 +25,10 @@ type followStateSource interface {
 func followCommand(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("follow", flag.ContinueOnError)
 	flags.SetOutput(stderr)
+	flags.Usage = func() {
+		fmt.Fprintln(stderr, "Usage: backlog follow <run-id> --raw [flags]")
+		flags.PrintDefaults()
+	}
 	repoDir := flags.String("repo-dir", ".", "Git repository associated with the Run")
 	stateDir := flags.String("state-dir", "", "runner state directory")
 	gitExecutable := flags.String("git", "git", "git executable used to identify the repository root")
@@ -81,17 +85,6 @@ func followFlagTakesValue(name string) bool {
 }
 
 func followRaw(ctx context.Context, source followStateSource, runID string, output io.Writer, pollInterval time.Duration) error {
-	return followRawWithProcessProbe(ctx, source, runID, output, pollInterval, followRunProcessGroupActive)
-}
-
-func followRawWithProcessProbe(
-	ctx context.Context,
-	source followStateSource,
-	runID string,
-	output io.Writer,
-	pollInterval time.Duration,
-	processGroupActive func(scheduler.Run) (bool, error),
-) error {
 	selected, err := loadFollowRun(source, runID)
 	if err != nil {
 		return err
@@ -128,39 +121,16 @@ func followRawWithProcessProbe(
 		if selected.LogPath != logPath {
 			return fmt.Errorf("Run %q Worker log changed from %q to %q", runID, logPath, selected.LogPath)
 		}
-		if scheduler.IsTerminal(selected.Status) {
-			active, err := processGroupActive(selected)
-			if err != nil {
-				return fmt.Errorf("follow Run %q: verify Worker process-group exit: %w", runID, err)
+		if scheduler.IsTerminal(selected.Status) && !selected.WorkerLogOpen {
+			if err := stream.emitAvailable(); err != nil {
+				return fmt.Errorf("finish following Run %q Worker log %q: %w", runID, logPath, err)
 			}
-			if !active {
-				if err := stream.emitAvailable(); err != nil {
-					return fmt.Errorf("finish following Run %q Worker log %q: %w", runID, logPath, err)
-				}
-				return nil
-			}
+			return nil
 		}
 		if !waitToFollow(ctx, pollInterval) {
 			return nil
 		}
 	}
-}
-
-func followRunProcessGroupActive(run scheduler.Run) (bool, error) {
-	pid := run.PID
-	if pid == 0 && run.ProcessIdentity != "" {
-		var err error
-		pid, err = processIdentityPID(run.ProcessIdentity)
-		if err != nil {
-			return false, fmt.Errorf("read recorded Worker identity: %w", err)
-		}
-	}
-	if pid <= 0 {
-		return false, nil
-	}
-	// POSIX signal 0 performs only existence and permission checks. It does not
-	// deliver a signal to the Worker process group.
-	return signalZero(-pid)
 }
 
 func loadFollowRun(source followStateSource, runID string) (scheduler.Run, error) {
@@ -188,9 +158,10 @@ func waitToFollow(ctx context.Context, interval time.Duration) bool {
 }
 
 type rawLogStream struct {
-	file    *os.File
-	output  io.Writer
-	pending []byte
+	file          *os.File
+	output        io.Writer
+	scannedOffset int64
+	emittedOffset int64
 }
 
 func (s *rawLogStream) emitAvailable() error {
@@ -198,12 +169,12 @@ func (s *rawLogStream) emitAvailable() error {
 	for {
 		count, err := s.file.Read(buffer)
 		if count > 0 {
-			s.pending = append(s.pending, buffer[:count]...)
-			if newline := bytes.LastIndexByte(s.pending, '\n'); newline >= 0 {
-				if err := writeAll(s.output, s.pending[:newline+1]); err != nil {
-					return fmt.Errorf("write raw JSONL: %w", err)
+			s.scannedOffset += int64(count)
+			if newline := bytes.LastIndexByte(buffer[:count], '\n'); newline >= 0 {
+				completeOffset := s.scannedOffset - int64(count-newline-1)
+				if err := s.emitThrough(completeOffset, buffer); err != nil {
+					return err
 				}
-				s.pending = append(s.pending[:0], s.pending[newline+1:]...)
 			}
 		}
 		if errors.Is(err, io.EOF) {
@@ -213,6 +184,28 @@ func (s *rawLogStream) emitAvailable() error {
 			return fmt.Errorf("read raw JSONL: %w", err)
 		}
 	}
+}
+
+func (s *rawLogStream) emitThrough(completeOffset int64, buffer []byte) error {
+	reader := io.NewSectionReader(s.file, s.emittedOffset, completeOffset-s.emittedOffset)
+	remaining := completeOffset - s.emittedOffset
+	for remaining > 0 {
+		count, err := reader.Read(buffer)
+		if count > 0 {
+			if writeErr := writeAll(s.output, buffer[:count]); writeErr != nil {
+				return fmt.Errorf("write raw JSONL: %w", writeErr)
+			}
+			remaining -= int64(count)
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("read complete raw JSONL: %w", err)
+		}
+		if count == 0 {
+			return fmt.Errorf("read complete raw JSONL: %w", io.ErrUnexpectedEOF)
+		}
+	}
+	s.emittedOffset = completeOffset
+	return nil
 }
 
 func writeAll(writer io.Writer, data []byte) error {

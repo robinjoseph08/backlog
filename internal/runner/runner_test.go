@@ -240,7 +240,7 @@ func TestRunnerPersistsObservableWorkerContextBeforeRelease(t *testing.T) {
 			return
 		}
 		run := findActiveRun(&current, issue)
-		if run.Status != scheduler.StatusRunning || run.PID != 1000+issue || run.ProcessIdentity == "" ||
+		if run.Status != scheduler.StatusRunning || run.PID != 1000+issue || run.ProcessIdentity == "" || !run.WorkerLogOpen ||
 			run.IssueTitle != "Make Runs observable" || run.IssueURL != "https://github.com/acme/widgets/issues/7" ||
 			run.LogPath != "/logs/run-7.jsonl" || run.StderrPath != "/logs/run-7.stderr.log" {
 			released <- fmt.Errorf("Run at release = %#v", run)

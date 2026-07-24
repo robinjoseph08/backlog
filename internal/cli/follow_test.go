@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -61,7 +62,8 @@ func TestFollowRawSelectsExactTerminalRunAndWritesCompleteRecordsVerbatim(t *tes
 func TestFollowRawStreamsAppendedCompleteRecordsWithoutLosingPartialRecord(t *testing.T) {
 	directory := t.TempDir()
 	logPath := filepath.Join(directory, "active.jsonl")
-	if err := os.WriteFile(logPath, []byte("{\"record\":1}\n{\"record\""), 0o600); err != nil {
+	largePartial := `{"record":"` + strings.Repeat("x", 70*1024)
+	if err := os.WriteFile(logPath, []byte("{\"record\":1}\n"+largePartial), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	store := state.FileStore{Path: filepath.Join(directory, "state.json")}
@@ -87,7 +89,7 @@ func TestFollowRawStreamsAppendedCompleteRecordsWithoutLosingPartialRecord(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := io.WriteString(log, ":2}\n{\"record\":3}\n"); err != nil {
+	if _, err := io.WriteString(log, `"}`+"\n{\"record\":3}\n"); err != nil {
 		log.Close()
 		t.Fatal(err)
 	}
@@ -107,81 +109,26 @@ func TestFollowRawStreamsAppendedCompleteRecordsWithoutLosingPartialRecord(t *te
 	case <-time.After(2 * time.Second):
 		t.Fatal("follower did not exit after Run became terminal")
 	}
-	want := "{\"record\":1}\n{\"record\":2}\n{\"record\":3}\n"
+	want := "{\"record\":1}\n" + largePartial + `"}` + "\n{\"record\":3}\n"
 	if got := output.String(); got != want {
 		t.Fatalf("raw output = %q, want %q", got, want)
 	}
 }
 
-func TestFollowRawDrainsRecordsAppendedAfterTerminalStateBeforeWorkerExit(t *testing.T) {
+func TestFollowRawDrainsRecordAppendedAsWorkerLogCloses(t *testing.T) {
 	directory := t.TempDir()
 	logPath := filepath.Join(directory, "terminal-race.jsonl")
 	if err := os.WriteFile(logPath, []byte("before-terminal\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store := state.FileStore{Path: filepath.Join(directory, "state.json")}
-	run := scheduler.Run{
+	source := &closingFollowSource{run: scheduler.Run{
 		Issue: 4, RunID: "terminal-race", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint,
-		PID: 444, ProcessIdentity: "444:start", StartedAt: time.Now(), LogPath: logPath,
-	}
-	if err := store.Save(state.State{
-		Version: state.CurrentVersion, Runs: []scheduler.Run{run},
-		Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
-	}); err != nil {
-		t.Fatal(err)
-	}
+		PID: 444, ProcessIdentity: "444:start", StartedAt: time.Now(), LogPath: logPath, WorkerLogOpen: true,
+	}}
 
-	workerExitObserved := make(chan struct{})
-	probeReached := make(chan struct{})
-	var probeOnce sync.Once
-	probe := func(selected scheduler.Run) (bool, error) {
-		if selected.RunID != run.RunID {
-			return false, errors.New("unexpected Run")
-		}
-		select {
-		case <-workerExitObserved:
-			return false, nil
-		default:
-			probeOnce.Do(func() { close(probeReached) })
-			return true, nil
-		}
-	}
-	var output synchronizedBuffer
-	done := make(chan error, 1)
-	go func() {
-		done <- followRawWithProcessProbe(context.Background(), store, run.RunID, &output, 5*time.Millisecond, probe)
-	}()
-	waitForBuffer(t, &output, "before-terminal\n")
-
-	run.Status = scheduler.StatusMerged
-	if err := store.Save(state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{run}}); err != nil {
+	var output bytes.Buffer
+	if err := followRaw(context.Background(), source, source.run.RunID, &output, time.Millisecond); err != nil {
 		t.Fatal(err)
-	}
-	select {
-	case <-probeReached:
-	case <-time.After(2 * time.Second):
-		t.Fatal("follower did not wait for terminal Worker's process group")
-	}
-	log, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := io.WriteString(log, "after-terminal\n"); err != nil {
-		log.Close()
-		t.Fatal(err)
-	}
-	if err := log.Close(); err != nil {
-		t.Fatal(err)
-	}
-	close(workerExitObserved)
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("follower did not exit after Worker process-group exit")
 	}
 	if got, want := output.String(), "before-terminal\nafter-terminal\n"; got != want {
 		t.Fatalf("raw output = %q, want %q", got, want)
@@ -218,6 +165,42 @@ func TestFollowRawWaitsForActiveRunLogPath(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("follower did not observe the new log path")
+	}
+	if got := output.String(); got != "ready\n" {
+		t.Fatalf("raw output = %q", got)
+	}
+}
+
+func TestFollowRawWaitsForWorktreeReadyRunLogPath(t *testing.T) {
+	directory := t.TempDir()
+	store := state.FileStore{Path: filepath.Join(directory, "state.json")}
+	run := scheduler.Run{Issue: 5, RunID: "worktree-ready", Status: scheduler.StatusWorktreeReady, WorkerMode: scheduler.WorkerModePrint}
+	if err := store.Save(state.State{
+		Version: state.CurrentVersion, Runs: []scheduler.Run{run},
+		Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var output synchronizedBuffer
+	done := make(chan error, 1)
+	go func() { done <- followRaw(context.Background(), store, run.RunID, &output, 5*time.Millisecond) }()
+
+	logPath := filepath.Join(directory, "worktree-ready.jsonl")
+	if err := os.WriteFile(logPath, []byte("ready\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run.LogPath = logPath
+	run.Status = scheduler.StatusFailed
+	if err := store.Save(state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{run}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("follower did not observe the worktree-ready Run log path")
 	}
 	if got := output.String(); got != "ready\n" {
 		t.Fatalf("raw output = %q", got)
@@ -418,18 +401,22 @@ func TestFollowRequiresRawModeAndRunID(t *testing.T) {
 func TestSplitFollowArgumentsAcceptsRunIDBeforeOrAfterFlags(t *testing.T) {
 	t.Parallel()
 
-	for _, args := range [][]string{
-		{"run-1", "--raw"},
-		{"--raw", "run-1"},
-		{"--repo-dir", "/tmp/repo", "run-1", "--raw"},
-		{"--state-dir=/tmp/state", "run-1", "--raw"},
-	} {
-		runID, flags, err := splitFollowArguments(args)
+	tests := []struct {
+		args      []string
+		wantFlags []string
+	}{
+		{[]string{"run-1", "--raw"}, []string{"--raw"}},
+		{[]string{"--raw", "run-1"}, []string{"--raw"}},
+		{[]string{"--repo-dir", "/tmp/repo", "run-1", "--raw"}, []string{"--repo-dir", "/tmp/repo", "--raw"}},
+		{[]string{"--state-dir=/tmp/state", "run-1", "--raw"}, []string{"--state-dir=/tmp/state", "--raw"}},
+	}
+	for _, test := range tests {
+		runID, flags, err := splitFollowArguments(test.args)
 		if err != nil {
-			t.Fatalf("split %q: %v", args, err)
+			t.Fatalf("split %q: %v", test.args, err)
 		}
-		if runID != "run-1" || len(flags) == 0 {
-			t.Fatalf("split %q = %q, %q", args, runID, flags)
+		if runID != "run-1" || !slices.Equal(flags, test.wantFlags) {
+			t.Fatalf("split %q = %q, %q, want flags %q", test.args, runID, flags, test.wantFlags)
 		}
 	}
 }
@@ -482,6 +469,36 @@ func (s *sequenceFollowSource) Preview() (state.State, bool, error) {
 		s.runs = s.runs[1:]
 	}
 	return state.State{Runs: []scheduler.Run{run}}, false, nil
+}
+
+type closingFollowSource struct {
+	mu       sync.Mutex
+	run      scheduler.Run
+	previews int
+}
+
+func (s *closingFollowSource) Preview() (state.State, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.previews++
+	if s.previews == 2 {
+		s.run.Status = scheduler.StatusMerged
+	}
+	if s.previews == 3 {
+		log, err := os.OpenFile(s.run.LogPath, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			return state.State{}, false, err
+		}
+		if _, err := io.WriteString(log, "after-terminal\n"); err != nil {
+			log.Close()
+			return state.State{}, false, err
+		}
+		if err := log.Close(); err != nil {
+			return state.State{}, false, err
+		}
+		s.run.WorkerLogOpen = false
+	}
+	return state.State{Runs: []scheduler.Run{s.run}}, false, nil
 }
 
 type failingWriter struct{}

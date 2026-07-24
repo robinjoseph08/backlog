@@ -11,7 +11,7 @@ func RequiresLease(status Status) bool {
 	}
 }
 
-// IsTerminal reports whether a status ends Follow after its Worker JSONL is drained.
+// IsTerminal reports whether a Run status stops producing autonomous work.
 func IsTerminal(status Status) bool {
 	switch status {
 	case StatusReset, StatusMerged, StatusFailed, StatusNeedsHuman:

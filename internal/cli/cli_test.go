@@ -389,7 +389,7 @@ func TestCommandHelpExitsSuccessfully(t *testing.T) {
 	if exit := Main(context.Background(), []string{"follow", "--help"}, &stdout, &stderr); exit != 0 {
 		t.Fatalf("follow help exit = %d, stderr = %q", exit, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "raw") || strings.Contains(stderr.String(), "requires a Run ID") {
+	if !strings.Contains(stderr.String(), "Usage: backlog follow <run-id> --raw [flags]") || strings.Contains(stderr.String(), "requires a Run ID") {
 		t.Fatalf("follow help = %q", stderr.String())
 	}
 

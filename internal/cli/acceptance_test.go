@@ -516,6 +516,9 @@ while IFS= read -r ignored; do :; done
 	if err := runnerCommand.Wait(); err != nil {
 		t.Fatalf("runner completion: %v\n%s", err, runnerOutput.String())
 	}
+	if strings.Contains(runnerOutput.String(), "Drain:") || strings.Contains(runnerOutput.String(), "Suspension:") {
+		t.Fatalf("follower Ctrl-C affected Runner lifecycle:\n%s", runnerOutput.String())
+	}
 	if err := secondFollower.Wait(); err != nil {
 		t.Fatalf("terminal follower: %v\n%s", err, secondOutput.String())
 	}
