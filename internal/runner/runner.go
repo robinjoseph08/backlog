@@ -585,6 +585,12 @@ func (r *Runner) initializeState(current *state.State) error {
 	}
 	current.DefaultBranch = r.Config.DefaultBranch
 	current.MaxConcurrentIssues = r.Config.MaxConcurrentIssues
+	// The CLI holds the exclusive repository scheduling lock before Run starts.
+	// Any persisted open marker therefore belongs to a previous Runner whose
+	// in-process Worker log writer is already closed.
+	for index := range current.Runs {
+		current.Runs[index].WorkerLogOpen = false
+	}
 	return nil
 }
 

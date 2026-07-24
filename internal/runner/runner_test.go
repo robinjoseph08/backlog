@@ -21,6 +21,29 @@ import (
 	"github.com/robinjoseph08/backlog/internal/worktree"
 )
 
+func TestRunnerStartupClosesOrphanedWorkerLogMarkers(t *testing.T) {
+	t.Parallel()
+
+	completedAt := time.Now()
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion,
+		Runs: []scheduler.Run{{
+			Issue: 27, RunID: "run-27", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModeRPC,
+			SessionID: "backlog-run-27", SessionDir: "/tmp/backlog-sessions/run-27",
+			LogPath: "/tmp/run-27.jsonl", WorkerLogOpen: true, CompletedAt: &completedAt,
+		}},
+	}}
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatalf("restart Runner: %v", err)
+	}
+	got := store.LoadValue()
+	if len(got.Runs) != 1 || got.Runs[0].WorkerLogOpen {
+		t.Fatalf("state after Runner restart = %#v, want orphaned Worker log closed", got)
+	}
+}
+
 func TestRunnerFillsSlotsAndImmediatelyRefillsAfterCompletion(t *testing.T) {
 	t.Parallel()
 
