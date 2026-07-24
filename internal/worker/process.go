@@ -890,17 +890,19 @@ func rejectDuplicateJSONKeys(decoder *json.Decoder) error {
 	return nil
 }
 
+type continuationEntry struct {
+	Type             string          `json:"type"`
+	ID               string          `json:"id"`
+	ParentID         *string         `json:"parentId"`
+	Message          json.RawMessage `json:"message"`
+	FirstKeptEntryID string          `json:"firstKeptEntryId"`
+}
+
 func verifyContinuationLeaf(entries []json.RawMessage, leafID string) error {
-	type entry struct {
-		Type     string          `json:"type"`
-		ID       string          `json:"id"`
-		ParentID *string         `json:"parentId"`
-		Message  json.RawMessage `json:"message"`
-	}
-	byID := make(map[string]entry, len(entries))
-	ordered := make([]entry, 0, len(entries))
+	byID := make(map[string]continuationEntry, len(entries))
+	ordered := make([]continuationEntry, 0, len(entries))
 	for _, raw := range entries {
-		if err := rejectNonCanonicalJSONFields(raw, "type", "id", "parentId", "message"); err != nil {
+		if err := rejectNonCanonicalJSONFields(raw, "type", "id", "parentId", "message", "firstKeptEntryId"); err != nil {
 			return fmt.Errorf("decode Pi session entry: %w", err)
 		}
 		var fields map[string]json.RawMessage
@@ -910,7 +912,7 @@ func verifyContinuationLeaf(entries []json.RawMessage, leafID string) error {
 		if _, exists := fields["parentId"]; !exists {
 			return errors.New("Pi session contains an entry without parent identity")
 		}
-		var value entry
+		var value continuationEntry
 		if err := json.Unmarshal(raw, &value); err != nil || value.ID == "" || value.Type == "" {
 			return errors.New("Pi session contains an entry without durable identity and type")
 		}
@@ -947,7 +949,7 @@ func verifyContinuationLeaf(entries []json.RawMessage, leafID string) error {
 	if ordered[len(ordered)-1].ID != leafID {
 		return fmt.Errorf("Pi session leaf %q is not the durable file leaf %q", leafID, ordered[len(ordered)-1].ID)
 	}
-	var branch []entry
+	var branch []continuationEntry
 	seen := make(map[string]struct{})
 	for current := leafID; current != ""; {
 		value, exists := byID[current]
@@ -968,8 +970,12 @@ func verifyContinuationLeaf(entries []json.RawMessage, leafID string) error {
 	for left, right := 0, len(branch)-1; left < right; left, right = left+1, right-1 {
 		branch[left], branch[right] = branch[right], branch[left]
 	}
+	contextBranch, err := compactionAwareBranch(branch)
+	if err != nil {
+		return err
+	}
 	pending := make(map[string]struct{})
-	for _, value := range branch {
+	for _, value := range contextBranch {
 		if value.Type != "message" {
 			continue
 		}
@@ -1031,6 +1037,37 @@ func verifyContinuationLeaf(entries []json.RawMessage, leafID string) error {
 		return fmt.Errorf("Pi session continuation has %d tool calls without durable results", len(pending))
 	}
 	return nil
+}
+
+func compactionAwareBranch(branch []continuationEntry) ([]continuationEntry, error) {
+	latestCompaction := -1
+	for index, value := range branch {
+		if value.Type == "compaction" {
+			latestCompaction = index
+		}
+	}
+	if latestCompaction < 0 {
+		return branch, nil
+	}
+	compaction := branch[latestCompaction]
+	if compaction.FirstKeptEntryID == "" {
+		return nil, fmt.Errorf("Pi session compaction entry %q has no first kept entry", compaction.ID)
+	}
+	firstKept := -1
+	for index := 0; index < latestCompaction; index++ {
+		if branch[index].ID == compaction.FirstKeptEntryID {
+			firstKept = index
+			break
+		}
+	}
+	if firstKept < 0 {
+		return nil, fmt.Errorf("Pi session compaction entry %q references missing first kept entry %q", compaction.ID, compaction.FirstKeptEntryID)
+	}
+	contextBranch := make([]continuationEntry, 0, 1+latestCompaction-firstKept+len(branch)-latestCompaction-1)
+	contextBranch = append(contextBranch, compaction)
+	contextBranch = append(contextBranch, branch[firstKept:latestCompaction]...)
+	contextBranch = append(contextBranch, branch[latestCompaction+1:]...)
+	return contextBranch, nil
 }
 
 func waitForProcessGroupExitContext(ctx context.Context, pid int) error {
@@ -1152,27 +1189,28 @@ type responseWaiter struct {
 }
 
 type rpcWriter struct {
-	mu                     sync.Mutex
-	destination            io.Writer
-	buffer                 []byte
-	lineNumber             int
-	issue                  int
-	commandID              string
-	state                  rpcAgentState
-	turnOpen               bool
-	completedTurns         int
-	messageOpen            bool
-	compactionOpen         bool
-	retryOpen              bool
-	retryAttempt           int
-	summarizationRetryOpen bool
-	openTools              map[string]struct{}
-	responses              map[string]responseWaiter
-	parseErrors            []error
-	settled                chan struct{}
-	failed                 chan struct{}
-	settledOnce            sync.Once
-	failedOnce             sync.Once
+	mu                        sync.Mutex
+	destination               io.Writer
+	buffer                    []byte
+	lineNumber                int
+	issue                     int
+	commandID                 string
+	state                     rpcAgentState
+	turnOpen                  bool
+	completedTurns            int
+	messageOpen               bool
+	compactionOpen            bool
+	retryOpen                 bool
+	retryAttempt              int
+	summarizationRetryOpen    bool
+	summarizationRetryAttempt int
+	openTools                 map[string]struct{}
+	responses                 map[string]responseWaiter
+	parseErrors               []error
+	settled                   chan struct{}
+	failed                    chan struct{}
+	settledOnce               sync.Once
+	failedOnce                sync.Once
 }
 
 func newRPCWriter(destination io.Writer, commandID string, issue int) *rpcWriter {
@@ -1413,7 +1451,7 @@ func (w *rpcWriter) validate(line []byte) {
 		}
 		w.compactionOpen = true
 	case "compaction_end":
-		if w.state != rpcBetweenAgentRuns || !w.compactionOpen {
+		if w.state != rpcBetweenAgentRuns || !w.compactionOpen || w.summarizationRetryOpen {
 			w.invalidOrder(message.Type)
 			return
 		}
@@ -1433,22 +1471,24 @@ func (w *rpcWriter) validate(line []byte) {
 		w.retryOpen = false
 		w.retryAttempt = 0
 	case "summarization_retry_scheduled":
-		if w.state != rpcBetweenAgentRuns || w.compactionOpen || w.retryOpen || w.summarizationRetryOpen || message.Attempt <= 0 {
+		if w.state != rpcBetweenAgentRuns || w.retryOpen || message.Attempt <= w.summarizationRetryAttempt {
 			w.invalidOrder(message.Type)
 			return
 		}
 		w.summarizationRetryOpen = true
+		w.summarizationRetryAttempt = message.Attempt
 	case "summarization_retry_attempt_start":
 		if w.state != rpcBetweenAgentRuns || !w.summarizationRetryOpen {
 			w.invalidOrder(message.Type)
 			return
 		}
 	case "summarization_retry_finished":
-		if w.state != rpcBetweenAgentRuns || !w.summarizationRetryOpen || w.compactionOpen {
+		if w.state != rpcBetweenAgentRuns || !w.summarizationRetryOpen {
 			w.invalidOrder(message.Type)
 			return
 		}
 		w.summarizationRetryOpen = false
+		w.summarizationRetryAttempt = 0
 	case "queue_update", "extension_error":
 		if w.state == rpcAwaitingResponse {
 			w.invalidOrder(message.Type)

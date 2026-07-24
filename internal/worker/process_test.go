@@ -274,11 +274,13 @@ printf '%s\n' \
   '{"type":"auto_retry_end","attempt":2}' \
   '{"type":"turn_end"}' \
   '{"type":"agent_end"}' \
+  '{"type":"compaction_start"}' \
   '{"type":"summarization_retry_scheduled","attempt":1,"maxAttempts":3,"delayMs":10,"errorMessage":"transient"}' \
   '{"type":"summarization_retry_attempt_start","source":"compaction","reason":"manual"}' \
-  '{"type":"compaction_start"}' \
-  '{"type":"compaction_end"}' \
+  '{"type":"summarization_retry_scheduled","attempt":2,"maxAttempts":3,"delayMs":20,"errorMessage":"transient again"}' \
+  '{"type":"summarization_retry_attempt_start","source":"compaction","reason":"manual"}' \
   '{"type":"summarization_retry_finished"}' \
+  '{"type":"compaction_end"}' \
   '{"type":"agent_settled"}'
 while IFS= read -r ignored; do :; done
 `)
@@ -1082,6 +1084,47 @@ func TestVerifyContinuationAcceptsDocumentedMessageRolesAndNonMessageLeaf(t *tes
 	)
 	if err != nil {
 		t.Fatalf("documented multi-root Pi session: %v", err)
+	}
+}
+
+func TestVerifyContinuationValidatesCompactionAwareToolTail(t *testing.T) {
+	t.Parallel()
+
+	sessionDir := t.TempDir()
+	worktree := t.TempDir()
+	sessionFile := filepath.Join(sessionDir, "session.jsonl")
+	tests := []struct {
+		name      string
+		firstKept string
+		wantError bool
+	}{
+		{name: "summarized incomplete tool call", firstKept: "kept"},
+		{name: "retained incomplete tool call", firstKept: "old-assistant", wantError: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			entries := []string{
+				`{"type":"message","id":"old-assistant","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"old-tool"}]}}`,
+				`{"type":"message","id":"kept","parentId":"old-assistant","message":{"role":"user","content":"kept context"}}`,
+				`{"type":"compaction","id":"compaction","parentId":"kept","summary":"summary","firstKeptEntryId":"` + test.firstKept + `","tokensBefore":100}`,
+				`{"type":"message","id":"leaf","parentId":"compaction","message":{"role":"user","content":"continue"}}`,
+			}
+			content := `{"type":"session","version":3,"id":"session-1","cwd":` + strconv.Quote(worktree) + `}` + "\n" + strings.Join(entries, "\n") + "\n"
+			if err := os.WriteFile(sessionFile, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			hash := sha256.Sum256([]byte(content))
+			err := VerifyContinuation(
+				ContinuationRequest{SessionID: "session-1", SessionDir: sessionDir, Worktree: worktree},
+				Continuation{SessionID: "session-1", SessionFile: sessionFile, Worktree: worktree, LeafID: "leaf", EntryCount: len(entries), SHA256: hex.EncodeToString(hash[:])},
+			)
+			if test.wantError && (err == nil || !strings.Contains(err.Error(), "without durable results")) {
+				t.Fatalf("retained tool tail error = %v", err)
+			}
+			if !test.wantError && err != nil {
+				t.Fatalf("summarized tool tail: %v", err)
+			}
+		})
 	}
 }
 
