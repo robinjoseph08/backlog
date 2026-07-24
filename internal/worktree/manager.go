@@ -132,7 +132,7 @@ func (m Manager) Verify(ctx context.Context, assignment Assignment) error {
 func rejectSymlinkedWorktreePath(worktreesDir, worktreePath string) error {
 	relative, err := filepath.Rel(worktreesDir, worktreePath)
 	if err != nil || relative == "." || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return nil
+		return fmt.Errorf("worktree %q is outside managed root %q", worktreePath, worktreesDir)
 	}
 	current := filepath.Clean(worktreesDir)
 	components := append([]string{""}, strings.Split(relative, string(filepath.Separator))...)

@@ -92,8 +92,8 @@ func TestManagerCreatesAndCleansRealIsolatedWorktree(t *testing.T) {
 	}
 	unrelated := filepath.Join(root, "unrelated")
 	runGit(t, "", "init", "-b", assignment.Branch, unrelated)
-	if err := manager.Verify(context.Background(), Assignment{Path: unrelated, Branch: assignment.Branch}); err == nil || !strings.Contains(err.Error(), "common directory") {
-		t.Fatalf("unrelated repository verification error = %v", err)
+	if err := manager.Verify(context.Background(), Assignment{Path: unrelated, Branch: assignment.Branch}); err == nil || !strings.Contains(err.Error(), "outside managed root") {
+		t.Fatalf("unmanaged worktree verification error = %v", err)
 	}
 	runGit(t, assignment.Path, "checkout", "-b", "changed-branch")
 	if err := manager.Verify(context.Background(), assignment); err == nil || !strings.Contains(err.Error(), "does not match expected branch") {

@@ -1074,6 +1074,37 @@ func TestVerifyContinuationRejectsCaseVariantIdentityAliases(t *testing.T) {
 			want:    "identity and type",
 		},
 		{
+			name:    "missing parent identity",
+			header:  `{"type":"session","id":"session-1","cwd":` + strconv.Quote(worktree) + `}`,
+			entries: `{"type":"message","id":"leaf","message":{"role":"user","content":"continue"}}`,
+			want:    "without parent identity",
+		},
+		{
+			name:   "second root truncates tool tail",
+			header: `{"type":"session","id":"session-1","cwd":` + strconv.Quote(worktree) + `}`,
+			entries: `{"type":"message","id":"assistant","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"tool-1"}]}}` + "\n" +
+				`{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"continue"}}`,
+			want: "root entries",
+		},
+		{
+			name:    "case-variant entry type",
+			header:  `{"type":"session","id":"session-1","cwd":` + strconv.Quote(worktree) + `}`,
+			entries: `{"type":"Message","id":"leaf","parentId":null,"message":{"role":"user","content":"continue"}}`,
+			want:    "non-canonical type",
+		},
+		{
+			name:    "case-variant message role",
+			header:  `{"type":"session","id":"session-1","cwd":` + strconv.Quote(worktree) + `}`,
+			entries: `{"type":"message","id":"leaf","parentId":null,"message":{"role":"Assistant","content":[]}}`,
+			want:    "unsupported role",
+		},
+		{
+			name:    "case-variant tool call type",
+			header:  `{"type":"session","id":"session-1","cwd":` + strconv.Quote(worktree) + `}`,
+			entries: `{"type":"message","id":"leaf","parentId":null,"message":{"role":"assistant","content":[{"type":"ToolCall","id":"tool-1"}]}}`,
+			want:    "non-canonical content type",
+		},
+		{
 			name:    "null message metadata",
 			header:  `{"type":"session","id":"session-1","cwd":` + strconv.Quote(worktree) + `}`,
 			entries: `{"type":"message","id":"leaf","parentId":null,"message":null}`,
@@ -1089,7 +1120,7 @@ func TestVerifyContinuationRejectsCaseVariantIdentityAliases(t *testing.T) {
 			hash := sha256.Sum256([]byte(content))
 			continuation := Continuation{
 				SessionID: "session-1", SessionFile: sessionFile, Worktree: worktree,
-				LeafID: "leaf", EntryCount: 1, SHA256: hex.EncodeToString(hash[:]),
+				LeafID: "leaf", EntryCount: strings.Count(test.entries, "\n") + 1, SHA256: hex.EncodeToString(hash[:]),
 			}
 			if err := VerifyContinuation(expected, continuation); err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("continuation metadata error = %v, want %q", err, test.want)

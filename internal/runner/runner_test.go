@@ -1937,6 +1937,11 @@ func TestRunnerRejectsUnsafeSuspendedContinuationAndRetainsLease(t *testing.T) {
 				return ghadapter.IssueState{Open: true, Labels: []string{"spec"}}, nil
 			}
 		}, wantError: "in-progress"},
+		{name: "case-variant in-progress", mutate: func(_ *scheduler.Run, github *fakeGitHub, _ *fakeWorktrees) {
+			github.issueStateFunc = func(int) (ghadapter.IssueState, error) {
+				return ghadapter.IssueState{Open: true, Labels: []string{"IN-PROGRESS"}}, nil
+			}
+		}, wantError: "in-progress"},
 		{name: "ready-for-agent conflict", mutate: func(_ *scheduler.Run, github *fakeGitHub, _ *fakeWorktrees) {
 			github.issueStateFunc = func(int) (ghadapter.IssueState, error) {
 				return ghadapter.IssueState{Open: true, Labels: []string{"in-progress", "ready-for-agent"}}, nil

@@ -249,6 +249,16 @@ func (c Client) IssueState(ctx context.Context, repo string, issue int) (IssueSt
 		if label.Name == "" {
 			return IssueState{}, errors.New("inspect issue state and labels: GitHub returned an unnamed label")
 		}
+		for _, existing := range labels {
+			if strings.EqualFold(existing, label.Name) {
+				return IssueState{}, fmt.Errorf("inspect issue state and labels: GitHub returned duplicate label %q", label.Name)
+			}
+		}
+		for _, managed := range []string{"in-progress", "ready-for-agent", "needs-triage", "needs-info", "ready-for-human", "wontfix"} {
+			if label.Name != managed && strings.EqualFold(label.Name, managed) {
+				return IssueState{}, fmt.Errorf("inspect issue state and labels: GitHub returned non-canonical managed label %q", label.Name)
+			}
+		}
 		labels = append(labels, label.Name)
 	}
 	return IssueState{Open: strings.EqualFold(response.State, "open"), Labels: labels}, nil
@@ -350,11 +360,30 @@ func (c Client) ResetResources(ctx context.Context, repo string, issueNumber int
 
 func resourceURLMatches(rawURL, repo, resource string, number int) bool {
 	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "github.com") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+	if err != nil || parsed.Scheme != "https" || !asciiEqualFold(parsed.Host, "github.com") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return false
 	}
 	expectedPath := fmt.Sprintf("/%s/%s/%d", repo, resource, number)
-	return strings.EqualFold(strings.TrimSuffix(parsed.Path, "/"), expectedPath)
+	return asciiEqualFold(strings.TrimSuffix(parsed.Path, "/"), expectedPath)
+}
+
+func asciiEqualFold(left, right string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range len(left) {
+		leftByte, rightByte := left[index], right[index]
+		if leftByte >= 'A' && leftByte <= 'Z' {
+			leftByte += 'a' - 'A'
+		}
+		if rightByte >= 'A' && rightByte <= 'Z' {
+			rightByte += 'a' - 'A'
+		}
+		if leftByte != rightByte {
+			return false
+		}
+	}
+	return true
 }
 
 func resetMergedState(raw json.RawMessage) (bool, error) {

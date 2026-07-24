@@ -891,13 +891,24 @@ func verifyContinuationLeaf(entries []json.RawMessage, leafID string) error {
 	}
 	byID := make(map[string]entry, len(entries))
 	ordered := make([]entry, 0, len(entries))
+	rootCount := 0
 	for _, raw := range entries {
 		if err := rejectNonCanonicalJSONFields(raw, "type", "id", "parentId", "message"); err != nil {
 			return fmt.Errorf("decode Pi session entry: %w", err)
 		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			return fmt.Errorf("decode Pi session entry fields: %w", err)
+		}
+		if _, exists := fields["parentId"]; !exists {
+			return errors.New("Pi session contains an entry without parent identity")
+		}
 		var value entry
 		if err := json.Unmarshal(raw, &value); err != nil || value.ID == "" || value.Type == "" {
 			return errors.New("Pi session contains an entry without durable identity and type")
+		}
+		if value.Type != "message" && strings.EqualFold(value.Type, "message") {
+			return fmt.Errorf("Pi session entry %q has non-canonical type %q", value.ID, value.Type)
 		}
 		if value.Type == "message" && (len(value.Message) == 0 || string(value.Message) == "null") {
 			return fmt.Errorf("Pi session message entry %q has no message metadata", value.ID)
@@ -905,11 +916,24 @@ func verifyContinuationLeaf(entries []json.RawMessage, leafID string) error {
 		if _, duplicate := byID[value.ID]; duplicate {
 			return fmt.Errorf("Pi session contains duplicate entry %q", value.ID)
 		}
+		if value.ParentID == nil {
+			rootCount++
+		} else if *value.ParentID == "" {
+			return fmt.Errorf("Pi session entry %q has an empty parent identity", value.ID)
+		} else if _, exists := byID[*value.ParentID]; !exists {
+			return fmt.Errorf("Pi session entry %q references missing or out-of-order parent %q", value.ID, *value.ParentID)
+		}
 		byID[value.ID] = value
 		ordered = append(ordered, value)
 	}
+	if rootCount != 1 {
+		return fmt.Errorf("Pi session contains %d root entries, want exactly one", rootCount)
+	}
 	if ordered[len(ordered)-1].ID != leafID {
 		return fmt.Errorf("Pi session leaf %q is not the durable file leaf %q", leafID, ordered[len(ordered)-1].ID)
+	}
+	if ordered[len(ordered)-1].Type != "message" {
+		return fmt.Errorf("Pi session durable leaf %q has unsupported type %q", leafID, ordered[len(ordered)-1].Type)
 	}
 	var branch []entry
 	seen := make(map[string]struct{})
@@ -952,6 +976,7 @@ func verifyContinuationLeaf(entries []json.RawMessage, leafID string) error {
 			return fmt.Errorf("Pi session message %q has no role", value.ID)
 		}
 		switch message.Role {
+		case "user":
 		case "assistant":
 			var rawContents []json.RawMessage
 			if err := json.Unmarshal(message.Content, &rawContents); err != nil {
@@ -968,6 +993,9 @@ func verifyContinuationLeaf(entries []json.RawMessage, leafID string) error {
 				if err := json.Unmarshal(rawContent, &content); err != nil {
 					return fmt.Errorf("decode Pi session assistant content %q: %w", value.ID, err)
 				}
+				if content.Type != "toolCall" && strings.EqualFold(content.Type, "toolCall") {
+					return fmt.Errorf("Pi session assistant entry %q has non-canonical content type %q", value.ID, content.Type)
+				}
 				if content.Type == "toolCall" {
 					if content.ID == "" {
 						return fmt.Errorf("Pi session assistant entry %q has a tool call without identity", value.ID)
@@ -983,6 +1011,8 @@ func verifyContinuationLeaf(entries []json.RawMessage, leafID string) error {
 				return fmt.Errorf("Pi session tool result %q has no pending tool call", message.ToolCallID)
 			}
 			delete(pending, message.ToolCallID)
+		default:
+			return fmt.Errorf("Pi session message %q has unsupported role %q", value.ID, message.Role)
 		}
 	}
 	if len(pending) != 0 {

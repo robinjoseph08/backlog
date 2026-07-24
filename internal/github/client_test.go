@@ -120,6 +120,37 @@ esac`)
 	}
 }
 
+func TestClientIssueInspectionRefusesAmbiguousManagedLabels(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		labels string
+		want   string
+	}{
+		{name: "duplicate", labels: `[{"name":"in-progress"},{"name":"in-progress"}]`, want: "duplicate label"},
+		{name: "case alias", labels: `[{"name":"IN-PROGRESS"}]`, want: "non-canonical managed label"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			gh := fakeGH(t, `
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":`+test.labels+`}' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+			got, err := (Client{Executable: gh}).IssueState(context.Background(), "acme/widgets", 42)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+			if got.Open || got.Labels != nil {
+				t.Fatalf("issue state = %#v, want fail-closed empty metadata", got)
+			}
+		})
+	}
+}
+
 func TestClientInspectsResetIssueLabelsAndOwnedPullRequests(t *testing.T) {
 	t.Parallel()
 
@@ -317,6 +348,25 @@ esac`)
 	got, err := (Client{Executable: gh}).IssueState(context.Background(), "acme/widgets", 42)
 	if err == nil || !strings.Contains(err.Error(), "mismatched") {
 		t.Fatalf("error = %v, want mismatched issue refusal", err)
+	}
+	if got.Open || got.Labels != nil {
+		t.Fatalf("issue state = %#v, want fail-closed empty metadata", got)
+	}
+}
+
+func TestClientIssueInspectionRefusesUnicodeRepositoryAlias(t *testing.T) {
+	t.Parallel()
+
+	gh := fakeGH(t, `
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgetſ/issues/42","state":"OPEN","labels":[{"name":"in-progress"}]}' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+
+	got, err := (Client{Executable: gh}).IssueState(context.Background(), "acme/widgets", 42)
+	if err == nil || !strings.Contains(err.Error(), "mismatched") {
+		t.Fatalf("error = %v, want Unicode repository alias refusal", err)
 	}
 	if got.Open || got.Labels != nil {
 		t.Fatalf("issue state = %#v, want fail-closed empty metadata", got)

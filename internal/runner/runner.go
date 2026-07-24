@@ -886,7 +886,7 @@ func verifyResumeLabels(issue ghadapter.IssueState) error {
 	}
 	labels := make(map[string]struct{}, len(issue.Labels))
 	for _, label := range issue.Labels {
-		labels[strings.ToLower(label)] = struct{}{}
+		labels[label] = struct{}{}
 	}
 	for _, human := range []string{"needs-triage", "needs-info", "ready-for-human", "wontfix"} {
 		if _, exists := labels[human]; exists {
