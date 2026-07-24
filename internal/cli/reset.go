@@ -162,7 +162,7 @@ func resetCommandWithInput(ctx context.Context, args []string, stdin io.Reader, 
 	if err := ensureResetStateBinding(commonDirectory, resolvedState); err != nil {
 		return err
 	}
-	if err := executor.apply(ctx); err != nil {
+	if err := executor.apply(ctx, plan); err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "Reset complete for issue #%d. No replacement Run was created.\n", issueNumber)
@@ -279,7 +279,9 @@ func validateArtifactFreeMutation(plan reset.Plan) error {
 
 func validateResetMutationStatus(status scheduler.Status) error {
 	switch status {
-	case scheduler.StatusFailed, scheduler.StatusSuspended, scheduler.StatusNeedsHuman, scheduler.StatusResetting, scheduler.StatusReset:
+	case scheduler.StatusClaimed, scheduler.StatusWorktreeReady, scheduler.StatusRunning,
+		scheduler.StatusFailed, scheduler.StatusSuspended, scheduler.StatusNeedsHuman,
+		scheduler.StatusResetting, scheduler.StatusReset:
 		return nil
 	default:
 		return fmt.Errorf("Run status %s is not eligible for Reset", status)
@@ -293,9 +295,29 @@ func resetPlansEqual(left, right reset.Plan) bool {
 	return leftText.String() == rightText.String()
 }
 
-func (e resetExecutor) apply(ctx context.Context) error {
+func (e resetExecutor) apply(ctx context.Context, approved reset.Plan) error {
+	plan, err := e.inspect(ctx)
+	if err != nil {
+		return err
+	}
+	if err := validateArtifactFreeMutation(plan); err != nil {
+		return err
+	}
+	if err := validateResetMutationStatus(plan.Snapshot.Run.Status); err != nil {
+		return err
+	}
+	if !resetPlansEqual(approved, plan) {
+		return errors.New("Reset Plan changed after confirmation; rerun Reset to review the current plan")
+	}
+	labels := normalizedLabelSet(plan.Snapshot.Issue.Labels)
+	if (labels["in-progress"] || !labels["ready-for-agent"]) && plan.Snapshot.Run.Status != scheduler.StatusResetting {
+		if err := e.markResetting(); err != nil {
+			return err
+		}
+	}
+
 	for {
-		plan, err := e.inspect(ctx)
+		plan, err = e.inspect(ctx)
 		if err != nil {
 			return err
 		}
@@ -305,18 +327,18 @@ func (e resetExecutor) apply(ctx context.Context) error {
 		if err := validateResetMutationStatus(plan.Snapshot.Run.Status); err != nil {
 			return err
 		}
-		labels := normalizedLabelSet(plan.Snapshot.Issue.Labels)
+		labels = normalizedLabelSet(plan.Snapshot.Issue.Labels)
 		switch {
 		case labels["in-progress"]:
-			if err := e.markResetting(); err != nil {
-				return err
-			}
 			before, err := e.inspect(ctx)
 			if err != nil {
 				return err
 			}
 			if err := validateArtifactFreeMutation(before); err != nil {
 				return err
+			}
+			if !resetPlansEqual(plan, before) {
+				return errors.New("Reset Plan changed immediately before removing issue label in-progress")
 			}
 			if !normalizedLabelSet(before.Snapshot.Issue.Labels)["in-progress"] {
 				continue
@@ -336,15 +358,15 @@ func (e resetExecutor) apply(ctx context.Context) error {
 				return errors.New("remove issue label in-progress did not satisfy its verified postcondition")
 			}
 		case !labels["ready-for-agent"]:
-			if err := e.markResetting(); err != nil {
-				return err
-			}
 			before, err := e.inspect(ctx)
 			if err != nil {
 				return err
 			}
 			if err := validateArtifactFreeMutation(before); err != nil {
 				return err
+			}
+			if !resetPlansEqual(plan, before) {
+				return errors.New("Reset Plan changed immediately before adding issue label ready-for-agent")
 			}
 			if normalizedLabelSet(before.Snapshot.Issue.Labels)["ready-for-agent"] {
 				continue
@@ -364,7 +386,7 @@ func (e resetExecutor) apply(ctx context.Context) error {
 				return errors.New("add issue label ready-for-agent did not satisfy its verified postcondition")
 			}
 		default:
-			return e.finalize(plan)
+			return e.finalize(ctx, plan)
 		}
 	}
 }
@@ -416,7 +438,15 @@ func (e resetExecutor) markResetting() error {
 	return e.store.Save(current)
 }
 
-func (e resetExecutor) finalize(verified reset.Plan) error {
+func (e resetExecutor) finalize(ctx context.Context, verified reset.Plan) error {
+	fresh, err := e.inspect(ctx)
+	if err != nil {
+		return err
+	}
+	if !resetPlansEqual(verified, fresh) {
+		return errors.New("Reset Plan changed immediately before finalization")
+	}
+	verified = fresh
 	labels := normalizedLabelSet(verified.Snapshot.Issue.Labels)
 	if labels["in-progress"] || !labels["ready-for-agent"] {
 		return errors.New("managed issue label postconditions were not verified")

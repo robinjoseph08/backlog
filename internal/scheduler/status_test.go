@@ -32,11 +32,17 @@ func TestRunStateTransitionsAreExplicit(t *testing.T) {
 
 	allowed := [][2]Status{
 		{StatusClaimed, StatusWorktreeReady},
+		{StatusClaimed, StatusResetting},
+		{StatusClaimed, StatusReset},
 		{StatusClaimed, StatusFailed},
 		{StatusClaimed, StatusMerged},
 		{StatusWorktreeReady, StatusRunning},
+		{StatusWorktreeReady, StatusResetting},
+		{StatusWorktreeReady, StatusReset},
 		{StatusRunning, StatusWaitingForMerge},
 		{StatusRunning, StatusSuspended},
+		{StatusRunning, StatusResetting},
+		{StatusRunning, StatusReset},
 		{StatusRunning, StatusMerged},
 		{StatusRunning, StatusFailed},
 		{StatusRunning, StatusNeedsHuman},

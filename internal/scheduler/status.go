@@ -19,11 +19,11 @@ func CanTransition(from, to Status) bool {
 	}
 	switch from {
 	case StatusClaimed:
-		return to == StatusWorktreeReady || to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman
+		return to == StatusWorktreeReady || to == StatusResetting || to == StatusReset || to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman
 	case StatusWorktreeReady:
-		return to == StatusRunning || to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman
+		return to == StatusRunning || to == StatusResetting || to == StatusReset || to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman
 	case StatusRunning:
-		return to == StatusWaitingForMerge || to == StatusSuspended || to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman
+		return to == StatusWaitingForMerge || to == StatusSuspended || to == StatusResetting || to == StatusReset || to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman
 	case StatusSuspended:
 		return to == StatusRunning || to == StatusWaitingForMerge || to == StatusMerged || to == StatusNeedsHuman || to == StatusResetting || to == StatusReset
 	case StatusWaitingForMerge:

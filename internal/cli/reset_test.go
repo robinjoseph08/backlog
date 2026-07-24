@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
@@ -604,9 +605,8 @@ func (f artifactFreeResetFixture) args(command string, extra ...string) []string
 	return append(args, extra...)
 }
 
-func (f artifactFreeResetFixture) resetArgs(extra ...string) []string {
-	args := []string{"42", "--repo-dir", f.repository, "--state-dir", f.stateDir, "--git", f.git, "--gh", f.gh}
-	return append(args, extra...)
+func (f artifactFreeResetFixture) resetArgs() []string {
+	return []string{"42", "--repo-dir", f.repository, "--state-dir", f.stateDir, "--git", f.git, "--gh", f.gh}
 }
 
 func (f artifactFreeResetFixture) labels(t *testing.T) []string {
@@ -686,6 +686,59 @@ func TestResetInteractiveDefaultNoInputsMakeNoChanges(t *testing.T) {
 			}
 			if fileDigest(t, fixture.store.Path) != beforeState || fileDigest(t, fixture.githubState) != beforeGitHub {
 				t.Fatal("cancelled Reset changed state")
+			}
+		})
+	}
+}
+
+func TestResetFinalizesArtifactFreeStaleRunStatuses(t *testing.T) {
+	for _, status := range []scheduler.Status{
+		scheduler.StatusClaimed,
+		scheduler.StatusWorktreeReady,
+		scheduler.StatusRunning,
+	} {
+		t.Run(string(status), func(t *testing.T) {
+			fixture := newArtifactFreeResetFixture(t, []string{"ready-for-agent", "spec"})
+			current, err := fixture.store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			current.Runs[0].Status = status
+			if status == scheduler.StatusRunning {
+				worker := exec.Command("sleep", "10")
+				if err := worker.Start(); err != nil {
+					t.Fatal(err)
+				}
+				identity, err := resetPIDIdentity(worker.Process.Pid)
+				if err != nil {
+					_ = worker.Process.Kill()
+					_ = worker.Wait()
+					t.Fatal(err)
+				}
+				if err := worker.Process.Kill(); err != nil {
+					t.Fatal(err)
+				}
+				if err := worker.Wait(); err == nil {
+					t.Fatal("killed Worker exited successfully")
+				}
+				current.Runs[0].PID = worker.Process.Pid
+				current.Runs[0].ProcessIdentity = identity
+				current.Runs[0].StartedAt = time.Now().UTC()
+			}
+			if err := fixture.store.Save(current); err != nil {
+				t.Fatal(err)
+			}
+
+			var stdout, stderr bytes.Buffer
+			if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit != 0 {
+				t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+			}
+			final, err := fixture.store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if final.Runs[0].Status != scheduler.StatusReset || len(final.Leases) != 0 {
+				t.Fatalf("final state = %#v", final)
 			}
 		})
 	}
@@ -819,6 +872,35 @@ esac
 	}
 	if fileDigest(t, fixture.store.Path) != before {
 		t.Fatal("second confirmation refusal changed state")
+	}
+}
+
+func TestResetRejectsPlanChangeAfterInteractiveReconfirmation(t *testing.T) {
+	t.Parallel()
+	fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "spec"})
+	views := filepath.Join(t.TempDir(), "views")
+	fixture.gh = writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef") printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    count=0
+    if test -f `+quote(views)+`; then count=$(cat `+quote(views)+`); fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > `+quote(views)+`
+    if test "$count" -ge 3; then labels='[{"name":"in-progress"},{"name":"ready-for-agent"},{"name":"spec"}]'; else labels='[{"name":"in-progress"},{"name":"spec"}]'; fi
+    printf '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":%s}\n' "$labels" ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	before := fileDigest(t, fixture.store.Path)
+	var stdout, stderr bytes.Buffer
+	err := resetCommandWithInput(context.Background(), fixture.resetArgs(), strings.NewReader("yes\n"), true, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "changed after confirmation") {
+		t.Fatalf("error = %v", err)
+	}
+	if fileDigest(t, fixture.store.Path) != before {
+		t.Fatal("late plan change mutated Run state")
 	}
 }
 
