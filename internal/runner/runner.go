@@ -215,7 +215,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 
 		resumedWorker := false
-		for !draining && len(localWorkers) < r.Config.MaxConcurrentIssues {
+		for !draining && persistedWorkerCount(&current) < r.Config.MaxConcurrentIssues {
 			run := nextSuspendedRun(&current)
 			if run.RunID == "" {
 				break
@@ -728,6 +728,12 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 	if err != nil {
 		_ = process.Abort()
 		closed := process.Close()
+		if !closed.GroupExited {
+			run = findActiveRun(current, run.Issue)
+			run.PID = process.PID()
+			run.ProcessIdentity = ""
+			replaceRun(current, run)
+		}
 		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("record replacement Pi Worker identity: %v; close: %v", err, closed.Err))
 	}
 	now := r.Now().UTC()
@@ -958,6 +964,11 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 			continue
 		}
 		allowWaiting := run.Status == scheduler.StatusWaitingForMerge || run.Status == scheduler.StatusRunning || run.Status == scheduler.StatusSuspended
+		if run.Status == scheduler.StatusRunning && run.WorkerMode == scheduler.WorkerModeRPC && (run.SessionID == "" || run.SessionDir == "") && !outcome.Merged && !outcome.PRFound {
+			r.needsHuman(current, run.Issue, "recovered RPC Run has missing durable session identity or storage")
+			changed = true
+			continue
+		}
 		recoverableMarker := run.Status == scheduler.StatusRunning && run.WorkerMode == scheduler.WorkerModeRPC && run.Continuation != nil
 		if (run.Status == scheduler.StatusSuspended || recoverableMarker) && !outcome.Merged && !outcome.PRFound {
 			if run.Status == scheduler.StatusSuspended {
@@ -1449,6 +1460,17 @@ func nextSuspendedRun(current *state.State) scheduler.Run {
 		}
 	}
 	return scheduler.Run{}
+}
+
+func persistedWorkerCount(current *state.State) int {
+	count := 0
+	for _, lease := range current.Leases {
+		run := findRun(current.Runs, lease.RunID)
+		if run.PID > 0 {
+			count++
+		}
+	}
+	return count
 }
 
 func unfinishedRunCount(current *state.State) int {

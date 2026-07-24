@@ -1438,6 +1438,44 @@ func TestRunnerRecoversPersistedContinuationMarkerBeforeFinalSuspendedState(t *t
 	}
 }
 
+func TestRunnerDoesNotResumeBeyondCapacityConsumedByRecoveredLiveWorker(t *testing.T) {
+	t.Parallel()
+
+	live := resumableRun(t, 69, "live-69")
+	live.Status = scheduler.StatusRunning
+	live.PID = 999
+	live.ProcessIdentity = "identity-999"
+	suspended := resumableRun(t, 70, "resume-70")
+	github := &fakeGitHub{}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs: []scheduler.Run{live, suspended}, Leases: []scheduler.Lease{
+			{LeaseID: "lease-69", Issue: 69, RunID: live.RunID},
+			{LeaseID: "lease-70", Issue: 70, RunID: suspended.RunID},
+		},
+	}}
+	runner := testRunner(github, workers, store, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	waitForPersistedRun(t, store, 69, func(run scheduler.Run) bool {
+		return run.Status == scheduler.StatusNeedsHuman && run.PID == 999
+	})
+	time.Sleep(20 * time.Millisecond)
+	if workers.wasStarted(70) {
+		t.Fatal("Suspended Run resumed despite recovered live Worker consuming all capacity")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	got := store.LoadValue()
+	if findActiveRun(&got, 70).Status != scheduler.StatusSuspended || len(got.Leases) != 2 {
+		t.Fatalf("capacity-blocked Suspended Run = %#v", got)
+	}
+}
+
 func TestRunnerRejectsCrashRecoveryWhileOldWorkerProcessGroupRemains(t *testing.T) {
 	t.Parallel()
 
@@ -1525,6 +1563,44 @@ func TestRunnerClassifiesMalformedPersistedRunningContinuationAsNeedsHuman(t *te
 	}
 	if got.Runs[0].Status != scheduler.StatusNeedsHuman || !strings.Contains(got.Runs[0].Error, "continuation") || len(got.Leases) != 1 || workers.wasStarted(66) {
 		t.Fatalf("malformed persisted Running continuation = %#v", got)
+	}
+}
+
+func TestRunnerClassifiesPersistedRunningRPCWithMissingSessionIdentityAsNeedsHuman(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	run := scheduler.Run{
+		Issue: 71, RunID: "resume-71", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModeRPC,
+		PID: 999999, ProcessIdentity: "999999:old", Branch: "agent/issue-71-resume-71", Worktree: t.TempDir(), StartedAt: time.Now(),
+	}
+	persisted := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
+		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: "lease-71", Issue: 71, RunID: run.RunID}},
+	}
+	encoded, err := json.Marshal(persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(root, "state.json")
+	if err := os.WriteFile(statePath, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workers := newFakeWorkers()
+	runner := &Runner{
+		Config: Config{Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1, PollInterval: 5 * time.Millisecond, SessionsDir: filepath.Join(root, "sessions")},
+		GitHub: &fakeGitHub{}, Store: state.FileStore{Path: statePath}, Worktrees: &fakeWorktrees{}, Workers: workers,
+		PIDAlive: func(int) bool { return false }, ProcessGroupAlive: func(int) (bool, error) { return false, nil },
+	}
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := (state.FileStore{Path: statePath}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Runs[0].Status != scheduler.StatusNeedsHuman || !strings.Contains(got.Runs[0].Error, "missing durable session") || len(got.Leases) != 1 || workers.wasStarted(71) {
+		t.Fatalf("missing persisted RPC session identity = %#v", got)
 	}
 }
 
@@ -1663,7 +1739,7 @@ func TestRunnerFailsClosedWhenReplacementWorkerCannotLaunchSafely(t *testing.T) 
 		{name: "start", configure: func(_ *Runner, workers *fakeWorkers) { workers.startErr = errors.New("start failed") }, wantError: "start failed"},
 		{name: "process identity", configure: func(runner *Runner, _ *fakeWorkers) {
 			runner.PIDIdentity = func(int) (string, error) { return "", errors.New("identity unavailable") }
-		}, wantError: "identity unavailable"},
+		}, wantError: "identity unavailable", wantPID: true},
 		{name: "release", configure: func(_ *Runner, workers *fakeWorkers) { workers.processReleaseErr = errors.New("release failed") }, wantError: "release failed", wantPID: true},
 	}
 	for index, test := range tests {
