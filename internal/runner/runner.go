@@ -169,21 +169,23 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := r.initializeState(&current); err != nil {
 		return err
 	}
-	if err := r.Store.Save(current); err != nil {
-		return fmt.Errorf("initialize runner state: %w", err)
-	}
 	if admission.stopped() {
 		event := <-signalEvents
 		draining = r.handleSignal(event, 0)
-	} else if err := r.reconcile(admissionCtx, &current, nil); err != nil {
-		switch {
-		case admissionCtx.Err() != nil && ctx.Err() == nil:
-			event := <-signalEvents
-			draining = r.handleSignal(event, 0)
-		case ctx.Err() != nil:
-			return nil
-		default:
-			return err
+	} else {
+		if err := r.reconcile(admissionCtx, &current, nil); err != nil {
+			switch {
+			case admissionCtx.Err() != nil && ctx.Err() == nil:
+				event := <-signalEvents
+				draining = r.handleSignal(event, 0)
+			case ctx.Err() != nil:
+				return nil
+			default:
+				return err
+			}
+		}
+		if err := r.Store.Save(current); err != nil {
+			return fmt.Errorf("initialize reconciled runner state: %w", err)
 		}
 	}
 
@@ -701,14 +703,11 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 	if err := verifyResumeLabels(issue); err != nil {
 		return nil, r.rejectResume(current, run.Issue, err.Error())
 	}
-	if run.WorkerMode != scheduler.WorkerModeRPC {
-		return nil, r.rejectResume(current, run.Issue, "legacy print-mode Run cannot Resume automatically")
-	}
 	if run.PID != 0 || run.ProcessIdentity != "" {
 		return nil, r.rejectResume(current, run.Issue, "old Worker absence is not proven before Resume")
 	}
-	if run.SessionID == "" || run.SessionDir == "" || run.Branch == "" || run.Worktree == "" || run.Continuation == nil {
-		return nil, r.rejectResume(current, run.Issue, "continuation artifacts are incomplete before Resume")
+	if err := verifyContinuationArtifacts(run); err != nil {
+		return nil, r.rejectResume(current, run.Issue, err.Error())
 	}
 	assignment := worktree.Assignment{Path: run.Worktree, Branch: run.Branch}
 	if err := r.Worktrees.Verify(operationCtx, assignment); err != nil {
@@ -718,15 +717,6 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("verify retained branch and worktree before Resume: %v", err))
 	}
 	boundary := run.Continuation
-	if err := worker.VerifyContinuation(worker.ContinuationRequest{
-		SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree,
-	}, worker.Continuation{
-		SessionID: boundary.SessionID, SessionFile: boundary.SessionFile, Worktree: boundary.Worktree,
-		LeafID: boundary.LeafID, EntryCount: boundary.EntryCount, SHA256: boundary.SHA256,
-	}); err != nil {
-		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("verify Pi continuation before Resume: %v", err))
-	}
-
 	process, err := r.Workers.Start(workerCtx, worker.Request{
 		Issue: run.Issue, RunID: run.RunID, Worktree: run.Worktree, SessionName: run.SessionName,
 		SessionID: run.SessionID, SessionDir: run.SessionDir, SessionFile: boundary.SessionFile, Resume: true,
@@ -753,17 +743,49 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 		_ = process.Close()
 		return nil, fmt.Errorf("persist replacement Worker identity before release for issue #%d: %w", run.Issue, err)
 	}
+	if err := verifyContinuationArtifacts(run); err != nil {
+		_ = process.Abort()
+		closed := process.Close()
+		run = findActiveRun(current, run.Issue)
+		if closed.GroupExited {
+			run.PID = 0
+			run.ProcessIdentity = ""
+			replaceRun(current, run)
+		}
+		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("reverify Pi continuation before replacement Worker release: %v; close: %v", err, closed.Err))
+	}
 	if err := process.Release(); err != nil {
 		_ = process.Abort()
 		closed := process.Close()
 		run = findActiveRun(current, run.Issue)
-		run.PID = 0
-		run.ProcessIdentity = ""
-		replaceRun(current, run)
+		if closed.GroupExited {
+			run.PID = 0
+			run.ProcessIdentity = ""
+			replaceRun(current, run)
+		}
 		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("release replacement Pi Worker: %v; close: %v", err, closed.Err))
 	}
 	r.logf("resumed issue #%d in %s (pid %d, Run %s)", run.Issue, run.Worktree, process.PID(), run.RunID)
 	return process, nil
+}
+
+func verifyContinuationArtifacts(run scheduler.Run) error {
+	if run.WorkerMode != scheduler.WorkerModeRPC {
+		return errors.New("legacy print-mode Run cannot Resume automatically")
+	}
+	if run.SessionID == "" || run.SessionDir == "" || run.Branch == "" || run.Worktree == "" || run.Continuation == nil {
+		return errors.New("continuation artifacts are incomplete before Resume")
+	}
+	boundary := run.Continuation
+	if err := worker.VerifyContinuation(worker.ContinuationRequest{
+		SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree,
+	}, worker.Continuation{
+		SessionID: boundary.SessionID, SessionFile: boundary.SessionFile, Worktree: boundary.Worktree,
+		LeafID: boundary.LeafID, EntryCount: boundary.EntryCount, SHA256: boundary.SHA256,
+	}); err != nil {
+		return fmt.Errorf("verify Pi continuation before Resume: %w", err)
+	}
+	return nil
 }
 
 func verifyResumeLabels(issue ghadapter.IssueState) error {
@@ -938,6 +960,18 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 		allowWaiting := run.Status == scheduler.StatusWaitingForMerge || run.Status == scheduler.StatusRunning || run.Status == scheduler.StatusSuspended
 		recoverableMarker := run.Status == scheduler.StatusRunning && run.WorkerMode == scheduler.WorkerModeRPC && run.Continuation != nil
 		if (run.Status == scheduler.StatusSuspended || recoverableMarker) && !outcome.Merged && !outcome.PRFound {
+			if run.Status == scheduler.StatusSuspended {
+				if run.PID != 0 || run.ProcessIdentity != "" {
+					r.needsHumanWithLiveWorker(current, run.Issue, "old Worker absence is not proven before Resume")
+					changed = true
+					continue
+				}
+				if err := verifyContinuationArtifacts(run); err != nil {
+					r.needsHuman(current, run.Issue, err.Error())
+					changed = true
+					continue
+				}
+			}
 			if recoverableMarker {
 				boundary := run.Continuation
 				if err := worker.VerifyContinuation(worker.ContinuationRequest{

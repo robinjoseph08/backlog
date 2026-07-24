@@ -575,12 +575,29 @@ func VerifyContinuation(expected ContinuationRequest, continuation Continuation)
 }
 
 func readSessionRecords(path string) ([]json.RawMessage, string, error) {
-	file, err := os.Open(path)
+	file, err := openSessionFile(path)
 	if err != nil {
-		return nil, "", fmt.Errorf("open Pi session file: %w", err)
+		return nil, "", err
 	}
 	defer file.Close()
 	return scanSessionRecords(file)
+}
+
+func openSessionFile(path string) (*os.File, error) {
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open Pi session file: %w", err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("inspect Pi session file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		file.Close()
+		return nil, fmt.Errorf("Pi session file %q is not a regular file", path)
+	}
+	return file, nil
 }
 
 func scanSessionRecords(file *os.File) ([]json.RawMessage, string, error) {
@@ -631,9 +648,9 @@ func verifyAndSyncSession(path string, expected ContinuationRequest, rpcEntries 
 	if leafID == "" || len(rpcEntries) == 0 {
 		return "", errors.New("Pi session has no durable continuation leaf")
 	}
-	file, err := os.Open(path)
+	file, err := openSessionFile(path)
 	if err != nil {
-		return "", fmt.Errorf("open Pi session file: %w", err)
+		return "", err
 	}
 	defer file.Close()
 	records, sessionHash, err := scanSessionRecords(file)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1317,6 +1318,16 @@ func TestRunnerResumesSuspendedRunBeforeNewCandidateWithSameIdentity(t *testing.
 		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: "lease-61", Issue: 61, RunID: run.RunID}},
 	}}
 	runner := testRunner(github, workers, store, 1)
+	releaseObserved := make(chan error, 1)
+	workers.onRelease = func(issue int) {
+		persisted := store.LoadValue()
+		resumed := findActiveRun(&persisted, issue)
+		if resumed.Status != scheduler.StatusRunning || resumed.PID != 1000+issue || resumed.ProcessIdentity == "" {
+			releaseObserved <- fmt.Errorf("replacement Worker released before identity persistence: %#v", resumed)
+			return
+		}
+		releaseObserved <- nil
+	}
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 
@@ -1327,6 +1338,9 @@ func TestRunnerResumesSuspendedRunBeforeNewCandidateWithSameIdentity(t *testing.
 	request := workers.requestFor(61)
 	if !request.Resume || request.RunID != run.RunID || request.SessionID != run.SessionID || request.SessionDir != run.SessionDir || request.SessionFile != run.Continuation.SessionFile || request.Worktree != run.Worktree {
 		t.Fatalf("replacement Worker request = %#v, want retained Run/session/worktree identity", request)
+	}
+	if err := <-releaseObserved; err != nil {
+		t.Fatal(err)
 	}
 	waitForPersistedRun(t, store, 61, func(run scheduler.Run) bool {
 		return run.Status == scheduler.StatusRunning && run.PID == 1061 && run.ProcessIdentity != ""
@@ -1343,6 +1357,57 @@ func TestRunnerResumesSuspendedRunBeforeNewCandidateWithSameIdentity(t *testing.
 	workers.complete(62, worker.Result{ExitCode: 1, Err: errors.New("stop fixture")})
 	if err := <-done; err != nil {
 		t.Fatalf("run: %v", err)
+	}
+}
+
+func TestRunnerRechecksGitHubCompletionImmediatelyBeforeResume(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		outcome ghadapter.CompletionOutcome
+		status  scheduler.Status
+	}{
+		{name: "merged", outcome: mergedOutcome(65), status: scheduler.StatusMerged},
+		{name: "waiting for merge", outcome: ghadapter.CompletionOutcome{PRFound: true, PullRequest: "https://example.test/pull/165", AutoMergeArmed: true}, status: scheduler.StatusWaitingForMerge},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			run := resumableRun(t, 65, "resume-65")
+			calls := 0
+			github := &fakeGitHub{}
+			github.completionFunc = func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
+				calls++
+				if calls == 1 {
+					return ghadapter.CompletionOutcome{}, nil
+				}
+				return test.outcome, nil
+			}
+			workers := newFakeWorkers()
+			store := &memoryStore{value: state.State{
+				Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+				Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: "lease-65", Issue: 65, RunID: run.RunID}},
+			}}
+			runner := testRunner(github, workers, store, 1)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- runner.Run(ctx) }()
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				if got := store.LoadValue(); len(got.Runs) == 1 && got.Runs[0].Status == test.status {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			cancel()
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			got := store.LoadValue()
+			if calls < 2 || got.Runs[0].Status != test.status || workers.wasStarted(65) {
+				t.Fatalf("Completion recheck result: calls=%d state=%#v starts=%v", calls, got, workers.startedSnapshot())
+			}
+		})
 	}
 }
 
@@ -1398,6 +1463,71 @@ func TestRunnerRejectsCrashRecoveryWhileOldWorkerProcessGroupRemains(t *testing.
 	}
 }
 
+func TestRunnerRejectsCrashRecoveryWhenProcessGroupInspectionIsUncertain(t *testing.T) {
+	t.Parallel()
+
+	run := resumableRun(t, 67, "resume-67")
+	run.Status = scheduler.StatusRunning
+	run.PID = 999999
+	run.ProcessIdentity = "999999:old"
+	github := &fakeGitHub{}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: "lease-67", Issue: 67, RunID: run.RunID}},
+	}}
+	runner := testRunner(github, workers, store, 1)
+	runner.PIDAlive = func(int) bool { return false }
+	runner.ProcessGroupAlive = func(int) (bool, error) { return false, errors.New("inspection unavailable") }
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID != 999999 || !strings.Contains(got.Runs[0].Error, "uncertain") || len(got.Leases) != 1 || workers.wasStarted(67) {
+		t.Fatalf("uncertain old Worker process group = %#v", got)
+	}
+}
+
+func TestRunnerClassifiesMalformedPersistedRunningContinuationAsNeedsHuman(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	run := resumableRun(t, 66, "resume-66")
+	run.Status = scheduler.StatusRunning
+	run.PID = 999999
+	run.ProcessIdentity = "999999:old"
+	run.Continuation.EntryCount = 0
+	persisted := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
+		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: "lease-66", Issue: 66, RunID: run.RunID}},
+	}
+	encoded, err := json.Marshal(persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(root, "state.json")
+	if err := os.WriteFile(statePath, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	github := &fakeGitHub{}
+	workers := newFakeWorkers()
+	runner := &Runner{
+		Config: Config{Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1, PollInterval: 5 * time.Millisecond, SessionsDir: filepath.Join(root, "sessions")},
+		GitHub: github, Store: state.FileStore{Path: statePath}, Worktrees: &fakeWorktrees{}, Workers: workers,
+		PIDAlive: func(int) bool { return false }, ProcessGroupAlive: func(int) (bool, error) { return false, nil },
+	}
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := (state.FileStore{Path: statePath}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Runs[0].Status != scheduler.StatusNeedsHuman || !strings.Contains(got.Runs[0].Error, "continuation") || len(got.Leases) != 1 || workers.wasStarted(66) {
+		t.Fatalf("malformed persisted Running continuation = %#v", got)
+	}
+}
+
 func TestRunnerRejectsUnsafeSuspendedContinuationAndRetainsLease(t *testing.T) {
 	t.Parallel()
 
@@ -1419,11 +1549,25 @@ func TestRunnerRejectsUnsafeSuspendedContinuationAndRetainsLease(t *testing.T) {
 		{name: "changed branch or worktree", mutate: func(_ *scheduler.Run, _ *fakeGitHub, worktrees *fakeWorktrees) {
 			worktrees.verifyErr = errors.New("branch changed")
 		}, wantError: "branch changed"},
-		{name: "human workflow label", mutate: func(_ *scheduler.Run, github *fakeGitHub, _ *fakeWorktrees) {
+		{name: "closed issue", mutate: func(_ *scheduler.Run, github *fakeGitHub, _ *fakeWorktrees) {
 			github.issueStateFunc = func(int) (ghadapter.IssueState, error) {
-				return ghadapter.IssueState{Open: true, Labels: []string{"in-progress", "ready-for-human"}}, nil
+				return ghadapter.IssueState{Open: false, Labels: []string{"in-progress"}}, nil
 			}
-		}, wantError: "ready-for-human"},
+		}, wantError: "not open"},
+		{name: "missing in-progress", mutate: func(_ *scheduler.Run, github *fakeGitHub, _ *fakeWorktrees) {
+			github.issueStateFunc = func(int) (ghadapter.IssueState, error) {
+				return ghadapter.IssueState{Open: true, Labels: []string{"spec"}}, nil
+			}
+		}, wantError: "in-progress"},
+		{name: "ready-for-agent conflict", mutate: func(_ *scheduler.Run, github *fakeGitHub, _ *fakeWorktrees) {
+			github.issueStateFunc = func(int) (ghadapter.IssueState, error) {
+				return ghadapter.IssueState{Open: true, Labels: []string{"in-progress", "ready-for-agent"}}, nil
+			}
+		}, wantError: "ready-for-agent"},
+		{name: "needs-triage label", mutate: resumeIssueLabels("needs-triage"), wantError: "needs-triage"},
+		{name: "needs-info label", mutate: resumeIssueLabels("needs-info"), wantError: "needs-info"},
+		{name: "ready-for-human label", mutate: resumeIssueLabels("ready-for-human"), wantError: "ready-for-human"},
+		{name: "wontfix label", mutate: resumeIssueLabels("wontfix"), wantError: "wontfix"},
 		{name: "uncertain issue state", mutate: func(_ *scheduler.Run, github *fakeGitHub, _ *fakeWorktrees) {
 			github.issueStateFunc = func(int) (ghadapter.IssueState, error) {
 				return ghadapter.IssueState{}, errors.New("GitHub unavailable")
@@ -1455,6 +1599,14 @@ func TestRunnerRejectsUnsafeSuspendedContinuationAndRetainsLease(t *testing.T) {
 	}
 }
 
+func resumeIssueLabels(label string) func(*scheduler.Run, *fakeGitHub, *fakeWorktrees) {
+	return func(_ *scheduler.Run, github *fakeGitHub, _ *fakeWorktrees) {
+		github.issueStateFunc = func(int) (ghadapter.IssueState, error) {
+			return ghadapter.IssueState{Open: true, Labels: []string{"in-progress", label}}, nil
+		}
+	}
+}
+
 func waitForPersistedRun(t *testing.T, store *memoryStore, issue int, condition func(scheduler.Run) bool) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -1470,6 +1622,35 @@ func waitForPersistedRun(t *testing.T, store *memoryStore, issue int, condition 
 	t.Fatalf("persisted Run for issue #%d did not reach expected state: %#v", issue, findActiveRun(&current, issue))
 }
 
+func TestRunnerReverifiesContinuationAtReplacementReleaseGate(t *testing.T) {
+	t.Parallel()
+
+	run := resumableRun(t, 68, "resume-68")
+	github := &fakeGitHub{}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: "lease-68", Issue: 68, RunID: run.RunID}},
+	}}
+	runner := testRunner(github, workers, store, 1)
+	runner.PIDIdentity = func(pid int) (string, error) {
+		if err := os.WriteFile(run.Continuation.SessionFile, []byte("changed after initial verification\n"), 0o600); err != nil {
+			return "", err
+		}
+		workers.mu.Lock()
+		workers.processes[68].closeResult.GroupExited = true
+		workers.mu.Unlock()
+		return fmt.Sprintf("identity-%d", pid), nil
+	}
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusNeedsHuman || !strings.Contains(got.Runs[0].Error, "reverify") || got.Runs[0].PID != 0 || len(got.Leases) != 1 || workers.releases != 0 || workers.abortedCount() == 0 {
+		t.Fatalf("changed continuation at release gate = %#v, releases=%d aborts=%d", got, workers.releases, workers.abortedCount())
+	}
+}
+
 func TestRunnerFailsClosedWhenReplacementWorkerCannotLaunchSafely(t *testing.T) {
 	t.Parallel()
 
@@ -1477,12 +1658,13 @@ func TestRunnerFailsClosedWhenReplacementWorkerCannotLaunchSafely(t *testing.T) 
 		name      string
 		configure func(*Runner, *fakeWorkers)
 		wantError string
+		wantPID   bool
 	}{
 		{name: "start", configure: func(_ *Runner, workers *fakeWorkers) { workers.startErr = errors.New("start failed") }, wantError: "start failed"},
 		{name: "process identity", configure: func(runner *Runner, _ *fakeWorkers) {
 			runner.PIDIdentity = func(int) (string, error) { return "", errors.New("identity unavailable") }
 		}, wantError: "identity unavailable"},
-		{name: "release", configure: func(_ *Runner, workers *fakeWorkers) { workers.processReleaseErr = errors.New("release failed") }, wantError: "release failed"},
+		{name: "release", configure: func(_ *Runner, workers *fakeWorkers) { workers.processReleaseErr = errors.New("release failed") }, wantError: "release failed", wantPID: true},
 	}
 	for index, test := range tests {
 		test := test
@@ -1500,7 +1682,7 @@ func TestRunnerFailsClosedWhenReplacementWorkerCannotLaunchSafely(t *testing.T) 
 				t.Fatalf("run: %v", err)
 			}
 			got := store.LoadValue()
-			if got.Runs[0].Status != scheduler.StatusNeedsHuman || !strings.Contains(got.Runs[0].Error, test.wantError) || got.Runs[0].PID != 0 || len(got.Leases) != 1 {
+			if got.Runs[0].Status != scheduler.StatusNeedsHuman || !strings.Contains(got.Runs[0].Error, test.wantError) || (got.Runs[0].PID != 0) != test.wantPID || len(got.Leases) != 1 {
 				t.Fatalf("unsafe replacement launch = %#v", got)
 			}
 		})

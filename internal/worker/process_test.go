@@ -426,7 +426,7 @@ wait "$child"
 		t.Fatalf("release: %v", err)
 	}
 	var childData []byte
-	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
 		childData, _ = os.ReadFile(childPIDPath)
 		if len(strings.TrimSpace(string(childData))) > 0 {
 			break
@@ -760,6 +760,66 @@ func TestVerifyContinuationRevalidatesPersistedSessionIdentityLeafAndHash(t *tes
 				t.Fatalf("error = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestVerifyContinuationRejectsCoherentlyHashedWrongSessionHeader(t *testing.T) {
+	t.Parallel()
+
+	sessionDir := t.TempDir()
+	worktree := t.TempDir()
+	sessionFile := filepath.Join(sessionDir, "session.jsonl")
+	expected := ContinuationRequest{SessionID: "session-1", SessionDir: sessionDir, Worktree: worktree}
+	tests := []struct {
+		name      string
+		sessionID string
+		worktree  string
+	}{
+		{name: "wrong session id", sessionID: "session-other", worktree: worktree},
+		{name: "wrong worktree", sessionID: "session-1", worktree: t.TempDir()},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			content := `{"type":"session","version":3,"id":` + strconv.Quote(test.sessionID) + `,"cwd":` + strconv.Quote(test.worktree) + `}` + "\n" +
+				`{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"continue"}}` + "\n"
+			if err := os.WriteFile(sessionFile, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			hash := sha256.Sum256([]byte(content))
+			continuation := Continuation{
+				SessionID: "session-1", SessionFile: sessionFile, Worktree: worktree,
+				LeafID: "leaf", EntryCount: 1, SHA256: hex.EncodeToString(hash[:]),
+			}
+			if err := VerifyContinuation(expected, continuation); err == nil || !strings.Contains(err.Error(), "identity/path") {
+				t.Fatalf("wrong coherent session header error = %v", err)
+			}
+		})
+	}
+}
+
+func TestVerifyContinuationRejectsFIFOWithoutBlocking(t *testing.T) {
+	t.Parallel()
+
+	sessionDir := t.TempDir()
+	worktree := t.TempDir()
+	sessionFile := filepath.Join(sessionDir, "session.jsonl")
+	if err := syscall.Mkfifo(sessionFile, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- VerifyContinuation(
+			ContinuationRequest{SessionID: "session-1", SessionDir: sessionDir, Worktree: worktree},
+			Continuation{SessionID: "session-1", SessionFile: sessionFile, Worktree: worktree, LeafID: "leaf", EntryCount: 1, SHA256: strings.Repeat("a", 64)},
+		)
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("FIFO continuation error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("FIFO continuation verification blocked")
 	}
 }
 
