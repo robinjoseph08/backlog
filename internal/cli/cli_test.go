@@ -407,6 +407,15 @@ func TestCommandHelpExitsSuccessfully(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
+	if exit := Main(context.Background(), []string{"reset", "--help"}, &stdout, &stderr); exit != 0 {
+		t.Fatalf("reset help exit = %d, stderr = %q", exit, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "dry-run") || strings.Contains(stderr.String(), "requires an issue number") {
+		t.Fatalf("reset help = %q", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
 	if exit := Main(context.Background(), []string{"retry", "--help"}, &stdout, &stderr); exit != 0 {
 		t.Fatalf("retry help exit = %d, stderr = %q", exit, stderr.String())
 	}

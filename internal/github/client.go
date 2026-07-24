@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os/exec"
@@ -24,6 +25,21 @@ type CompletionOutcome struct {
 	PRFound        bool
 	Merged         bool
 	IssueClosed    bool
+	AutoMergeArmed bool
+}
+
+type ResetIssue struct {
+	Number int
+	URL    string
+	State  string
+	Labels []string
+}
+
+type ResetPullRequest struct {
+	Number         int
+	URL            string
+	State          string
+	Merged         bool
 	AutoMergeArmed bool
 }
 
@@ -203,6 +219,137 @@ func (c Client) resolveReference(ctx context.Context, currentRepo string, refere
 		blocker.Owner, blocker.Repo = parts[0], parts[1]
 	}
 	return blocker, strings.EqualFold(issue.State, "open"), nil
+}
+
+// ResetResources reads the issue and every pull request for the exact owned
+// branch. Incomplete or mismatched identities fail closed.
+func (c Client) ResetResources(ctx context.Context, repo string, issueNumber int, branch string) (ResetIssue, []ResetPullRequest, error) {
+	var issue struct {
+		Number int             `json:"number"`
+		URL    string          `json:"url"`
+		State  string          `json:"state"`
+		Labels json.RawMessage `json:"labels"`
+	}
+	if err := c.jsonCommand(ctx, &issue, "issue", "view", fmt.Sprint(issueNumber), "--repo", repo,
+		"--json", "number,url,state,labels"); err != nil {
+		return ResetIssue{}, nil, fmt.Errorf("inspect Reset issue: %w", err)
+	}
+	if issue.Number != issueNumber || !resourceURLMatches(issue.URL, repo, "issues", issueNumber) ||
+		(!strings.EqualFold(issue.State, "open") && !strings.EqualFold(issue.State, "closed")) {
+		return ResetIssue{}, nil, fmt.Errorf("inspect Reset issue: gh returned incomplete or unknown issue identity/state")
+	}
+	var labels []struct {
+		Name string `json:"name"`
+	}
+	if len(issue.Labels) == 0 || string(issue.Labels) == "null" || json.Unmarshal(issue.Labels, &labels) != nil {
+		return ResetIssue{}, nil, fmt.Errorf("inspect Reset issue: gh returned unknown labels")
+	}
+	resultIssue := ResetIssue{Number: issue.Number, URL: issue.URL, State: strings.ToLower(issue.State)}
+	for _, label := range labels {
+		if label.Name == "" {
+			return ResetIssue{}, nil, fmt.Errorf("inspect Reset issue: gh returned a label without identity")
+		}
+		resultIssue.Labels = append(resultIssue.Labels, label.Name)
+	}
+
+	if branch == "" {
+		return resultIssue, nil, nil
+	}
+	parts := strings.SplitN(repo, "/", 2)
+	if len(parts) != 2 || parts[0] == "" {
+		return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull requests: invalid repository %q", repo)
+	}
+	var pulls []struct {
+		Number           int             `json:"number"`
+		URL              string          `json:"url"`
+		State            string          `json:"state"`
+		MergedAt         json.RawMessage `json:"mergedAt"`
+		AutoMergeRequest json.RawMessage `json:"autoMergeRequest"`
+		IsDraft          *bool           `json:"isDraft"`
+		HeadRefName      string          `json:"headRefName"`
+		HeadOwner        struct {
+			Login string `json:"login"`
+		} `json:"headRepositoryOwner"`
+		HeadRepository struct {
+			NameWithOwner string `json:"nameWithOwner"`
+		} `json:"headRepository"`
+	}
+	var pullsJSON json.RawMessage
+	if err := c.jsonCommand(ctx, &pullsJSON, "pr", "list", "--repo", repo, "--state", "all", "--head", branch, "--limit", "1000",
+		"--json", "number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository"); err != nil {
+		return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull requests: %w", err)
+	}
+	if len(pullsJSON) == 0 || string(pullsJSON) == "null" || json.Unmarshal(pullsJSON, &pulls) != nil {
+		return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull requests: gh returned an unknown pull request list")
+	}
+	if len(pulls) == 1000 {
+		return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull requests: result reached the inspection limit; completeness is unknown")
+	}
+	resultPulls := make([]ResetPullRequest, 0, len(pulls))
+	for _, pull := range pulls {
+		if pull.Number <= 0 || !resourceURLMatches(pull.URL, repo, "pull", pull.Number) || pull.HeadRefName != branch ||
+			!strings.EqualFold(pull.HeadOwner.Login, parts[0]) || !strings.EqualFold(pull.HeadRepository.NameWithOwner, repo) {
+			return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull requests: gh returned incomplete or mismatched pull request identity")
+		}
+		state := strings.ToLower(pull.State)
+		if state != "open" && state != "closed" && state != "merged" {
+			return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull request #%d: unknown state %q", pull.Number, pull.State)
+		}
+		merged, err := resetMergedState(pull.MergedAt)
+		if err != nil {
+			return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull request #%d: %w", pull.Number, err)
+		}
+		autoMergeArmed, err := resetAutoMergeState(pull.AutoMergeRequest, pull.IsDraft)
+		if err != nil {
+			return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull request #%d: %w", pull.Number, err)
+		}
+		merged = merged || state == "merged"
+		if merged {
+			state = "merged"
+		}
+		resultPulls = append(resultPulls, ResetPullRequest{
+			Number: pull.Number, URL: pull.URL, State: state, Merged: merged,
+			AutoMergeArmed: autoMergeArmed,
+		})
+	}
+	return resultIssue, resultPulls, nil
+}
+
+func resourceURLMatches(rawURL, repo, resource string, number int) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "github.com") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+	expectedPath := fmt.Sprintf("/%s/%s/%d", repo, resource, number)
+	return strings.EqualFold(strings.TrimSuffix(parsed.Path, "/"), expectedPath)
+}
+
+func resetMergedState(raw json.RawMessage) (bool, error) {
+	if len(raw) == 0 {
+		return false, errors.New("gh returned unknown merged state")
+	}
+	if string(raw) == "null" {
+		return false, nil
+	}
+	var mergedAt time.Time
+	if err := json.Unmarshal(raw, &mergedAt); err != nil || mergedAt.IsZero() {
+		return false, errors.New("gh returned unknown merged state")
+	}
+	return true, nil
+}
+
+func resetAutoMergeState(raw json.RawMessage, isDraft *bool) (bool, error) {
+	if len(raw) == 0 || isDraft == nil {
+		return false, errors.New("gh returned unknown auto-merge state")
+	}
+	if string(raw) == "null" {
+		return false, nil
+	}
+	var request map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &request); err != nil || request == nil {
+		return false, errors.New("gh returned unknown auto-merge state")
+	}
+	return !*isDraft, nil
 }
 
 func (c Client) Completion(ctx context.Context, repo string, issue int, branch string) (CompletionOutcome, error) {
