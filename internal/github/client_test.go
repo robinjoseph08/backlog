@@ -266,7 +266,7 @@ func TestClientVerifiesCompletionFromPullRequestAndIssue(t *testing.T) {
 
 	gh := fakeGH(t, `
 case "$*" in
-  "pr list --repo acme/widgets --state all --head acme:agent/issue-42-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+  "pr list --repo acme/widgets --state all --head agent/issue-42-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
     printf '%s\n' '[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"MERGED","mergedAt":"2026-01-03T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-42-run","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
   "issue view 42 --repo acme/widgets --json state,title,url")
     printf '%s\n' '{"state":"CLOSED","title":"done","url":"https://github.com/acme/widgets/issues/42"}' ;;
@@ -288,7 +288,7 @@ func TestClientRecognizesArmedAutoMergeAsUnderstoodWait(t *testing.T) {
 
 	gh := fakeGH(t, `
 case "$*" in
-  "pr list --repo acme/widgets --state all --head acme:agent/issue-7-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+  "pr list --repo acme/widgets --state all --head agent/issue-7-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
     printf '%s\n' '[{"number":101,"url":"https://github.com/acme/widgets/pull/101","state":"OPEN","mergedAt":null,"autoMergeRequest":{"mergeMethod":"SQUASH"},"isDraft":false,"headRefName":"agent/issue-7-run","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
   "issue view 7 --repo acme/widgets --json state,title,url")
     printf '%s\n' '{"state":"OPEN","title":"waiting","url":"https://github.com/acme/widgets/issues/7"}' ;;
@@ -309,7 +309,7 @@ func TestClientCompletionRefusesSameBranchFromFork(t *testing.T) {
 
 	gh := fakeGH(t, `
 case "$*" in
-  "pr list --repo acme/widgets --state all --head acme:agent/issue-9-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+  "pr list --repo acme/widgets --state all --head agent/issue-9-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
     printf '%s\n' '[{"number":109,"url":"https://github.com/acme/widgets/pull/109","state":"MERGED","mergedAt":"2026-01-03T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-9-run","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/fork"}}]' ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
 esac`)

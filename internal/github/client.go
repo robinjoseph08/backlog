@@ -398,7 +398,7 @@ func (c Client) Completion(ctx context.Context, repo string, issue int, branch s
 		} `json:"headRepository"`
 	}
 	var pullsJSON json.RawMessage
-	if err := c.jsonCommand(ctx, &pullsJSON, "pr", "list", "--repo", repo, "--state", "all", "--head", parts[0]+":"+branch, "--limit", "1000",
+	if err := c.jsonCommand(ctx, &pullsJSON, "pr", "list", "--repo", repo, "--state", "all", "--head", branch, "--limit", "1000",
 		"--json", "number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository"); err != nil {
 		return CompletionOutcome{}, fmt.Errorf("find pull request: %w", err)
 	}
