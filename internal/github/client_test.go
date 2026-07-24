@@ -331,8 +331,10 @@ func TestClientIssueInspectionRefusesDuplicateIdentityFields(t *testing.T) {
 		response string
 	}{
 		{name: "number", response: `{"number":41,"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"}]}`},
+		{name: "number case alias", response: `{"number":41,"Number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"}]}`},
 		{name: "URL", response: `{"number":42,"url":"https://github.com/acme/widgets/issues/41","url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"}]}`},
 		{name: "state", response: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","state":"OPEN","labels":[{"name":"in-progress"}]}`},
+		{name: "nested label case alias", response: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"ready-for-human","Name":"in-progress"}]}`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -384,6 +386,7 @@ func TestClientCompletionRefusesDuplicateIssueIdentityFields(t *testing.T) {
 		response string
 	}{
 		{name: "number", response: `{"number":41,"number":42,"state":"OPEN","url":"https://github.com/acme/widgets/issues/42"}`},
+		{name: "number case alias", response: `{"number":41,"Number":42,"state":"OPEN","url":"https://github.com/acme/widgets/issues/42"}`},
 		{name: "URL", response: `{"number":42,"state":"OPEN","url":"https://github.com/acme/widgets/issues/41","url":"https://github.com/acme/widgets/issues/42"}`},
 		{name: "state", response: `{"number":42,"state":"CLOSED","state":"OPEN","url":"https://github.com/acme/widgets/issues/42"}`},
 	}
@@ -407,6 +410,25 @@ esac`)
 				t.Fatalf("completion = %#v, want fail-closed empty outcome", got)
 			}
 		})
+	}
+}
+
+func TestClientCompletionRefusesCaseVariantPullRequestIdentity(t *testing.T) {
+	t.Parallel()
+
+	gh := fakeGH(t, `
+case "$*" in
+  "pr list --repo acme/widgets --state all --head agent/issue-9-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+    printf '%s\n' '[{"number":109,"url":"https://github.com/acme/widgets/pull/109","state":"MERGED","mergedAt":"2026-01-03T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-9-run","headRepositoryOwner":{"login":"other","Login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+
+	got, err := (Client{Executable: gh}).Completion(context.Background(), "acme/widgets", 9, "agent/issue-9-run")
+	if err == nil || !strings.Contains(err.Error(), "duplicate JSON field") {
+		t.Fatalf("error = %v, want case-variant pull request identity refusal", err)
+	}
+	if got != (CompletionOutcome{}) {
+		t.Fatalf("completion = %#v, want fail-closed empty outcome", got)
 	}
 }
 

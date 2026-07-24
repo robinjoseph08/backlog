@@ -872,6 +872,16 @@ func TestVerifySessionBoundaryRejectsPathIdentityAndEntryMismatches(t *testing.T
 	if _, err := verifyAndSyncSession(sessionFile, expected, []json.RawMessage{json.RawMessage(duplicate)}, "leaf", syncFile); err == nil || !strings.Contains(err.Error(), "duplicate key") {
 		t.Fatalf("duplicate-key error = %v", err)
 	}
+	caseVariantHeader := `{"type":"other","Type":"session","id":"wrong","ID":"session-1","cwd":"wrong","CWD":` + strconv.Quote(worktree) + `}`
+	if err := os.WriteFile(sessionFile, []byte(caseVariantHeader+"\n"+diskEntry+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifyAndSyncSession(sessionFile, expected, []json.RawMessage{json.RawMessage(diskEntry)}, "leaf", syncFile); err == nil || !strings.Contains(err.Error(), "duplicate key") {
+		t.Fatalf("case-variant header error = %v", err)
+	}
+	if err := os.WriteFile(sessionFile, []byte(header+"\n"+diskEntry+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	syncFailure := errors.New("sync failed")
 	if _, err := verifyAndSyncSession(sessionFile, expected, []json.RawMessage{json.RawMessage(diskEntry)}, "leaf", func(*os.File) error { return syncFailure }); !errors.Is(err, syncFailure) {
 		t.Fatalf("sync failure = %v", err)
@@ -929,6 +939,47 @@ func TestVerifyContinuationRevalidatesPersistedSessionIdentityLeafAndHash(t *tes
 			}
 			if err := VerifyContinuation(expected, value); err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestVerifyContinuationRejectsCaseVariantIdentityAliases(t *testing.T) {
+	t.Parallel()
+
+	sessionDir := t.TempDir()
+	worktree := t.TempDir()
+	sessionFile := filepath.Join(sessionDir, "session.jsonl")
+	expected := ContinuationRequest{SessionID: "session-1", SessionDir: sessionDir, Worktree: worktree}
+	tests := []struct {
+		name    string
+		header  string
+		entries string
+	}{
+		{
+			name:    "session header",
+			header:  `{"type":"other","Type":"session","id":"wrong","ID":"session-1","cwd":"wrong","CWD":` + strconv.Quote(worktree) + `}`,
+			entries: `{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"continue"}}`,
+		},
+		{
+			name:    "durable leaf",
+			header:  `{"type":"session","id":"session-1","cwd":` + strconv.Quote(worktree) + `}`,
+			entries: `{"type":"message","id":"wrong","ID":"leaf","parentId":null,"message":{"role":"user","content":"continue"}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			content := test.header + "\n" + test.entries + "\n"
+			if err := os.WriteFile(sessionFile, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			hash := sha256.Sum256([]byte(content))
+			continuation := Continuation{
+				SessionID: "session-1", SessionFile: sessionFile, Worktree: worktree,
+				LeafID: "leaf", EntryCount: 1, SHA256: hex.EncodeToString(hash[:]),
+			}
+			if err := VerifyContinuation(expected, continuation); err == nil || !strings.Contains(err.Error(), "duplicate key") {
+				t.Fatalf("case-variant identity error = %v", err)
 			}
 		})
 	}

@@ -707,6 +707,9 @@ func verifyAndSyncSession(path string, expected ContinuationRequest, rpcEntries 
 		ID   string `json:"id"`
 		CWD  string `json:"cwd"`
 	}
+	if _, err := decodeExactJSON(records[0]); err != nil {
+		return "", fmt.Errorf("decode Pi session header: %w", err)
+	}
 	if err := json.Unmarshal(records[0], &header); err != nil || header.Type != "session" {
 		return "", errors.New("Pi session file has an invalid header")
 	}
@@ -786,10 +789,11 @@ func rejectDuplicateJSONKeys(decoder *json.Decoder) error {
 			if !ok {
 				return errors.New("JSON object key is not a string")
 			}
-			if _, duplicate := keys[key]; duplicate {
+			foldedKey := strings.ToLower(key)
+			if _, duplicate := keys[foldedKey]; duplicate {
 				return fmt.Errorf("JSON object contains duplicate key %q", key)
 			}
-			keys[key] = struct{}{}
+			keys[foldedKey] = struct{}{}
 			if err := rejectDuplicateJSONKeys(decoder); err != nil {
 				return err
 			}
