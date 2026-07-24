@@ -45,9 +45,12 @@ type ResetIssue struct {
 type ResetPullRequest struct {
 	Number         int
 	URL            string
+	Branch         string
+	Commit         string
 	State          string
 	Merged         bool
 	AutoMergeArmed bool
+	Comments       []string
 }
 
 type Client struct {
@@ -316,6 +319,7 @@ func (c Client) ResetResources(ctx context.Context, repo string, issueNumber int
 		AutoMergeRequest json.RawMessage `json:"autoMergeRequest"`
 		IsDraft          *bool           `json:"isDraft"`
 		HeadRefName      string          `json:"headRefName"`
+		HeadRefOID       string          `json:"headRefOid"`
 		HeadOwner        struct {
 			Login string `json:"login"`
 		} `json:"headRepositoryOwner"`
@@ -325,7 +329,7 @@ func (c Client) ResetResources(ctx context.Context, repo string, issueNumber int
 	}
 	var pullsJSON json.RawMessage
 	if err := c.jsonCommand(ctx, &pullsJSON, "pr", "list", "--repo", repo, "--state", "all", "--head", branch, "--limit", "1000",
-		"--json", "number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository"); err != nil {
+		"--json", "number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository"); err != nil {
 		return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull requests: %w", err)
 	}
 	if len(pullsJSON) == 0 || string(pullsJSON) == "null" || json.Unmarshal(pullsJSON, &pulls) != nil {
@@ -336,7 +340,7 @@ func (c Client) ResetResources(ctx context.Context, repo string, issueNumber int
 	}
 	resultPulls := make([]ResetPullRequest, 0, len(pulls))
 	for _, pull := range pulls {
-		if pull.Number <= 0 || !resourceURLMatches(pull.URL, repo, "pull", pull.Number) || pull.HeadRefName != branch ||
+		if pull.Number <= 0 || !resourceURLMatches(pull.URL, repo, "pull", pull.Number) || pull.HeadRefName != branch || !validCommitOID(pull.HeadRefOID) ||
 			!strings.EqualFold(pull.HeadOwner.Login, parts[0]) || !strings.EqualFold(pull.HeadRepository.NameWithOwner, repo) {
 			return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull requests: gh returned incomplete or mismatched pull request identity")
 		}
@@ -356,12 +360,66 @@ func (c Client) ResetResources(ctx context.Context, repo string, issueNumber int
 		if merged {
 			state = "merged"
 		}
-		resultPulls = append(resultPulls, ResetPullRequest{
-			Number: pull.Number, URL: pull.URL, State: state, Merged: merged,
-			AutoMergeArmed: autoMergeArmed,
-		})
+		result := ResetPullRequest{
+			Number: pull.Number, URL: pull.URL, Branch: pull.HeadRefName, Commit: pull.HeadRefOID,
+			State: state, Merged: merged, AutoMergeArmed: autoMergeArmed,
+		}
+		if state == "open" {
+			comments, err := c.resetPullRequestComments(ctx, repo, pull.Number)
+			if err != nil {
+				return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull request #%d comments: %w", pull.Number, err)
+			}
+			result.Comments = comments
+		}
+		resultPulls = append(resultPulls, result)
 	}
 	return resultIssue, resultPulls, nil
+}
+
+func (c Client) resetPullRequestComments(ctx context.Context, repo string, number int) ([]string, error) {
+	var pagesJSON json.RawMessage
+	endpoint := fmt.Sprintf("repos/%s/issues/%d/comments?per_page=100", repo, number)
+	if err := c.jsonCommand(ctx, &pagesJSON, "api",
+		"-H", "Accept: application/vnd.github+json",
+		"-H", "X-GitHub-Api-Version: 2026-03-10",
+		endpoint, "--paginate", "--slurp",
+	); err != nil {
+		return nil, err
+	}
+	var pages [][]struct {
+		Body *string `json:"body"`
+	}
+	if len(pagesJSON) == 0 || string(pagesJSON) == "null" || json.Unmarshal(pagesJSON, &pages) != nil {
+		return nil, errors.New("gh returned an unknown comment list")
+	}
+	if len(pages) == 0 {
+		return nil, errors.New("gh returned an unknown comment list")
+	}
+	var comments []string
+	for _, page := range pages {
+		if page == nil {
+			return nil, errors.New("gh returned an unknown comment page")
+		}
+		for _, comment := range page {
+			if comment.Body == nil {
+				return nil, errors.New("gh returned a comment without a body")
+			}
+			comments = append(comments, *comment.Body)
+		}
+	}
+	return comments, nil
+}
+
+func validCommitOID(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if !strings.ContainsRune("0123456789abcdefABCDEF", character) {
+			return false
+		}
+	}
+	return strings.Trim(value, "0") != ""
 }
 
 func resourceURLMatches(rawURL, repo, resource string, number int) bool {
@@ -414,10 +472,25 @@ func resetAutoMergeState(raw json.RawMessage, isDraft *bool) (bool, error) {
 		return false, nil
 	}
 	var request map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &request); err != nil || request == nil {
+	if err := json.Unmarshal(raw, &request); err != nil || request == nil || *isDraft {
 		return false, errors.New("gh returned unknown auto-merge state")
 	}
-	return !*isDraft, nil
+	return true, nil
+}
+
+// DisablePullRequestAutoMerge disarms one freshly verified pull request.
+func (c Client) DisablePullRequestAutoMerge(ctx context.Context, repo string, number int) error {
+	return c.command(ctx, "pr", "merge", fmt.Sprint(number), "--repo", repo, "--disable-auto")
+}
+
+// CommentOnPullRequest records the explanation for abandoning a Run.
+func (c Client) CommentOnPullRequest(ctx context.Context, repo string, number int, body string) error {
+	return c.command(ctx, "pr", "comment", fmt.Sprint(number), "--repo", repo, "--body", body)
+}
+
+// ClosePullRequest closes one freshly verified unmerged pull request.
+func (c Client) ClosePullRequest(ctx context.Context, repo string, number int) error {
+	return c.command(ctx, "pr", "close", fmt.Sprint(number), "--repo", repo)
 }
 
 // AddIssueLabel adds one managed label without replacing unrelated labels.

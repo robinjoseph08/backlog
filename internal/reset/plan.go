@@ -27,8 +27,11 @@ type Issue struct {
 type PullRequest struct {
 	Number         int
 	URL            string
+	Branch         string
+	Commit         string
 	State          PullRequestState
 	AutoMergeArmed bool
+	ResetCommented bool
 }
 
 type Branch struct {
@@ -100,8 +103,8 @@ func Build(snapshot Snapshot) (Plan, error) {
 	pullNumbers := make(map[int]struct{}, len(pullRequests))
 	pullURLs := make(map[string]struct{}, len(pullRequests))
 	for _, pull := range pullRequests {
-		if pull.Number <= 0 || pull.URL == "" {
-			return Plan{}, fmt.Errorf("Run %s has a pull request with incomplete identity", snapshot.Run.RunID)
+		if pull.Number <= 0 || pull.URL == "" || pull.Branch != snapshot.Run.Branch || strings.TrimSpace(pull.Commit) == "" {
+			return Plan{}, fmt.Errorf("Run %s has a pull request with incomplete or mismatched branch identity", snapshot.Run.RunID)
 		}
 		if _, duplicate := pullNumbers[pull.Number]; duplicate {
 			return Plan{}, fmt.Errorf("Run %s has duplicate pull request number #%d", snapshot.Run.RunID, pull.Number)
@@ -132,14 +135,53 @@ func Build(snapshot Snapshot) (Plan, error) {
 	}
 
 	plan := Plan{Snapshot: snapshot}
+	planning := snapshot
+	planning.PullRequests = pullRequests
+	hasOpenPullRequest := false
 	for _, pull := range pullRequests {
-		if pull.State != PullRequestOpen {
+		if pull.State == PullRequestOpen {
+			hasOpenPullRequest = true
+			break
+		}
+	}
+	_, hasInProgress := labels["in-progress"]
+	_, hasReadyForAgent := labels["ready-for-agent"]
+	needsProgress := hasOpenPullRequest || snapshot.RemoteBranch.Present || hasInProgress || !hasReadyForAgent
+	if needsProgress && planning.Run.Status != scheduler.StatusResetting && planning.Run.Status != scheduler.StatusWaitingForMerge && planning.Run.Status != scheduler.StatusReset {
+		plan.Actions = append(plan.Actions, fmt.Sprintf("mark Run %s resetting while retaining Lease %s", snapshot.Run.RunID, snapshot.Lease.LeaseID))
+		planning.Run.Status = scheduler.StatusResetting
+	}
+	for {
+		pull, found := NextPullRequestForReset(planning)
+		if planning.Run.Status == scheduler.StatusWaitingForMerge && (!found || !pull.AutoMergeArmed) {
+			plan.Actions = append(plan.Actions, fmt.Sprintf("mark Run %s resetting while retaining Lease %s", snapshot.Run.RunID, snapshot.Lease.LeaseID))
+			planning.Run.Status = scheduler.StatusResetting
 			continue
 		}
-		if pull.AutoMergeArmed {
-			plan.Actions = append(plan.Actions, fmt.Sprintf("disable auto-merge for pull request #%d (%s)", pull.Number, pull.URL))
+		if !found {
+			break
 		}
-		plan.Actions = append(plan.Actions, fmt.Sprintf("close unmerged pull request #%d (%s)", pull.Number, pull.URL))
+		for index := range planning.PullRequests {
+			if planning.PullRequests[index].Number != pull.Number {
+				continue
+			}
+			switch {
+			case pull.AutoMergeArmed:
+				plan.Actions = append(plan.Actions, fmt.Sprintf("disable auto-merge for pull request #%d (%s)", pull.Number, pull.URL))
+				planning.PullRequests[index].AutoMergeArmed = false
+				if planning.Run.Status == scheduler.StatusWaitingForMerge {
+					plan.Actions = append(plan.Actions, fmt.Sprintf("mark Run %s resetting while retaining Lease %s", snapshot.Run.RunID, snapshot.Lease.LeaseID))
+					planning.Run.Status = scheduler.StatusResetting
+				}
+			case !pull.ResetCommented:
+				plan.Actions = append(plan.Actions, fmt.Sprintf("explain Reset on pull request #%d (%s)", pull.Number, pull.URL))
+				planning.PullRequests[index].ResetCommented = true
+			default:
+				plan.Actions = append(plan.Actions, fmt.Sprintf("close unmerged pull request #%d (%s)", pull.Number, pull.URL))
+				planning.PullRequests[index].State = PullRequestClosed
+			}
+			break
+		}
 	}
 	if snapshot.RemoteBranch.Present {
 		plan.Actions = append(plan.Actions, fmt.Sprintf("delete remote branch %s at %s", snapshot.RemoteBranch.Name, snapshot.RemoteBranch.Commit))
@@ -163,6 +205,32 @@ func Build(snapshot Snapshot) (Plan, error) {
 		plan.Actions = append(plan.Actions, fmt.Sprintf("mark Run %s reset and release Lease %s", snapshot.Run.RunID, snapshot.Lease.LeaseID))
 	}
 	return plan, nil
+}
+
+// NextPullRequestForReset returns the owned open pull request targeted by the
+// next Reset action. A waiting-for-merge Run must handle its recorded pull
+// request before Reset can advance to the other pull requests for its branch.
+func NextPullRequestForReset(snapshot Snapshot) (PullRequest, bool) {
+	if snapshot.Run.Status == scheduler.StatusWaitingForMerge {
+		for _, pull := range snapshot.PullRequests {
+			if pull.URL == snapshot.Run.PullRequest {
+				return pull, pull.State == PullRequestOpen
+			}
+		}
+		return PullRequest{}, false
+	}
+
+	result := PullRequest{}
+	found := false
+	for _, pull := range snapshot.PullRequests {
+		if pull.State != PullRequestOpen {
+			continue
+		}
+		if !found || (pull.AutoMergeArmed && !result.AutoMergeArmed) || (pull.AutoMergeArmed == result.AutoMergeArmed && pull.Number < result.Number) {
+			result, found = pull, true
+		}
+	}
+	return result, found
 }
 
 func validateIdentity(snapshot Snapshot) error {
