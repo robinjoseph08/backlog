@@ -659,7 +659,7 @@ func rejectDuplicateJSONKeys(decoder *json.Decoder) error {
 	if err != nil {
 		return err
 	}
-	if closing != json.Delim(map[json.Delim]json.Delim{'{': '}', '[': ']'}[delimiter]) {
+	if closing != map[json.Delim]json.Delim{'{': '}', '[': ']'}[delimiter] {
 		return errors.New("JSON composite has mismatched delimiter")
 	}
 	return nil

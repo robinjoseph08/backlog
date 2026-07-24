@@ -390,14 +390,14 @@ func (r *Runner) observeSignals(ctx context.Context, admission *admissionGate, c
 	return events
 }
 
-func (r *Runner) requestSuspension(exitCode int, cancelOperations context.CancelFunc) {
+func (r *Runner) requestSuspension(exitCode int32, cancelOperations context.CancelFunc) {
 	r.suspensionMu.Lock()
 	defer r.suspensionMu.Unlock()
 	if r.suspensionExit.Load() != 0 {
 		return
 	}
 	r.suspensionDeadline = time.Now().Add(r.Config.SuspensionTimeout)
-	r.suspensionExit.Store(int32(exitCode))
+	r.suspensionExit.Store(exitCode)
 	cancelOperations()
 }
 
@@ -1204,6 +1204,7 @@ func pidIdentity(pid int) (string, error) {
 	if pid <= 0 {
 		return "", fmt.Errorf("invalid pid %d", pid)
 	}
+	// #nosec G204: pid is validated as positive and passed as a single argument.
 	command := exec.Command("ps", "-p", fmt.Sprint(pid), "-o", "lstart=")
 	output, err := command.CombinedOutput()
 	if err != nil {

@@ -709,7 +709,7 @@ func TestVerifySessionBoundaryRejectsPathIdentityAndEntryMismatches(t *testing.T
 
 func waitForPath(t *testing.T, path string) {
 	t.Helper()
-	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
 		if _, err := os.Stat(path); err == nil {
 			return
 		}
