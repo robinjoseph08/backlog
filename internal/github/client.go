@@ -118,6 +118,12 @@ func (c Client) candidate(ctx context.Context, repo string, number int) (schedul
 	if !strings.EqualFold(issue.State, "open") {
 		return scheduler.Candidate{}, fmt.Errorf("candidate is no longer open")
 	}
+	if issue.Number != number || issue.Number <= 0 {
+		return scheduler.Candidate{}, fmt.Errorf("candidate identity mismatch: requested #%d, received #%d", number, issue.Number)
+	}
+	if strings.TrimSpace(issue.Title) == "" || strings.TrimSpace(issue.URL) == "" || issue.CreatedAt.IsZero() {
+		return scheduler.Candidate{}, errors.New("candidate omitted required title, URL, or creation time")
+	}
 
 	blockers, err := c.nativeBlockers(ctx, repo, number)
 	if err != nil {
@@ -414,6 +420,16 @@ func resetAutoMergeState(raw json.RawMessage, isDraft *bool) (bool, error) {
 	return !*isDraft, nil
 }
 
+// AddIssueLabel adds one managed label without replacing unrelated labels.
+func (c Client) AddIssueLabel(ctx context.Context, repo string, issue int, label string) error {
+	return c.command(ctx, "issue", "edit", fmt.Sprint(issue), "--repo", repo, "--add-label", label)
+}
+
+// RemoveIssueLabel removes one managed label without replacing unrelated labels.
+func (c Client) RemoveIssueLabel(ctx context.Context, repo string, issue int, label string) error {
+	return c.command(ctx, "issue", "edit", fmt.Sprint(issue), "--repo", repo, "--remove-label", label)
+}
+
 func (c Client) Completion(ctx context.Context, repo string, issue int, branch string) (CompletionOutcome, error) {
 	parts := strings.SplitN(repo, "/", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || branch == "" {
@@ -485,6 +501,24 @@ func (c Client) Completion(ctx context.Context, repo string, issue int, branch s
 	}
 	outcome.IssueClosed = strings.EqualFold(issueState.State, "closed")
 	return outcome, nil
+}
+
+func (c Client) command(ctx context.Context, args ...string) error {
+	executable := c.Executable
+	if executable == "" {
+		executable = "gh"
+	}
+	command := exec.CommandContext(ctx, executable, args...)
+	command.Dir = c.Dir
+	output, err := command.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	message := strings.TrimSpace(string(output))
+	if message != "" {
+		return fmt.Errorf("gh %s: %s", strings.Join(args, " "), message)
+	}
+	return fmt.Errorf("gh %s: %w", strings.Join(args, " "), err)
 }
 
 func (c Client) jsonCommand(ctx context.Context, target any, args ...string) error {

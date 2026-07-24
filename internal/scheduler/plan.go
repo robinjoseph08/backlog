@@ -13,6 +13,8 @@ const (
 	StatusRunning         Status = "running"
 	StatusWaitingForMerge Status = "waiting-for-merge"
 	StatusSuspended       Status = "suspended"
+	StatusResetting       Status = "resetting"
+	StatusReset           Status = "reset"
 	StatusMerged          Status = "merged"
 	StatusFailed          Status = "failed"
 	StatusNeedsHuman      Status = "needs-human"
@@ -53,6 +55,8 @@ type ContinuationBoundary struct {
 
 type Run struct {
 	Issue           int                   `json:"issue"`
+	IssueTitle      string                `json:"issueTitle,omitempty"`
+	IssueURL        string                `json:"issueUrl,omitempty"`
 	RunID           string                `json:"runId"`
 	Status          Status                `json:"status"`
 	WorkerMode      WorkerMode            `json:"workerMode"`

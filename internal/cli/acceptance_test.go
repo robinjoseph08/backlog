@@ -605,6 +605,10 @@ printf '%s\n' "$*" > `+quote(piArgs)+`
 touch `+quote(piAlive)+`
 grep -q '"status": "running"' `+quote(statePath)+`
 grep -q '"workerMode": "rpc"' `+quote(statePath)+`
+grep -q '"issueTitle": "RPC"' `+quote(statePath)+`
+grep -q '"issueUrl": "https://example.test/issues/5"' `+quote(statePath)+`
+grep -q '"logPath": ".*\.jsonl"' `+quote(statePath)+`
+grep -q '"stderrPath": ".*\.stderr\.log"' `+quote(statePath)+`
 grep -q '"pid": '"$$" `+quote(statePath)+`
 IFS= read -r command
 printf '%s\n' "$command" > `+quote(prompt)+`
@@ -672,7 +676,9 @@ rm -f `+quote(piAlive)+`
 		t.Fatalf("Runs/Leases = %#v/%#v", current.Runs, current.Leases)
 	}
 	run := current.Runs[0]
-	if run.Status != scheduler.StatusMerged || run.WorkerMode != scheduler.WorkerModeRPC || run.SessionID != "backlog-"+run.RunID {
+	if run.Status != scheduler.StatusMerged || run.WorkerMode != scheduler.WorkerModeRPC || run.SessionID != "backlog-"+run.RunID ||
+		run.Issue != 5 || run.IssueTitle != "RPC" || run.IssueURL != "https://example.test/issues/5" ||
+		run.LogPath != filepath.Join(stateDir, "logs", run.RunID+".jsonl") || run.StderrPath != filepath.Join(stateDir, "logs", run.RunID+".stderr.log") {
 		t.Fatalf("persisted RPC Run = %#v", run)
 	}
 	wantSessionDir := filepath.Join(stateDir, "sessions", run.RunID)
@@ -702,6 +708,70 @@ rm -f `+quote(piAlive)+`
 	)
 	if output, err := unavailableSocket.CombinedOutput(); err != nil {
 		t.Fatalf("Herdr socket failure changed runner outcome: %v\n%s", err, output)
+	}
+}
+
+func TestCompiledExecutablePersistsNewRunContextWhenWorkerSetupFails(t *testing.T) {
+	root := t.TempDir()
+	repository := filepath.Join(root, "repo")
+	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, output)
+	}
+	binary := buildExecutable(t, root)
+
+	stateDir := filepath.Join(root, "state")
+	statePath := filepath.Join(stateDir, "state.json")
+	piStarted := filepath.Join(root, "pi-started")
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef")
+    printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
+    printf '%s\n' '[{"number":6,"title":"Setup failure context","createdAt":"2026-01-01T00:00:00Z","url":"https://example.test/issues/6"}]' ;;
+  "issue view 6 --repo acme/widgets --json number,title,body,state,url,createdAt")
+    printf '%s\n' '{"number":6,"title":"Setup failure context","body":"","state":"OPEN","url":"https://example.test/issues/6","createdAt":"2026-01-01T00:00:00Z"}' ;;
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/6/comments?per_page=100 --paginate --slurp"|\
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/6/dependencies/blocked_by?per_page=100 --paginate --slurp")
+    printf '%s\n' '[[]]' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	git := writeExecutable(t, `#!/bin/sh
+set -eu
+if [ "$3" = "rev-parse" ] && [ "$4" = "--show-toplevel" ]; then printf '%s\n' `+quote(repository)+`; exit 0; fi
+if [ "$3" = "rev-parse" ] && [ "$4" = "--git-common-dir" ]; then printf '%s\n' `+quote(filepath.Join(repository, ".git"))+`; exit 0; fi
+if [ "$3" = "worktree" ] && [ "$4" = "add" ]; then
+  mkdir -p "$7"
+  printf blocked > `+quote(filepath.Join(stateDir, "logs"))+`
+  exit 0
+fi
+exit 0
+`)
+	pi := writeExecutable(t, `#!/bin/sh
+touch `+quote(piStarted)+`
+exit 9
+`)
+
+	output, err := exec.Command(binary, "run", "--repo-dir", repository, "--state-dir", stateDir,
+		"--max-workers", "1", "--poll", "5ms", "--gh", gh, "--git", git, "--pi", pi).CombinedOutput()
+	if err != nil {
+		t.Fatalf("compiled run with Worker setup failure: %v\n%s", err, output)
+	}
+	current, err := (state.FileStore{Path: statePath}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.Runs) != 1 || len(current.Leases) != 1 {
+		t.Fatalf("Runs/Leases after setup failure = %#v/%#v", current.Runs, current.Leases)
+	}
+	run := current.Runs[0]
+	if run.Issue != 6 || run.IssueTitle != "Setup failure context" || run.IssueURL != "https://example.test/issues/6" ||
+		run.Status != scheduler.StatusFailed || !strings.Contains(run.Error, "create worker log directory") || run.LogPath != "" || run.StderrPath != "" {
+		t.Fatalf("Run after Worker setup failure = %#v", run)
+	}
+	if _, err := os.Stat(piStarted); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Pi started despite setup failure: %v", err)
 	}
 }
 
@@ -773,8 +843,9 @@ func TestCompiledExecutableMigratesV1StatusAndReconcilesStartup(t *testing.T) {
 	if upgraded.Version != state.CurrentVersion || len(upgraded.Runs) != 2 || len(upgraded.Leases) != 1 {
 		t.Fatalf("upgraded status = %#v", upgraded)
 	}
-	if upgraded.Leases[0].RunID != "legacy-running" || upgraded.Runs[0].WorkerMode != scheduler.WorkerModePrint || upgraded.Runs[1].WorkerMode != scheduler.WorkerModePrint {
-		t.Fatalf("upgraded worker and Lease metadata = %#v / %#v", upgraded.Runs, upgraded.Leases)
+	if upgraded.Leases[0].RunID != "legacy-running" || upgraded.Runs[0].WorkerMode != scheduler.WorkerModePrint || upgraded.Runs[1].WorkerMode != scheduler.WorkerModePrint ||
+		upgraded.Runs[0].IssueTitle != "" || upgraded.Runs[0].IssueURL != "" || upgraded.Runs[1].IssueTitle != "" || upgraded.Runs[1].IssueURL != "" {
+		t.Fatalf("upgraded worker, Lease, and issue snapshot metadata = %#v / %#v", upgraded.Runs, upgraded.Leases)
 	}
 	persistedAfterStatus, err := os.ReadFile(statePath)
 	if err != nil {
@@ -823,13 +894,15 @@ esac
 	if len(final.Runs) != 2 || len(final.Leases) != 0 {
 		t.Fatalf("reconciled Runs/Leases = %#v/%#v", final.Runs, final.Leases)
 	}
-	if final.Runs[0].RunID != "old-merged" || final.Runs[0].Error != "retained merged diagnostic" {
-		t.Fatalf("existing merged history changed: %#v", final.Runs[0])
+	if final.Runs[0].RunID != "old-merged" || final.Runs[0].Error != "retained merged diagnostic" ||
+		final.Runs[0].IssueTitle != "" || final.Runs[0].IssueURL != "" {
+		t.Fatalf("existing merged history changed or was backfilled: %#v", final.Runs[0])
 	}
 	reconciled := final.Runs[1]
 	if reconciled.RunID != "legacy-running" || reconciled.Status != scheduler.StatusMerged || reconciled.WorkerMode != scheduler.WorkerModePrint ||
 		reconciled.Branch != "agent/issue-42-legacy-running" || reconciled.Worktree != worktreePath || reconciled.SessionName != "afk #42" ||
-		reconciled.LogPath != "/retained/legacy.jsonl" || reconciled.StderrPath != "/retained/legacy.stderr.log" || reconciled.PullRequest != "https://github.com/acme/widgets/pull/42" {
+		reconciled.LogPath != "/retained/legacy.jsonl" || reconciled.StderrPath != "/retained/legacy.stderr.log" || reconciled.PullRequest != "https://github.com/acme/widgets/pull/42" ||
+		reconciled.IssueTitle != "" || reconciled.IssueURL != "" {
 		t.Fatalf("startup reconciliation lost migrated artifacts: %#v", reconciled)
 	}
 }

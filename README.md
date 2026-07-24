@@ -12,7 +12,7 @@ Each issue receives its own lease, Git branch, Git worktree, Pi process, named P
 - GitHub CLI `gh`, authenticated for the target repository
 - Pi 0.80.4 or newer with the global `afk` skill available
 - A Git remote named `origin`
-- GitHub API access with Issues read permission
+- GitHub API access with Issues write permission
 
 The runner uses GitHub's versioned issue dependency endpoint. A dependency lookup failure stops scheduling rather than treating the issue as unblocked.
 
@@ -88,7 +88,7 @@ AFK repeats its own blocker check inside the worker as a final safety check.
 
 For issue `#123`, the runner fetches the latest default branch before creating an isolated worktree. A failed fetch is attempted up to three times, with waits of one and two seconds between attempts. Shutdown cancellation interrupts those waits.
 
-The runner starts Pi in RPC mode in the issue worktree using a deterministic session ID derived from the Run ID and a dedicated session directory under Backlog state. A start gate prevents Pi from opening the session or receiving the AFK prompt until the Worker PID and process-start identity are durable.
+The runner starts Pi in RPC mode in the issue worktree using a deterministic session ID derived from the Run ID and a dedicated session directory under Backlog state. A start gate prevents Pi from opening the session or receiving the AFK prompt until the Worker JSONL and standard-error log paths, PID, and process-start identity are durable.
 
 Backlog submits `/skill:afk 123` as a correlated RPC `prompt` command. Standard output uses strict LF-delimited JSONL and is saved separately from standard error. Malformed or truncated records, mismatched or duplicate responses, and invalid lifecycle ordering fail closed and preserve the worktree.
 
@@ -102,13 +102,13 @@ State and logs live outside the target repository. By default they are stored un
 
 State is written with same-directory temporary files, file sync, atomic rename, and directory sync. A repository-level advisory lock in the Git common directory prevents two local runner instances from scheduling the same backlog, even if they request different state paths. The first runner start, or a status command that migrates version 1 state, binds the repository to one state directory; later conflicting `--state-dir` values are rejected.
 
-State keeps historical Runs separate from active Leases. New Runs persist their RPC session identity and dedicated session storage before launch. Upgrading version 1 state preserves Run metadata and artifacts, removes the obsolete paused setting, and records legacy print-mode Runs as non-resumable. During migration, incomplete and intervention-required Runs retain their Leases, while verified merged Runs remain as history without active ownership.
+State keeps historical Runs separate from active Leases. New Runs snapshot the Candidate issue title and URL when their Lease is created, then persist their RPC session identity and dedicated session storage before launch. Worker log paths become durable as soon as the gated Worker starts. Existing Runs without issue snapshots or startup log paths remain valid and are not backfilled through GitHub. Upgrading version 1 state preserves Run metadata and artifacts, removes the obsolete paused setting, and records legacy print-mode Runs as non-resumable. During migration, incomplete and intervention-required Runs retain their Leases, while verified merged Runs remain as history without active ownership.
 
 On restart, the runner reconciles persisted Leases with process liveness and GitHub pull request and issue state before Candidate admission. Safe Suspended Runs fill Worker capacity before new Candidates. Resume rechecks Completion, the open issue and managed workflow labels, the exact branch and worktree, the Pi session identity, durable leaf, entry count and file hash, and proof that the old Worker stopped. A replacement Worker keeps the Run, Lease, branch, worktree, and Pi session identities while receiving a new PID and process-start identity. Its prompt requires Pi to reassess repository and GitHub state before continuing AFK.
 
 A continuation marker persisted before a crash can recover a dead Worker into Resume. Missing, changed, malformed, or uncertain continuation state on a Suspended Run becomes `needs-human` with its Lease retained. Legacy print-mode Runs never Resume automatically. The runner compares each recovered PID with its persisted operating-system process start identity, so PID reuse becomes `needs-human` instead of being mistaken for the Worker. A live matching Worker is never launched twice. A recovered live RPC Worker becomes `needs-human` because a replacement runner cannot restore its prompt and event pipes. Its process identity remains durable and consumes Worker capacity. Recovered Workers older than `--max-worker-age` also become `needs-human`.
 
-Inspect state. Reading version 1 state performs the version 2 migration under the repository lock before printing status:
+Inspect state. Plain status includes each snapshotted issue title when available and falls back to its issue number for older history. Reading version 1 state performs the version 2 migration under the repository lock before printing status:
 
 ```sh
 backlog status
@@ -121,15 +121,22 @@ Inspect the exact actions required to Reset an incomplete Run:
 backlog reset 123 --dry-run
 ```
 
-Reset dry-run holds the repository coordination lock while it inspects the Run, Lease, Worker, GitHub issue and pull requests, remote and local branches, worktree, and Pi session. It prints only actions still required. It refuses live or uncertain Workers, merged work, unknown resource state, unexplained issue closure, and human workflow labels. It never prompts, writes, or requires `--yes`; passing `--yes` has no effect.
+Reset dry-run holds the repository coordination lock while it inspects the Run, Lease, Worker, GitHub issue and pull requests, remote and local branches, worktree, and Pi session. It prints only actions still required. It refuses live or uncertain Workers, merged work, unknown resource state, unexplained issue closure, and human workflow labels. It never prompts or writes, and it does not require `--yes`.
 
-Mutating Reset is intentionally not available yet. Until it replaces Retry, allow a failed or `needs-human` issue to be scheduled again with:
+Mutating Reset currently supports eligible Runs whose pull requests, branches, worktrees, and Pi sessions are already absent. Run it interactively to review and confirm the plan, or pass `--yes` for non-interactive use:
 
 ```sh
-backlog retry 123
+backlog reset 123
+backlog reset 123 --yes
 ```
 
-Retry removes the active Lease but preserves the historical Run and prior worktree for diagnosis. The next attempt receives a new Run identity, branch, and worktree.
+Interactive confirmation defaults to no. Reset rechecks the plan after confirmation, restores the managed issue labels while preserving unrelated labels, verifies every postcondition, then atomically marks the historical Run `reset` and releases its Lease. It does not create a replacement Run. Runs with remaining artifacts can be inspected with `--dry-run`, but mutating Reset refuses them until artifact retirement is implemented.
+
+`retry` is a deprecated alias for the same Reset path, flags, output, mutations, and exit statuses. It adds a deprecation warning:
+
+```sh
+backlog retry 123 --yes
+```
 
 ## Shutdown
 

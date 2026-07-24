@@ -14,6 +14,8 @@ func TestRequiresLeaseCoversEveryStatus(t *testing.T) {
 		{StatusRunning, true},
 		{StatusWaitingForMerge, true},
 		{StatusSuspended, true},
+		{StatusResetting, true},
+		{StatusReset, false},
 		{StatusMerged, false},
 		{StatusFailed, false},
 		{StatusNeedsHuman, false},
@@ -30,11 +32,17 @@ func TestRunStateTransitionsAreExplicit(t *testing.T) {
 
 	allowed := [][2]Status{
 		{StatusClaimed, StatusWorktreeReady},
+		{StatusClaimed, StatusResetting},
+		{StatusClaimed, StatusReset},
 		{StatusClaimed, StatusFailed},
 		{StatusClaimed, StatusMerged},
 		{StatusWorktreeReady, StatusRunning},
+		{StatusWorktreeReady, StatusResetting},
+		{StatusWorktreeReady, StatusReset},
 		{StatusRunning, StatusWaitingForMerge},
 		{StatusRunning, StatusSuspended},
+		{StatusRunning, StatusResetting},
+		{StatusRunning, StatusReset},
 		{StatusRunning, StatusMerged},
 		{StatusRunning, StatusFailed},
 		{StatusRunning, StatusNeedsHuman},
@@ -45,6 +53,13 @@ func TestRunStateTransitionsAreExplicit(t *testing.T) {
 		{StatusSuspended, StatusWaitingForMerge},
 		{StatusSuspended, StatusMerged},
 		{StatusSuspended, StatusNeedsHuman},
+		{StatusFailed, StatusResetting},
+		{StatusNeedsHuman, StatusResetting},
+		{StatusSuspended, StatusResetting},
+		{StatusFailed, StatusReset},
+		{StatusNeedsHuman, StatusReset},
+		{StatusSuspended, StatusReset},
+		{StatusResetting, StatusReset},
 	}
 	for _, transition := range allowed {
 		if !CanTransition(transition[0], transition[1]) {
@@ -57,6 +72,8 @@ func TestRunStateTransitionsAreExplicit(t *testing.T) {
 		{StatusFailed, StatusClaimed},
 		{StatusNeedsHuman, StatusRunning},
 		{StatusClaimed, StatusWaitingForMerge},
+		{StatusReset, StatusRunning},
+		{StatusReset, StatusResetting},
 	}
 	for _, transition := range rejected {
 		if CanTransition(transition[0], transition[1]) {

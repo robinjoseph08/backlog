@@ -236,6 +236,12 @@ func (p *Process) PID() int {
 	return p.command.Process.Pid
 }
 
+// LogPaths returns the durable JSONL and standard-error log identities chosen
+// before the Worker process started.
+func (p *Process) LogPaths() (string, string) {
+	return p.logPath, p.stderrPath
+}
+
 func (p *Process) Release() error {
 	p.releaseOnce.Do(func() {
 		if err := releaseGate(p.gatePath); err != nil {

@@ -222,12 +222,18 @@ func TestRunnerRetainsFailedWorktree(t *testing.T) {
 	if worktrees.cleanupCount() != 0 {
 		t.Fatalf("cleanup count = %d, want failed worktree retained", worktrees.cleanupCount())
 	}
+	run := store.LoadValue().Runs[0]
+	if run.LogPath != "/logs/run-11.jsonl" || run.StderrPath != "/logs/run-11.stderr.log" {
+		t.Fatalf("failed Run lost startup log identities: %#v", run)
+	}
 }
 
-func TestRunnerPersistsWorkerIdentityBeforeRelease(t *testing.T) {
+func TestRunnerPersistsObservableWorkerContextBeforeRelease(t *testing.T) {
 	t.Parallel()
 
-	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 7, CreatedAt: time.Now()}}}
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{
+		Number: 7, Title: "Make Runs observable", URL: "https://github.com/acme/widgets/issues/7", CreatedAt: time.Now(),
+	}}}
 	workers := newFakeWorkers()
 	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
 	released := make(chan error, 1)
@@ -238,7 +244,9 @@ func TestRunnerPersistsWorkerIdentityBeforeRelease(t *testing.T) {
 			return
 		}
 		run := findActiveRun(&current, issue)
-		if run.Status != scheduler.StatusRunning || run.PID != 1000+issue || run.ProcessIdentity == "" {
+		if run.Status != scheduler.StatusRunning || run.PID != 1000+issue || run.ProcessIdentity == "" ||
+			run.IssueTitle != "Make Runs observable" || run.IssueURL != "https://github.com/acme/widgets/issues/7" ||
+			run.LogPath != "/logs/run-7.jsonl" || run.StderrPath != "/logs/run-7.stderr.log" {
 			released <- fmt.Errorf("Run at release = %#v", run)
 			return
 		}
@@ -251,6 +259,55 @@ func TestRunnerPersistsWorkerIdentityBeforeRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	workers.complete(7, worker.Result{ExitCode: 1, Err: errors.New("failed")})
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	var admitted scheduler.Run
+	for _, saved := range store.SaveHistory() {
+		if len(saved.Runs) == 1 && len(saved.Leases) == 1 && saved.Runs[0].Status == scheduler.StatusClaimed {
+			admitted = saved.Runs[0]
+			break
+		}
+	}
+	if admitted.RunID == "" || admitted.IssueTitle != "Make Runs observable" || admitted.IssueURL != "https://github.com/acme/widgets/issues/7" {
+		t.Fatalf("Run admission did not durably snapshot issue context: %#v", admitted)
+	}
+}
+
+func TestRunnerPersistsLogIdentitiesBeforeInspectingWorkerPID(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{
+		Number: 21, Title: "Observe startup", URL: "https://github.com/acme/widgets/issues/21", CreatedAt: time.Now(),
+	}}}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	identityStarted := make(chan struct{})
+	inspectIdentity := make(chan struct{})
+	runner := testRunner(github, workers, store, 1)
+	runner.PIDIdentity = func(_ context.Context, pid int) (string, error) {
+		close(identityStarted)
+		<-inspectIdentity
+		return fmt.Sprintf("identity-%d", pid), nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 21)
+	<-identityStarted
+
+	current := store.LoadValue()
+	run := findActiveRun(&current, 21)
+	if run.Status != scheduler.StatusWorktreeReady || run.PID != 0 || run.ProcessIdentity != "" ||
+		run.IssueTitle != "Observe startup" || run.IssueURL != "https://github.com/acme/widgets/issues/21" ||
+		run.LogPath != "/logs/run-21.jsonl" || run.StderrPath != "/logs/run-21.stderr.log" {
+		t.Fatalf("Run while PID inspection is blocked = %#v", run)
+	}
+	if workers.releaseCount() != 0 {
+		t.Fatal("Worker was released before startup context became durable")
+	}
+
+	close(inspectIdentity)
+	workers.complete(21, worker.Result{ExitCode: 1, Err: errors.New("failed")})
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
@@ -277,23 +334,136 @@ func TestRunnerDoesNotCommitInMemoryLeaseWhenAdmissionSaveFails(t *testing.T) {
 	}
 }
 
-func TestRunnerStopsGatedWorkerWhenPIDPersistenceFails(t *testing.T) {
+func TestRunnerStopsGatedWorkerWhenLogPersistenceFails(t *testing.T) {
 	t.Parallel()
 
 	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 6, CreatedAt: time.Now()}}}
 	workers := newFakeWorkers()
+	workers.startupCloseResult.GroupExited = true
 	store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 5}
 	runner := testRunner(github, workers, store, 1)
 
 	err := runner.Run(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "persist worker") {
-		t.Fatalf("run error = %v, want PID persistence failure", err)
+	if err == nil || !strings.Contains(err.Error(), "persist worker logs") {
+		t.Fatalf("run error = %v, want log persistence failure", err)
 	}
 	if workers.runningCount() != 0 {
 		t.Fatalf("running workers = %d, want gated worker stopped", workers.runningCount())
 	}
 	if workers.releaseCount() != 0 {
 		t.Fatalf("release count = %d, want gated worker unreleased", workers.releaseCount())
+	}
+	run := store.LoadValue().Runs[0]
+	if run.LogPath != "/logs/run-6.jsonl" || run.StderrPath != "/logs/run-6.stderr.log" {
+		t.Fatalf("log persistence failure lost recoverable log identities: %#v", run)
+	}
+}
+
+func TestRunnerStopsGatedWorkerWhenPIDPersistenceFails(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 16, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	workers.startupCloseResult.GroupExited = true
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 6}
+	runner := testRunner(github, workers, store, 1)
+
+	err := runner.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "persist worker for issue #16") {
+		t.Fatalf("run error = %v, want PID persistence failure", err)
+	}
+	if workers.runningCount() != 0 || workers.releaseCount() != 0 {
+		t.Fatalf("running/released workers = %d/%d, want gated Worker stopped and unreleased", workers.runningCount(), workers.releaseCount())
+	}
+	run := store.LoadValue().Runs[0]
+	if run.LogPath != "/logs/run-16.jsonl" || run.StderrPath != "/logs/run-16.stderr.log" {
+		t.Fatalf("PID persistence failure lost startup log identities: %#v", run)
+	}
+}
+
+func TestRunnerRetainsLogIdentitiesWhenPIDInspectionFails(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 17, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	workers.startupCloseResult.GroupExited = true
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+	runner.PIDIdentity = func(context.Context, int) (string, error) { return "", errors.New("identity unavailable") }
+
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	run := store.LoadValue().Runs[0]
+	if run.Status != scheduler.StatusFailed || run.LogPath != "/logs/run-17.jsonl" || run.StderrPath != "/logs/run-17.stderr.log" {
+		t.Fatalf("Run after PID inspection failure = %#v", run)
+	}
+}
+
+func TestRunnerRetainsLogIdentitiesWhenWorkerReleaseFails(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 18, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	workers.releaseErr = errors.New("prompt unavailable")
+	workers.startupCloseResult.GroupExited = true
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	run := store.LoadValue().Runs[0]
+	if run.Status != scheduler.StatusFailed || run.LogPath != "/logs/run-18.jsonl" || run.StderrPath != "/logs/run-18.stderr.log" {
+		t.Fatalf("Run after Worker release failure = %#v", run)
+	}
+	if workers.runningCount() != 0 {
+		t.Fatalf("running Workers = %d, want released Worker stopped", workers.runningCount())
+	}
+}
+
+func TestRunnerFailsRunWhenWorkerOmitsLogIdentity(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 20, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	workers.omitLogPaths = true
+	workers.startupCloseResult.GroupExited = true
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	run := store.LoadValue().Runs[0]
+	if run.Status != scheduler.StatusFailed || !strings.Contains(run.Error, "omitted a JSONL or standard-error log identity") {
+		t.Fatalf("Run after incomplete Worker startup = %#v", run)
+	}
+	if workers.runningCount() != 0 || workers.releaseCount() != 0 {
+		t.Fatalf("running/released workers = %d/%d, want gated Worker stopped and unreleased", workers.runningCount(), workers.releaseCount())
+	}
+}
+
+func TestRunnerRetainsLiveWorkerIdentityWhenGatedShutdownCannotBeVerified(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 22, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	workers.omitLogPaths = true
+	workers.startupCloseResult = worker.Result{Err: errors.New("process group still alive")}
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+
+	err := runner.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "process-group exit was not verified") {
+		t.Fatalf("run error = %v, want unverified gated Worker shutdown", err)
+	}
+	run := store.LoadValue().Runs[0]
+	if run.Status != scheduler.StatusNeedsHuman || run.PID != 1022 || !strings.Contains(run.Error, "stop Worker after startup failure") {
+		t.Fatalf("Run after unverified gated Worker shutdown = %#v", run)
+	}
+	if workers.releaseCount() != 0 {
+		t.Fatalf("release count = %d, want gated Worker unreleased", workers.releaseCount())
 	}
 }
 
@@ -1373,6 +1543,29 @@ func TestRunnerDrainCancellationDoesNotEraseRecoveredWorkerPID(t *testing.T) {
 	}
 }
 
+func TestRunnerLeavesResettingRunForResetReconciliation(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{}
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs:   []scheduler.Run{{Issue: 1, RunID: "resetting", Status: scheduler.StatusResetting, WorkerMode: scheduler.WorkerModePrint}},
+		Leases: []scheduler.Lease{{LeaseID: "resetting", Issue: 1, RunID: "resetting"}},
+	}}
+	runner := testRunner(github, newFakeWorkers(), store, 1)
+	current := store.LoadValue()
+	if err := runner.reconcile(context.Background(), &current, map[int]WorkerProcess{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusResetting || len(got.Leases) != 1 {
+		t.Fatalf("resetting Run changed during runner reconciliation: %#v", got)
+	}
+	if branches := github.completionBranchSnapshot(); len(branches) != 0 {
+		t.Fatalf("resetting Run triggered GitHub completion lookup: %q", branches)
+	}
+}
+
 func TestRunnerReconcilesClaimedRunWithoutLookingUpAnEmptyBranch(t *testing.T) {
 	t.Parallel()
 
@@ -2047,7 +2240,7 @@ func TestRunnerFailsClosedWhenReplacementWorkerCannotLaunchSafely(t *testing.T) 
 		{name: "process identity", configure: func(runner *Runner, _ *fakeWorkers) {
 			runner.PIDIdentity = func(context.Context, int) (string, error) { return "", errors.New("identity unavailable") }
 		}, wantError: "identity unavailable", wantPID: true},
-		{name: "release", configure: func(_ *Runner, workers *fakeWorkers) { workers.processReleaseErr = errors.New("release failed") }, wantError: "release failed", wantPID: true},
+		{name: "release", configure: func(_ *Runner, workers *fakeWorkers) { workers.releaseErr = errors.New("release failed") }, wantError: "release failed", wantPID: true},
 	}
 	for index, test := range tests {
 		test := test
@@ -2585,7 +2778,7 @@ func TestRunnerForceEscalationCleansBeforePersistingNewMergedOutcome(t *testing.
 func TestRunnerDoesNotPersistBoundaryAfterMarkerWriteFails(t *testing.T) {
 	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 44, CreatedAt: time.Now()}}}
 	workers := newFakeWorkers()
-	store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 6}
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 7}
 	signals := make(chan os.Signal, 1)
 	runner := testRunner(github, workers, store, 1)
 	runner.Signals = signals
@@ -2621,7 +2814,7 @@ func TestRunnerRecoversPersistedContinuationAfterFinalSuspensionSaveFails(t *tes
 			LeafID: "leaf", EntryCount: 1, SHA256: hex.EncodeToString(hash[:]),
 		}, nil
 	}
-	store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 7}
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 8}
 	signals := make(chan os.Signal, 1)
 	runner := testRunner(github, workers, store, 1)
 	runner.Signals = signals
@@ -3185,6 +3378,7 @@ func testRunner(github *fakeGitHub, workers *fakeWorkers, store *memoryStore, ma
 type memoryStore struct {
 	mu           sync.Mutex
 	value        state.State
+	saveHistory  []state.State
 	saveCount    int
 	failAtSave   int
 	failNextSave bool
@@ -3204,7 +3398,17 @@ func (s *memoryStore) Save(value state.State) error {
 		return errors.New("injected state save failure")
 	}
 	s.value = cloneState(value)
+	s.saveHistory = append(s.saveHistory, cloneState(value))
 	return nil
+}
+func (s *memoryStore) SaveHistory() []state.State {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	history := make([]state.State, len(s.saveHistory))
+	for index, saved := range s.saveHistory {
+		history[index] = cloneState(saved)
+	}
+	return history
 }
 func (s *memoryStore) failNext() {
 	s.mu.Lock()
@@ -3434,11 +3638,20 @@ type fakeProcess struct {
 }
 
 func (p *fakeProcess) PID() int { return 1000 + p.issue }
-func (p *fakeProcess) Release() error {
-	p.owner.released(p.issue)
+func (p *fakeProcess) LogPaths() (string, string) {
 	p.owner.mu.Lock()
 	defer p.owner.mu.Unlock()
-	return p.owner.processReleaseErr
+	if p.owner.omitLogPaths {
+		return "", ""
+	}
+	return fmt.Sprintf("/logs/run-%d.jsonl", p.issue), fmt.Sprintf("/logs/run-%d.stderr.log", p.issue)
+}
+func (p *fakeProcess) Release() error {
+	p.owner.mu.Lock()
+	releaseErr := p.owner.releaseErr
+	p.owner.mu.Unlock()
+	p.owner.released(p.issue)
+	return releaseErr
 }
 func (p *fakeProcess) Abort() error {
 	p.owner.recordAbort()
@@ -3545,7 +3758,9 @@ type fakeWorkers struct {
 	authorizedForceStops int
 	abortCount           int
 	startErr             error
-	processReleaseErr    error
+	omitLogPaths         bool
+	releaseErr           error
+	startupCloseResult   worker.Result
 	suspendFunc          func(context.Context, int, worker.ContinuationRequest) (worker.Continuation, error)
 	startChanged         chan struct{}
 	closeContextStarted  chan int
@@ -3567,7 +3782,7 @@ func (w *fakeWorkers) Start(_ context.Context, request worker.Request) (WorkerPr
 	if w.startErr != nil {
 		return nil, w.startErr
 	}
-	process := &fakeProcess{issue: request.Issue, owner: w, done: make(chan worker.Result, 1)}
+	process := &fakeProcess{issue: request.Issue, owner: w, done: make(chan worker.Result, 1), closeResult: w.startupCloseResult}
 	w.processes[request.Issue] = process
 	w.started = append(w.started, request.Issue)
 	w.requests = append(w.requests, request)

@@ -271,6 +271,9 @@ func validate(value State, recoverUnsafeContinuation bool) error {
 		if run.Status == scheduler.StatusMerged {
 			return fmt.Errorf("Lease %q references merged Run %q", lease.LeaseID, run.RunID)
 		}
+		if run.Status == scheduler.StatusReset {
+			return fmt.Errorf("Lease %q references reset Run %q", lease.LeaseID, run.RunID)
+		}
 	}
 	for _, run := range value.Runs {
 		if scheduler.RequiresLease(run.Status) {
@@ -330,7 +333,8 @@ func validateRun(run scheduler.Run, requireWorkerMode, recoverUnsafeContinuation
 func knownStatus(status scheduler.Status) bool {
 	switch status {
 	case scheduler.StatusClaimed, scheduler.StatusWorktreeReady, scheduler.StatusRunning,
-		scheduler.StatusWaitingForMerge, scheduler.StatusSuspended, scheduler.StatusMerged, scheduler.StatusFailed, scheduler.StatusNeedsHuman:
+		scheduler.StatusWaitingForMerge, scheduler.StatusSuspended, scheduler.StatusResetting, scheduler.StatusReset,
+		scheduler.StatusMerged, scheduler.StatusFailed, scheduler.StatusNeedsHuman:
 		return true
 	default:
 		return false

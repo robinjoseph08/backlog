@@ -55,6 +55,7 @@ type Worktrees interface {
 
 type WorkerProcess interface {
 	PID() int
+	LogPaths() (string, string)
 	Release() error
 	Abort() error
 	Suspend(context.Context, worker.ContinuationRequest) (worker.Continuation, error)
@@ -642,7 +643,8 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 	now := r.Now().UTC()
 	runID := r.NewRunID(candidate.Number)
 	run := scheduler.Run{
-		Issue: candidate.Number, RunID: runID, Status: scheduler.StatusClaimed, WorkerMode: scheduler.WorkerModeRPC,
+		Issue: candidate.Number, IssueTitle: candidate.Title, IssueURL: candidate.URL,
+		RunID: runID, Status: scheduler.StatusClaimed, WorkerMode: scheduler.WorkerModeRPC,
 		SessionName: fmt.Sprintf("afk #%d", candidate.Number), SessionID: "backlog-" + runID,
 		SessionDir: filepath.Join(r.Config.SessionsDir, runID), StartedAt: now, UpdatedAt: now,
 	}
@@ -704,12 +706,25 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 		r.failRun(current, candidate.Number, fmt.Sprintf("start Pi worker: %v", err))
 		return nil, r.saveAfterFailure(*current, candidate.Number)
 	}
+	logPath, stderrPath := process.LogPaths()
+	if logPath == "" || stderrPath == "" {
+		return nil, r.failAfterWorkerStart(current, candidate.Number, process, "record Pi worker logs: Worker omitted a JSONL or standard-error log identity")
+	}
+	run = findActiveRun(current, candidate.Number)
+	run.LogPath = logPath
+	run.StderrPath = stderrPath
+	run.UpdatedAt = r.Now().UTC()
+	replaceRun(current, run)
+	if err := r.Store.Save(*current); err != nil {
+		failureErr := r.failAfterWorkerStart(current, candidate.Number, process, fmt.Sprintf("persist Pi worker logs before identity inspection: %v", err))
+		return nil, errors.Join(
+			fmt.Errorf("persist worker logs for issue #%d before identity inspection: %w", candidate.Number, err),
+			failureErr,
+		)
+	}
 	identity, err := r.PIDIdentity(operationCtx, process.PID())
 	if err != nil {
-		_ = process.Abort()
-		_ = process.Close()
-		r.failRun(current, candidate.Number, fmt.Sprintf("record Pi worker identity: %v", err))
-		return nil, r.saveAfterFailure(*current, candidate.Number)
+		return nil, r.failAfterWorkerStart(current, candidate.Number, process, fmt.Sprintf("record Pi worker identity: %v", err))
 	}
 	run = findActiveRun(current, candidate.Number)
 	transitionStatus(&run, scheduler.StatusRunning)
@@ -718,20 +733,14 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 	run.UpdatedAt = r.Now().UTC()
 	replaceRun(current, run)
 	if err := r.Store.Save(*current); err != nil {
-		_ = process.Abort()
-		_ = process.Close()
-		r.failRun(current, candidate.Number, fmt.Sprintf("persist worker identity before release: %v", err))
-		persistErr := r.Store.Save(*current)
+		failureErr := r.failAfterWorkerStart(current, candidate.Number, process, fmt.Sprintf("persist worker identity before release: %v", err))
 		return nil, errors.Join(
 			fmt.Errorf("persist worker for issue #%d before release: %w", candidate.Number, err),
-			persistErr,
+			failureErr,
 		)
 	}
 	if err := process.Release(); err != nil {
-		_ = process.Abort()
-		_ = process.Close()
-		r.failRun(current, candidate.Number, fmt.Sprintf("release Pi worker: %v", err))
-		return nil, r.saveAfterFailure(*current, candidate.Number)
+		return nil, r.failAfterWorkerStart(current, candidate.Number, process, fmt.Sprintf("release Pi worker: %v", err))
 	}
 	r.logf("started issue #%d in %s (pid %d)", candidate.Number, assignment.Path, process.PID())
 	return process, nil
@@ -1064,7 +1073,7 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 			continue
 		}
 		switch run.Status {
-		case scheduler.StatusMerged, scheduler.StatusFailed, scheduler.StatusNeedsHuman:
+		case scheduler.StatusMerged, scheduler.StatusFailed, scheduler.StatusNeedsHuman, scheduler.StatusResetting, scheduler.StatusReset:
 			continue
 		case scheduler.StatusRunning:
 			if run.PID > 0 && r.PIDAlive(run.PID) {
@@ -1083,7 +1092,7 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 					continue
 				}
 				if r.Now().Sub(run.StartedAt) > r.Config.MaxWorkerAge {
-					r.needsHumanWithLiveWorker(current, run.Issue, "recorded worker exceeded the maximum age; verify process identity before retrying")
+					r.needsHumanWithLiveWorker(current, run.Issue, "recorded worker exceeded the maximum age; verify process identity before Reset")
 					changed = true
 					continue
 				}
@@ -1343,6 +1352,29 @@ func (r *Runner) retainProvisionalCompletion(current *state.State, run *schedule
 	r.logf("issue #%d needs human attention: %s", run.Issue, message)
 }
 
+func (r *Runner) failAfterWorkerStart(current *state.State, issue int, process WorkerProcess, message string) error {
+	abortErr := process.Abort()
+	closed := process.Close()
+	if closed.GroupExited {
+		r.failRun(current, issue, message)
+		return r.saveAfterFailure(*current, issue)
+	}
+
+	run := findActiveRun(current, issue)
+	run.PID = process.PID()
+	replaceRun(current, run)
+	cleanupErr := errors.Join(
+		errors.New("Worker process-group exit was not verified after startup failed"),
+		abortErr,
+		closed.Err,
+	)
+	r.needsHumanWithLiveWorker(current, issue, fmt.Sprintf("%s; stop Worker after startup failure: %v", message, cleanupErr))
+	return errors.Join(
+		fmt.Errorf("stop Worker for issue #%d after startup failure: %w", issue, cleanupErr),
+		r.saveAfterFailure(*current, issue),
+	)
+}
+
 func (r *Runner) failRun(current *state.State, issue int, message string) {
 	run := findActiveRun(current, issue)
 	transitionStatus(&run, scheduler.StatusFailed)
@@ -1481,7 +1513,7 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 	closeProcess := func(issue int, process WorkerProcess) {
 		go func() {
 			result := process.CloseContext(ctx, r.authorizeSuspensionKill(runIDs[issue], process))
-			if result.GroupExited && !result.ForceStopped {
+			if result.GroupExited && !result.ForceStopped && ctx.Err() == nil {
 				forceStopRemaining.Add(-1)
 			}
 			closeResults <- suspensionCloseResult{issue: issue, result: result}

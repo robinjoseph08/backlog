@@ -296,8 +296,19 @@ func TestFileStoreRejectsInvalidRunAndLeaseReferences(t *testing.T) {
 			want: "merged Run",
 		},
 		{
+			name: "reset Run leased",
+			value: State{Version: CurrentVersion, Runs: []scheduler.Run{printRun(1, "reset", scheduler.StatusReset)},
+				Leases: []scheduler.Lease{{LeaseID: "lease", Issue: 1, RunID: "reset"}}},
+			want: "reset Run",
+		},
+		{
 			name:  "active Run has no Lease",
 			value: State{Version: CurrentVersion, Runs: []scheduler.Run{printRun(1, "running", scheduler.StatusClaimed)}},
+			want:  "has no Lease",
+		},
+		{
+			name:  "resetting Run has no Lease",
+			value: State{Version: CurrentVersion, Runs: []scheduler.Run{printRun(1, "resetting", scheduler.StatusResetting)}},
 			want:  "has no Lease",
 		},
 		{

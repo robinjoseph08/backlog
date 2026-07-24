@@ -82,6 +82,55 @@ esac`)
 	}
 }
 
+func TestClientRejectsIncompleteCandidateSnapshots(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		issue string
+		want  string
+	}{
+		{
+			name:  "mismatched issue number",
+			issue: `{"number":2,"title":"title","body":"","state":"OPEN","url":"https://github.com/acme/widgets/issues/2","createdAt":"2026-01-01T00:00:00Z"}`,
+			want:  "identity mismatch",
+		},
+		{
+			name:  "missing title",
+			issue: `{"number":1,"title":" ","body":"","state":"OPEN","url":"https://github.com/acme/widgets/issues/1","createdAt":"2026-01-01T00:00:00Z"}`,
+			want:  "omitted required title",
+		},
+		{
+			name:  "missing URL",
+			issue: `{"number":1,"title":"title","body":"","state":"OPEN","url":"","createdAt":"2026-01-01T00:00:00Z"}`,
+			want:  "omitted required title",
+		},
+		{
+			name:  "missing creation time",
+			issue: `{"number":1,"title":"title","body":"","state":"OPEN","url":"https://github.com/acme/widgets/issues/1"}`,
+			want:  "omitted required title",
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			gh := fakeGH(t, `
+case "$*" in
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
+    printf '%s\n' '[{"number":1,"title":"title","createdAt":"2026-01-01T00:00:00Z","url":"https://github.com/acme/widgets/issues/1"}]' ;;
+  "issue view 1 --repo acme/widgets --json number,title,body,state,url,createdAt")
+    printf '%s\n' '`+test.issue+`' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+			_, err := (Client{Executable: gh}).Candidates(context.Background(), "acme/widgets")
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestClientFailsClosedWhenNativeDependencyLookupFails(t *testing.T) {
 	t.Parallel()
 
@@ -290,6 +339,48 @@ esac`)
 	if err == nil || !strings.Contains(err.Error(), "inspection limit") {
 		t.Fatalf("error = %v", err)
 	}
+}
+
+func TestClientMutatesOnlyOneIssueLabel(t *testing.T) {
+	t.Parallel()
+
+	logPath := filepath.Join(t.TempDir(), "calls")
+	gh := fakeGH(t, `
+printf '%s\n' "$*" >> `+shellQuote(logPath)+`
+case "$*" in
+  "issue edit 42 --repo acme/widgets --remove-label in-progress"|\
+  "issue edit 42 --repo acme/widgets --add-label ready-for-agent") ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+	client := Client{Executable: gh}
+	if err := client.RemoveIssueLabel(context.Background(), "acme/widgets", 42, "in-progress"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.AddIssueLabel(context.Background(), "acme/widgets", 42, "ready-for-agent"); err != nil {
+		t.Fatal(err)
+	}
+	calls, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "issue edit 42 --repo acme/widgets --remove-label in-progress\n" +
+		"issue edit 42 --repo acme/widgets --add-label ready-for-agent\n"
+	if string(calls) != want {
+		t.Fatalf("calls = %q, want %q", calls, want)
+	}
+}
+
+func TestClientLabelMutationReportsGitHubFailure(t *testing.T) {
+	t.Parallel()
+	gh := fakeGH(t, `echo "label denied" >&2; exit 1`)
+	err := (Client{Executable: gh}).AddIssueLabel(context.Background(), "acme/widgets", 42, "ready-for-agent")
+	if err == nil || !strings.Contains(err.Error(), "label denied") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 func TestClientVerifiesCompletionFromPullRequestAndIssue(t *testing.T) {
@@ -508,8 +599,12 @@ func fakeGH(t *testing.T, body string) string {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "gh")
+	stagedPath := filepath.Join(dir, ".gh-staged")
 	script := "#!/bin/sh\nset -eu\n" + body + "\n"
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+	if err := os.WriteFile(stagedPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(stagedPath, path); err != nil {
 		t.Fatal(err)
 	}
 	return path
