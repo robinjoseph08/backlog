@@ -1532,10 +1532,16 @@ func TestRunnerRechecksGitHubCompletionImmediatelyBeforeResume(t *testing.T) {
 	}
 }
 
-func TestRunnerRefusesCompletionCleanupForChangedResumedWorktree(t *testing.T) {
+func TestRunnerRefusesCompletionCleanupForReplacedResumedWorktree(t *testing.T) {
 	t.Parallel()
 
 	run := resumableRun(t, 66, "resume-66")
+	if err := os.RemoveAll(run.Worktree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(run.Worktree, []byte("not a worktree"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	github := &fakeGitHub{completionFunc: func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
 		return mergedOutcome(66), nil
 	}}
@@ -1554,6 +1560,32 @@ func TestRunnerRefusesCompletionCleanupForChangedResumedWorktree(t *testing.T) {
 	got := store.LoadValue()
 	if got.Runs[0].Status != scheduler.StatusNeedsHuman || !strings.Contains(got.Runs[0].Error, "worktree identity changed") || len(got.Leases) != 1 || worktrees.cleanupCount() != 0 || workers.wasStarted(66) {
 		t.Fatalf("changed completed worktree = %#v, cleanup=%d, starts=%v", got, worktrees.cleanupCount(), workers.startedSnapshot())
+	}
+}
+
+func TestRunnerRefusesCompletionCleanupWhenWorktreeInspectionIsUncertain(t *testing.T) {
+	t.Parallel()
+
+	run := resumableRun(t, 67, "resume-67")
+	github := &fakeGitHub{completionFunc: func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
+		return mergedOutcome(67), nil
+	}}
+	workers := newFakeWorkers()
+	worktrees := &fakeWorktrees{}
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: "lease-67", Issue: 67, RunID: run.RunID}},
+	}}
+	runner := testRunner(github, workers, store, 1)
+	runner.Worktrees = worktrees
+	runner.Lstat = func(string) (os.FileInfo, error) { return nil, errors.New("worktree inspection unavailable") }
+
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusNeedsHuman || !strings.Contains(got.Runs[0].Error, "inspection unavailable") || len(got.Leases) != 1 || worktrees.cleanupCount() != 0 || workers.wasStarted(67) {
+		t.Fatalf("uncertain completed worktree = %#v, cleanup=%d, starts=%v", got, worktrees.cleanupCount(), workers.startedSnapshot())
 	}
 }
 

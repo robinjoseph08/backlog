@@ -82,6 +82,7 @@ type Runner struct {
 	PIDAlive          func(pid int) bool
 	PIDIdentity       func(pid int) (string, error)
 	ProcessGroupAlive func(pid int) (bool, error)
+	Lstat             func(string) (os.FileInfo, error)
 
 	suspensionExit     atomic.Int32
 	suspensionFailed   atomic.Bool
@@ -549,6 +550,9 @@ func (r *Runner) validate() error {
 	}
 	if r.ProcessGroupAlive == nil {
 		r.ProcessGroupAlive = processGroupAlive
+	}
+	if r.Lstat == nil {
+		r.Lstat = os.Lstat
 	}
 	if r.Output == nil {
 		r.Output = io.Discard
@@ -1111,10 +1115,16 @@ func (r *Runner) finalizeSettledWorker(ctx context.Context, current *state.State
 }
 
 func (r *Runner) verifyAndCleanupWorktree(ctx context.Context, assignment worktree.Assignment) error {
-	if r.Worktrees.Exists(assignment) {
+	lstat := r.Lstat
+	if lstat == nil {
+		lstat = os.Lstat
+	}
+	if _, err := lstat(assignment.Path); err == nil {
 		if err := r.Worktrees.Verify(ctx, assignment); err != nil {
 			return fmt.Errorf("verify retained worktree before cleanup: %w", err)
 		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect retained worktree before cleanup: %w", err)
 	}
 	return r.Worktrees.Cleanup(ctx, assignment)
 }
