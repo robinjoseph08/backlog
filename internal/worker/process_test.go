@@ -826,13 +826,24 @@ func (*gateCheckingWriteCloser) Close() error { return nil }
 func TestReplacementWorkerPromptRequiresFreshRepositoryAndGitHubAssessment(t *testing.T) {
 	root := t.TempDir()
 	inputPath := filepath.Join(root, "input")
+	argsPath := filepath.Join(root, "args")
 	pi := fakePi(t, `
+printf '%s\n' "$*" > `+shellQuote(argsPath)+`
 IFS= read -r command
 printf '%s\n' "$command" > `+shellQuote(inputPath)+`
 printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 while IFS= read -r ignored; do :; done
 `)
-	request := request(81, "run-81", t.TempDir(), filepath.Join(root, "session"))
+	sessionDir := filepath.Join(root, "session")
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sessionFile := filepath.Join(sessionDir, "session.jsonl")
+	if err := os.WriteFile(sessionFile, []byte("session\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request := request(81, "run-81", t.TempDir(), sessionDir)
+	request.SessionFile = sessionFile
 	request.Resume = true
 	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(context.Background(), request)
 	if err != nil {
@@ -854,6 +865,13 @@ while IFS= read -r ignored; do :; done
 	message := string(input)
 	if !strings.Contains(message, "Reassess the repository and GitHub state") || !strings.Contains(message, "existing AFK workflow") {
 		t.Fatalf("replacement prompt = %q", message)
+	}
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(args), "--session "+sessionFile) || strings.Contains(string(args), "--session-id") {
+		t.Fatalf("replacement Worker args = %q, want exact verified session file", args)
 	}
 }
 

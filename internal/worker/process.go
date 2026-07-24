@@ -30,6 +30,7 @@ type Request struct {
 	SessionName string
 	SessionID   string
 	SessionDir  string
+	SessionFile string
 	Resume      bool
 }
 
@@ -104,6 +105,11 @@ func (s Supervisor) Start(ctx context.Context, request Request) (*Process, error
 	if !safeSessionIDPattern.MatchString(request.SessionID) {
 		return nil, fmt.Errorf("session id %q contains unsafe characters", request.SessionID)
 	}
+	if request.Resume {
+		if err := verifySessionPath(request.SessionDir, request.SessionFile); err != nil {
+			return nil, fmt.Errorf("verify resumed Pi session path: %w", err)
+		}
+	}
 	if err := os.MkdirAll(s.LogsDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create worker log directory: %w", err)
 	}
@@ -143,8 +149,12 @@ func (s Supervisor) Start(ctx context.Context, request Request) (*Process, error
 	piArgs = append(piArgs,
 		"--name", request.SessionName,
 		"--session-dir", request.SessionDir,
-		"--session-id", request.SessionID,
 	)
+	if request.Resume {
+		piArgs = append(piArgs, "--session", request.SessionFile)
+	} else {
+		piArgs = append(piArgs, "--session-id", request.SessionID)
+	}
 
 	// The wrapper cannot exec Pi until Release creates the gate. This lets the
 	// runner durably record the Worker PID and process-start identity first.
@@ -570,6 +580,10 @@ func readSessionRecords(path string) ([]json.RawMessage, string, error) {
 		return nil, "", fmt.Errorf("open Pi session file: %w", err)
 	}
 	defer file.Close()
+	return scanSessionRecords(file)
+}
+
+func scanSessionRecords(file *os.File) ([]json.RawMessage, string, error) {
 	hash := sha256.New()
 	scanner := bufio.NewScanner(io.TeeReader(file, hash))
 	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
@@ -622,19 +636,9 @@ func verifyAndSyncSession(path string, expected ContinuationRequest, rpcEntries 
 		return "", fmt.Errorf("open Pi session file: %w", err)
 	}
 	defer file.Close()
-	hash := sha256.New()
-	scanner := bufio.NewScanner(io.TeeReader(file, hash))
-	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
-	var records []json.RawMessage
-	for scanner.Scan() {
-		line := append([]byte(nil), scanner.Bytes()...)
-		if !json.Valid(line) {
-			return "", fmt.Errorf("Pi session file contains malformed JSON on line %d", len(records)+1)
-		}
-		records = append(records, line)
-	}
-	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("read Pi session file: %w", err)
+	records, sessionHash, err := scanSessionRecords(file)
+	if err != nil {
+		return "", err
 	}
 	if len(records) != len(rpcEntries)+1 {
 		return "", fmt.Errorf("Pi session file has %d entries, RPC reported %d", len(records)-1, len(rpcEntries))
@@ -680,7 +684,7 @@ func verifyAndSyncSession(path string, expected ContinuationRequest, rpcEntries 
 	if err := directory.Close(); err != nil {
 		return "", fmt.Errorf("close Pi session directory: %w", err)
 	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
+	return sessionHash, nil
 }
 
 func decodeExactJSON(raw []byte) (any, error) {

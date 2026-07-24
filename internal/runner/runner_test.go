@@ -1325,7 +1325,7 @@ func TestRunnerResumesSuspendedRunBeforeNewCandidateWithSameIdentity(t *testing.
 		t.Fatalf("Worker start order = %v, want resumed issue first", got)
 	}
 	request := workers.requestFor(61)
-	if !request.Resume || request.RunID != run.RunID || request.SessionID != run.SessionID || request.SessionDir != run.SessionDir || request.Worktree != run.Worktree {
+	if !request.Resume || request.RunID != run.RunID || request.SessionID != run.SessionID || request.SessionDir != run.SessionDir || request.SessionFile != run.Continuation.SessionFile || request.Worktree != run.Worktree {
 		t.Fatalf("replacement Worker request = %#v, want retained Run/session/worktree identity", request)
 	}
 	waitForPersistedRun(t, store, 61, func(run scheduler.Run) bool {
@@ -1373,6 +1373,31 @@ func TestRunnerRecoversPersistedContinuationMarkerBeforeFinalSuspendedState(t *t
 	}
 }
 
+func TestRunnerRejectsCrashRecoveryWhileOldWorkerProcessGroupRemains(t *testing.T) {
+	t.Parallel()
+
+	run := resumableRun(t, 64, "resume-64")
+	run.Status = scheduler.StatusRunning
+	run.PID = 999999
+	run.ProcessIdentity = "999999:old"
+	github := &fakeGitHub{}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: "lease-64", Issue: 64, RunID: run.RunID}},
+	}}
+	runner := testRunner(github, workers, store, 1)
+	runner.PIDAlive = func(int) bool { return false }
+	runner.ProcessGroupAlive = func(int) (bool, error) { return true, nil }
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID != 999999 || got.Runs[0].ProcessIdentity != "999999:old" || len(got.Leases) != 1 || workers.wasStarted(64) {
+		t.Fatalf("surviving old Worker process group = %#v", got)
+	}
+}
+
 func TestRunnerRejectsUnsafeSuspendedContinuationAndRetainsLease(t *testing.T) {
 	t.Parallel()
 
@@ -1381,6 +1406,13 @@ func TestRunnerRejectsUnsafeSuspendedContinuationAndRetainsLease(t *testing.T) {
 		mutate    func(*scheduler.Run, *fakeGitHub, *fakeWorktrees)
 		wantError string
 	}{
+		{name: "missing continuation", mutate: func(run *scheduler.Run, _ *fakeGitHub, _ *fakeWorktrees) {
+			run.Continuation = nil
+		}, wantError: "incomplete"},
+		{name: "legacy print mode", mutate: func(run *scheduler.Run, _ *fakeGitHub, _ *fakeWorktrees) {
+			run.WorkerMode = scheduler.WorkerModePrint
+			run.Continuation = nil
+		}, wantError: "legacy print-mode"},
 		{name: "changed session", mutate: func(run *scheduler.Run, _ *fakeGitHub, _ *fakeWorktrees) {
 			run.Continuation.SHA256 = strings.Repeat("0", 64)
 		}, wantError: "hash"},
@@ -2075,15 +2107,16 @@ func (w *diagnosticWriter) String() string {
 
 func testRunner(github *fakeGitHub, workers *fakeWorkers, store *memoryStore, maxWorkers int) *Runner {
 	return &Runner{
-		Config:      Config{Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: maxWorkers, PollInterval: 5 * time.Millisecond, SessionsDir: "/tmp/backlog-sessions"},
-		GitHub:      github,
-		Store:       store,
-		Worktrees:   &fakeWorktrees{},
-		Workers:     workers,
-		Now:         func() time.Time { return time.Date(2026, 7, 2, 3, 4, 5, 0, time.UTC) },
-		NewRunID:    func(issue int) string { return fmt.Sprintf("run-%d", issue) },
-		PIDAlive:    func(int) bool { return true },
-		PIDIdentity: func(pid int) (string, error) { return fmt.Sprintf("identity-%d", pid), nil },
+		Config:            Config{Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: maxWorkers, PollInterval: 5 * time.Millisecond, SessionsDir: "/tmp/backlog-sessions"},
+		GitHub:            github,
+		Store:             store,
+		Worktrees:         &fakeWorktrees{},
+		Workers:           workers,
+		Now:               func() time.Time { return time.Date(2026, 7, 2, 3, 4, 5, 0, time.UTC) },
+		NewRunID:          func(issue int) string { return fmt.Sprintf("run-%d", issue) },
+		PIDAlive:          func(int) bool { return true },
+		PIDIdentity:       func(pid int) (string, error) { return fmt.Sprintf("identity-%d", pid), nil },
+		ProcessGroupAlive: func(int) (bool, error) { return false, nil },
 	}
 }
 

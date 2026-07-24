@@ -77,10 +77,11 @@ type Runner struct {
 	Output    io.Writer
 	Signals   <-chan os.Signal
 
-	Now         func() time.Time
-	NewRunID    func(issue int) string
-	PIDAlive    func(pid int) bool
-	PIDIdentity func(pid int) (string, error)
+	Now               func() time.Time
+	NewRunID          func(issue int) string
+	PIDAlive          func(pid int) bool
+	PIDIdentity       func(pid int) (string, error)
+	ProcessGroupAlive func(pid int) (bool, error)
 
 	suspensionExit     atomic.Int32
 	suspensionFailed   atomic.Bool
@@ -544,6 +545,9 @@ func (r *Runner) validate() error {
 	if r.PIDIdentity == nil {
 		r.PIDIdentity = pidIdentity
 	}
+	if r.ProcessGroupAlive == nil {
+		r.ProcessGroupAlive = processGroupAlive
+	}
 	if r.Output == nil {
 		r.Output = io.Discard
 	}
@@ -725,7 +729,7 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 
 	process, err := r.Workers.Start(workerCtx, worker.Request{
 		Issue: run.Issue, RunID: run.RunID, Worktree: run.Worktree, SessionName: run.SessionName,
-		SessionID: run.SessionID, SessionDir: run.SessionDir, Resume: true,
+		SessionID: run.SessionID, SessionDir: run.SessionDir, SessionFile: boundary.SessionFile, Resume: true,
 	})
 	if err != nil {
 		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("start replacement Pi Worker: %v", err))
@@ -785,7 +789,12 @@ func verifyResumeLabels(issue ghadapter.IssueState) error {
 }
 
 func (r *Runner) rejectResume(current *state.State, issue int, message string) error {
-	r.needsHuman(current, issue, message)
+	run := findActiveRun(current, issue)
+	if run.PID != 0 || run.ProcessIdentity != "" {
+		r.needsHumanWithLiveWorker(current, issue, message)
+	} else {
+		r.needsHuman(current, issue, message)
+	}
 	if err := r.Store.Save(*current); err != nil {
 		return fmt.Errorf("persist unsafe Resume for issue #%d: %w", issue, err)
 	}
@@ -889,6 +898,17 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 				}
 				continue
 			}
+			groupAlive, err := r.ProcessGroupAlive(run.PID)
+			if err != nil {
+				r.needsHumanWithLiveWorker(current, run.Issue, fmt.Sprintf("old Worker process-group absence is uncertain: %v", err))
+				changed = true
+				continue
+			}
+			if groupAlive {
+				r.needsHumanWithLiveWorker(current, run.Issue, "old Worker process group remains alive after its leader exited")
+				changed = true
+				continue
+			}
 		case scheduler.StatusWaitingForMerge, scheduler.StatusSuspended:
 			// Always verify waiting and suspended Runs without making retained
 			// continuation state eligible for normal admission.
@@ -919,6 +939,17 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 		recoverableMarker := run.Status == scheduler.StatusRunning && run.WorkerMode == scheduler.WorkerModeRPC && run.Continuation != nil
 		if (run.Status == scheduler.StatusSuspended || recoverableMarker) && !outcome.Merged && !outcome.PRFound {
 			if recoverableMarker {
+				boundary := run.Continuation
+				if err := worker.VerifyContinuation(worker.ContinuationRequest{
+					SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree,
+				}, worker.Continuation{
+					SessionID: boundary.SessionID, SessionFile: boundary.SessionFile, Worktree: boundary.Worktree,
+					LeafID: boundary.LeafID, EntryCount: boundary.EntryCount, SHA256: boundary.SHA256,
+				}); err != nil {
+					r.needsHuman(current, run.Issue, fmt.Sprintf("verify persisted Pi continuation after interrupted suspension: %v", err))
+					changed = true
+					continue
+				}
 				run.PID = 0
 				run.ProcessIdentity = ""
 				transitionStatus(&run, scheduler.StatusSuspended)
@@ -1428,4 +1459,18 @@ func pidAlive(pid int) bool {
 	}
 	err = process.Signal(syscall.Signal(0))
 	return err == nil || errors.Is(err, os.ErrPermission)
+}
+
+func processGroupAlive(pid int) (bool, error) {
+	if pid <= 0 {
+		return false, nil
+	}
+	err := syscall.Kill(-pid, 0)
+	if err == nil || errors.Is(err, syscall.EPERM) {
+		return true, nil
+	}
+	if errors.Is(err, syscall.ESRCH) {
+		return false, nil
+	}
+	return false, err
 }

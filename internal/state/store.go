@@ -89,7 +89,7 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 		if err := json.Unmarshal(encoded, &value); err != nil {
 			return State{}, false, fmt.Errorf("decode state: %w", err)
 		}
-		if err := validate(value); err != nil {
+		if err := validate(value, true); err != nil {
 			return State{}, false, err
 		}
 		return value, false, nil
@@ -135,7 +135,7 @@ func migrateV1(legacy legacyState) (State, error) {
 			})
 		}
 	}
-	if err := validate(value); err != nil {
+	if err := validate(value, false); err != nil {
 		return State{}, fmt.Errorf("migrate version 1 state: %w", err)
 	}
 	return value, nil
@@ -145,7 +145,7 @@ func (s FileStore) Save(value State) error {
 	if value.Version == 0 {
 		value.Version = CurrentVersion
 	}
-	if err := validate(value); err != nil {
+	if err := validate(value, false); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
@@ -209,7 +209,7 @@ func validateV1(value legacyState) error {
 	}
 	issues := make(map[int]struct{}, len(value.Runs))
 	for _, run := range value.Runs {
-		if err := validateRun(run, false); err != nil {
+		if err := validateRun(run, false, false); err != nil {
 			return err
 		}
 		if _, exists := issues[run.Issue]; exists {
@@ -220,13 +220,13 @@ func validateV1(value legacyState) error {
 	return nil
 }
 
-func validate(value State) error {
+func validate(value State, recoverUnsafeContinuation bool) error {
 	if value.Version != CurrentVersion {
 		return fmt.Errorf("unsupported state version %d", value.Version)
 	}
 	runs := make(map[string]scheduler.Run, len(value.Runs))
 	for _, run := range value.Runs {
-		if err := validateRun(run, true); err != nil {
+		if err := validateRun(run, true, recoverUnsafeContinuation); err != nil {
 			return err
 		}
 		if _, exists := runs[run.RunID]; exists {
@@ -282,7 +282,7 @@ func validate(value State) error {
 	return nil
 }
 
-func validateRun(run scheduler.Run, requireWorkerMode bool) error {
+func validateRun(run scheduler.Run, requireWorkerMode, recoverUnsafeContinuation bool) error {
 	if run.Issue <= 0 {
 		return fmt.Errorf("state contains invalid issue number %d", run.Issue)
 	}
@@ -295,7 +295,8 @@ func validateRun(run scheduler.Run, requireWorkerMode bool) error {
 	if requireWorkerMode && run.WorkerMode != scheduler.WorkerModePrint && run.WorkerMode != scheduler.WorkerModeRPC {
 		return fmt.Errorf("state contains Run %q with unknown worker mode %q", run.RunID, run.WorkerMode)
 	}
-	if run.WorkerMode == scheduler.WorkerModeRPC && (run.SessionID == "" || run.SessionDir == "") {
+	unsafeContinuation := run.Status == scheduler.StatusNeedsHuman || recoverUnsafeContinuation && (run.Status == scheduler.StatusSuspended || run.Status == scheduler.StatusRunning)
+	if run.WorkerMode == scheduler.WorkerModeRPC && (run.SessionID == "" || run.SessionDir == "") && !unsafeContinuation {
 		return fmt.Errorf("state contains RPC Run %q without durable session identity and storage", run.RunID)
 	}
 	if run.Status == scheduler.StatusRunning {
@@ -303,7 +304,7 @@ func validateRun(run scheduler.Run, requireWorkerMode bool) error {
 			return fmt.Errorf("state contains running issue #%d without durable process identity", run.Issue)
 		}
 	}
-	if run.Continuation != nil {
+	if run.Continuation != nil && !unsafeContinuation {
 		boundary := run.Continuation
 		_, hashErr := hex.DecodeString(boundary.SHA256)
 		if run.WorkerMode != scheduler.WorkerModeRPC || boundary.SessionID != run.SessionID || boundary.Worktree != run.Worktree ||
@@ -315,7 +316,7 @@ func validateRun(run scheduler.Run, requireWorkerMode bool) error {
 			return fmt.Errorf("state contains Run %q with a continuation file outside its session directory", run.RunID)
 		}
 	}
-	if run.Status == scheduler.StatusSuspended {
+	if run.Status == scheduler.StatusSuspended && !unsafeContinuation {
 		if run.PID != 0 || run.ProcessIdentity != "" || run.Continuation == nil {
 			return fmt.Errorf("state contains suspended issue #%d without a verified stopped continuation", run.Issue)
 		}

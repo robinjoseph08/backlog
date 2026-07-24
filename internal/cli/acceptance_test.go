@@ -245,7 +245,11 @@ exit 0
 set -eu
 session_id=
 while [ "$#" -gt 0 ]; do
-  case "$1" in --session-id) session_id=$2; shift 2 ;; *) shift ;; esac
+  case "$1" in
+    --session-id) session_id=$2; shift 2 ;;
+    --session) test "$2" = `+quote(sessionFile)+`; session_id=session-91; shift 2 ;;
+    *) shift ;;
+  esac
 done
 IFS= read -r prompt
 case "$session_id" in

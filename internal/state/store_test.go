@@ -411,6 +411,63 @@ func TestFileStorePersistsOnlyVerifiedStoppedSuspension(t *testing.T) {
 	}
 }
 
+func TestFileStoreLoadsUnsafeSuspensionForNeedsHumanRecovery(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	path := filepath.Join(root, "state.json")
+	baseRun := scheduler.Run{
+		Issue: 9, RunID: "run-9", Status: scheduler.StatusSuspended, WorkerMode: scheduler.WorkerModeRPC,
+		Branch: "agent/issue-9-run-9", Worktree: filepath.Join(root, "worktree"),
+		SessionID: "backlog-run-9", SessionDir: filepath.Join(root, "sessions", "run-9"),
+		Continuation: &scheduler.ContinuationBoundary{
+			SessionID: "backlog-run-9", SessionFile: filepath.Join(root, "sessions", "run-9", "session.jsonl"),
+			Worktree: filepath.Join(root, "worktree"), LeafID: "leaf", EntryCount: 3, SHA256: strings.Repeat("a", 64), VerifiedAt: time.Now(),
+		},
+	}
+	tests := []struct {
+		name   string
+		mutate func(*scheduler.Run)
+	}{
+		{name: "missing continuation", mutate: func(run *scheduler.Run) { run.Continuation = nil }},
+		{name: "malformed continuation", mutate: func(run *scheduler.Run) { run.Continuation.EntryCount = 0 }},
+		{name: "legacy print suspension", mutate: func(run *scheduler.Run) {
+			run.WorkerMode = scheduler.WorkerModePrint
+			run.SessionID = ""
+			run.SessionDir = ""
+			run.Continuation = nil
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			run := baseRun
+			boundary := *baseRun.Continuation
+			run.Continuation = &boundary
+			test.mutate(&run)
+			value := State{Version: CurrentVersion, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: "lease-9", Issue: 9, RunID: run.RunID}}}
+			encoded, err := json.Marshal(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, encoded, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := (FileStore{Path: path}).Load()
+			if err != nil {
+				t.Fatalf("load unsafe suspension for reconciliation: %v", err)
+			}
+			loaded.Runs[0].Status = scheduler.StatusNeedsHuman
+			loaded.Runs[0].Error = "unsafe continuation"
+			if err := (FileStore{Path: path}).Save(loaded); err != nil {
+				t.Fatalf("persist needs-human recovery: %v", err)
+			}
+			if len(loaded.Leases) != 1 {
+				t.Fatalf("unsafe suspension Lease = %#v", loaded.Leases)
+			}
+		})
+	}
+}
+
 func TestFileStoreRejectsRunningLeaseWithoutStartIdentity(t *testing.T) {
 	t.Parallel()
 
