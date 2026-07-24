@@ -29,7 +29,7 @@ An incomplete Run that retains its Lease because Backlog cannot safely continue 
 _Avoid_: Past failed Run, historical failure
 
 **Drain**:
-A runner shutdown phase that stops creating Leases while allowing every live Worker to finish before the runner exits.
+A runner shutdown phase that stops creating Leases while allowing every Owned Worker to finish before the runner exits.
 _Avoid_: Pause, cancellation
 
 **Suspended Run**:
@@ -51,6 +51,10 @@ _Avoid_: Generic cleanup plan
 **Worker**:
 The live Pi process belonging to a run.
 _Avoid_: Agent, subagent
+
+**Owned Worker**:
+A live Worker whose lifecycle is directly supervised by the current runner invocation.
+_Avoid_: Any live Worker, leased Run
 
 **Subagent**:
 A subordinate autonomous executor launched by a Worker to perform part of its Run.
