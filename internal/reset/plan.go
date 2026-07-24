@@ -27,8 +27,11 @@ type Issue struct {
 type PullRequest struct {
 	Number         int
 	URL            string
+	Branch         string
+	Commit         string
 	State          PullRequestState
 	AutoMergeArmed bool
+	ResetCommented bool
 }
 
 type Branch struct {
@@ -100,8 +103,8 @@ func Build(snapshot Snapshot) (Plan, error) {
 	pullNumbers := make(map[int]struct{}, len(pullRequests))
 	pullURLs := make(map[string]struct{}, len(pullRequests))
 	for _, pull := range pullRequests {
-		if pull.Number <= 0 || pull.URL == "" {
-			return Plan{}, fmt.Errorf("Run %s has a pull request with incomplete identity", snapshot.Run.RunID)
+		if pull.Number <= 0 || pull.URL == "" || pull.Branch != snapshot.Run.Branch || strings.TrimSpace(pull.Commit) == "" {
+			return Plan{}, fmt.Errorf("Run %s has a pull request with incomplete or mismatched branch identity", snapshot.Run.RunID)
 		}
 		if _, duplicate := pullNumbers[pull.Number]; duplicate {
 			return Plan{}, fmt.Errorf("Run %s has duplicate pull request number #%d", snapshot.Run.RunID, pull.Number)
@@ -138,6 +141,9 @@ func Build(snapshot Snapshot) (Plan, error) {
 		}
 		if pull.AutoMergeArmed {
 			plan.Actions = append(plan.Actions, fmt.Sprintf("disable auto-merge for pull request #%d (%s)", pull.Number, pull.URL))
+		}
+		if !pull.ResetCommented {
+			plan.Actions = append(plan.Actions, fmt.Sprintf("explain Reset on pull request #%d (%s)", pull.Number, pull.URL))
 		}
 		plan.Actions = append(plan.Actions, fmt.Sprintf("close unmerged pull request #%d (%s)", pull.Number, pull.URL))
 	}

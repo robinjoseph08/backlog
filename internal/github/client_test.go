@@ -158,8 +158,10 @@ func TestClientInspectsResetIssueLabelsAndOwnedPullRequests(t *testing.T) {
 case "$*" in
   "issue view 42 --repo acme/widgets --json number,url,state,labels")
     printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"},{"name":"spec"}]}' ;;
-  "pr list --repo acme/widgets --state all --head agent/issue-42-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
-    printf '%s\n' '[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"OPEN","mergedAt":null,"autoMergeRequest":{"mergeMethod":"SQUASH"},"isDraft":false,"headRefName":"agent/issue-42-run","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+  "pr list --repo acme/widgets --state all --head agent/issue-42-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    printf '%s\n' '[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"OPEN","mergedAt":null,"autoMergeRequest":{"mergeMethod":"SQUASH"},"isDraft":false,"headRefName":"agent/issue-42-run","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/100/comments?per_page=100 --paginate --slurp")
+    printf '%s\n' '[[{"body":"existing comment"}]]' ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
 esac`)
 	issue, pulls, err := (Client{Executable: gh}).ResetResources(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
@@ -169,7 +171,9 @@ esac`)
 	if issue.Number != 42 || issue.State != "open" || strings.Join(issue.Labels, ",") != "in-progress,spec" {
 		t.Fatalf("issue = %#v", issue)
 	}
-	if len(pulls) != 1 || pulls[0].Number != 100 || pulls[0].State != "open" || !pulls[0].AutoMergeArmed {
+	if len(pulls) != 1 || pulls[0].Number != 100 || pulls[0].State != "open" || !pulls[0].AutoMergeArmed ||
+		pulls[0].Branch != "agent/issue-42-run" || pulls[0].Commit != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ||
+		strings.Join(pulls[0].Comments, ",") != "existing comment" {
 		t.Fatalf("pulls = %#v", pulls)
 	}
 }
@@ -203,7 +207,7 @@ func TestClientResetInspectionRefusesSameOwnerForkAndUnknownFields(t *testing.T)
 		{
 			name:  "same owner fork",
 			issue: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[]}`,
-			pull:  `[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"OPEN","mergedAt":null,"autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-42-run","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/fork"}}]`,
+			pull:  `[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"OPEN","mergedAt":null,"autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-42-run","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/fork"}}]`,
 			want:  "mismatched",
 		},
 		{
@@ -239,13 +243,13 @@ func TestClientResetInspectionRefusesSameOwnerForkAndUnknownFields(t *testing.T)
 		{
 			name:  "missing auto merge",
 			issue: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[]}`,
-			pull:  `[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"OPEN","mergedAt":null,"isDraft":false,"headRefName":"agent/issue-42-run","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]`,
+			pull:  `[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"OPEN","mergedAt":null,"isDraft":false,"headRefName":"agent/issue-42-run","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]`,
 			want:  "unknown auto-merge state",
 		},
 		{
 			name:  "missing merged state",
 			issue: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[]}`,
-			pull:  `[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"OPEN","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-42-run","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]`,
+			pull:  `[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"OPEN","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-42-run","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]`,
 			want:  "unknown merged state",
 		},
 	}
@@ -263,6 +267,36 @@ esac`)
 			_, _, err := (Client{Executable: gh}).ResetResources(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestClientResetInspectionRefusesUnknownCommentState(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name     string
+		comments string
+	}{
+		{name: "null list", comments: `null`},
+		{name: "missing body", comments: `[[{}]]`},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			gh := fakeGH(t, `
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[]}' ;;
+  "pr list "*)
+    printf '%s\n' '[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"OPEN","mergedAt":null,"autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-42-run","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+  "api "*) printf '%s\n' '`+test.comments+`' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+			_, _, err := (Client{Executable: gh}).ResetResources(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
+			if err == nil || !strings.Contains(err.Error(), "comment") {
+				t.Fatalf("error = %v", err)
 			}
 		})
 	}
@@ -288,6 +322,48 @@ case "$*" in
 esac`)
 	_, _, err := (Client{Executable: gh}).ResetResources(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
 	if err == nil || !strings.Contains(err.Error(), "inspection limit") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestClientPerformsNarrowPullRequestResetMutations(t *testing.T) {
+	t.Parallel()
+
+	logPath := filepath.Join(t.TempDir(), "calls")
+	gh := fakeGH(t, `
+printf '%s\n' "$*" >> `+shellQuote(logPath)+`
+case "$*" in
+  "pr merge 100 --repo acme/widgets --disable-auto"|\
+  "pr comment 100 --repo acme/widgets --body explanation"|\
+  "pr close 100 --repo acme/widgets") ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+	client := Client{Executable: gh}
+	if err := client.DisablePullRequestAutoMerge(context.Background(), "acme/widgets", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.CommentOnPullRequest(context.Background(), "acme/widgets", 100, "explanation"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.ClosePullRequest(context.Background(), "acme/widgets", 100); err != nil {
+		t.Fatal(err)
+	}
+	calls, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "pr merge 100 --repo acme/widgets --disable-auto\n" +
+		"pr comment 100 --repo acme/widgets --body explanation\n" +
+		"pr close 100 --repo acme/widgets\n"
+	if string(calls) != want {
+		t.Fatalf("calls = %q, want %q", calls, want)
+	}
+}
+
+func TestClientPullRequestResetMutationReportsGitHubFailure(t *testing.T) {
+	t.Parallel()
+	gh := fakeGH(t, `echo "pull request denied" >&2; exit 1`)
+	if err := (Client{Executable: gh}).ClosePullRequest(context.Background(), "acme/widgets", 100); err == nil || !strings.Contains(err.Error(), "pull request denied") {
 		t.Fatalf("error = %v", err)
 	}
 }

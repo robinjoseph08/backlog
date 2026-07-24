@@ -12,7 +12,7 @@ func TestBuildTailorsOrderedResetActions(t *testing.T) {
 		Run:          scheduler.Run{Issue: 42, RunID: "run-42", Status: scheduler.StatusSuspended, Branch: "agent/issue-42-run-42", Worktree: "/state/worktrees/issue-42-run-42", SessionID: "backlog-run-42", SessionDir: "/state/sessions/run-42", PullRequest: "https://github.com/acme/widgets/pull/7"},
 		Lease:        scheduler.Lease{LeaseID: "lease-42", Issue: 42, RunID: "run-42"},
 		Issue:        Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", Open: true, Labels: []string{"in-progress", "spec"}},
-		PullRequests: []PullRequest{{Number: 7, URL: "https://github.com/acme/widgets/pull/7", State: PullRequestOpen, AutoMergeArmed: true}},
+		PullRequests: []PullRequest{{Number: 7, URL: "https://github.com/acme/widgets/pull/7", Branch: "agent/issue-42-run-42", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", State: PullRequestOpen, AutoMergeArmed: true}},
 		RemoteBranch: Branch{Name: "agent/issue-42-run-42", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Present: true},
 		LocalBranch:  Branch{Name: "agent/issue-42-run-42", Commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Present: true},
 		Worktree:     Worktree{Path: "/state/worktrees/issue-42-run-42", Branch: "agent/issue-42-run-42", Commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Present: true},
@@ -23,6 +23,7 @@ func TestBuildTailorsOrderedResetActions(t *testing.T) {
 	}
 	want := []string{
 		"disable auto-merge for pull request #7 (https://github.com/acme/widgets/pull/7)",
+		"explain Reset on pull request #7 (https://github.com/acme/widgets/pull/7)",
 		"close unmerged pull request #7 (https://github.com/acme/widgets/pull/7)",
 		"delete remote branch agent/issue-42-run-42 at aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"remove local worktree /state/worktrees/issue-42-run-42 for agent/issue-42-run-42 at bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -129,20 +130,24 @@ func TestBuildRefusesUnsafeStates(t *testing.T) {
 	tests := map[string]func(*Snapshot){
 		"merged Run": func(s *Snapshot) { s.Run.Status = scheduler.StatusMerged },
 		"merged pull request": func(s *Snapshot) {
-			s.PullRequests = []PullRequest{{Number: 7, URL: "https://example.test/pull/7", State: PullRequestMerged}}
+			s.PullRequests = []PullRequest{{Number: 7, URL: "https://example.test/pull/7", Branch: "agent/issue-42-run-42", Commit: "abc", State: PullRequestMerged}}
 		},
 		"unexplained issue closure":     func(s *Snapshot) { s.Issue.Open = false },
 		"human workflow label":          func(s *Snapshot) { s.Issue.Labels = append(s.Issue.Labels, "needs-info") },
 		"mismatched Lease":              func(s *Snapshot) { s.Lease.RunID = "other" },
 		"missing recorded pull request": func(s *Snapshot) { s.Run.PullRequest = "https://example.test/pull/missing" },
 		"unknown pull request state": func(s *Snapshot) {
-			s.PullRequests = []PullRequest{{Number: 7, URL: "https://example.test/pull/7", State: "unknown"}}
+			s.PullRequests = []PullRequest{{Number: 7, URL: "https://example.test/pull/7", Branch: "agent/issue-42-run-42", Commit: "abc", State: "unknown"}}
 		},
 		"closed pull request with armed auto-merge": func(s *Snapshot) {
-			s.PullRequests = []PullRequest{{Number: 7, URL: "https://example.test/pull/7", State: PullRequestClosed, AutoMergeArmed: true}}
+			s.PullRequests = []PullRequest{{Number: 7, URL: "https://example.test/pull/7", Branch: "agent/issue-42-run-42", Commit: "abc", State: PullRequestClosed, AutoMergeArmed: true}}
 		},
 		"mismatched remote branch": func(s *Snapshot) {
 			s.RemoteBranch = Branch{Name: "other", Commit: "abc", Present: true}
+		},
+		"mismatched pull request branch": func(s *Snapshot) {
+			s.Run.Branch = "agent/issue-42-run-42"
+			s.PullRequests = []PullRequest{{Number: 7, URL: "https://example.test/pull/7", Branch: "other", Commit: "abc", State: PullRequestOpen}}
 		},
 		"mismatched Pi session": func(s *Snapshot) {
 			s.Session = Session{ID: "other", Dir: "/other", Present: true}

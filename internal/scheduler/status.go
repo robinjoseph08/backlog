@@ -27,7 +27,7 @@ func CanTransition(from, to Status) bool {
 	case StatusSuspended:
 		return to == StatusRunning || to == StatusWaitingForMerge || to == StatusMerged || to == StatusNeedsHuman || to == StatusResetting || to == StatusReset
 	case StatusWaitingForMerge:
-		return to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman
+		return to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman || to == StatusResetting
 	case StatusFailed, StatusNeedsHuman:
 		return to == StatusResetting || to == StatusReset
 	case StatusResetting:
