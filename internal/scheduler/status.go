@@ -11,6 +11,16 @@ func RequiresLease(status Status) bool {
 	}
 }
 
+// IsTerminal reports whether a Run status stops producing autonomous work.
+func IsTerminal(status Status) bool {
+	switch status {
+	case StatusReset, StatusMerged, StatusFailed, StatusNeedsHuman:
+		return true
+	default:
+		return false
+	}
+}
+
 // CanTransition defines every persisted Run-state transition. Reset may move
 // an eligible unfinished Run through resetting before it becomes reset.
 func CanTransition(from, to Status) bool {

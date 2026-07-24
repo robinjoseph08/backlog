@@ -25,6 +25,29 @@ import (
 	"github.com/robinjoseph08/backlog/internal/worktree"
 )
 
+func TestRunnerStartupClosesOrphanedWorkerLogMarkers(t *testing.T) {
+	t.Parallel()
+
+	completedAt := time.Now()
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion,
+		Runs: []scheduler.Run{{
+			Issue: 27, RunID: "run-27", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModeRPC,
+			SessionID: "backlog-run-27", SessionDir: "/tmp/backlog-sessions/run-27",
+			LogPath: "/tmp/run-27.jsonl", WorkerLogOpen: true, CompletedAt: &completedAt,
+		}},
+	}}
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatalf("restart Runner: %v", err)
+	}
+	got := store.LoadValue()
+	if len(got.Runs) != 1 || got.Runs[0].WorkerLogOpen {
+		t.Fatalf("state after Runner restart = %#v, want orphaned Worker log closed", got)
+	}
+}
+
 func TestRunnerFillsSlotsAndImmediatelyRefillsAfterCompletion(t *testing.T) {
 	t.Parallel()
 
@@ -172,6 +195,83 @@ func TestRunnerClosesWorkerAndRetainsLeaseWhenCompletionSaveFails(t *testing.T) 
 	}
 }
 
+func TestRunnerShutsDownWorkersWhenLogClosureSaveFails(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                    string
+		completedClose          worker.Result
+		abortClosesProcessGroup bool
+		wantStatus              scheduler.Status
+		wantPID                 int
+		wantAborts              int
+	}{
+		{
+			name: "completed process group exits after abort", completedClose: worker.Result{LogClosed: true},
+			abortClosesProcessGroup: true, wantStatus: scheduler.StatusMerged, wantAborts: 2,
+		},
+		{
+			name: "completed close reports an error", completedClose: worker.Result{LogClosed: true, GroupExited: true, Err: errors.New("close failed")},
+			wantStatus: scheduler.StatusNeedsHuman, wantAborts: 1,
+		},
+		{
+			name: "completed process group remains live", completedClose: worker.Result{LogClosed: true},
+			wantStatus: scheduler.StatusNeedsHuman, wantPID: 1012, wantAborts: 2,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			github := &fakeGitHub{candidates: []scheduler.Candidate{
+				{Number: 12, CreatedAt: time.Now()},
+				{Number: 13, CreatedAt: time.Now().Add(time.Second)},
+			}}
+			workers := newFakeWorkers()
+			workers.startupCloseResult = worker.Result{LogClosed: true, GroupExited: true}
+			workers.settledCloseLeavesGroup = true
+			workers.abortClosesProcessGroup = test.abortClosesProcessGroup
+			// Startup writes once, then each Worker writes its Lease, planned and
+			// prepared worktree, log paths, and process identity. The completed Run
+			// is save 12 and its log closure marker is save 13.
+			store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 13}
+			runner := testRunner(github, workers, store, 2)
+			done := make(chan error, 1)
+			go func() { done <- runner.Run(context.Background()) }()
+
+			workers.waitForStarts(t, 12, 13)
+			workers.setCloseResult(12, test.completedClose)
+			github.setCompletion(12, mergedOutcome(12))
+			workers.complete(12, worker.Result{ExitCode: 0})
+
+			select {
+			case err := <-done:
+				if err == nil || !strings.Contains(err.Error(), "persist closed Worker log") {
+					t.Fatalf("run error = %v, want Worker log closure persistence failure", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("Runner did not shut down after Worker log closure persistence failed")
+			}
+			if got := workers.abortedCount(); got != test.wantAborts {
+				t.Fatalf("aborted Workers = %d, want %d", got, test.wantAborts)
+			}
+			if got := workers.runningCount(); got != 0 {
+				t.Fatalf("running Workers = %d, want all Workers closed", got)
+			}
+			got := store.LoadValue()
+			completed := findRun(got.Runs, "run-12")
+			failed := findRun(got.Runs, "run-13")
+			if completed.Status != test.wantStatus || completed.WorkerLogOpen || completed.PID != test.wantPID {
+				t.Fatalf("completed Run after closure save failure = %#v, want status %s and PID %d", completed, test.wantStatus, test.wantPID)
+			}
+			if test.wantStatus == scheduler.StatusNeedsHuman && (len(got.Leases) != 2 || completed.Error == "") {
+				t.Fatalf("unverified completed Run did not retain its Lease and diagnostic: %#v", got)
+			}
+			if failed.Status != scheduler.StatusFailed || failed.WorkerLogOpen || !strings.Contains(failed.Error, "log closure persistence failed") {
+				t.Fatalf("other Run after closure save failure = %#v", failed)
+			}
+		})
+	}
+}
+
 func TestRunnerFailsClosedWhenRPCOutputBreaksAfterSettlement(t *testing.T) {
 	t.Parallel()
 
@@ -244,7 +344,7 @@ func TestRunnerPersistsObservableWorkerContextBeforeRelease(t *testing.T) {
 			return
 		}
 		run := findActiveRun(&current, issue)
-		if run.Status != scheduler.StatusRunning || run.PID != 1000+issue || run.ProcessIdentity == "" ||
+		if run.Status != scheduler.StatusRunning || run.PID != 1000+issue || run.ProcessIdentity == "" || !run.WorkerLogOpen ||
 			run.IssueTitle != "Make Runs observable" || run.IssueURL != "https://github.com/acme/widgets/issues/7" ||
 			run.LogPath != "/logs/run-7.jsonl" || run.StderrPath != "/logs/run-7.stderr.log" {
 			released <- fmt.Errorf("Run at release = %#v", run)
@@ -3687,7 +3787,13 @@ func (p *fakeProcess) Release() error {
 	return releaseErr
 }
 func (p *fakeProcess) Abort() error {
-	p.owner.recordAbort()
+	p.owner.mu.Lock()
+	p.owner.abortCount++
+	if p.owner.abortClosesProcessGroup {
+		p.closeResult.LogClosed = true
+		p.closeResult.GroupExited = true
+	}
+	p.owner.mu.Unlock()
 	select {
 	case p.done <- worker.Result{ExitCode: -1, Err: context.Canceled}:
 	default:
@@ -3720,12 +3826,15 @@ func (p *fakeProcess) Close() worker.Result {
 func (p *fakeProcess) CloseWithForceContext(ctx context.Context, authorizeKill func() error) worker.Result {
 	p.owner.mu.Lock()
 	blockSettledClose := p.owner.blockSettledClose
+	settledCloseLeavesGroup := p.owner.settledCloseLeavesGroup
 	settledCloseStarted := p.owner.settledCloseStarted
 	authorizeClose := p.owner.authorizeClose
 	p.owner.mu.Unlock()
 	if !blockSettledClose {
 		result := p.Close()
-		result.GroupExited = true
+		if !settledCloseLeavesGroup {
+			result.GroupExited = true
+		}
 		return result
 	}
 	settledCloseStarted <- p.issue
@@ -3774,30 +3883,32 @@ func (p *fakeProcess) CloseContext(ctx context.Context, authorizeKill func() err
 }
 
 type fakeWorkers struct {
-	mu                   sync.Mutex
-	started              []int
-	requests             []worker.Request
-	processes            map[int]*fakeProcess
-	running              int
-	maximum              int
-	releases             int
-	recoveredReleases    int
-	onStart              func(int)
-	onRelease            func(int)
-	onCloseContext       func(int) error
-	authorizeClose       bool
-	waitForForce         bool
-	blockSettledClose    bool
-	authorizedForceStops int
-	abortCount           int
-	startErr             error
-	omitLogPaths         bool
-	releaseErr           error
-	startupCloseResult   worker.Result
-	suspendFunc          func(context.Context, int, worker.ContinuationRequest) (worker.Continuation, error)
-	startChanged         chan struct{}
-	closeContextStarted  chan int
-	settledCloseStarted  chan int
+	mu                      sync.Mutex
+	started                 []int
+	requests                []worker.Request
+	processes               map[int]*fakeProcess
+	running                 int
+	maximum                 int
+	releases                int
+	recoveredReleases       int
+	onStart                 func(int)
+	onRelease               func(int)
+	onCloseContext          func(int) error
+	authorizeClose          bool
+	waitForForce            bool
+	blockSettledClose       bool
+	settledCloseLeavesGroup bool
+	abortClosesProcessGroup bool
+	authorizedForceStops    int
+	abortCount              int
+	startErr                error
+	omitLogPaths            bool
+	releaseErr              error
+	startupCloseResult      worker.Result
+	suspendFunc             func(context.Context, int, worker.ContinuationRequest) (worker.Continuation, error)
+	startChanged            chan struct{}
+	closeContextStarted     chan int
+	settledCloseStarted     chan int
 }
 
 func newFakeWorkers() *fakeWorkers {
@@ -3831,11 +3942,6 @@ func (w *fakeWorkers) Release(string) error {
 	defer w.mu.Unlock()
 	w.recoveredReleases++
 	return nil
-}
-func (w *fakeWorkers) recordAbort() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.abortCount++
 }
 func (w *fakeWorkers) recordAuthorizedForceStop() {
 	w.mu.Lock()

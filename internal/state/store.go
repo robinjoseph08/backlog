@@ -402,6 +402,9 @@ func validateRun(run scheduler.Run, requireWorkerMode, recoverUnsafeContinuation
 	if run.WorkerMode == scheduler.WorkerModeRPC && (run.SessionID == "" || run.SessionDir == "") && !unsafeContinuation {
 		return fmt.Errorf("state contains RPC Run %q without durable session identity and storage", run.RunID)
 	}
+	if run.WorkerLogOpen && run.LogPath == "" {
+		return fmt.Errorf("state contains Run %q with an open Worker log but no log path", run.RunID)
+	}
 	if run.Status == scheduler.StatusRunning {
 		if run.PID <= 0 || run.StartedAt.IsZero() || run.ProcessIdentity == "" {
 			return fmt.Errorf("state contains running issue #%d without durable process identity", run.Issue)
