@@ -489,6 +489,42 @@ func TestFileStoreLoadsUnsafeSuspensionForNeedsHumanRecovery(t *testing.T) {
 	}
 }
 
+func TestFileStoreLoadsStructurallyMalformedContinuationForRecovery(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	path := filepath.Join(root, "state.json")
+	encoded := map[string]any{
+		"version": CurrentVersion,
+		"runs": []any{map[string]any{
+			"issue": 9, "runId": "run-9", "status": "suspended", "workerMode": "rpc",
+			"branch": "agent/issue-9-run-9", "worktree": filepath.Join(root, "worktree"),
+			"sessionId": "session-9", "sessionDir": filepath.Join(root, "sessions"),
+			"startedAt": time.Now(), "updatedAt": time.Now(), "continuation": "malformed",
+		}},
+		"leases": []any{map[string]any{"leaseId": "lease-9", "issue": 9, "runId": "run-9"}},
+	}
+	contents, err := json.Marshal(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := (FileStore{Path: path}).Load()
+	if err != nil {
+		t.Fatalf("load malformed continuation for recovery: %v", err)
+	}
+	if len(loaded.Runs) != 1 || loaded.Runs[0].Continuation != nil || len(loaded.Leases) != 1 {
+		t.Fatalf("recoverable malformed continuation = %#v", loaded)
+	}
+	loaded.Runs[0].Status = scheduler.StatusNeedsHuman
+	loaded.Runs[0].Error = "malformed continuation"
+	if err := (FileStore{Path: path}).Save(loaded); err != nil {
+		t.Fatalf("persist malformed continuation recovery: %v", err)
+	}
+}
+
 func TestFileStoreRejectsRunningLeaseWithoutStartIdentity(t *testing.T) {
 	t.Parallel()
 

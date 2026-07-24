@@ -208,6 +208,7 @@ func TestProcessRPCValidationFailsClosed(t *testing.T) {
 		{"unmatched turn end", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n{"type":"agent_start"}\n{"type":"turn_end"}\n`, "invalidly ordered Pi RPC turn_end"},
 		{"unsupported dialog", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n{"type":"agent_start"}\n{"type":"extension_ui_request","id":"ui-1","method":"confirm"}\n`, "unsupported interactive Pi RPC request"},
 		{"duplicate retry attempt", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n{"type":"agent_start"}\n{"type":"turn_start"}\n{"type":"turn_end"}\n{"type":"agent_end"}\n{"type":"auto_retry_start","attempt":1}\n{"type":"auto_retry_start","attempt":1}\n`, "invalidly ordered Pi RPC auto_retry_start"},
+		{"unfinished summarization retry", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n{"type":"agent_start"}\n{"type":"turn_start"}\n{"type":"turn_end"}\n{"type":"agent_end"}\n{"type":"summarization_retry_scheduled","attempt":1}\n{"type":"agent_settled"}\n`, "invalidly ordered Pi RPC agent_settled"},
 		{"unknown type", `{"type":"surprise"}\n`, "unknown Pi RPC message type"},
 	}
 	for _, test := range tests {
@@ -273,6 +274,11 @@ printf '%s\n' \
   '{"type":"auto_retry_end","attempt":2}' \
   '{"type":"turn_end"}' \
   '{"type":"agent_end"}' \
+  '{"type":"summarization_retry_scheduled","attempt":1,"maxAttempts":3,"delayMs":10,"errorMessage":"transient"}' \
+  '{"type":"summarization_retry_attempt_start","source":"compaction","reason":"manual"}' \
+  '{"type":"compaction_start"}' \
+  '{"type":"compaction_end"}' \
+  '{"type":"summarization_retry_finished"}' \
   '{"type":"agent_settled"}'
 while IFS= read -r ignored; do :; done
 `)
@@ -1060,6 +1066,23 @@ func TestVerifyContinuationAcceptsDocumentedMessageRolesAndNonMessageLeaf(t *tes
 	if err != nil {
 		t.Fatalf("documented Pi session structure: %v", err)
 	}
+
+	multiRootEntries := []string{
+		`{"type":"message","id":"abandoned","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"abandoned-tool"}]}}`,
+		`{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"safe active root"}}`,
+	}
+	multiRootContent := `{"type":"session","version":3,"id":"session-1","cwd":` + strconv.Quote(worktree) + `}` + "\n" + strings.Join(multiRootEntries, "\n") + "\n"
+	if err := os.WriteFile(sessionFile, []byte(multiRootContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	multiRootHash := sha256.Sum256([]byte(multiRootContent))
+	err = VerifyContinuation(
+		ContinuationRequest{SessionID: "session-1", SessionDir: sessionDir, Worktree: worktree},
+		Continuation{SessionID: "session-1", SessionFile: sessionFile, Worktree: worktree, LeafID: "leaf", EntryCount: len(multiRootEntries), SHA256: hex.EncodeToString(multiRootHash[:])},
+	)
+	if err != nil {
+		t.Fatalf("documented multi-root Pi session: %v", err)
+	}
 }
 
 func TestVerifyContinuationRejectsCaseVariantIdentityAliases(t *testing.T) {
@@ -1132,13 +1155,6 @@ func TestVerifyContinuationRejectsCaseVariantIdentityAliases(t *testing.T) {
 			header:  `{"type":"session","id":"session-1","cwd":` + strconv.Quote(worktree) + `}`,
 			entries: `{"type":"message","id":"leaf","message":{"role":"user","content":"continue"}}`,
 			want:    "without parent identity",
-		},
-		{
-			name:   "second root truncates tool tail",
-			header: `{"type":"session","id":"session-1","cwd":` + strconv.Quote(worktree) + `}`,
-			entries: `{"type":"message","id":"assistant","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"tool-1"}]}}` + "\n" +
-				`{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"continue"}}`,
-			want: "root entries",
 		},
 		{
 			name:    "case-variant entry type",

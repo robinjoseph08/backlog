@@ -85,8 +85,8 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 	}
 	switch header.Version {
 	case CurrentVersion:
-		var value State
-		if err := json.Unmarshal(encoded, &value); err != nil {
+		value, err := decodeCurrentState(encoded)
+		if err != nil {
 			return State{}, false, fmt.Errorf("decode state: %w", err)
 		}
 		if err := validate(value, true); err != nil {
@@ -191,6 +191,57 @@ func (s FileStore) Save(value State) error {
 		return fmt.Errorf("close state directory: %w", err)
 	}
 	return nil
+}
+
+func decodeCurrentState(encoded json.RawMessage) (State, error) {
+	var raw struct {
+		Version             int               `json:"version"`
+		Repo                string            `json:"repo"`
+		DefaultBranch       string            `json:"defaultBranch"`
+		MaxConcurrentIssues int               `json:"maxConcurrentIssues"`
+		Runs                []json.RawMessage `json:"runs"`
+		Leases              []scheduler.Lease `json:"leases"`
+	}
+	if err := json.Unmarshal(encoded, &raw); err != nil {
+		return State{}, err
+	}
+	value := State{
+		Version: raw.Version, Repo: raw.Repo, DefaultBranch: raw.DefaultBranch,
+		MaxConcurrentIssues: raw.MaxConcurrentIssues, Leases: raw.Leases,
+		Runs: make([]scheduler.Run, 0, len(raw.Runs)),
+	}
+	for index, encodedRun := range raw.Runs {
+		run, err := decodeRecoverableRun(encodedRun)
+		if err != nil {
+			return State{}, fmt.Errorf("decode Run %d: %w", index+1, err)
+		}
+		value.Runs = append(value.Runs, run)
+	}
+	return value, nil
+}
+
+func decodeRecoverableRun(encoded json.RawMessage) (scheduler.Run, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		return scheduler.Run{}, err
+	}
+	continuation, hasContinuation := fields["continuation"]
+	delete(fields, "continuation")
+	withoutContinuation, err := json.Marshal(fields)
+	if err != nil {
+		return scheduler.Run{}, err
+	}
+	var run scheduler.Run
+	if err := json.Unmarshal(withoutContinuation, &run); err != nil {
+		return scheduler.Run{}, err
+	}
+	if hasContinuation && string(continuation) != "null" {
+		var boundary scheduler.ContinuationBoundary
+		if err := json.Unmarshal(continuation, &boundary); err == nil {
+			run.Continuation = &boundary
+		}
+	}
+	return run, nil
 }
 
 func ensureEOF(decoder *json.Decoder) error {

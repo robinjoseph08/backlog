@@ -899,7 +899,6 @@ func verifyContinuationLeaf(entries []json.RawMessage, leafID string) error {
 	}
 	byID := make(map[string]entry, len(entries))
 	ordered := make([]entry, 0, len(entries))
-	rootCount := 0
 	for _, raw := range entries {
 		if err := rejectNonCanonicalJSONFields(raw, "type", "id", "parentId", "message"); err != nil {
 			return fmt.Errorf("decode Pi session entry: %w", err)
@@ -934,18 +933,16 @@ func verifyContinuationLeaf(entries []json.RawMessage, leafID string) error {
 		if _, duplicate := byID[value.ID]; duplicate {
 			return fmt.Errorf("Pi session contains duplicate entry %q", value.ID)
 		}
-		if value.ParentID == nil {
-			rootCount++
-		} else if *value.ParentID == "" {
-			return fmt.Errorf("Pi session entry %q has an empty parent identity", value.ID)
-		} else if _, exists := byID[*value.ParentID]; !exists {
-			return fmt.Errorf("Pi session entry %q references missing or out-of-order parent %q", value.ID, *value.ParentID)
+		if value.ParentID != nil {
+			if *value.ParentID == "" {
+				return fmt.Errorf("Pi session entry %q has an empty parent identity", value.ID)
+			}
+			if _, exists := byID[*value.ParentID]; !exists {
+				return fmt.Errorf("Pi session entry %q references missing or out-of-order parent %q", value.ID, *value.ParentID)
+			}
 		}
 		byID[value.ID] = value
 		ordered = append(ordered, value)
-	}
-	if rootCount != 1 {
-		return fmt.Errorf("Pi session contains %d root entries, want exactly one", rootCount)
 	}
 	if ordered[len(ordered)-1].ID != leafID {
 		return fmt.Errorf("Pi session leaf %q is not the durable file leaf %q", leafID, ordered[len(ordered)-1].ID)
@@ -1155,26 +1152,27 @@ type responseWaiter struct {
 }
 
 type rpcWriter struct {
-	mu             sync.Mutex
-	destination    io.Writer
-	buffer         []byte
-	lineNumber     int
-	issue          int
-	commandID      string
-	state          rpcAgentState
-	turnOpen       bool
-	completedTurns int
-	messageOpen    bool
-	compactionOpen bool
-	retryOpen      bool
-	retryAttempt   int
-	openTools      map[string]struct{}
-	responses      map[string]responseWaiter
-	parseErrors    []error
-	settled        chan struct{}
-	failed         chan struct{}
-	settledOnce    sync.Once
-	failedOnce     sync.Once
+	mu                     sync.Mutex
+	destination            io.Writer
+	buffer                 []byte
+	lineNumber             int
+	issue                  int
+	commandID              string
+	state                  rpcAgentState
+	turnOpen               bool
+	completedTurns         int
+	messageOpen            bool
+	compactionOpen         bool
+	retryOpen              bool
+	retryAttempt           int
+	summarizationRetryOpen bool
+	openTools              map[string]struct{}
+	responses              map[string]responseWaiter
+	parseErrors            []error
+	settled                chan struct{}
+	failed                 chan struct{}
+	settledOnce            sync.Once
+	failedOnce             sync.Once
 }
 
 func newRPCWriter(destination io.Writer, commandID string, issue int) *rpcWriter {
@@ -1253,7 +1251,7 @@ func (w *rpcWriter) CancelResponse(id string) {
 func (w *rpcWriter) Idle() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.state != rpcAgentSettled || w.turnOpen || w.messageOpen || w.compactionOpen || w.retryOpen || len(w.openTools) != 0 {
+	if w.state != rpcAgentSettled || w.turnOpen || w.messageOpen || w.compactionOpen || w.retryOpen || w.summarizationRetryOpen || len(w.openTools) != 0 {
 		return errors.New("Pi RPC events do not prove streaming, compaction, retries, and tools are idle")
 	}
 	return nil
@@ -1279,7 +1277,7 @@ func (w *rpcWriter) validate(line []byte) {
 		w.addError(fmt.Errorf("malformed Pi RPC JSON on line %d: %w", w.lineNumber, err))
 		return
 	}
-	if err := rejectNonCanonicalJSONFields(line, "type", "id", "command", "method", "toolCallId", "attempt", "success", "data", "error"); err != nil {
+	if err := rejectNonCanonicalJSONFields(line, "type", "id", "command", "method", "toolCallId", "attempt", "maxAttempts", "delayMs", "errorMessage", "source", "reason", "success", "data", "error"); err != nil {
 		w.addError(fmt.Errorf("malformed Pi RPC JSON on line %d: %w", w.lineNumber, err))
 		return
 	}
@@ -1345,7 +1343,7 @@ func (w *rpcWriter) validate(line []byte) {
 		}
 		w.state = rpcBetweenAgentRuns
 	case "agent_settled":
-		if w.state != rpcBetweenAgentRuns || w.compactionOpen || w.retryOpen {
+		if w.state != rpcBetweenAgentRuns || w.compactionOpen || w.retryOpen || w.summarizationRetryOpen {
 			w.invalidOrder(message.Type)
 			return
 		}
@@ -1434,6 +1432,23 @@ func (w *rpcWriter) validate(line []byte) {
 		}
 		w.retryOpen = false
 		w.retryAttempt = 0
+	case "summarization_retry_scheduled":
+		if w.state != rpcBetweenAgentRuns || w.compactionOpen || w.retryOpen || w.summarizationRetryOpen || message.Attempt <= 0 {
+			w.invalidOrder(message.Type)
+			return
+		}
+		w.summarizationRetryOpen = true
+	case "summarization_retry_attempt_start":
+		if w.state != rpcBetweenAgentRuns || !w.summarizationRetryOpen {
+			w.invalidOrder(message.Type)
+			return
+		}
+	case "summarization_retry_finished":
+		if w.state != rpcBetweenAgentRuns || !w.summarizationRetryOpen || w.compactionOpen {
+			w.invalidOrder(message.Type)
+			return
+		}
+		w.summarizationRetryOpen = false
 	case "queue_update", "extension_error":
 		if w.state == rpcAwaitingResponse {
 			w.invalidOrder(message.Type)
