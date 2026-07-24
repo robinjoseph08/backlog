@@ -88,7 +88,7 @@ AFK repeats its own blocker check inside the worker as a final safety check.
 
 For issue `#123`, the runner fetches the latest default branch before creating an isolated worktree. A failed fetch is attempted up to three times, with waits of one and two seconds between attempts. Shutdown cancellation interrupts those waits.
 
-The runner starts Pi in RPC mode in the issue worktree using a deterministic session ID derived from the Run ID and a dedicated session directory under Backlog state. A start gate prevents Pi from opening the session or receiving the AFK prompt until the Worker PID and process-start identity are durable.
+The runner starts Pi in RPC mode in the issue worktree using a deterministic session ID derived from the Run ID and a dedicated session directory under Backlog state. A start gate prevents Pi from opening the session or receiving the AFK prompt until the Worker JSONL and standard-error log paths, PID, and process-start identity are durable.
 
 Backlog submits `/skill:afk 123` as a correlated RPC `prompt` command. Standard output uses strict LF-delimited JSONL and is saved separately from standard error. Malformed or truncated records, mismatched or duplicate responses, and invalid lifecycle ordering fail closed and preserve the worktree.
 
@@ -102,11 +102,11 @@ State and logs live outside the target repository. By default they are stored un
 
 State is written with same-directory temporary files, file sync, atomic rename, and directory sync. A repository-level advisory lock in the Git common directory prevents two local runner instances from scheduling the same backlog, even if they request different state paths. The first runner start, or a status command that migrates version 1 state, binds the repository to one state directory; later conflicting `--state-dir` values are rejected.
 
-State keeps historical Runs separate from active Leases. New Runs persist their RPC session identity and dedicated session storage before launch. Upgrading version 1 state preserves Run metadata and artifacts, removes the obsolete paused setting, and records legacy print-mode Runs as non-resumable. During migration, incomplete and intervention-required Runs retain their Leases, while verified merged Runs remain as history without active ownership.
+State keeps historical Runs separate from active Leases. New Runs snapshot the Candidate issue title and URL when their Lease is created, then persist their RPC session identity and dedicated session storage before launch. Worker log paths become durable as soon as the gated Worker starts. Existing Runs without issue snapshots or startup log paths remain valid and are not backfilled through GitHub. Upgrading version 1 state preserves Run metadata and artifacts, removes the obsolete paused setting, and records legacy print-mode Runs as non-resumable. During migration, incomplete and intervention-required Runs retain their Leases, while verified merged Runs remain as history without active ownership.
 
 On restart, the runner reconciles persisted Leases with process liveness and GitHub pull request and issue state. Suspended Runs retain their Lease, branch, worktree, Pi session, and verified continuation boundary without becoming eligible for a duplicate launch. It compares each recovered PID with its persisted operating-system process start identity, so PID reuse becomes `needs-human` instead of being mistaken for the worker. A live matching worker is never launched twice. A recovered live RPC Worker becomes `needs-human` because a replacement runner cannot restore its prompt and event pipes. Its process identity remains durable, consumes Worker capacity, and prevents `retry`; future lifecycle work must verify process-group exit before clearing it. A dead worker is verified against GitHub before being classified. Recovered workers older than `--max-worker-age` also become `needs-human`. Uncertainty becomes `needs-human`, never a new launch.
 
-Inspect state. Reading version 1 state performs the version 2 migration under the repository lock before printing status:
+Inspect state. Plain status includes each snapshotted issue title when available and falls back to its issue number for older history. Reading version 1 state performs the version 2 migration under the repository lock before printing status:
 
 ```sh
 backlog status

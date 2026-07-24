@@ -189,6 +189,36 @@ func TestRetryRefusesRunWithRetainedLiveWorkerIdentity(t *testing.T) {
 	}
 }
 
+func TestStatusPrintsIssueTitlesAndFallsBackToIssueNumbers(t *testing.T) {
+	t.Parallel()
+
+	stateDir := t.TempDir()
+	repository := filepath.Join(t.TempDir(), "repo")
+	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, output)
+	}
+	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
+	if err := store.Save(state.State{
+		Version: state.CurrentVersion,
+		Runs: []scheduler.Run{
+			{Issue: 26, IssueTitle: "Show observable Run context in status", RunID: "new", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModeRPC, SessionID: "backlog-new", SessionDir: "/sessions/new"},
+			{Issue: 7, RunID: "old", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if exit := Main(context.Background(), []string{"status", "--repo-dir", repository, "--state-dir", stateDir}, &stdout, &stderr); exit != 0 {
+		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "#26  Show observable Run context in status") {
+		t.Fatalf("stdout = %q, want snapshotted issue title", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "#7  merged") {
+		t.Fatalf("stdout = %q, want old Run issue-number fallback", stdout.String())
+	}
+}
+
 func TestStatusPrintsMachineReadableState(t *testing.T) {
 	t.Parallel()
 
@@ -198,7 +228,15 @@ func TestStatusPrintsMachineReadableState(t *testing.T) {
 		t.Fatalf("git init: %v\n%s", err, output)
 	}
 	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
-	if err := store.Save(state.State{Version: state.CurrentVersion, Repo: "acme/widgets"}); err != nil {
+	if err := store.Save(state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets",
+		Runs: []scheduler.Run{{
+			Issue: 26, IssueTitle: "Observable context", IssueURL: "https://github.com/acme/widgets/issues/26",
+			RunID: "run-26", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModeRPC,
+			SessionID: "backlog-run-26", SessionDir: "/sessions/run-26",
+			LogPath: "/logs/run-26.jsonl", StderrPath: "/logs/run-26.stderr.log",
+		}},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer
@@ -209,8 +247,13 @@ func TestStatusPrintsMachineReadableState(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
 		t.Fatalf("status JSON: %v", err)
 	}
-	if got.Repo != "acme/widgets" {
-		t.Fatalf("repo = %q", got.Repo)
+	if got.Repo != "acme/widgets" || len(got.Runs) != 1 {
+		t.Fatalf("status state = %#v", got)
+	}
+	run := got.Runs[0]
+	if run.Issue != 26 || run.IssueTitle != "Observable context" || run.IssueURL != "https://github.com/acme/widgets/issues/26" ||
+		run.LogPath != "/logs/run-26.jsonl" || run.StderrPath != "/logs/run-26.stderr.log" {
+		t.Fatalf("status Run metadata = %#v", run)
 	}
 }
 

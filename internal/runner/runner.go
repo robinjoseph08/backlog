@@ -53,6 +53,7 @@ type Worktrees interface {
 
 type WorkerProcess interface {
 	PID() int
+	LogPaths() (string, string)
 	Release() error
 	Abort() error
 	Suspend(context.Context, worker.ContinuationRequest) (worker.Continuation, error)
@@ -582,7 +583,8 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 	now := r.Now().UTC()
 	runID := r.NewRunID(candidate.Number)
 	run := scheduler.Run{
-		Issue: candidate.Number, RunID: runID, Status: scheduler.StatusClaimed, WorkerMode: scheduler.WorkerModeRPC,
+		Issue: candidate.Number, IssueTitle: candidate.Title, IssueURL: candidate.URL,
+		RunID: runID, Status: scheduler.StatusClaimed, WorkerMode: scheduler.WorkerModeRPC,
 		SessionName: fmt.Sprintf("afk #%d", candidate.Number), SessionID: "backlog-" + runID,
 		SessionDir: filepath.Join(r.Config.SessionsDir, runID), StartedAt: now, UpdatedAt: now,
 	}
@@ -643,6 +645,28 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 	if err != nil {
 		r.failRun(current, candidate.Number, fmt.Sprintf("start Pi worker: %v", err))
 		return nil, r.saveAfterFailure(*current, candidate.Number)
+	}
+	logPath, stderrPath := process.LogPaths()
+	if logPath == "" || stderrPath == "" {
+		_ = process.Abort()
+		_ = process.Close()
+		r.failRun(current, candidate.Number, "record Pi worker logs: Worker omitted a JSONL or standard-error log identity")
+		return nil, r.saveAfterFailure(*current, candidate.Number)
+	}
+	run = findActiveRun(current, candidate.Number)
+	run.LogPath = logPath
+	run.StderrPath = stderrPath
+	run.UpdatedAt = r.Now().UTC()
+	replaceRun(current, run)
+	if err := r.Store.Save(*current); err != nil {
+		_ = process.Abort()
+		_ = process.Close()
+		r.failRun(current, candidate.Number, fmt.Sprintf("persist Pi worker logs before identity inspection: %v", err))
+		persistErr := r.Store.Save(*current)
+		return nil, errors.Join(
+			fmt.Errorf("persist worker logs for issue #%d before identity inspection: %w", candidate.Number, err),
+			persistErr,
+		)
 	}
 	identity, err := r.PIDIdentity(operationCtx, process.PID())
 	if err != nil {
