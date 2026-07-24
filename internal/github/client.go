@@ -519,11 +519,12 @@ func consumeJSONValue(decoder *json.Decoder) error {
 			if !ok {
 				return errors.New("invalid JSON object field")
 			}
-			foldedField := strings.ToLower(field)
-			if _, exists := fields[foldedField]; exists {
-				return fmt.Errorf("duplicate JSON field %q", field)
+			for existing := range fields {
+				if strings.EqualFold(existing, field) {
+					return fmt.Errorf("duplicate JSON field %q", field)
+				}
 			}
-			fields[foldedField] = struct{}{}
+			fields[field] = struct{}{}
 			if err := consumeJSONValue(decoder); err != nil {
 				return err
 			}

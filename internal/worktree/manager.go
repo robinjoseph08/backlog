@@ -69,8 +69,18 @@ func (m Manager) Verify(ctx context.Context, assignment Assignment) error {
 	if assignment.Path == "" || assignment.Branch == "" {
 		return fmt.Errorf("worktree assignment is incomplete")
 	}
-	if !m.Exists(assignment) {
-		return fmt.Errorf("worktree %q is missing", assignment.Path)
+	info, err := os.Lstat(assignment.Path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("worktree %q is missing", assignment.Path)
+		}
+		return fmt.Errorf("inspect worktree path: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("worktree %q is a symlink", assignment.Path)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("worktree %q is not a directory", assignment.Path)
 	}
 	expectedPath, err := filepath.EvalSymlinks(assignment.Path)
 	if err != nil {

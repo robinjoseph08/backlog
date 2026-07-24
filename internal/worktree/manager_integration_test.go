@@ -51,6 +51,22 @@ func TestManagerCreatesAndCleansRealIsolatedWorktree(t *testing.T) {
 	if err := manager.Verify(context.Background(), assignment); err != nil {
 		t.Fatalf("verify retained worktree: %v", err)
 	}
+	moved := assignment.Path + "-moved"
+	if err := os.Rename(assignment.Path, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(moved, assignment.Path); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Verify(context.Background(), assignment); err == nil || !strings.Contains(err.Error(), "is a symlink") {
+		t.Fatalf("substituted worktree symlink verification error = %v", err)
+	}
+	if err := os.Remove(assignment.Path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(moved, assignment.Path); err != nil {
+		t.Fatal(err)
+	}
 	nested := filepath.Join(assignment.Path, "nested")
 	if err := os.Mkdir(nested, 0o700); err != nil {
 		t.Fatal(err)

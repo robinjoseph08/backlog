@@ -305,6 +305,9 @@ func (p *Process) Suspend(ctx context.Context, expected ContinuationRequest) (Co
 		SessionID           string `json:"sessionId"`
 		PendingMessageCount *int   `json:"pendingMessageCount"`
 	}
+	if _, err := decodeExactJSON(stateResponse.Data); err != nil {
+		return Continuation{}, fmt.Errorf("decode Pi RPC state: %w", err)
+	}
 	if err := json.Unmarshal(stateResponse.Data, &rpcState); err != nil {
 		return Continuation{}, fmt.Errorf("decode Pi RPC state: %w", err)
 	}
@@ -331,6 +334,9 @@ func (p *Process) Suspend(ctx context.Context, expected ContinuationRequest) (Co
 	var rpcEntries struct {
 		Entries []json.RawMessage `json:"entries"`
 		LeafID  string            `json:"leafId"`
+	}
+	if _, err := decodeExactJSON(entriesResponse.Data); err != nil {
+		return Continuation{}, fmt.Errorf("decode Pi session entries: %w", err)
 	}
 	if err := json.Unmarshal(entriesResponse.Data, &rpcEntries); err != nil {
 		return Continuation{}, fmt.Errorf("decode Pi session entries: %w", err)
@@ -789,11 +795,12 @@ func rejectDuplicateJSONKeys(decoder *json.Decoder) error {
 			if !ok {
 				return errors.New("JSON object key is not a string")
 			}
-			foldedKey := strings.ToLower(key)
-			if _, duplicate := keys[foldedKey]; duplicate {
-				return fmt.Errorf("JSON object contains duplicate key %q", key)
+			for existing := range keys {
+				if strings.EqualFold(existing, key) {
+					return fmt.Errorf("JSON object contains duplicate key %q", key)
+				}
 			}
-			keys[foldedKey] = struct{}{}
+			keys[key] = struct{}{}
 			if err := rejectDuplicateJSONKeys(decoder); err != nil {
 				return err
 			}
@@ -1146,7 +1153,11 @@ func (w *rpcWriter) validate(line []byte) {
 		Success    *bool           `json:"success"`
 		Data       json.RawMessage `json:"data"`
 	}
-	if !json.Valid(line) || json.Unmarshal(line, &message) != nil || message.Type == "" {
+	if _, err := decodeExactJSON(line); err != nil {
+		w.addError(fmt.Errorf("malformed Pi RPC JSON on line %d: %w", w.lineNumber, err))
+		return
+	}
+	if json.Unmarshal(line, &message) != nil || message.Type == "" {
 		w.addError(fmt.Errorf("malformed Pi RPC JSON on line %d", w.lineNumber))
 		return
 	}

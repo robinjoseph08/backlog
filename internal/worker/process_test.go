@@ -192,6 +192,8 @@ func TestProcessRPCValidationFailsClosed(t *testing.T) {
 		{"truncated", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}`, "truncated Pi RPC JSON"},
 		{"duplicate response", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n`, "duplicated Pi RPC prompt response"},
 		{"mismatched response", `{"id":"wrong","type":"response","command":"prompt","success":true}\n`, "mismatched Pi RPC response"},
+		{"case-variant response identity", `{"id":"wrong","ID":"backlog-afk-prompt","type":"response","command":"prompt","success":true}\n`, "duplicate key"},
+		{"Unicode response success alias", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":false,"\u017Fuccess":true}\n`, "duplicate key"},
 		{"wrong response command", `{"id":"backlog-afk-prompt","type":"response","command":"abort","success":true}\n`, "mismatched Pi RPC response"},
 		{"missing response success", `{"id":"backlog-afk-prompt","type":"response","command":"prompt"}\n`, "Pi RPC prompt was rejected"},
 		{"rejected response", `{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":false}\n`, "Pi RPC prompt was rejected"},
@@ -740,6 +742,7 @@ func TestProcessSuspendRejectsIncompleteIdleStateAndWrongSession(t *testing.T) {
 	tests := []struct {
 		name        string
 		stateData   func(string) string
+		entriesData func(string) string
 		settleEvent string
 		want        string
 	}{
@@ -761,6 +764,14 @@ func TestProcessSuspendRejectsIncompleteIdleStateAndWrongSession(t *testing.T) {
 		{name: "wrong session", stateData: func(path string) string {
 			return `{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(path) + `,"sessionId":"another-session"}`
 		}, settleEvent: `{"type":"agent_settled"}`, want: "does not match"},
+		{name: "case-variant session identity", stateData: func(path string) string {
+			return `{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(path) + `,"sessionId":"another-session","SessionID":"backlog-run-52"}`
+		}, settleEvent: `{"type":"agent_settled"}`, want: "duplicate key"},
+		{name: "case-variant leaf identity", stateData: func(path string) string {
+			return `{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(path) + `,"sessionId":"backlog-run-52"}`
+		}, entriesData: func(entry string) string {
+			return `{"entries":[` + entry + `],"leafId":"wrong","LeafID":"user"}`
+		}, settleEvent: `{"type":"agent_settled"}`, want: "duplicate key"},
 		{name: "missing settlement", stateData: func(path string) string {
 			return `{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(path) + `,"sessionId":"backlog-run-52"}`
 		}, want: "deadline exceeded"},
@@ -781,6 +792,11 @@ func TestProcessSuspendRejectsIncompleteIdleStateAndWrongSession(t *testing.T) {
 			header := `{"type":"session","id":"backlog-run-52","cwd":` + strconv.Quote(worktree) + `}`
 			entry := `{"type":"message","id":"user","parentId":null,"message":{"role":"user","content":"work"}}`
 			stateResponse := `{"id":"backlog-suspend-state","type":"response","command":"get_state","success":true,"data":` + test.stateData(sessionFile) + `}`
+			entriesData := `{"entries":[` + entry + `],"leafId":"user"}`
+			if test.entriesData != nil {
+				entriesData = test.entriesData(entry)
+			}
+			entriesResponse := `{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":` + entriesData + `}`
 			settleCommands := ""
 			for _, event := range strings.Split(test.settleEvent, "\n") {
 				if event != "" {
@@ -798,7 +814,7 @@ printf '%s\n' '{"id":"backlog-suspend-abort","type":"response","command":"abort"
 IFS= read -r state
 printf '%s\n' `+shellQuote(stateResponse)+`
 IFS= read -r entries
-printf '%s\n' '{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[`+entry+`],"leafId":"user"}}'
+printf '%s\n' `+shellQuote(entriesResponse)+`
 while IFS= read -r ignored; do :; done
 `)
 			process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(context.Background(), request(52, "run-52", worktree, sessionDir))
