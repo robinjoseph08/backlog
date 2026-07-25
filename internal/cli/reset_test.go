@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -38,6 +39,9 @@ func TestResetHelpShowsMutationAndDryRunFlags(t *testing.T) {
 		"preserves logs and history",
 		"idempotent",
 		"deprecated retry command",
+		"Interactive confirmation defaults to no",
+		"Enter, EOF, and every non-affirmative response cancel without mutation",
+		"Non-interactive mutation requires --yes",
 		"Exit statuses: 0 success or interactive cancellation; 1 refusal or failure.",
 	} {
 		if !strings.Contains(stderr.String(), text) {
@@ -46,7 +50,7 @@ func TestResetHelpShowsMutationAndDryRunFlags(t *testing.T) {
 	}
 }
 
-func TestResetDryRunPrintsPlanWithoutChangingResources(t *testing.T) {
+func TestCompiledResetDryRunPrintsPlanWithoutConfirmationOrMutation(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -81,20 +85,21 @@ esac
 `)
 
 	git := githubGit(t)
+	binary := buildExecutable(t, root)
 	beforeState := fileDigest(t, store.Path)
 	beforeGit := gitSnapshot(t, repository)
 	beforeGitEntries := directoryEntries(t, filepath.Join(repository, ".git"))
 	beforeGitHub := fileDigest(t, githubState)
 	beforeFilesystem := directoryEntries(t, root)
 
-	var stdout, stderr bytes.Buffer
-	exit := Main(context.Background(), []string{
-		"reset", "42", "--dry-run", "--yes", "--repo-dir", repository, "--state-dir", stateDir, "--git", git, "--gh", gh,
-	}, &stdout, &stderr)
-	if exit != 0 {
-		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+	command := exec.Command(binary,
+		"reset", "42", "--dry-run", "--repo-dir", repository, "--state-dir", stateDir, "--git", git, "--gh", gh,
+	)
+	combinedOutput, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("compiled dry-run: %v, output = %q", err, combinedOutput)
 	}
-	output := stdout.String()
+	output := string(combinedOutput)
 	if !strings.Contains(output, "Reset Plan for issue #42") ||
 		!strings.Contains(output, "add issue label ready-for-agent") ||
 		!strings.Contains(output, "mark Run run-42 reset and release Lease lease-42") ||
@@ -1213,7 +1218,7 @@ func newArtifactFreeResetFixture(t *testing.T, labels []string) artifactFreeRese
 		t.Fatal(err)
 	}
 	githubState := filepath.Join(root, "github.json")
-	if err := os.WriteFile(githubState, []byte(`{"labels":`+string(encodedLabels)+`}`), 0o600); err != nil {
+	if err := os.WriteFile(githubState, []byte(`{"state":"OPEN","labels":`+string(encodedLabels)+`}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	gh := writeExecutable(t, `#!/bin/sh
@@ -1223,7 +1228,8 @@ case "$*" in
     printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
   "issue view 42 --repo acme/widgets --json number,url,state,labels")
     labels=$(jq -c '[.labels[] | {name:.}]' `+quote(githubState)+`)
-    printf '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":%s}\n' "$labels" ;;
+    state=$(jq -r '.state' `+quote(githubState)+`)
+    printf '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"%s","labels":%s}\n' "$state" "$labels" ;;
   "issue edit 42 --repo acme/widgets --remove-label in-progress")
     temporary=`+quote(githubState)+`.tmp
     jq '.labels = [.labels[] | select(ascii_downcase != "in-progress")]' `+quote(githubState)+` > "$temporary"
@@ -1287,6 +1293,174 @@ func TestCompiledResetFinalizesArtifactFreeRun(t *testing.T) {
 	if !strings.Contains(string(output), "No replacement Run was created") {
 		t.Fatalf("compiled Reset output = %q", output)
 	}
+}
+
+func TestCompiledResetReconcilesEveryManagedLabelCombination(t *testing.T) {
+	binary := buildExecutable(t, t.TempDir())
+	for _, labels := range [][]string{
+		{"spec"},
+		{"in-progress", "spec"},
+		{"ready-for-agent", "spec"},
+		{"in-progress", "ready-for-agent", "spec"},
+	} {
+		labels := labels
+		t.Run(strings.Join(labels, "+"), func(t *testing.T) {
+			fixture := newArtifactFreeResetFixture(t, labels)
+			command := exec.Command(binary, fixture.args("reset", "--yes")...)
+			output, err := command.CombinedOutput()
+			if err != nil {
+				t.Fatalf("compiled Reset: %v, output = %q", err, output)
+			}
+			current, err := fixture.store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if current.Runs[0].Status != scheduler.StatusReset || len(current.Leases) != 0 || strings.Join(fixture.labels(t), ",") != "ready-for-agent,spec" {
+				t.Fatalf("compiled managed-label Reset state = %#v, labels = %v", current, fixture.labels(t))
+			}
+		})
+	}
+}
+
+func TestCompiledResetRefusesUnsafeRunsWithoutMutation(t *testing.T) {
+	binary := buildExecutable(t, t.TempDir())
+	humanLabels := []string{"needs-triage", "needs-info", "ready-for-human", "wontfix"}
+	for _, label := range humanLabels {
+		t.Run("human label "+label, func(t *testing.T) {
+			fixture := newArtifactFreeResetFixture(t, []string{label, "spec"})
+			assertCompiledResetRefusal(t, binary, fixture, "human workflow label")
+		})
+	}
+	t.Run("closed issue", func(t *testing.T) {
+		fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "spec"})
+		data, err := os.ReadFile(fixture.githubState)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var githubState map[string]any
+		if err := json.Unmarshal(data, &githubState); err != nil {
+			t.Fatal(err)
+		}
+		githubState["state"] = "CLOSED"
+		encoded, err := json.Marshal(githubState)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fixture.githubState, encoded, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		assertCompiledResetRefusal(t, binary, fixture, "closed without verified Completion")
+	})
+	t.Run("live Worker", func(t *testing.T) {
+		fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "spec"})
+		worker := exec.Command("sleep", "30")
+		if err := worker.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			_ = worker.Process.Kill()
+			_ = worker.Wait()
+		}()
+		identity, err := pidStartIdentity(worker.Process.Pid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		current, err := fixture.store.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		current.Runs[0].Status = scheduler.StatusRunning
+		current.Runs[0].PID = worker.Process.Pid
+		current.Runs[0].ProcessIdentity = identity
+		current.Runs[0].StartedAt = time.Now().UTC()
+		if err := fixture.store.Save(current); err != nil {
+			t.Fatal(err)
+		}
+		assertCompiledResetRefusal(t, binary, fixture, "liveness is uncertain")
+	})
+	t.Run("uncertain Worker identity", func(t *testing.T) {
+		fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "spec"})
+		current, err := fixture.store.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		current.Runs[0].Status = scheduler.StatusRunning
+		current.Runs[0].PID = os.Getpid()
+		current.Runs[0].ProcessIdentity = fmt.Sprintf("%d:incorrect", os.Getpid())
+		current.Runs[0].StartedAt = time.Now().UTC()
+		if err := fixture.store.Save(current); err != nil {
+			t.Fatal(err)
+		}
+		assertCompiledResetRefusal(t, binary, fixture, "liveness is uncertain")
+	})
+}
+
+func assertCompiledResetRefusal(t *testing.T, binary string, fixture artifactFreeResetFixture, want string) {
+	t.Helper()
+	beforeState := fileDigest(t, fixture.store.Path)
+	beforeGitHub := fileDigest(t, fixture.githubState)
+	command := exec.Command(binary, fixture.args("reset", "--yes")...)
+	output, err := command.CombinedOutput()
+	var exitError *exec.ExitError
+	if err == nil || !errors.As(err, &exitError) || exitError.ExitCode() != 1 || !strings.Contains(string(output), want) {
+		t.Fatalf("compiled Reset error = %v, output = %q, want refusal containing %q", err, output, want)
+	}
+	if fileDigest(t, fixture.store.Path) != beforeState || fileDigest(t, fixture.githubState) != beforeGitHub {
+		t.Fatal("compiled Reset refusal changed state")
+	}
+}
+
+func TestCompiledInteractiveResetDefaultsToNo(t *testing.T) {
+	binary := buildExecutable(t, t.TempDir())
+	for _, test := range []struct {
+		name  string
+		input string
+	}{
+		{name: "Enter", input: "\n"},
+		{name: "EOF"},
+		{name: "non-affirmative", input: "no\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "spec"})
+			beforeState := fileDigest(t, fixture.store.Path)
+			beforeGitHub := fileDigest(t, fixture.githubState)
+			command := compiledInteractiveCommand(binary, fixture.args("reset")...)
+			command.Stdin = strings.NewReader(test.input)
+			output, err := command.CombinedOutput()
+			if err != nil || !strings.Contains(string(output), "Reset cancelled; no changes made.") {
+				t.Fatalf("compiled interactive Reset: %v, output = %q", err, output)
+			}
+			if fileDigest(t, fixture.store.Path) != beforeState || fileDigest(t, fixture.githubState) != beforeGitHub {
+				t.Fatal("compiled interactive cancellation changed state")
+			}
+		})
+	}
+
+	t.Run("non-interactive requires yes", func(t *testing.T) {
+		fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "spec"})
+		beforeState := fileDigest(t, fixture.store.Path)
+		beforeGitHub := fileDigest(t, fixture.githubState)
+		command := exec.Command(binary, fixture.args("reset")...)
+		output, err := command.CombinedOutput()
+		var exitError *exec.ExitError
+		if err == nil || !errors.As(err, &exitError) || exitError.ExitCode() != 1 || !strings.Contains(string(output), "requires --yes") {
+			t.Fatalf("compiled non-interactive Reset refusal: %v, output = %q", err, output)
+		}
+		if fileDigest(t, fixture.store.Path) != beforeState || fileDigest(t, fixture.githubState) != beforeGitHub {
+			t.Fatal("compiled non-interactive refusal changed state")
+		}
+	})
+}
+
+func compiledInteractiveCommand(binary string, args ...string) *exec.Cmd {
+	if runtime.GOOS == "darwin" {
+		return exec.Command("script", append([]string{"-q", "/dev/null", binary}, args...)...)
+	}
+	command := quote(binary)
+	for _, arg := range args {
+		command += " " + quote(arg)
+	}
+	return exec.Command("script", "-q", "-c", command, "/dev/null")
 }
 
 func TestResetMutationRequiresYesWhenNonInteractive(t *testing.T) {
@@ -1622,7 +1796,7 @@ func TestResetRepairsManagedLabelDriftForAlreadyResetRun(t *testing.T) {
 	if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit != 0 {
 		t.Fatalf("initial exit = %d, stderr = %q", exit, stderr.String())
 	}
-	if err := os.WriteFile(fixture.githubState, []byte(`{"labels":["in-progress","spec"]}`), 0o600); err != nil {
+	if err := os.WriteFile(fixture.githubState, []byte(`{"state":"OPEN","labels":["in-progress","spec"]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1690,6 +1864,38 @@ func TestRetryUsesResetMutationPathWithDeprecationWarning(t *testing.T) {
 	if resetState.Runs[0].Status != retryState.Runs[0].Status || len(resetState.Leases) != len(retryState.Leases) ||
 		strings.Join(resetFixture.labels(t), ",") != strings.Join(retryFixture.labels(t), ",") {
 		t.Fatalf("reset/retry mutations differ: %#v / %#v", resetState, retryState)
+	}
+}
+
+func TestCompiledRetryMatchesResetMutationBehavior(t *testing.T) {
+	binary := buildExecutable(t, t.TempDir())
+	resetFixture := newArtifactFreeResetFixture(t, []string{"in-progress", "spec"})
+	retryFixture := newArtifactFreeResetFixture(t, []string{"in-progress", "spec"})
+	resetCommand := exec.Command(binary, resetFixture.args("reset", "--yes")...)
+	resetOutput, resetErr := resetCommand.CombinedOutput()
+	if resetErr != nil {
+		t.Fatalf("compiled Reset: %v, output = %q", resetErr, resetOutput)
+	}
+	retryCommand := exec.Command(binary, retryFixture.args("retry", "--yes")...)
+	retryOutput, retryErr := retryCommand.CombinedOutput()
+	if retryErr != nil {
+		t.Fatalf("compiled Retry: %v, output = %q", retryErr, retryOutput)
+	}
+	warning := "Warning: backlog retry is deprecated; use backlog reset.\n"
+	if string(resetOutput) != strings.TrimPrefix(string(retryOutput), warning) || !strings.HasPrefix(string(retryOutput), warning) {
+		t.Fatalf("compiled reset/retry output differs: %q / %q", resetOutput, retryOutput)
+	}
+	resetState, err := resetFixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryState, err := retryFixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resetState.Runs[0].Status != retryState.Runs[0].Status || len(resetState.Leases) != len(retryState.Leases) ||
+		strings.Join(resetFixture.labels(t), ",") != strings.Join(retryFixture.labels(t), ",") {
+		t.Fatalf("compiled reset/retry mutations differ: %#v / %#v", resetState, retryState)
 	}
 }
 
@@ -2436,6 +2642,33 @@ func TestResetWaitingForMergeDisablesAutoMergeBeforeResetting(t *testing.T) {
 	}
 	if !strings.HasPrefix(string(calls), "disable\ncomment\nclose\n") {
 		t.Fatalf("GitHub action order = %q", calls)
+	}
+}
+
+func TestCompiledResetRefusesMergedPullRequestWithoutMutation(t *testing.T) {
+	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusFailed, false, false, false)
+	command := exec.Command("jq", `.pr="MERGED" | .merged=true | .auto=false`, fixture.githubState)
+	output, err := command.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fixture.githubState, output, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeState := fileDigest(t, fixture.store.Path)
+	beforeGitHub := fileDigest(t, fixture.githubState)
+	binary := buildExecutable(t, t.TempDir())
+	resetCommand := exec.Command(binary, fixture.args("reset", "--yes")...)
+	resetOutput, err := resetCommand.CombinedOutput()
+	var exitError *exec.ExitError
+	if err == nil || !errors.As(err, &exitError) || exitError.ExitCode() != 1 || !strings.Contains(string(resetOutput), "merged") {
+		t.Fatalf("compiled merged PR refusal = %v, output = %q", err, resetOutput)
+	}
+	if fileDigest(t, fixture.store.Path) != beforeState || fileDigest(t, fixture.githubState) != beforeGitHub {
+		t.Fatal("merged PR refusal changed state")
+	}
+	if _, err := os.Stat(fixture.githubCalls); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("merged PR refusal executed an action: %v", err)
 	}
 }
 

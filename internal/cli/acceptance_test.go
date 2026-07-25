@@ -21,6 +21,143 @@ import (
 	"github.com/robinjoseph08/backlog/internal/state"
 )
 
+func TestCompiledExecutableUsesLifecycleExitForSignalDuringSetup(t *testing.T) {
+	binary := buildExecutable(t, t.TempDir())
+	for _, test := range []struct {
+		name       string
+		signal     os.Signal
+		wantExit   int
+		wantOutput string
+	}{
+		{name: "SIGINT", signal: os.Interrupt, wantExit: 0, wantOutput: "Drain: admission stopped during setup; 0 Workers remaining"},
+		{name: "SIGTERM", signal: syscall.SIGTERM, wantExit: 143, wantOutput: "Suspension: SIGTERM accepted during setup; 0 Workers remaining"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			repository := filepath.Join(root, "repo")
+			if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
+				t.Fatalf("git init: %v\n%s", err, output)
+			}
+			started := filepath.Join(root, "setup-started")
+			git := writeExecutable(t, "#!/bin/sh\ntouch "+quote(started)+"\nexec sleep 30\n")
+			command := exec.Command(binary, "run", "--repo-dir", repository, "--state-dir", filepath.Join(root, "state"), "--git", git)
+			var output bytes.Buffer
+			command.Stdout = &output
+			command.Stderr = &output
+			if err := command.Start(); err != nil {
+				t.Fatal(err)
+			}
+			waitForFile(t, started)
+			if err := command.Process.Signal(test.signal); err != nil {
+				t.Fatal(err)
+			}
+			err := command.Wait()
+			if test.wantExit == 0 {
+				if err != nil {
+					t.Fatalf("compiled setup signal exit: %v, output = %q", err, output.String())
+				}
+			} else {
+				var exitError *exec.ExitError
+				if !errors.As(err, &exitError) || exitError.ExitCode() != test.wantExit {
+					t.Fatalf("compiled setup signal exit: %v, output = %q, want %d", err, output.String(), test.wantExit)
+				}
+			}
+			if !strings.Contains(output.String(), test.wantOutput) {
+				t.Fatalf("compiled setup signal output = %q, want %q", output.String(), test.wantOutput)
+			}
+		})
+	}
+}
+
+func TestCompiledExecutableDrainSucceedsWhenMalformedRPCRequiresAttention(t *testing.T) {
+	root := t.TempDir()
+	repository := filepath.Join(root, "repo")
+	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, output)
+	}
+	binary := buildExecutable(t, root)
+	stateDir := filepath.Join(root, "state")
+	workerStarted := filepath.Join(root, "worker-started")
+	workerRelease := filepath.Join(root, "worker-release")
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef")
+    printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
+    printf '%s\n' '[{"number":35,"title":"Protocol failure","createdAt":"2026-01-01T00:00:00Z","url":"https://example.test/issues/35"}]' ;;
+  "issue view 35 --repo acme/widgets --json number,title,body,state,url,createdAt")
+    printf '%s\n' '{"number":35,"title":"Protocol failure","body":"","state":"OPEN","url":"https://example.test/issues/35","createdAt":"2026-01-01T00:00:00Z"}' ;;
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/35/comments?per_page=100 --paginate --slurp"|\
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/35/dependencies/blocked_by?per_page=100 --paginate --slurp")
+    printf '%s\n' '[[]]' ;;
+  "pr list --repo acme/widgets --state all --head agent/issue-35-"*)
+    printf '%s\n' '[]' ;;
+  "issue view 35 --repo acme/widgets --json number,state,title,url")
+    printf '%s\n' '{"number":35,"state":"OPEN","title":"Protocol failure","url":"https://github.com/acme/widgets/issues/35"}' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	git := writeExecutable(t, `#!/bin/sh
+set -eu
+if [ "$3" = "rev-parse" ] && [ "$4" = "--show-toplevel" ]; then printf '%s\n' `+quote(repository)+`; exit 0; fi
+if [ "$3" = "rev-parse" ] && [ "$4" = "--git-common-dir" ]; then printf '%s\n' `+quote(filepath.Join(repository, ".git"))+`; exit 0; fi
+if [ "$3" = "worktree" ] && [ "$4" = "add" ]; then mkdir -p "$7"; exit 0; fi
+exit 0
+`)
+	pi := writeExecutable(t, `#!/bin/sh
+set -eu
+IFS= read -r prompt
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
+touch `+quote(workerStarted)+`
+while ! test -f `+quote(workerRelease)+`; do sleep 0.01; done
+trap 'exit 0' TERM INT
+printf '%s\n' 'malformed Pi RPC JSON'
+while :; do sleep 0.1; done
+`)
+	command := exec.Command(binary, "run", "--repo-dir", repository, "--state-dir", stateDir,
+		"--max-workers", "1", "--poll", "5ms", "--gh", gh, "--git", git, "--pi", pi)
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	lines := make(chan string, 20)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+		close(lines)
+	}()
+	waitForFile(t, workerStarted)
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	for line := range lines {
+		if strings.Contains(line, "Drain: admission stopped; 1 Worker remaining") {
+			break
+		}
+	}
+	if err := os.WriteFile(workerRelease, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err != nil {
+		t.Fatalf("compiled Drain with Attention Required: %v, stderr = %q", err, stderr.String())
+	}
+	current, err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.Runs) != 1 || current.Runs[0].Status != scheduler.StatusFailed || len(current.Leases) != 1 {
+		t.Fatalf("state after compiled malformed RPC Drain = %#v", current)
+	}
+}
+
 func TestCompiledExecutableSuspendsOnSecondSIGINTWithoutAdmittingAnotherLease(t *testing.T) {
 	root := t.TempDir()
 	repository := filepath.Join(root, "repo")
@@ -32,6 +169,7 @@ func TestCompiledExecutableSuspendsOnSecondSIGINTWithoutAdmittingAnotherLease(t 
 	stateDir := filepath.Join(root, "state")
 	statePath := filepath.Join(stateDir, "state.json")
 	workerStarted := filepath.Join(root, "worker-started")
+	suspensionRelease := filepath.Join(root, "suspension-release")
 	gh := writeExecutable(t, `#!/bin/sh
 set -eu
 case "$*" in
@@ -48,10 +186,13 @@ case "$*" in
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/32/comments?per_page=100 --paginate --slurp"|\
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/32/dependencies/blocked_by?per_page=100 --paginate --slurp")
     printf '%s\n' '[[]]' ;;
-  "pr list --repo acme/widgets --state all --head agent/issue-31-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+  "pr list --repo acme/widgets --state all --head agent/issue-31-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository"|\
+  "pr list --repo acme/widgets --state all --head agent/issue-32-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
     printf '%s\n' '[]' ;;
   "issue view 31 --repo acme/widgets --json number,state,title,url")
     printf '%s\n' '{"number":31,"state":"OPEN","title":"First","url":"https://github.com/acme/widgets/issues/31"}' ;;
+  "issue view 32 --repo acme/widgets --json number,state,title,url")
+    printf '%s\n' '{"number":32,"state":"OPEN","title":"Later","url":"https://github.com/acme/widgets/issues/32"}' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
 `)
@@ -78,6 +219,7 @@ IFS= read -r prompt
 touch `+quote(workerStarted)+`
 printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
 IFS= read -r abort
+while ! test -f `+quote(suspensionRelease)+`; do sleep 0.01; done
 session_file="$session_dir/session.jsonl"
 printf '{"type":"session","version":3,"id":"%s","cwd":"%s"}\n' "$session_id" "$worktree" > "$session_file"
 printf '%s\n' '{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"work"}}' >> "$session_file"
@@ -92,7 +234,7 @@ while IFS= read -r ignored; do :; done
 `)
 
 	command := exec.Command(binary, "run", "--repo-dir", repository, "--state-dir", stateDir,
-		"--max-workers", "1", "--poll", "5ms", "--gh", gh, "--git", git, "--pi", pi)
+		"--max-workers", "2", "--poll", "5ms", "--gh", gh, "--git", git, "--pi", pi)
 	stdout, err := command.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -111,8 +253,16 @@ while IFS= read -r ignored; do :; done
 		close(lines)
 	}()
 	waitForFile(t, workerStarted)
-	if current, err := (state.FileStore{Path: statePath}).Load(); err != nil || len(current.Leases) != 1 || current.Leases[0].Issue != 31 {
-		t.Fatalf("state before SIGINT = %#v, err = %v", current, err)
+	var beforeSignal state.State
+	for deadline := time.Now().Add(2 * time.Second); ; {
+		beforeSignal, err = (state.FileStore{Path: statePath}).Load()
+		if err == nil && len(beforeSignal.Leases) == 2 && len(beforeSignal.Runs) == 2 && beforeSignal.Runs[0].PID != 0 && beforeSignal.Runs[1].PID != 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("state before SIGINT = %#v, err = %v", beforeSignal, err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if err := command.Process.Signal(os.Interrupt); err != nil {
 		t.Fatalf("send SIGINT: %v", err)
@@ -124,7 +274,7 @@ while IFS= read -r ignored; do :; done
 			t.Fatalf("process exited before reporting Drain, output = %q, stderr = %q", outputLines, stderr.String())
 		}
 		outputLines = append(outputLines, line)
-		if strings.Contains(line, "Drain: admission stopped; 1 Worker remaining; next SIGINT will be recorded as a suspension request") {
+		if strings.Contains(line, "Drain: admission stopped; 2 Workers remaining; next SIGINT will be recorded as a suspension request") {
 			break
 		}
 	}
@@ -137,9 +287,26 @@ while IFS= read -r ignored; do :; done
 			t.Fatalf("process exited before reporting repeated SIGINT, output = %q, stderr = %q", outputLines, stderr.String())
 		}
 		outputLines = append(outputLines, line)
-		if strings.Contains(line, "Drain: additional interrupt recorded as a suspension request; 1 Worker remaining") {
+		if strings.Contains(line, "Drain: additional interrupt recorded as a suspension request; 2 Workers remaining") {
 			break
 		}
+	}
+	for deadline := time.Now().Add(2 * time.Second); ; {
+		current, loadErr := (state.FileStore{Path: statePath}).Load()
+		if loadErr == nil && len(current.Runs) == 2 && current.Runs[0].SuspendingAt != nil && current.Runs[1].SuspendingAt != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("state while suspending = %#v, err = %v", current, loadErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	statusOutput, statusErr := exec.Command(binary, "status", "--repo-dir", repository, "--state-dir", stateDir, "--git", git).CombinedOutput()
+	if statusErr != nil || strings.Count(string(statusOutput), "suspending") != 2 {
+		t.Fatalf("compiled status while suspending: %v, output = %q", statusErr, statusOutput)
+	}
+	if err := os.WriteFile(suspensionRelease, nil, 0o600); err != nil {
+		t.Fatal(err)
 	}
 	if err := command.Wait(); err != nil {
 		var exitError *exec.ExitError
@@ -156,9 +323,13 @@ while IFS= read -r ignored; do :; done
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(current.Runs) != 1 || current.Runs[0].Issue != 31 || current.Runs[0].Status != scheduler.StatusSuspended ||
-		current.Runs[0].PID != 0 || current.Runs[0].Continuation == nil || len(current.Leases) != 1 {
+	if len(current.Runs) != 2 || len(current.Leases) != 2 {
 		t.Fatalf("persisted state after second SIGINT = %#v", current)
+	}
+	for _, run := range current.Runs {
+		if run.Status != scheduler.StatusSuspended || run.PID != 0 || run.Continuation == nil || run.SuspendingAt != nil || run.SuspendedAt == nil {
+			t.Fatalf("persisted Run after second SIGINT = %#v", run)
+		}
 	}
 	output := strings.Join(outputLines, "\n")
 	if !strings.Contains(output, "Suspension complete: 0 Workers remaining") {

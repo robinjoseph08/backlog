@@ -524,11 +524,45 @@ while IFS= read -r ignored; do :; done
 	if result := process.Wait(); result.Err != nil || !result.Settled {
 		t.Fatalf("wait = %#v", result)
 	}
-	if result := process.Close(); result.Err != nil {
+	if result := process.Close(); result.Err != nil || result.ControlErr != nil {
 		t.Fatalf("close = %#v", result)
 	}
 	if _, err := os.Stat(childDone); err != nil {
 		t.Fatalf("Close returned before a process-group child exited: %v", err)
+	}
+}
+
+func TestCloseEscalatesSurvivingProcessGroupAfterLeaderExit(t *testing.T) {
+	root := t.TempDir()
+	childPIDPath := filepath.Join(root, "child.pid")
+	pi := fakePi(t, `
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+sh -c 'trap "" TERM; while :; do sleep 1; done' &
+printf '%s\n' "$!" > `+shellQuote(childPIDPath)+`
+while IFS= read -r ignored; do :; done
+exit 9
+`)
+	process, err := (Supervisor{
+		Executable: pi, LogsDir: filepath.Join(root, "logs"), TerminationGrace: 30 * time.Millisecond,
+	}).Start(context.Background(), request(13, "run-13", root, filepath.Join(root, "sessions", "run-13")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if result := process.Wait(); result.Err != nil || !result.Settled {
+		t.Fatalf("wait = %#v", result)
+	}
+	waitForPath(t, childPIDPath)
+	started := time.Now()
+	result := process.Close()
+	if !result.GroupExited || result.Err == nil || !strings.Contains(result.Err.Error(), "exit status 9") {
+		t.Fatalf("close surviving process group = %#v", result)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("surviving process-group escalation took %s", elapsed)
 	}
 }
 
@@ -559,8 +593,9 @@ while :; do sleep 1; done
 	if time.Since(started) > time.Second {
 		t.Fatalf("Close took %s, want bounded escalation", time.Since(started))
 	}
-	if result.Err == nil || !strings.Contains(result.Err.Error(), "did not exit after input closed") {
-		t.Fatalf("close error = %v, want graceful-exit timeout", result.Err)
+	if result.Err == nil || !strings.Contains(result.Err.Error(), "did not exit after input closed") ||
+		result.ControlErr == nil || !strings.Contains(result.ControlErr.Error(), "did not exit after input closed") {
+		t.Fatalf("close result = %#v, want graceful-exit timeout in Err and ControlErr", result)
 	}
 	if err := syscall.Kill(-process.PID(), syscall.Signal(0)); !errors.Is(err, syscall.ESRCH) {
 		t.Fatalf("Worker process group survived Close escalation: %v", err)
@@ -651,6 +686,39 @@ while :; do sleep 1; done
 	}
 	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("force context did not bypass settled Worker grace: %s", elapsed)
+	}
+}
+
+func TestCloseWithForceContextHonorsCancellationAfterGraceExpires(t *testing.T) {
+	root := t.TempDir()
+	pi := fakePi(t, `
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+trap '' TERM
+while :; do sleep 1; done
+`)
+	process, err := (Supervisor{
+		Executable: pi, LogsDir: filepath.Join(root, "logs"), TerminationGrace: 20 * time.Millisecond,
+	}).Start(context.Background(), request(20, "run-20", root, filepath.Join(root, "sessions", "run-20")))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if result := process.Wait(); result.Err != nil || !result.Settled {
+		t.Fatalf("wait = %#v", result)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	result := process.CloseWithForceContext(ctx, func() error { return nil })
+	if !result.GroupExited || !result.ForceStopped {
+		t.Fatalf("force close after grace = %#v", result)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("cancellation after grace did not bound close: %s", elapsed)
 	}
 }
 

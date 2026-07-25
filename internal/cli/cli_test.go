@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -15,9 +16,22 @@ import (
 	"github.com/robinjoseph08/backlog/internal/state"
 )
 
-func TestMainWithSignalsCancelsCommandsDuringRepositorySetup(t *testing.T) {
-	for _, command := range []string{"run", "status"} {
-		t.Run(command, func(t *testing.T) {
+func TestMainWithSignalsUsesRunLifecycleExitStatusesDuringRepositorySetup(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		command  string
+		signals  []os.Signal
+		wantExit int
+	}{
+		{name: "run SIGINT drains idle setup", command: "run", signals: []os.Signal{os.Interrupt}, wantExit: 0},
+		{name: "run repeated SIGINT suspends", command: "run", signals: []os.Signal{os.Interrupt, os.Interrupt}, wantExit: 130},
+		{name: "later SIGTERM preserves SIGINT suspension exit", command: "run", signals: []os.Signal{os.Interrupt, os.Interrupt, syscall.SIGTERM}, wantExit: 130},
+		{name: "run SIGTERM suspends directly", command: "run", signals: []os.Signal{syscall.SIGTERM}, wantExit: 143},
+		{name: "later SIGINT preserves SIGTERM suspension exit", command: "run", signals: []os.Signal{syscall.SIGTERM, os.Interrupt}, wantExit: 143},
+		{name: "force SIGINT preserves SIGTERM suspension exit", command: "run", signals: []os.Signal{syscall.SIGTERM, os.Interrupt, os.Interrupt}, wantExit: 143},
+		{name: "status remains cancellable", command: "status", signals: []os.Signal{os.Interrupt}, wantExit: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
 			started := filepath.Join(root, "git-started")
 			git := writeExecutable(t, `#!/bin/sh
@@ -25,21 +39,23 @@ set -eu
 touch `+quote(started)+`
 exec sleep 30
 `)
-			signals := make(chan os.Signal, 1)
+			signals := make(chan os.Signal, len(test.signals))
 			done := make(chan int, 1)
 			var stdout, stderr bytes.Buffer
 			go func() {
-				done <- MainWithSignals(context.Background(), []string{command, "--git", git}, &stdout, &stderr, signals)
+				done <- MainWithSignals(context.Background(), []string{test.command, "--git", git}, &stdout, &stderr, signals)
 			}()
 			waitForFile(t, started)
-			signals <- os.Interrupt
+			for _, signal := range test.signals {
+				signals <- signal
+			}
 			select {
 			case exitCode := <-done:
-				if exitCode != 1 {
-					t.Fatalf("exit = %d, stderr = %q", exitCode, stderr.String())
+				if exitCode != test.wantExit {
+					t.Fatalf("exit = %d, want %d, stderr = %q", exitCode, test.wantExit, stderr.String())
 				}
 			case <-time.After(2 * time.Second):
-				t.Fatalf("%s did not stop after SIGINT during setup", command)
+				t.Fatalf("%s did not stop after %v during setup", test.command, test.signals)
 			}
 		})
 	}
@@ -129,6 +145,15 @@ func TestStatusPrintsIssueTitlesAndFallsBackToIssueNumbers(t *testing.T) {
 	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
 		t.Fatalf("git init: %v\n%s", err, output)
 	}
+	commonDirectory, err := gitCommonDirectory(context.Background(), "git", repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervision, err := establishRunnerSupervision(commonDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer supervision.Release()
 	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
 	if err := store.Save(state.State{
 		Version: state.CurrentVersion,
@@ -138,6 +163,7 @@ func TestStatusPrintsIssueTitlesAndFallsBackToIssueNumbers(t *testing.T) {
 				Issue: 7, RunID: "old-active", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModeRPC,
 				SessionID: "backlog-old-active", SessionDir: "/sessions/old-active", PID: 700,
 				ProcessIdentity: "identity-700", StartedAt: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
+				SuspendingAt: timePointer(time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC)),
 			},
 		},
 		Leases: []scheduler.Lease{{LeaseID: "old-active", Issue: 7, RunID: "old-active"}},
@@ -151,9 +177,24 @@ func TestStatusPrintsIssueTitlesAndFallsBackToIssueNumbers(t *testing.T) {
 	if !strings.Contains(stdout.String(), "#26  Show observable Run context in status") {
 		t.Fatalf("stdout = %q, want snapshotted issue title", stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "#7  running") {
-		t.Fatalf("stdout = %q, want old active Run issue-number fallback", stdout.String())
+	if !strings.Contains(stdout.String(), "#7  suspending") {
+		t.Fatalf("stdout = %q, want active suspension status", stdout.String())
 	}
+	if err := supervision.Release(); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if exit := Main(context.Background(), []string{"status", "--repo-dir", repository, "--state-dir", stateDir}, &stdout, &stderr); exit != 0 {
+		t.Fatalf("unsupervised exit = %d, stderr = %q", exit, stderr.String())
+	}
+	if strings.Contains(stdout.String(), "#7  suspending") || !strings.Contains(stdout.String(), "#7  running") {
+		t.Fatalf("unsupervised stdout = %q, want stale suspension marker rendered as running", stdout.String())
+	}
+}
+
+func timePointer(value time.Time) *time.Time {
+	return &value
 }
 
 func TestStatusPrintsMachineReadableState(t *testing.T) {
@@ -172,6 +213,8 @@ func TestStatusPrintsMachineReadableState(t *testing.T) {
 			RunID: "run-26", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModeRPC,
 			SessionID: "backlog-run-26", SessionDir: "/sessions/run-26",
 			LogPath: "/logs/run-26.jsonl", StderrPath: "/logs/run-26.stderr.log",
+			SuspendingAt: timePointer(time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC)),
+			SuspendedAt:  timePointer(time.Date(2026, 7, 3, 0, 0, 0, 0, time.UTC)),
 		}},
 	}); err != nil {
 		t.Fatal(err)
@@ -179,6 +222,10 @@ func TestStatusPrintsMachineReadableState(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if exit := Main(context.Background(), []string{"status", "--repo-dir", repository, "--state-dir", stateDir, "--json"}, &stdout, &stderr); exit != 0 {
 		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"suspendingAt": "2026-07-02T00:00:00Z"`) ||
+		!strings.Contains(stdout.String(), `"suspendedAt": "2026-07-03T00:00:00Z"`) {
+		t.Fatalf("status JSON omitted lifecycle timestamp contract: %s", stdout.String())
 	}
 	var got state.State
 	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
@@ -189,7 +236,7 @@ func TestStatusPrintsMachineReadableState(t *testing.T) {
 	}
 	run := got.Runs[0]
 	if run.Issue != 26 || run.IssueTitle != "Observable context" || run.IssueURL != "https://github.com/acme/widgets/issues/26" ||
-		run.LogPath != "/logs/run-26.jsonl" || run.StderrPath != "/logs/run-26.stderr.log" {
+		run.LogPath != "/logs/run-26.jsonl" || run.StderrPath != "/logs/run-26.stderr.log" || run.SuspendedAt == nil {
 		t.Fatalf("status Run metadata = %#v", run)
 	}
 }

@@ -178,6 +178,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	defer stopSignals()
 	signalEvents := r.observeSignals(signalCtx, admission, cancelAdmission, cancelOperations)
 	draining := false
+	var drainOperationalErr error
 
 	current, err := r.Store.Load()
 	if err != nil {
@@ -302,6 +303,14 @@ func (r *Runner) Run(ctx context.Context) error {
 				for _, candidate := range plan.Starts {
 					process, startedDraining, err := r.startWhileObservingSignals(workerCtx, operationCtx, admission, &current, candidate, signalEvents, len(localWorkers))
 					draining = startedDraining || draining
+					if err != nil && operationCtx.Err() != nil && r.suspensionExit.Load() != 0 {
+						persisted, reloadErr := r.Store.Load()
+						if reloadErr != nil {
+							return errors.Join(err, fmt.Errorf("reload state after interrupted Worker launch: %w", reloadErr))
+						}
+						current = persisted
+						break
+					}
 					if err != nil {
 						shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after a worker launch error; worktree retained")
 						return errors.Join(err, shutdownErr)
@@ -334,6 +343,14 @@ func (r *Runner) Run(ctx context.Context) error {
 				}
 			}
 		} else if draining && len(localWorkers) == 0 {
+			if drainOperationalErr != nil {
+				if unverified := persistedWorkerCount(&current); unverified > 0 {
+					r.logf("Drain incomplete: 0 supervised Workers remaining; %s retained with unverified liveness", workerSummary(unverified))
+				} else {
+					r.logf("Drain complete: 0 Workers remaining; exiting after an operational failure")
+				}
+				return drainOperationalErr
+			}
 			r.logf("Drain complete: 0 Workers remaining; exiting successfully")
 			return nil
 		}
@@ -347,23 +364,29 @@ func (r *Runner) Run(ctx context.Context) error {
 				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after an unknown worker completion; worktree retained")
 				return errors.Join(fmt.Errorf("worker completed for unowned issue #%d", completion.issue), shutdownErr)
 			}
+			completedRun := findActiveRun(&current, completion.issue)
+			runID := completedRun.RunID
 			closedBeforeReconciliation := false
 			var closed worker.Result
+			var workerControlErr error
 			if !completion.result.Settled {
 				if completion.result.StreamErr == nil {
 					completion.result.StreamErr = errors.New("Pi RPC worker ended without agent_settled")
 					completion.result.Err = errors.Join(completion.result.Err, completion.result.StreamErr)
 				}
 				if err := process.Abort(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-					completion.result.Err = errors.Join(completion.result.Err, fmt.Errorf("stop invalid Pi RPC worker: %w", err))
+					workerControlErr = errors.Join(workerControlErr, fmt.Errorf("stop invalid Pi RPC worker: %w", err))
+					completion.result.Err = errors.Join(completion.result.Err, workerControlErr)
 				}
 				closed = process.Close()
+				workerControlErr = errors.Join(workerControlErr, closed.ControlErr)
+				if !closed.GroupExited {
+					workerControlErr = errors.Join(workerControlErr, fmt.Errorf("invalid Pi RPC Worker process-group exit was not verified for issue #%d", completion.issue))
+				}
 				closedBeforeReconciliation = true
 				completion.result.ExitCode = closed.ExitCode
 				completion.result.Err = errors.Join(completion.result.Err, closed.Err)
 			}
-			completedRun := findActiveRun(&current, completion.issue)
-			runID := completedRun.RunID
 			if closedBeforeReconciliation && workerLogIsClosed(closed) {
 				markWorkerLogClosed(&current, runID)
 			}
@@ -378,15 +401,47 @@ func (r *Runner) Run(ctx context.Context) error {
 				continue
 			}
 			if err != nil {
-				_ = process.Abort()
-				_ = process.Close()
+				abortErr := process.Abort()
+				closedAfterError := process.Close()
 				delete(localWorkers, completion.issue)
 				persisted, reloadErr := r.Store.Load()
+				var recoverySaveErr error
 				if reloadErr == nil {
 					current = persisted
+					if draining {
+						message := fmt.Sprintf("completion reconciliation failed during Drain: %v", err)
+						if closedAfterError.GroupExited {
+							r.needsHuman(&current, completion.issue, message)
+						} else {
+							r.needsHumanWithLiveWorker(&current, completion.issue, message)
+						}
+						if workerLogIsClosed(closedAfterError) {
+							markWorkerLogClosed(&current, runID)
+						}
+						recoverySaveErr = r.Store.Save(current)
+					}
+				}
+				var unverifiedExitErr error
+				if !closedAfterError.GroupExited {
+					unverifiedExitErr = fmt.Errorf("completion-error Worker process-group exit was not verified for issue #%d", completion.issue)
+				}
+				completionErr := errors.Join(err, abortErr, closedAfterError.Err, unverifiedExitErr, reloadErr, recoverySaveErr)
+				if draining {
+					drainOperationalErr = errors.Join(drainOperationalErr, completionErr)
+					if len(localWorkers) > 0 {
+						r.logf("Drain: %s remaining; next SIGINT will be recorded as a suspension request", workerSummary(len(localWorkers)))
+					}
+					continue
 				}
 				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after a completion error; worktree retained")
-				return errors.Join(err, reloadErr, shutdownErr)
+				return errors.Join(completionErr, shutdownErr)
+			}
+			if draining && workerControlErr != nil {
+				var retainErr error
+				if !closed.GroupExited {
+					retainErr = r.retainUnverifiedWorker(&current, completedRun, workerControlErr.Error(), closed)
+				}
+				drainOperationalErr = errors.Join(drainOperationalErr, workerControlErr, retainErr)
 			}
 			// Reconciliation and its durable state write happen while the idle RPC
 			// process is still alive. EOF is sent only after that write succeeds.
@@ -416,7 +471,7 @@ func (r *Runner) Run(ctx context.Context) error {
 						completedFailure := errors.Join(closed.Err, completedShutdownErr)
 						if completion.result.Settled {
 							if completedFailure == nil {
-								completedShutdownErr = errors.Join(completedShutdownErr, r.finalizeSettledWorker(ctx, &current, runID, nil, true))
+								completedShutdownErr = errors.Join(completedShutdownErr, r.finalizeSettledWithinLifecycle(ctx, &current, runID, nil, true))
 							} else {
 								completed := findRun(current.Runs, runID)
 								if completed.Status == scheduler.StatusMerged || completed.Status == scheduler.StatusWaitingForMerge {
@@ -430,12 +485,29 @@ func (r *Runner) Run(ctx context.Context) error {
 							}
 						}
 						delete(localWorkers, completion.issue)
+						if draining {
+							drainOperationalErr = errors.Join(drainOperationalErr, markerErr, completedShutdownErr)
+							if len(localWorkers) > 0 {
+								r.logf("Drain: %s remaining; next SIGINT will be recorded as a suspension request", workerSummary(len(localWorkers)))
+							}
+							continue
+						}
 						shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after Worker log closure persistence failed; worktree retained")
 						return errors.Join(markerErr, completedShutdownErr, shutdownErr)
 					}
 				}
 			}
-			if closedBeforeReconciliation || closed.GroupExited {
+			if !closedBeforeReconciliation && draining {
+				settledControlErr := closed.ControlErr
+				if !closed.GroupExited && r.suspensionExit.Load() == 0 {
+					settledControlErr = errors.Join(settledControlErr, fmt.Errorf("settled Worker process-group exit was not verified for issue #%d", completion.issue))
+					settledControlErr = errors.Join(settledControlErr, r.retainUnverifiedWorker(&current, completedRun, settledControlErr.Error(), closed))
+				}
+				if settledControlErr != nil {
+					drainOperationalErr = errors.Join(drainOperationalErr, settledControlErr)
+				}
+			}
+			if closedBeforeReconciliation || closed.GroupExited || draining && r.suspensionExit.Load() == 0 {
 				delete(localWorkers, completion.issue)
 			}
 			if draining && len(localWorkers) > 0 {
@@ -451,7 +523,16 @@ func (r *Runner) Run(ctx context.Context) error {
 				}
 				continue
 			}
-			if err := r.finalizeSettledWorker(ctx, &current, runID, closed.Err, completion.result.Settled); err != nil {
+			if err := r.finalizeSettledWithinLifecycle(ctx, &current, runID, closed.Err, completion.result.Settled); err != nil {
+				if r.suspensionExit.Load() != 0 {
+					r.suspensionFailed.Store(true)
+					r.logf("Suspension: merged cleanup stopped at the shared deadline: %v", err)
+					continue
+				}
+				if draining {
+					drainOperationalErr = errors.Join(drainOperationalErr, err)
+					continue
+				}
 				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after an RPC finalization error; worktree retained")
 				return errors.Join(err, shutdownErr)
 			}
@@ -1126,6 +1207,23 @@ func (r *Runner) handleWorkerCompletion(ctx context.Context, current *state.Stat
 
 func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[int]WorkerProcess) error {
 	changed := false
+	for _, historical := range append([]scheduler.Run(nil), current.Runs...) {
+		if !historical.CleanupPending {
+			continue
+		}
+		assignment := worktree.Assignment{Path: historical.Worktree, Branch: historical.Branch}
+		if assignment.Path != "" && assignment.Branch != "" {
+			if err := r.verifyAndCleanupWorktree(ctx, assignment); err != nil {
+				return fmt.Errorf("retry pending Completion cleanup for issue #%d: %w", historical.Issue, err)
+			}
+		}
+		historical.CleanupPending = false
+		historical.Error = ""
+		historical.UpdatedAt = r.Now().UTC()
+		replaceRun(current, historical)
+		changed = true
+		r.logf("completed pending worktree cleanup for merged issue #%d", historical.Issue)
+	}
 	for _, lease := range append([]scheduler.Lease(nil), current.Leases...) {
 		run := findRun(current.Runs, lease.RunID)
 		if run.Issue == 0 || run.Issue != lease.Issue {
@@ -1250,9 +1348,7 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 				}
 				run.PID = 0
 				run.ProcessIdentity = ""
-				transitionStatus(&run, scheduler.StatusSuspended)
-				run.Error = ""
-				run.UpdatedAt = r.Now().UTC()
+				r.transitionToSuspended(&run)
 				replaceRun(current, run)
 				changed = true
 			}
@@ -1316,6 +1412,49 @@ func (r *Runner) applyOutcome(ctx context.Context, current *state.State, run sch
 	return nil
 }
 
+func (r *Runner) finalizeSettledWithinLifecycle(ctx context.Context, current *state.State, runID string, closeErr error, settled bool) error {
+	cleanupCtx, cancel := r.suspensionAwareCleanupContext(ctx)
+	defer cancel()
+	return r.finalizeSettledWorker(cleanupCtx, current, runID, closeErr, settled)
+}
+
+func (r *Runner) suspensionAwareCleanupContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if r.suspensionExit.Load() != 0 {
+		return r.suspensionCleanupContext()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	go func() {
+		select {
+		case <-r.suspensionEventReady:
+			r.suspensionMu.Lock()
+			deadline := r.suspensionDeadline
+			r.suspensionMu.Unlock()
+			if delay := time.Until(deadline); delay > 0 {
+				timer := time.NewTimer(delay)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					return
+				}
+			}
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
+func (r *Runner) suspensionCleanupContext() (context.Context, context.CancelFunc) {
+	r.suspensionMu.Lock()
+	deadline := r.suspensionDeadline
+	r.suspensionMu.Unlock()
+	if deadline.IsZero() {
+		deadline = time.Now().Add(r.Config.SuspensionTimeout)
+	}
+	return context.WithDeadline(context.Background(), deadline)
+}
+
 func (r *Runner) finalizeForceStoppedSettledWorker(current *state.State, runID string, closeErr error) error {
 	if closeErr != nil {
 		return fmt.Errorf("force close settled Worker: %w", closeErr)
@@ -1331,13 +1470,7 @@ func (r *Runner) finalizeForceStoppedSettledWorker(current *state.State, runID s
 	if assignment.Path == "" || assignment.Branch == "" {
 		return nil
 	}
-	r.suspensionMu.Lock()
-	deadline := r.suspensionDeadline
-	r.suspensionMu.Unlock()
-	if deadline.IsZero() {
-		deadline = time.Now().Add(r.Config.SuspensionTimeout)
-	}
-	cleanupCtx, cancel := context.WithDeadline(context.Background(), deadline)
+	cleanupCtx, cancel := r.suspensionCleanupContext()
 	defer cancel()
 	var cleanupErr error
 	if run.Continuation != nil {
@@ -1382,6 +1515,14 @@ func (r *Runner) finalizeSettledWorker(ctx context.Context, current *state.State
 		cleanupErr = r.Worktrees.Cleanup(ctx, assignment)
 	}
 	if cleanupErr != nil {
+		if ctx.Err() != nil {
+			run.CleanupPending = true
+			run.Error = fmt.Sprintf("completion verified; worktree cleanup remains pending after lifecycle deadline: %v", ctx.Err())
+			run.UpdatedAt = r.Now().UTC()
+			replaceRun(current, run)
+			saveErr := r.Store.Save(*current)
+			return errors.Join(fmt.Errorf("cleanup issue #%d worktree within lifecycle deadline: %w", run.Issue, ctx.Err()), saveErr)
+		}
 		r.retainProvisionalCompletion(current, &run, fmt.Sprintf("completion verified but worktree cleanup failed: %v", cleanupErr))
 		if saveErr := r.Store.Save(*current); saveErr != nil {
 			return errors.Join(fmt.Errorf("cleanup issue #%d worktree: %w", run.Issue, cleanupErr), fmt.Errorf("persist retained completion: %w", saveErr))
@@ -1416,6 +1557,32 @@ func (r *Runner) retainProvisionalCompletion(current *state.State, run *schedule
 		current.Leases = append(current.Leases, scheduler.Lease{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID})
 	}
 	r.logf("issue #%d needs human attention: %s", run.Issue, message)
+}
+
+func (r *Runner) retainUnverifiedWorker(current *state.State, original scheduler.Run, message string, closed worker.Result) error {
+	run := findRun(current.Runs, original.RunID)
+	if run.RunID == "" {
+		return fmt.Errorf("retain unknown unverified Worker Run %q", original.RunID)
+	}
+	run.Status = scheduler.StatusNeedsHuman
+	run.CompletedAt = nil
+	run.PID = original.PID
+	run.ProcessIdentity = original.ProcessIdentity
+	run.SuspendingAt = nil
+	run.Error = message
+	run.UpdatedAt = r.Now().UTC()
+	if workerLogIsClosed(closed) {
+		run.WorkerLogOpen = false
+	}
+	replaceRun(current, run)
+	if findActiveRun(current, run.Issue).RunID == "" {
+		current.Leases = append(current.Leases, scheduler.Lease{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID})
+	}
+	r.logf("issue #%d needs human attention: %s", run.Issue, message)
+	if err := r.Store.Save(*current); err != nil {
+		return fmt.Errorf("persist unverified Worker for issue #%d: %w", run.Issue, err)
+	}
+	return nil
 }
 
 func (r *Runner) failAfterWorkerStart(current *state.State, issue int, process WorkerProcess, message string) error {
@@ -1541,7 +1708,9 @@ func (r *Runner) authorizeSuspensionKill(runID string, process WorkerProcess) fu
 func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess, exitCode int) error {
 	if len(local) == 0 {
 		if r.suspensionFailed.Load() {
-			return &SignalExit{Code: exitCode, Cause: errors.New("suspension could not establish a continuation boundary for every admitted Run")}
+			cause := errors.New("suspension could not establish a continuation boundary for every admitted Run")
+			r.logf("Suspension incomplete: %v", cause)
+			return &SignalExit{Code: exitCode, Cause: cause}
 		}
 		r.logf("Suspension complete: 0 Workers remaining")
 		return &SignalExit{Code: exitCode}
@@ -1549,6 +1718,21 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 	ctx, cancel := r.suspensionContext()
 	defer cancel()
 	r.logf("Suspension: establishing continuation boundaries for %s; one %s deadline; next SIGINT will force stop remaining verified Worker groups", workerSummary(len(local)), r.Config.SuspensionTimeout)
+
+	suspendingAt := r.Now().UTC()
+	for issue := range local {
+		run := findActiveRun(current, issue)
+		if run.Status != scheduler.StatusRunning {
+			continue
+		}
+		run.SuspendingAt = &suspendingAt
+		run.UpdatedAt = suspendingAt
+		replaceRun(current, run)
+	}
+	var suspendingPersistenceErr error
+	if err := r.Store.Save(*current); err != nil {
+		suspendingPersistenceErr = fmt.Errorf("persist suspending Runs: %w", err)
+	}
 
 	workerCount := len(local)
 	var forceStopRemaining atomic.Int64
@@ -1658,6 +1842,10 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 	}
 
 	var persistenceErrors []error
+	if suspendingPersistenceErr != nil {
+		clean = false
+		persistenceErrors = append(persistenceErrors, suspendingPersistenceErr)
+	}
 	for completed := 0; completed < workerCount; completed++ {
 		closed := <-closeResults
 		if closed.result.GroupExited {
@@ -1690,13 +1878,14 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 			if !closed.result.GroupExited || closed.result.Err != nil {
 				clean = false
 			}
+			run.SuspendingAt = nil
 			if workerLogIsClosed(closed.result) {
 				run.WorkerLogOpen = false
-				replaceRun(current, run)
-				if err := r.Store.Save(*current); err != nil {
-					clean = false
-					persistenceErrors = append(persistenceErrors, fmt.Errorf("persist closed Worker log for issue #%d: %w", closed.issue, err))
-				}
+			}
+			replaceRun(current, run)
+			if err := r.Store.Save(*current); err != nil {
+				clean = false
+				persistenceErrors = append(persistenceErrors, fmt.Errorf("persist terminal suspension outcome for issue #%d: %w", closed.issue, err))
 			}
 			r.logf("Suspension: %s remaining", workerSummary(len(local)))
 			continue
@@ -1720,6 +1909,7 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 			run.Status = scheduler.StatusNeedsHuman
 			run.CompletedAt = nil
 			run.Error = message
+			run.SuspendingAt = nil
 			run.UpdatedAt = r.Now().UTC()
 			replaceRun(current, run)
 		} else {
@@ -1746,16 +1936,17 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 				run.CompletedAt = nil
 				run.Error = "Worker exited without a persisted continuation marker"
 			} else if run.Status == scheduler.StatusRunning {
-				transitionStatus(&run, scheduler.StatusSuspended)
-				run.Error = ""
+				r.transitionToSuspended(&run)
 			}
+			run.SuspendingAt = nil
 			replaceRun(current, run)
 		}
 		if closed.result.GroupExited && run.Status == scheduler.StatusMerged {
-			// Force escalation cancels the shared suspension context. Cleanup gets
-			// a fresh bounded context and completes before merged state becomes
-			// durable, so cancellation cannot overwrite a terminal outcome.
-			cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), r.Config.SuspensionTimeout)
+			// Force escalation cancels Worker operations, but merged cleanup still
+			// uses the original absolute suspension deadline. Every Run therefore
+			// remains inside one wall-clock bound without allowing cancellation to
+			// overwrite a verified terminal outcome.
+			cleanupCtx, cancelCleanup := r.suspensionCleanupContext()
 			err := r.finalizeSettledWorker(cleanupCtx, current, run.RunID, nil, true)
 			cancelCleanup()
 			if err != nil {
@@ -1831,7 +2022,16 @@ func (r *Runner) logf(format string, args ...any) {
 	fmt.Fprintf(r.Output, format+"\n", args...)
 }
 
+func (r *Runner) transitionToSuspended(run *scheduler.Run) {
+	transitionStatus(run, scheduler.StatusSuspended)
+	suspendedAt := r.Now().UTC()
+	run.SuspendedAt = &suspendedAt
+	run.Error = ""
+	run.UpdatedAt = suspendedAt
+}
+
 func transitionStatus(run *scheduler.Run, next scheduler.Status) {
+	run.SuspendingAt = nil
 	if !scheduler.CanTransition(run.Status, next) {
 		previous := run.Status
 		run.Status = scheduler.StatusNeedsHuman

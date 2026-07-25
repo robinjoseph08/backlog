@@ -62,6 +62,7 @@ type Result struct {
 	StderrPath   string
 	Settled      bool
 	StreamErr    error
+	ControlErr   error
 	cleanupErr   error
 	Err          error
 }
@@ -485,15 +486,28 @@ func (p *Process) CloseWithForceContext(ctx context.Context, authorizeKill func(
 		return p.forceStop(authorizeKill, ctx.Err())
 	case <-grace.C:
 		gracefulErr = errors.New("Pi RPC process did not exit after input closed")
-		if err := p.terminate(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			gracefulErr = errors.Join(gracefulErr, fmt.Errorf("terminate Pi RPC process group: %w", err))
+		terminationResult := make(chan error, 1)
+		go func() { terminationResult <- p.terminate() }()
+		select {
+		case err := <-terminationResult:
+			if err != nil && !errors.Is(err, os.ErrProcessDone) {
+				gracefulErr = errors.Join(gracefulErr, fmt.Errorf("terminate Pi RPC process group: %w", err))
+			}
+		case <-ctx.Done():
+			return p.forceStop(authorizeKill, ctx.Err())
 		}
-		<-p.exitDone
+		select {
+		case <-p.exitDone:
+		case <-ctx.Done():
+			return p.forceStop(authorizeKill, ctx.Err())
+		}
 	}
 	result := p.exitResult()
-	groupErr := waitForProcessGroupExit(p.PID(), p.processGroupGrace)
-	result.Err = errors.Join(result.Err, p.closeInputErr, gracefulErr, groupErr)
+	groupForceStopped, groupErr := waitForProcessGroupExitBounded(ctx, p.PID(), p.processGroupGrace)
+	result.ControlErr = errors.Join(result.ControlErr, p.closeInputErr, gracefulErr, groupErr)
+	result.Err = errors.Join(result.Err, result.ControlErr)
 	result.GroupExited = groupErr == nil
+	result.ForceStopped = result.ForceStopped || groupForceStopped
 	return result
 }
 
@@ -514,11 +528,13 @@ func (p *Process) CloseContext(ctx context.Context, authorizeKill func() error) 
 		if err := waitForProcessGroupExitContext(ctx, p.PID()); err == nil {
 			result := p.exitResult()
 			result.GroupExited = true
-			result.Err = errors.Join(result.Err, p.closeInputErr)
+			result.ControlErr = errors.Join(result.ControlErr, p.closeInputErr)
+			result.Err = errors.Join(result.Err, result.ControlErr)
 			return result
 		} else if ctx.Err() == nil {
 			result := p.exitResult()
-			result.Err = errors.Join(result.Err, p.closeInputErr, err)
+			result.ControlErr = errors.Join(result.ControlErr, p.closeInputErr, err)
+			result.Err = errors.Join(result.Err, result.ControlErr)
 			return result
 		}
 	case <-ctx.Done():
@@ -530,7 +546,8 @@ func (p *Process) CloseContext(ctx context.Context, authorizeKill func() error) 
 func (p *Process) forceStop(authorizeKill func() error, triggerErr error) Result {
 	unauthorized := func(err error) Result {
 		result := p.exitResult()
-		result.Err = errors.Join(result.Err, p.closeInputErr, triggerErr, err)
+		result.ControlErr = errors.Join(result.ControlErr, p.closeInputErr, err)
+		result.Err = errors.Join(result.Err, triggerErr, result.ControlErr)
 		return result
 	}
 	if authorizeKill == nil {
@@ -561,14 +578,15 @@ func (p *Process) forceStop(authorizeKill func() error, triggerErr error) Result
 	result := p.exitResult()
 	result.GroupExited = true
 	result.ForceStopped = forceStopped
+	result.ControlErr = errors.Join(result.ControlErr, result.cleanupErr, p.closeInputErr)
 	if forceStopped {
 		// A SIGKILL exit and the context trigger are expected after an authorized
 		// force stop. Protocol, log cleanup, and input-close failures remain errors.
-		result.Err = errors.Join(result.StreamErr, result.cleanupErr, p.closeInputErr)
+		result.Err = errors.Join(result.StreamErr, result.ControlErr)
 	} else {
 		// The leader exited between authorization and signaling. Preserve its
 		// actual exit result instead of claiming that SIGKILL caused the exit.
-		result.Err = errors.Join(result.Err, p.closeInputErr)
+		result.Err = errors.Join(result.Err, result.ControlErr)
 	}
 	return result
 }
@@ -610,7 +628,7 @@ func (p *Process) reap() {
 	p.result = Result{
 		ExitCode: exitCode, LogClosed: true, LogPath: p.logPath, StderrPath: p.stderrPath,
 		Settled:   p.events.Settled() && streamErr == nil,
-		StreamErr: streamErr, cleanupErr: closeErr, Err: errors.Join(waitErr, streamErr, closeErr),
+		StreamErr: streamErr, ControlErr: closeErr, cleanupErr: closeErr, Err: errors.Join(waitErr, streamErr, closeErr),
 	}
 	p.resultMu.Unlock()
 	close(p.exitDone)
@@ -1104,32 +1122,55 @@ func waitForProcessGroupExitContext(ctx context.Context, pid int) error {
 	}
 }
 
-func waitForProcessGroupExit(pid int, grace time.Duration) error {
+func waitForProcessGroupExitBounded(ctx context.Context, pid int, grace time.Duration) (bool, error) {
 	if pid <= 0 {
-		return nil
+		return false, nil
 	}
-	exited, err := waitForProcessGroup(pid, grace)
+	exited, err := waitForProcessGroupContext(ctx, pid, grace)
 	if err != nil || exited {
-		return err
+		return false, err
 	}
-	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return fmt.Errorf("terminate surviving Worker process group: %w", err)
-	}
-	exited, err = waitForProcessGroup(pid, grace)
-	if err != nil || exited {
-		return err
+	if ctx.Err() == nil {
+		if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return false, fmt.Errorf("terminate surviving Worker process group: %w", err)
+		}
+		exited, err = waitForProcessGroupContext(ctx, pid, grace)
+		if err != nil || exited {
+			return false, err
+		}
 	}
 	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return fmt.Errorf("kill surviving Worker process group: %w", err)
+		return false, fmt.Errorf("kill surviving Worker process group: %w", err)
 	}
 	exited, err = waitForProcessGroup(pid, grace)
 	if err != nil {
-		return err
+		return true, err
 	}
 	if !exited {
-		return fmt.Errorf("Worker process group %d survived shutdown escalation", pid)
+		return true, fmt.Errorf("Worker process group %d survived shutdown escalation", pid)
 	}
-	return nil
+	return true, nil
+}
+
+func waitForProcessGroupContext(ctx context.Context, pid int, grace time.Duration) (bool, error) {
+	deadline := time.NewTimer(grace)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := syscall.Kill(-pid, syscall.Signal(0)); errors.Is(err, syscall.ESRCH) {
+			return true, nil
+		} else if err != nil && !errors.Is(err, syscall.EPERM) {
+			return false, err
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			return false, nil
+		case <-ctx.Done():
+			return false, nil
+		}
+	}
 }
 
 func waitForProcessGroup(pid int, grace time.Duration) (bool, error) {
