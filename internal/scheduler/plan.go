@@ -75,6 +75,7 @@ type Run struct {
 	PullRequest     string                `json:"pullRequest,omitempty"`
 	Error           string                `json:"error,omitempty"`
 	StartedAt       time.Time             `json:"startedAt"`
+	WorkerStartedAt time.Time             `json:"workerStartedAt,omitempty"`
 	UpdatedAt       time.Time             `json:"updatedAt"`
 	CompletedAt     *time.Time            `json:"completedAt,omitempty"`
 }

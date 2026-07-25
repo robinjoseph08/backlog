@@ -391,6 +391,54 @@ while IFS= read -r ignored; do :; done
 	}
 }
 
+func TestActivityProjectionAppendFailureDoesNotAlterWorkerResult(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	continuePath := filepath.Join(root, "continue")
+	pi := fakePi(t, fmt.Sprintf(`
+IFS= read -r command
+printf '%%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}'
+while [ ! -f %q ]; do sleep 0.01; done
+printf '%%s\n' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+while IFS= read -r ignored; do :; done
+`, continuePath))
+	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(
+		context.Background(), request(28, "activity-append-failure", root, filepath.Join(root, "sessions", "activity-append-failure")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if process.activity == nil {
+		t.Fatal("Activity writer was not created")
+	}
+	if err := process.activity.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(continuePath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if result := process.Wait(); result.Err != nil || !result.Settled {
+		t.Fatalf("append failure changed Worker result: %#v", result)
+	}
+	if result := process.Close(); result.Err != nil {
+		t.Fatal(result.Err)
+	}
+	raw, err := os.ReadFile(process.logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"type":"turn_end"`) {
+		t.Fatalf("append failure changed raw Worker JSONL: %s", raw)
+	}
+	if _, err := os.Stat(activity.UnavailablePath(activity.PathForLog(process.logPath))); err != nil {
+		t.Fatalf("append failure diagnostic was not recorded: %v", err)
+	}
+}
+
 func TestCloseReportsProtocolFailureAfterSettlement(t *testing.T) {
 	t.Parallel()
 

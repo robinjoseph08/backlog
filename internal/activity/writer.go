@@ -23,7 +23,7 @@ type Writer struct {
 func NewWriter(path string, appendExisting bool) (*Writer, error) {
 	flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
 	if appendExisting {
-		flags = os.O_CREATE | os.O_WRONLY | os.O_APPEND
+		flags = os.O_WRONLY | os.O_APPEND
 	}
 	file, err := os.OpenFile(path, flags, 0o600)
 	if err != nil {

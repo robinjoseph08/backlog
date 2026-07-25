@@ -212,17 +212,28 @@ func (p *Projector) activeToolName() string {
 }
 
 type assistantMessage struct {
-	Role    string            `json:"role"`
-	Content []json.RawMessage `json:"content"`
+	Content []json.RawMessage
 	Usage   *struct {
 		TotalTokens *int64 `json:"totalTokens"`
-	} `json:"usage"`
+	}
 }
 
 func decodeAssistantMessage(raw json.RawMessage) (assistantMessage, bool) {
-	var message assistantMessage
-	if json.Unmarshal(raw, &message) != nil || message.Role != "assistant" {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
 		return assistantMessage{}, false
+	}
+	var role string
+	if json.Unmarshal(fields["role"], &role) != nil || role != "assistant" {
+		return assistantMessage{}, false
+	}
+	var message assistantMessage
+	_ = json.Unmarshal(fields["content"], &message.Content)
+	var usage struct {
+		TotalTokens *int64 `json:"totalTokens"`
+	}
+	if json.Unmarshal(fields["usage"], &usage) == nil {
+		message.Usage = &usage
 	}
 	return message, true
 }

@@ -546,6 +546,14 @@ func TestFollowNormalizedReplaysSemanticWorkerActivityWithUsageAndPrivacy(t *tes
 		`{"type":"tool_execution_update","toolCallId":"tool-1","toolName":"bash","partialResult":{"output":"secret result","durationMs":30}}`,
 		`{"type":"tool_execution_end","toolCallId":"tool-1","toolName":"bash","result":{"content":"full secret result"},"isError":false}`,
 		`{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hidden chain of thought"},{"type":"text","text":"Visible final answer"}],"usage":{"totalTokens":123}}}`,
+		`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Second visible answer"}],"usage":{"totalTokens":77}}}`,
+		`{"type":"auto_retry_start","attempt":1,"errorMessage":"temporary failure"}`,
+		`{"type":"auto_retry_end","attempt":1}`,
+		`{"type":"compaction_start"}`,
+		`{"type":"summarization_retry_scheduled","attempt":2}`,
+		`{"type":"summarization_retry_attempt_start"}`,
+		`{"type":"summarization_retry_finished"}`,
+		`{"type":"compaction_end"}`,
 		`{"type":"turn_end"}`,
 		`{"type":"agent_end"}`,
 		`{"type":"agent_settled"}`,
@@ -559,6 +567,7 @@ func TestFollowNormalizedReplaysSemanticWorkerActivityWithUsageAndPrivacy(t *tes
 		Issue: 28, IssueTitle: "Normalized Worker Activity", IssueURL: "https://example.test/issues/28",
 		RunID: "run-28", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModeRPC,
 		LogPath: logPath, StartedAt: time.Date(2026, 1, 1, 11, 0, 0, 0, time.UTC),
+		WorkerStartedAt: time.Date(2026, 1, 1, 11, 45, 0, 0, time.UTC),
 	}
 	source := &sequenceFollowSource{runs: []scheduler.Run{run}}
 	fixedNow := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
@@ -570,8 +579,10 @@ func TestFollowNormalizedReplaysSemanticWorkerActivityWithUsageAndPrivacy(t *tes
 	for _, want := range []string{
 		"Run: run-28", "Issue: #28  Normalized Worker Activity  https://example.test/issues/28", "State: merged",
 		"Elapsed: 1h0m0s", "Activity age: n/a", "Current Worker operation: n/a",
-		"Completed Worker turns: 1", "Completed Worker tokens: 123", "Visible final answer",
-		"Tool bash started", "Tool bash output changed", "Tool bash completed", "Worker settled",
+		"Completed Worker turns: 1", "Completed Worker tokens: 200", "Visible final answer", "Second visible answer",
+		"Tool bash started", "Tool bash output changed", "Tool bash completed", "Worker retry 1 started: temporary failure",
+		"Worker retry 1 ended", "Context compaction started", "Compaction retry 2 scheduled", "Compaction retry started",
+		"Compaction retry finished", "Context compaction ended", "Worker settled",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("normalized output missing %q:\n%s", want, got)
@@ -681,10 +692,80 @@ func TestFollowNormalizedStreamsProjectionAndPrintsTerminalSummary(t *testing.T)
 		t.Fatal("normalized follower did not exit at terminal state")
 	}
 	got := output.String()
-	for _, want := range []string{"Run state changed to failed", "Terminal Run summary:", "State: failed", "Completed Worker tokens: 77"} {
+	for _, want := range []string{"Current Worker operation: starting", "Run state changed to failed", "Terminal Run summary:", "State: failed", "Completed Worker tokens: 77"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("live normalized output missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestFollowNormalizedRetainsPartialProjectionRecordUntilCompleted(t *testing.T) {
+	directory := t.TempDir()
+	logPath := filepath.Join(directory, "partial-projection.jsonl")
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projectionPath := activity.PathForLog(logPath)
+	writeActivityEntries(t, projectionPath, activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: time.Now(), Kind: "lifecycle", Description: "Worker started",
+	})
+	completed, err := json.Marshal(activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: time.Now(), Kind: "model", Description: "Assistant response completed: after partial",
+		ResponseCompleted: true, TokensKnown: true, TokenDelta: 31,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	half := len(completed) / 2
+	projection, err := os.OpenFile(projectionPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := projection.Write(completed[:half]); err != nil {
+		projection.Close()
+		t.Fatal(err)
+	}
+	if err := projection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store := state.FileStore{Path: filepath.Join(directory, "state.json")}
+	run := scheduler.Run{
+		Issue: 28, RunID: "partial-projection", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModeRPC,
+		PID: 2829, ProcessIdentity: "2829:start", LogPath: logPath, WorkerLogOpen: true, StartedAt: time.Now(),
+		SessionID: "session-partial-projection", SessionDir: filepath.Join(directory, "session"),
+	}
+	if err := store.Save(state.State{
+		Version: state.CurrentVersion, Runs: []scheduler.Run{run},
+		Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var output synchronizedBuffer
+	done := make(chan error, 1)
+	go func() {
+		done <- followNormalized(ctx, store, run.RunID, &output, io.Discard, 5*time.Millisecond, time.Now)
+	}()
+	waitForBuffer(t, &output, "Worker started")
+	projection, err = os.OpenFile(projectionPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := projection.Write(append(completed[half:], '\n')); err != nil {
+		projection.Close()
+		t.Fatal(err)
+	}
+	if err := projection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitForBuffer(t, &output, "Assistant response completed: after partial")
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if count := strings.Count(output.String(), "Assistant response completed: after partial"); count != 1 {
+		t.Fatalf("completed partial entries = %d, output = %q", count, output.String())
 	}
 }
 
@@ -796,7 +877,7 @@ func TestFollowNormalizedPropagatesOutputFailure(t *testing.T) {
 func TestFollowNormalizedDiagnosesBadProjectionWithoutFailingRunObservation(t *testing.T) {
 	directory := t.TempDir()
 	logPath := filepath.Join(directory, "bad-projection.jsonl")
-	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+	if err := os.WriteFile(logPath, []byte("{\"type\":\"agent_settled\"}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	valid, err := json.Marshal(activity.Entry{
@@ -813,7 +894,7 @@ func TestFollowNormalizedDiagnosesBadProjectionWithoutFailingRunObservation(t *t
 	if err := followNormalized(context.Background(), &sequenceFollowSource{runs: []scheduler.Run{run}}, run.RunID, &output, &diagnostics, time.Millisecond, time.Now); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output.String(), "Worker settled") || !strings.Contains(diagnostics.String(), "ignored an unusable Activity projection record") {
+	if !strings.Contains(output.String(), "Worker settled") || !strings.Contains(diagnostics.String(), "unusable Activity projection record; replaying raw Worker Activity") {
 		t.Fatalf("output = %q, diagnostics = %q", output.String(), diagnostics.String())
 	}
 }

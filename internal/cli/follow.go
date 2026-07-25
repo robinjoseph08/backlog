@@ -177,6 +177,9 @@ type followMetrics struct {
 
 func (m *followMetrics) apply(entry activity.Entry) {
 	m.entries = append(m.entries, entry)
+	if len(m.entries) > 20 {
+		m.entries = append([]activity.Entry(nil), m.entries[len(m.entries)-20:]...)
+	}
 	if !entry.ObservedAt.IsZero() && entry.ObservedAt.After(m.latest) {
 		m.latest = entry.ObservedAt
 	}
@@ -196,25 +199,39 @@ func (m *followMetrics) apply(entry activity.Entry) {
 }
 
 type completeRecordReader struct {
-	path   string
-	offset int
+	path    string
+	offset  int64
+	pending []byte
 }
 
 func (r *completeRecordReader) read() ([][]byte, error) {
-	data, err := os.ReadFile(r.path)
+	file, err := os.Open(r.path)
 	if err != nil {
 		return nil, err
 	}
-	if len(data) < r.offset {
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() < r.offset {
 		return nil, errors.New("Activity source was truncated while being followed")
 	}
-	available := data[r.offset:]
-	lastNewline := bytes.LastIndexByte(available, '\n')
+	if _, err := file.Seek(r.offset, io.SeekStart); err != nil {
+		return nil, err
+	}
+	appended, err := io.ReadAll(file)
+	if err != nil {
+		return nil, err
+	}
+	r.offset += int64(len(appended))
+	r.pending = append(r.pending, appended...)
+	lastNewline := bytes.LastIndexByte(r.pending, '\n')
 	if lastNewline < 0 {
 		return nil, nil
 	}
-	complete := available[:lastNewline]
-	r.offset += lastNewline + 1
+	complete := r.pending[:lastNewline]
+	r.pending = append([]byte(nil), r.pending[lastNewline+1:]...)
 	if len(complete) == 0 {
 		return nil, nil
 	}
@@ -282,8 +299,11 @@ func (s *normalizedActivitySource) read() ([]activity.Entry, int, bool) {
 		if s.projected {
 			var entry activity.Entry
 			if err := json.Unmarshal(line, &entry); err != nil || entry.Version != activity.CurrentVersion || entry.Kind == "" || entry.Description == "" {
-				fmt.Fprintln(s.stderr, "Follow diagnostic: ignored an unusable Activity projection record")
-				continue
+				fmt.Fprintln(s.stderr, "Follow diagnostic: unusable Activity projection record; replaying raw Worker Activity")
+				fmt.Fprintln(s.stderr, "Follow diagnostic: replayed Activity age is n/a")
+				replayed = s.switchToRaw()
+				replayedEntries, _, _ := s.read()
+				return replayedEntries, replayed, true
 			}
 			entries = append(entries, entry)
 			continue
@@ -320,13 +340,17 @@ func (s *normalizedActivitySource) fallbackIfProjectionFailed() (int, bool) {
 		fmt.Fprintf(s.stderr, "Follow diagnostic: Activity projection diagnostic unavailable: %v\n", err)
 	}
 	fmt.Fprintln(s.stderr, "Follow diagnostic: replayed Activity age is n/a")
+	return s.switchToRaw(), true
+}
+
+func (s *normalizedActivitySource) switchToRaw() int {
 	replayed := s.semanticRead
 	s.reader = completeRecordReader{path: s.rawPath}
 	s.projected = false
 	s.projector = activity.Projector{}
 	s.initial = true
 	s.semanticRead = 0
-	return replayed, true
+	return replayed
 }
 
 func consumeActivity(metrics *followMetrics, source *normalizedActivitySource) []activity.Entry {
