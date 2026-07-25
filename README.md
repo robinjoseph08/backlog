@@ -94,7 +94,7 @@ Backlog submits `/skill:afk 123` as a correlated RPC `prompt` command. Standard 
 
 `agent_settled` is the normal completion trigger. An unexpected process exit triggers fail-closed reconciliation instead. While the idle Pi RPC process is still alive, the runner looks up the pull request by the Run's unique branch, verifies the issue state, and persists the reconciled Run. It then closes RPC input, escalates if orderly shutdown exceeds its grace period, confirms process-group exit, and releases Worker capacity. An armed open pull request becomes `waiting-for-merge`; other unverified outcomes require human attention.
 
-Only verified merged runs have their worktrees and local branches removed. Failed and ambiguous runs are retained.
+Normal completion cleanup removes worktrees and local branches only for verified merged Runs. Incomplete Runs retain them until an explicit Reset retires them.
 
 ## State and recovery
 
@@ -102,7 +102,7 @@ State and logs live outside the target repository. By default they are stored un
 
 State is written with same-directory temporary files, file sync, atomic rename, and directory sync. A repository-level advisory lock in the Git common directory prevents two local runner instances from scheduling the same backlog, even if they request different state paths. The first runner start, or a status command that migrates version 1 state, binds the repository to one state directory; later conflicting `--state-dir` values are rejected.
 
-State keeps historical Runs separate from active Leases. New Runs snapshot the Candidate issue title and URL when their Lease is created, then persist their RPC session identity and dedicated session storage before launch. Worker log paths become durable as soon as the gated Worker starts. Existing Runs without issue snapshots or startup log paths remain valid and are not backfilled through GitHub. Upgrading version 1 state preserves Run metadata and artifacts, removes the obsolete paused setting, and records legacy print-mode Runs as non-resumable. During migration, incomplete and intervention-required Runs retain their Leases, while verified merged Runs remain as history without active ownership.
+State keeps historical Runs separate from active Leases. New Runs snapshot the Candidate issue title and URL when their Lease is created, then persist their RPC session identity and dedicated session storage before launch. Worker log paths become durable as soon as the gated Worker starts. Existing Runs without issue snapshots or startup log paths remain valid and are not backfilled through GitHub. Upgrading version 1 state preserves Run metadata and artifacts, removes the obsolete paused setting, and records legacy print-mode Runs as non-resumable. During migration, incomplete and intervention-required Runs retain their Leases, while verified merged Runs remain as history without active ownership. Legacy print-mode Runs cannot Resume because they have no verified RPC continuation boundary. Backlog refuses state from newer unsupported versions rather than attempting a downgrade.
 
 On restart, the runner reconciles persisted Leases with process liveness and GitHub pull request and issue state before Candidate admission. Safe Suspended Runs fill Worker capacity before new Candidates. Resume rechecks Completion, the open issue and managed workflow labels, the exact branch and worktree, the Pi session identity, durable leaf, entry count and file hash, and proof that the old Worker stopped. A replacement Worker keeps the Run, Lease, branch, worktree, and Pi session identities while receiving a new PID and process-start identity. Its prompt requires Pi to reassess repository and GitHub state before continuing AFK.
 
@@ -131,14 +131,16 @@ backlog reset 123 --dry-run
 
 Reset dry-run holds the repository coordination lock while it inspects the Run, Lease, Worker, GitHub issue and pull requests, remote and local branches, worktree, and Pi session. It prints only actions still required. It refuses live or uncertain Workers, merged work, unknown resource state, unexplained issue closure, and human workflow labels. It never prompts or writes, and it does not require `--yes`.
 
-Mutating Reset supports owned GitHub pull requests and remote branches when the local branch, worktree, and Pi session are already absent. Run it interactively to review and confirm the plan, or pass `--yes` for non-interactive use:
+Mutating Reset handles the complete owned artifact set, including GitHub pull requests, remote and local branches, the real worktree, and the active Pi session. Run it interactively to review and confirm the plan, or pass `--yes` for non-interactive use:
 
 ```sh
 backlog reset 123
 backlog reset 123 --yes
 ```
 
-Interactive confirmation defaults to no. Reset rechecks pull request identity, merge and auto-merge state, branch name, and expected commit before each GitHub mutation. For each open pull request that Reset closes, it disables auto-merge when needed and posts an explanation before closure. It conditionally deletes the owned remote branch at its verified commit. Verified partial progress leaves the Run `resetting` with its Lease held, so a rerun performs only remaining actions. After restoring managed issue labels while preserving unrelated labels, Reset verifies every postcondition, then atomically marks the historical Run `reset` and releases its Lease. It does not create a replacement Run. Runs with remaining local artifacts can be inspected with `--dry-run`, but mutating Reset refuses them until local artifact retirement is implemented.
+Interactive confirmation defaults to no. Reset rechecks pull request identity, merge and auto-merge state, branch name, commit, and worktree association immediately before each destructive mutation. For each open pull request that Reset closes, it disables auto-merge when needed and posts an explanation before closure. It conditionally deletes the owned remote branch at its verified commit, force-removes the verified worktree, and deletes the local branch with an expected-commit check. The active Pi session is atomically renamed into `history/sessions/<run-id>` under the state directory, outside the active session path used by Resume. Already-absent artifacts and an already-archived session are successful and omitted from later plans.
+
+Verified partial progress leaves the Run `resetting` with its Lease held, so a rerun performs only remaining actions. Changed, reassigned, mismatched, or unknown artifacts stop Reset without releasing the Lease. After restoring managed issue labels while preserving unrelated labels, Reset verifies that all owned artifacts are retired and the session is non-resumable, then atomically marks the historical Run `reset` and releases its Lease. Worker JSONL, standard-error logs, Run diagnostics, issue snapshots, and the recorded pull request URL remain in history. Reset does not create a replacement Run.
 
 `retry` is a deprecated alias for the same Reset path, flags, output, mutations, and exit statuses. It adds a deprecation warning:
 
@@ -152,9 +154,19 @@ The first `SIGINT` enters Drain. Backlog atomically stops admitting new Leases, 
 
 A second `SIGINT`, or the first `SIGTERM`, starts bounded suspension directly. All Owned Workers share one 60-second wall-clock deadline. For each unfinished Run, Backlog requires a correlated successful RPC `abort` response and `agent_settled`, proves streaming, compaction, retry, tool, and message queues are idle, compares the exact RPC session and complete entry tree with the synced session file, and persists the continuation marker while RPC is still open. GitHub Completion and armed auto-merge outcomes take precedence. After verified process-group exit, one atomic state write records `suspended` and clears the PID. The Lease, branch, worktree, and Pi session remain in place.
 
-A third `SIGINT` bypasses the remaining deadline. Third-signal and timeout escalation use the same force-stop path, which reloads the current Run and rechecks Worker liveness, PID, and process-start identity immediately before signaling the process group. A mismatched or unverifiable process is not signaled and its Run becomes `needs-human` with its Lease retained. Verified merged, waiting-for-merge, and suspended outcomes are preserved. A force-stopped Run is classified as suspended only when its continuation marker was already durable; otherwise it becomes `needs-human`. Signal shutdown exits 130 when initiated by `SIGINT` and 143 when initiated by `SIGTERM`, including force escalation.
+A third `SIGINT` bypasses the remaining deadline. Third-signal and timeout escalation use the same force-stop path, which reloads the current Run and rechecks Worker liveness, PID, and process-start identity immediately before signaling the process group. A mismatched or unverifiable process is not signaled and its Run becomes `needs-human` with its Lease retained. Verified merged, waiting-for-merge, and suspended outcomes are preserved. A force-stopped Run is classified as suspended only when its continuation marker was already durable; otherwise it becomes `needs-human`. A completed first-`SIGINT` Drain exits successfully. Suspension initiated by a second `SIGINT`, including later force escalation, exits 130. Suspension initiated by `SIGTERM`, including force escalation, exits 143.
 
 Non-signal context cancellation retains the immediate failure shutdown behavior. Persisted live Workers discovered from an earlier runner are not killed because the new process does not own them.
+
+## Exit statuses
+
+- `0`: command succeeded, a dry-run completed, or interactive Reset was declined
+- `1`: an ownership or safety check refused the command, or an operational command failed
+- `2`: the top-level command was missing or unknown
+- `130`: `backlog run` suspension was initiated by a second `SIGINT`
+- `143`: `backlog run` suspension was initiated by `SIGTERM`
+
+Flag parsing failures currently use status `1`. `retry` has the same status as the equivalent `reset` invocation and additionally prints its deprecation warning.
 
 ## Validation
 

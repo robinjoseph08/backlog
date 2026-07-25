@@ -48,9 +48,11 @@ type Worktree struct {
 }
 
 type Session struct {
-	ID      string
-	Dir     string
-	Present bool
+	ID         string
+	Dir        string
+	ArchiveDir string
+	Present    bool
+	Archived   bool
 }
 
 // Snapshot contains only known-present or known-absent resources. Inspectors
@@ -146,7 +148,8 @@ func Build(snapshot Snapshot) (Plan, error) {
 	}
 	_, hasInProgress := labels["in-progress"]
 	_, hasReadyForAgent := labels["ready-for-agent"]
-	needsProgress := hasOpenPullRequest || snapshot.RemoteBranch.Present || hasInProgress || !hasReadyForAgent
+	needsProgress := hasOpenPullRequest || snapshot.RemoteBranch.Present || snapshot.LocalBranch.Present ||
+		snapshot.Worktree.Present || snapshot.Session.Present || hasInProgress || !hasReadyForAgent
 	if needsProgress && planning.Run.Status != scheduler.StatusResetting && planning.Run.Status != scheduler.StatusWaitingForMerge && planning.Run.Status != scheduler.StatusReset {
 		plan.Actions = append(plan.Actions, fmt.Sprintf("mark Run %s resetting while retaining Lease %s", snapshot.Run.RunID, snapshot.Lease.LeaseID))
 		planning.Run.Status = scheduler.StatusResetting
@@ -193,7 +196,7 @@ func Build(snapshot Snapshot) (Plan, error) {
 		plan.Actions = append(plan.Actions, fmt.Sprintf("delete local branch %s at %s", snapshot.LocalBranch.Name, snapshot.LocalBranch.Commit))
 	}
 	if snapshot.Session.Present {
-		plan.Actions = append(plan.Actions, fmt.Sprintf("retire Pi session %s in %s", snapshot.Session.ID, snapshot.Session.Dir))
+		plan.Actions = append(plan.Actions, fmt.Sprintf("archive Pi session %s from %s to %s", snapshot.Session.ID, snapshot.Session.Dir, snapshot.Session.ArchiveDir))
 	}
 	if _, present := labels["in-progress"]; present {
 		plan.Actions = append(plan.Actions, fmt.Sprintf("remove issue label in-progress from %s", snapshot.Issue.URL))
@@ -257,8 +260,11 @@ func validateIdentity(snapshot Snapshot) error {
 	if snapshot.Worktree.Present && (snapshot.Worktree.Path != run.Worktree || snapshot.Worktree.Branch != run.Branch || snapshot.Worktree.Commit == "") {
 		return fmt.Errorf("local worktree identity does not match Run %s", run.RunID)
 	}
-	if snapshot.Session.Present && (snapshot.Session.ID != run.SessionID || snapshot.Session.Dir != run.SessionDir) {
+	if (snapshot.Session.Present || snapshot.Session.Archived) && (snapshot.Session.ID != run.SessionID || snapshot.Session.Dir != run.SessionDir || snapshot.Session.ArchiveDir == "") {
 		return fmt.Errorf("Pi session identity does not match Run %s", run.RunID)
+	}
+	if snapshot.Session.Present && snapshot.Session.Archived {
+		return fmt.Errorf("Pi session %s is present in both active and historical storage", run.SessionID)
 	}
 	return nil
 }
