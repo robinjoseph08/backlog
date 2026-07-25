@@ -641,6 +641,27 @@ func TestFollowNormalizedLimitsInitialProjectionToLatestTwentyAndReportsAge(t *t
 	}
 }
 
+func TestFollowSummaryStopsElapsedAtTerminalUpdateWithoutCompletionTime(t *testing.T) {
+	t.Parallel()
+
+	startedAt := time.Date(2026, 3, 4, 1, 0, 0, 0, time.UTC)
+	updatedAt := startedAt.Add(time.Hour)
+	for _, status := range []scheduler.Status{scheduler.StatusFailed, scheduler.StatusNeedsHuman} {
+		status := status
+		t.Run(string(status), func(t *testing.T) {
+			t.Parallel()
+			run := scheduler.Run{Issue: 28, RunID: "terminal-elapsed", Status: status, StartedAt: startedAt, UpdatedAt: updatedAt}
+			var output bytes.Buffer
+			if err := printFollowSummary(&output, run, followMetrics{}, updatedAt.Add(24*time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+			if got := output.String(); !strings.Contains(got, "Elapsed: 1h0m0s") {
+				t.Fatalf("terminal summary = %q", got)
+			}
+		})
+	}
+}
+
 func TestFollowNormalizedStreamsProjectionAndPrintsTerminalSummary(t *testing.T) {
 	directory := t.TempDir()
 	logPath := filepath.Join(directory, "live.jsonl")
@@ -856,6 +877,71 @@ func TestFollowNormalizedFallsBackWhenLiveProjectionBecomesUnavailable(t *testin
 	got := output.String()
 	if strings.Count(got, "Worker started") != 1 || !strings.Contains(got, "Completed Worker tokens: 55") || !strings.Contains(diagnostics.String(), "replayed Activity age is n/a") {
 		t.Fatalf("live fallback output = %q, diagnostics = %q", got, diagnostics.String())
+	}
+}
+
+func TestFollowNormalizedFallsBackWhenLiveProjectionCannotBeRead(t *testing.T) {
+	directory := t.TempDir()
+	logPath := filepath.Join(directory, "live-read-fallback.jsonl")
+	if err := os.WriteFile(logPath, []byte("{\"type\":\"agent_start\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projectionPath := activity.PathForLog(logPath)
+	writeActivityEntries(t, projectionPath, activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: time.Now(), Kind: "lifecycle", Description: "Worker started",
+		Operation: "starting", OperationChanged: true,
+	})
+	store := state.FileStore{Path: filepath.Join(directory, "state.json")}
+	run := scheduler.Run{
+		Issue: 28, RunID: "live-read-fallback", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModeRPC,
+		PID: 2830, ProcessIdentity: "2830:start", LogPath: logPath, WorkerLogOpen: true, StartedAt: time.Now().Add(-time.Minute),
+		SessionID: "session-live-read-fallback", SessionDir: filepath.Join(directory, "session"),
+	}
+	if err := store.Save(state.State{
+		Version: state.CurrentVersion, Runs: []scheduler.Run{run},
+		Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var output, diagnostics synchronizedBuffer
+	done := make(chan error, 1)
+	go func() {
+		done <- followNormalized(context.Background(), store, run.RunID, &output, &diagnostics, 5*time.Millisecond, time.Now)
+	}()
+	waitForBuffer(t, &output, "Worker started")
+	log, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(log, "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[],\"usage\":{\"totalTokens\":89}}}\n"); err != nil {
+		log.Close()
+		t.Fatal(err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(projectionPath); err != nil {
+		t.Fatal(err)
+	}
+	waitForBuffer(t, &diagnostics, "Activity projection unavailable:")
+	waitForBuffer(t, &output, "Assistant response completed")
+	run.Status = scheduler.StatusFailed
+	run.WorkerLogOpen = false
+	run.UpdatedAt = time.Now()
+	if err := store.Save(state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{run}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("normalized read-fallback follower did not exit")
+	}
+	got := output.String()
+	if strings.Count(got, "Worker started") != 1 || !strings.Contains(got, "Completed Worker tokens: 89") {
+		t.Fatalf("live read fallback output = %q, diagnostics = %q", got, diagnostics.String())
 	}
 }
 

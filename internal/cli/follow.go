@@ -291,6 +291,13 @@ func (s *normalizedActivitySource) read() ([]activity.Entry, int, bool) {
 	replayed, reset := s.fallbackIfProjectionFailed()
 	lines, err := s.reader.read()
 	if err != nil {
+		if s.projected {
+			fmt.Fprintf(s.stderr, "Follow diagnostic: Activity projection unavailable: %v; replaying raw Worker Activity\n", err)
+			fmt.Fprintln(s.stderr, "Follow diagnostic: replayed Activity age is n/a")
+			replayed = s.switchToRaw()
+			replayedEntries, _, _ := s.read()
+			return replayedEntries, replayed, true
+		}
 		fmt.Fprintf(s.stderr, "Follow diagnostic: Worker Activity unavailable: %v\n", err)
 		return nil, replayed, reset
 	}
@@ -476,6 +483,8 @@ func printFollowSummary(output io.Writer, run scheduler.Run, metrics followMetri
 	elapsedEnd := now
 	if run.CompletedAt != nil {
 		elapsedEnd = *run.CompletedAt
+	} else if scheduler.IsTerminal(run.Status) && !run.UpdatedAt.IsZero() {
+		elapsedEnd = run.UpdatedAt
 	}
 	elapsed := "n/a"
 	if !run.StartedAt.IsZero() {
