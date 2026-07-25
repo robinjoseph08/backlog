@@ -503,13 +503,15 @@ func (p *Process) CloseWithForceContext(ctx context.Context, authorizeKill func(
 		}
 	}
 	result := p.exitResult()
-	groupErr := waitForProcessGroupExitContext(ctx, p.PID())
-	if groupErr != nil && ctx.Err() != nil {
-		return p.forceStop(authorizeKill, ctx.Err())
-	}
+	groupForceStopped, groupErr := waitForProcessGroupExitBounded(ctx, p.PID(), p.processGroupGrace)
 	result.ControlErr = errors.Join(result.ControlErr, p.closeInputErr, gracefulErr, groupErr)
-	result.Err = errors.Join(result.Err, result.ControlErr)
+	if groupForceStopped {
+		result.Err = errors.Join(result.StreamErr, result.ControlErr)
+	} else {
+		result.Err = errors.Join(result.Err, result.ControlErr)
+	}
 	result.GroupExited = groupErr == nil
+	result.ForceStopped = result.ForceStopped || groupForceStopped
 	return result
 }
 
@@ -1120,6 +1122,57 @@ func waitForProcessGroupExitContext(ctx context.Context, pid int) error {
 		case <-ticker.C:
 		case <-ctx.Done():
 			return errors.Join(ctx.Err(), errors.New("Worker process-group exit was not verified"))
+		}
+	}
+}
+
+func waitForProcessGroupExitBounded(ctx context.Context, pid int, grace time.Duration) (bool, error) {
+	if pid <= 0 {
+		return false, nil
+	}
+	exited, err := waitForProcessGroupContext(ctx, pid, grace)
+	if err != nil || exited {
+		return false, err
+	}
+	if ctx.Err() == nil {
+		if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return false, fmt.Errorf("terminate surviving Worker process group: %w", err)
+		}
+		exited, err = waitForProcessGroupContext(ctx, pid, grace)
+		if err != nil || exited {
+			return false, err
+		}
+	}
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return false, fmt.Errorf("kill surviving Worker process group: %w", err)
+	}
+	exited, err = waitForProcessGroup(pid, grace)
+	if err != nil {
+		return true, err
+	}
+	if !exited {
+		return true, fmt.Errorf("Worker process group %d survived shutdown escalation", pid)
+	}
+	return true, nil
+}
+
+func waitForProcessGroupContext(ctx context.Context, pid int, grace time.Duration) (bool, error) {
+	deadline := time.NewTimer(grace)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := syscall.Kill(-pid, syscall.Signal(0)); errors.Is(err, syscall.ESRCH) {
+			return true, nil
+		} else if err != nil && !errors.Is(err, syscall.EPERM) {
+			return false, err
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			return false, nil
+		case <-ctx.Done():
+			return false, nil
 		}
 	}
 }

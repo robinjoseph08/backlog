@@ -532,6 +532,39 @@ while IFS= read -r ignored; do :; done
 	}
 }
 
+func TestCloseEscalatesSurvivingProcessGroupAfterLeaderExit(t *testing.T) {
+	root := t.TempDir()
+	childPIDPath := filepath.Join(root, "child.pid")
+	pi := fakePi(t, `
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+sh -c 'trap "" TERM; while :; do sleep 1; done' &
+printf '%s\n' "$!" > `+shellQuote(childPIDPath)+`
+while IFS= read -r ignored; do :; done
+`)
+	process, err := (Supervisor{
+		Executable: pi, LogsDir: filepath.Join(root, "logs"), TerminationGrace: 30 * time.Millisecond,
+	}).Start(context.Background(), request(13, "run-13", root, filepath.Join(root, "sessions", "run-13")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if result := process.Wait(); result.Err != nil || !result.Settled {
+		t.Fatalf("wait = %#v", result)
+	}
+	waitForPath(t, childPIDPath)
+	started := time.Now()
+	result := process.Close()
+	if !result.GroupExited || result.Err == nil || !strings.Contains(result.Err.Error(), "did not exit after input closed") {
+		t.Fatalf("close surviving process group = %#v", result)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("surviving process-group escalation took %s", elapsed)
+	}
+}
+
 func TestCloseEscalatesWhenWorkerIgnoresInputClosure(t *testing.T) {
 	t.Parallel()
 
