@@ -1548,6 +1548,9 @@ func (w *rpcWriter) validate(line []byte) {
 		}
 		w.summarizationRetryOpen = false
 		w.summarizationRetryAttempt = 0
+	case "entry_appended":
+		// Pi extensions persist custom session metadata through appendEntry.
+		// The resulting event does not change the agent lifecycle.
 	case "queue_update", "extension_error":
 		if w.state == rpcAwaitingResponse {
 			w.invalidOrder(message.Type)

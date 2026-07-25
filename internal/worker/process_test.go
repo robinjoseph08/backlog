@@ -239,6 +239,43 @@ printf '`+test.output+`'
 	}
 }
 
+func TestProcessAcceptsEntryAppendedDuringToolExecution(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	pi := fakePi(t, `
+IFS= read -r command
+printf '%s\n' \
+  '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' \
+  '{"type":"agent_start"}' \
+  '{"type":"turn_start"}' \
+  '{"type":"tool_execution_start","toolCallId":"subagent-1","toolName":"Agent","args":{"subagent_type":"general-purpose","description":"Implement status progress view","prompt":"Implement issue 31"}}' \
+  '{"type":"entry_appended","entry":{"type":"custom","customType":"subagents:record","id":"entry-1","parentId":"parent-1","timestamp":"2026-07-25T21:40:01.859Z","data":{"id":"record-1","type":"general-purpose","description":"Implement status progress view","status":"completed","result":"STATUS: success","startedAt":1785014520878,"completedAt":1785015601858}}}' \
+  '{"type":"tool_execution_end","toolCallId":"subagent-1","toolName":"Agent","result":{"content":[{"type":"text","text":"STATUS: success"}],"details":{"status":"completed"}},"isError":false}' \
+  '{"type":"turn_end"}' \
+  '{"type":"agent_end"}' \
+  '{"type":"agent_settled"}'
+while IFS= read -r ignored; do :; done
+`)
+	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(
+		context.Background(), request(31, "entry-appended-31", root, filepath.Join(root, "sessions", "entry-appended-31")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if result := process.Wait(); result.Err != nil || !result.Settled {
+		_ = process.Abort()
+		_ = process.Close()
+		t.Fatalf("entry_appended event was rejected: %v", result.Err)
+	}
+	if result := process.Close(); result.Err != nil {
+		t.Fatal(result.Err)
+	}
+}
+
 func TestProcessAcceptsRetriesAndFireAndForgetExtensionUI(t *testing.T) {
 	t.Parallel()
 
