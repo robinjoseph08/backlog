@@ -231,8 +231,19 @@ func TestStatusDoesNotMigrateV1WhileRunnerLockIsHeld(t *testing.T) {
 
 func writeExecutable(t *testing.T, content string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "fake")
-	if err := os.WriteFile(path, []byte(content), 0o700); err != nil {
+	directory := t.TempDir()
+	source := filepath.Join(directory, "source")
+	path := filepath.Join(directory, "fake")
+	if err := os.WriteFile(source, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A concurrent fork can briefly inherit a recently closed writable descriptor,
+	// causing Linux to reject execution with ETXTBSY. Let a child process create the
+	// executable so the parallel test process never opens its inode for writing.
+	if output, err := exec.Command("cp", source, path).CombinedOutput(); err != nil {
+		t.Fatalf("copy test executable: %v\n%s", err, output)
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	return path
