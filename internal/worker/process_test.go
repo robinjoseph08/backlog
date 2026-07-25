@@ -541,6 +541,7 @@ printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","
 sh -c 'trap "" TERM; while :; do sleep 1; done' &
 printf '%s\n' "$!" > `+shellQuote(childPIDPath)+`
 while IFS= read -r ignored; do :; done
+exit 9
 `)
 	process, err := (Supervisor{
 		Executable: pi, LogsDir: filepath.Join(root, "logs"), TerminationGrace: 30 * time.Millisecond,
@@ -557,7 +558,8 @@ while IFS= read -r ignored; do :; done
 	waitForPath(t, childPIDPath)
 	started := time.Now()
 	result := process.Close()
-	if !result.GroupExited || result.Err == nil || !strings.Contains(result.Err.Error(), "did not exit after input closed") {
+	if !result.GroupExited || result.Err == nil || !strings.Contains(result.Err.Error(), "did not exit after input closed") ||
+		!strings.Contains(result.Err.Error(), "exit status 9") {
 		t.Fatalf("close surviving process group = %#v", result)
 	}
 	if elapsed := time.Since(started); elapsed > time.Second {

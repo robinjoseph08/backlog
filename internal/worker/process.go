@@ -505,11 +505,7 @@ func (p *Process) CloseWithForceContext(ctx context.Context, authorizeKill func(
 	result := p.exitResult()
 	groupForceStopped, groupErr := waitForProcessGroupExitBounded(ctx, p.PID(), p.processGroupGrace)
 	result.ControlErr = errors.Join(result.ControlErr, p.closeInputErr, gracefulErr, groupErr)
-	if groupForceStopped {
-		result.Err = errors.Join(result.StreamErr, result.ControlErr)
-	} else {
-		result.Err = errors.Join(result.Err, result.ControlErr)
-	}
+	result.Err = errors.Join(result.Err, result.ControlErr)
 	result.GroupExited = groupErr == nil
 	result.ForceStopped = result.ForceStopped || groupForceStopped
 	return result
