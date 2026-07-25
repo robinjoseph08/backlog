@@ -449,7 +449,6 @@ func followNormalized(
 				Version: activity.CurrentVersion, ObservedAt: now().UTC(), Kind: "lifecycle",
 				Description: "Run state changed to " + string(selected.Status),
 			}
-			metrics.apply(entry)
 			if err := printActivityEntry(output, entry); err != nil {
 				return err
 			}

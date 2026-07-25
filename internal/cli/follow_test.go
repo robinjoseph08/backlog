@@ -713,7 +713,7 @@ func TestFollowNormalizedStreamsProjectionAndPrintsTerminalSummary(t *testing.T)
 		t.Fatal("normalized follower did not exit at terminal state")
 	}
 	got := output.String()
-	for _, want := range []string{"Current Worker operation: starting", "Run state changed to failed", "Terminal Run summary:", "State: failed", "Completed Worker tokens: 77"} {
+	for _, want := range []string{"Current Worker operation: starting", "Run state changed to failed", "Terminal Run summary:", "State: failed", "Activity age: 1s", "Completed Worker tokens: 77"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("live normalized output missing %q:\n%s", want, got)
 		}
