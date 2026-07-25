@@ -1008,10 +1008,36 @@ func verifyOwnedFinalState(snapshot reset.Snapshot) error {
 	if snapshot.Session.Present {
 		return fmt.Errorf("active Pi session %s remains resumable in %s", snapshot.Session.ID, snapshot.Session.Dir)
 	}
+	return verifyDurableRunLogs(snapshot.Run)
+}
+
+func verifyDurableRunLogs(run scheduler.Run) error {
+	for _, log := range []struct {
+		description string
+		path        string
+	}{
+		{description: "Worker JSONL log", path: run.LogPath},
+		{description: "Worker standard-error log", path: run.StderrPath},
+	} {
+		description, path := log.description, log.path
+		if path == "" {
+			continue
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return fmt.Errorf("verify durable %s for Run %s at %s: %w", description, run.RunID, path, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("durable %s for Run %s at %s is not a regular file", description, run.RunID, path)
+		}
+	}
 	return nil
 }
 
 func verifyResetFinalState(current state.State, expected scheduler.Run) error {
+	if err := verifyDurableRunLogs(expected); err != nil {
+		return err
+	}
 	found := false
 	for _, run := range current.Runs {
 		if run.RunID == expected.RunID {

@@ -970,6 +970,7 @@ func TestResetReadLockCoordinatesWithRepositoryRunnerLock(t *testing.T) {
 type artifactFreeResetFixture struct {
 	repository  string
 	stateDir    string
+	logPath     string
 	store       state.FileStore
 	githubState string
 	git         string
@@ -984,12 +985,19 @@ func newArtifactFreeResetFixture(t *testing.T, labels []string) artifactFreeRese
 		t.Fatalf("git init: %v\n%s", err, output)
 	}
 	stateDir := filepath.Join(root, "state")
+	logPath := filepath.Join(stateDir, "logs", "run-42.jsonl")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte("preserved Worker log\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
 	if err := store.Save(state.State{
 		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
 		Runs: []scheduler.Run{{
 			Issue: 42, RunID: "run-42", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint,
-			LogPath: "/history/run-42.jsonl", Error: "preserved diagnostic",
+			LogPath: logPath, Error: "preserved diagnostic",
 		}},
 		Leases: []scheduler.Lease{{LeaseID: "lease-42", Issue: 42, RunID: "run-42"}},
 	}); err != nil {
@@ -1023,7 +1031,7 @@ case "$*" in
 esac
 `)
 	return artifactFreeResetFixture{
-		repository: repository, stateDir: stateDir, store: store, githubState: githubState,
+		repository: repository, stateDir: stateDir, logPath: logPath, store: store, githubState: githubState,
 		git: githubGit(t), gh: gh,
 	}
 }
@@ -1254,6 +1262,28 @@ func TestResetFinalizationPersistsRunAndLeaseTogether(t *testing.T) {
 	}
 }
 
+func TestResetFinalizationRequiresDurableRecordedLogs(t *testing.T) {
+	t.Parallel()
+	fixture := newArtifactFreeResetFixture(t, []string{"ready-for-agent", "spec"})
+	if err := os.Remove(fixture.logPath); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit != 1 {
+		t.Fatalf("exit = %d, want 1; stderr = %q", exit, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "verify durable Worker JSONL log") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status == scheduler.StatusReset || len(current.Leases) != 1 {
+		t.Fatalf("missing log released ownership: %#v", current)
+	}
+}
+
 func TestResetConvergesEveryManagedLabelCombinationAndPreservesHistory(t *testing.T) {
 	for _, labels := range [][]string{
 		{"spec"},
@@ -1275,7 +1305,7 @@ func TestResetConvergesEveryManagedLabelCombinationAndPreservesHistory(t *testin
 			if len(current.Runs) != 1 || current.Runs[0].Status != scheduler.StatusReset || len(current.Leases) != 0 {
 				t.Fatalf("final Runs/Leases = %#v/%#v", current.Runs, current.Leases)
 			}
-			if current.Runs[0].LogPath != "/history/run-42.jsonl" || current.Runs[0].Error != "preserved diagnostic" {
+			if current.Runs[0].LogPath != fixture.logPath || current.Runs[0].Error != "preserved diagnostic" {
 				t.Fatalf("historical metadata changed: %#v", current.Runs[0])
 			}
 			if got := strings.Join(fixture.labels(t), ","); got != "ready-for-agent,spec" {
