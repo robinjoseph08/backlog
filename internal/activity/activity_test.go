@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -84,6 +85,57 @@ func TestProjectorMarksCompletedResponsesAndKeepsParallelToolOperation(t *testin
 	}
 	if ended.Operation != "read" {
 		t.Fatalf("operation after parallel tool ended = %q, want read", ended.Operation)
+	}
+}
+
+func TestProjectorTracksSubagentMeaningfulChangesAndCoalescesOnlyFeedRendering(t *testing.T) {
+	t.Parallel()
+
+	var projector Projector
+	started := time.Date(2026, 4, 5, 6, 7, 8, 0, time.UTC)
+	if _, semantic, err := projector.Observe([]byte(`{"type":"tool_execution_start","toolCallId":"agent-1","toolName":"Agent"}`), started); err != nil || !semantic {
+		t.Fatalf("start Agent tool: semantic = %t, err = %v", semantic, err)
+	}
+	initial := `{"type":"tool_execution_update","toolCallId":"agent-1","toolName":"Agent","partialResult":{"content":[{"type":"text","text":"first hidden output"}],"details":{"description":"Implement Follow","status":"queued","activity":"thinking","turnCount":1,"toolUses":0,"tokens":"1.0k token","durationMs":0,"spinnerFrame":0}}}`
+	entry, semantic, err := projector.Observe([]byte(initial), started)
+	if err != nil || !semantic || entry.SuppressFeed || entry.Subagent == nil || entry.Subagent.ApproxTokens == nil || *entry.Subagent.ApproxTokens != 1000 {
+		t.Fatalf("initial Subagent entry = %#v, semantic = %t, err = %v", entry, semantic, err)
+	}
+
+	cosmetic := `{"type":"tool_execution_update","toolCallId":"agent-1","toolName":"Agent","partialResult":{"content":[{"type":"text","text":"first hidden output"}],"details":{"description":"Implement Follow","status":"queued","activity":"thinking","turnCount":1,"toolUses":0,"tokens":"1.0k token","durationMs":100,"spinnerFrame":7}}}`
+	if entry, semantic, err := projector.Observe([]byte(cosmetic), started.Add(100*time.Millisecond)); err != nil || semantic {
+		t.Fatalf("cosmetic Subagent entry = %#v, semantic = %t, err = %v", entry, semantic, err)
+	}
+
+	outputChanged := strings.Replace(cosmetic, "first hidden output", "second hidden output", 1)
+	entry, semantic, err = projector.Observe([]byte(outputChanged), started.Add(200*time.Millisecond))
+	if err != nil || !semantic || !entry.SuppressFeed {
+		t.Fatalf("changed output entry = %#v, semantic = %t, err = %v", entry, semantic, err)
+	}
+	if strings.Contains(entry.Description, "hidden output") {
+		t.Fatalf("changed output leaked into Activity: %#v", entry)
+	}
+
+	statusChanged := strings.Replace(outputChanged, `"status":"queued"`, `"status":"running"`, 1)
+	entry, semantic, err = projector.Observe([]byte(statusChanged), started.Add(300*time.Millisecond))
+	if err != nil || !semantic || entry.SuppressFeed {
+		t.Fatalf("status milestone entry = %#v, semantic = %t, err = %v", entry, semantic, err)
+	}
+	turnChanged := strings.Replace(statusChanged, `"turnCount":1`, `"turnCount":2`, 1)
+	entry, semantic, err = projector.Observe([]byte(turnChanged), started.Add(400*time.Millisecond))
+	if err != nil || !semantic || entry.SuppressFeed || !strings.Contains(entry.Description, "reached turn 2") {
+		t.Fatalf("turn milestone entry = %#v, semantic = %t, err = %v", entry, semantic, err)
+	}
+
+	activityChanged := strings.Replace(turnChanged, `"activity":"thinking"`, `"activity":"testing"`, 1)
+	entry, semantic, err = projector.Observe([]byte(activityChanged), started.Add(500*time.Millisecond))
+	if err != nil || !semantic || !entry.SuppressFeed {
+		t.Fatalf("rapid activity entry = %#v, semantic = %t, err = %v", entry, semantic, err)
+	}
+	laterActivity := strings.Replace(activityChanged, `"activity":"testing"`, `"activity":"writing"`, 1)
+	entry, semantic, err = projector.Observe([]byte(laterActivity), started.Add(1500*time.Millisecond))
+	if err != nil || !semantic || entry.SuppressFeed {
+		t.Fatalf("later activity entry = %#v, semantic = %t, err = %v", entry, semantic, err)
 	}
 }
 
