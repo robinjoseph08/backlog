@@ -519,6 +519,31 @@ func TestFollowCommandReportsVerifiedWorkerLivenessAndRunnerSupervision(t *testi
 	}
 }
 
+func TestFollowWorkerLivenessHandlesIncompleteAndRetainedIdentities(t *testing.T) {
+	t.Parallel()
+
+	identity, err := pidStartIdentity(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		run  scheduler.Run
+		want string
+	}{
+		{name: "PID without identity", run: scheduler.Run{PID: os.Getpid()}, want: fmt.Sprintf("unknown (PID %d has no persisted process-start identity)", os.Getpid())},
+		{name: "retained live identity", run: scheduler.Run{ProcessIdentity: identity}, want: fmt.Sprintf("alive (PID %d and process-start identity verified)", os.Getpid())},
+		{name: "invalid retained identity", run: scheduler.Run{ProcessIdentity: "invalid"}, want: "unknown (persisted process-start identity has no valid PID)"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := followWorkerLiveness(test.run); got != test.want {
+				t.Fatalf("Worker liveness = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestFollowCommandKeepsObservingUnsupervisedRunAndReportsReturningSupervision(t *testing.T) {
 	repository := initializeFollowRepository(t)
 	stateDir := t.TempDir()
@@ -556,6 +581,53 @@ func TestFollowCommandKeepsObservingUnsupervisedRunAndReportsReturningSupervisio
 	}
 }
 
+func TestFollowCommandReportsWorkerDeathAndKeepsObserving(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	worker := exec.Command("sleep", "30")
+	if err := worker.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if worker.ProcessState == nil {
+			_ = worker.Process.Kill()
+			_ = worker.Wait()
+		}
+	}()
+	identity, err := pidStartIdentity(worker.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := scheduler.Run{
+		Issue: 30, RunID: "Worker-dies", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint,
+		PID: worker.Process.Pid, ProcessIdentity: identity, StartedAt: time.Now(),
+	}
+	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
+	if err := store.Save(state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{
+		LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var output synchronizedBuffer
+	done := make(chan error, 1)
+	go func() {
+		done <- followCommand(ctx, []string{run.RunID, "--repo-dir", repository, "--state-dir", stateDir}, &output, io.Discard)
+	}()
+	waitForBuffer(t, &output, "Worker liveness: alive")
+	if err := worker.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.Wait(); err != nil && !strings.Contains(err.Error(), "signal: killed") {
+		t.Fatal(err)
+	}
+	waitForBuffer(t, &output, "Worker liveness changed to dead")
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestFollowRawCommandPrintsResolvedIssueRunIDWithoutChangingJSONL(t *testing.T) {
 	t.Parallel()
 
@@ -574,8 +646,73 @@ func TestFollowRawCommandPrintsResolvedIssueRunIDWithoutChangingJSONL(t *testing
 	if err := followCommand(context.Background(), []string{"30", "--raw", "--repo-dir", repository, "--state-dir", stateDir}, &output, &diagnostics); err != nil {
 		t.Fatal(err)
 	}
-	if output.String() != "record\n" || !strings.Contains(diagnostics.String(), "Run: raw-by-issue\n") {
+	if output.String() != "record\n" || !strings.Contains(diagnostics.String(), "Run: raw-by-issue\n") ||
+		!strings.Contains(diagnostics.String(), "Runner supervision: n/a (terminal Run)\n") ||
+		!strings.Contains(diagnostics.String(), "Worker liveness: absent\n") {
 		t.Fatalf("raw output = %q, diagnostics = %q", output.String(), diagnostics.String())
+	}
+}
+
+func TestFollowRawCommandReportsObservationChangesOnStderr(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	logPath := filepath.Join(stateDir, "raw.jsonl")
+	if err := os.WriteFile(logPath, []byte("record\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	worker := exec.Command("sleep", "30")
+	if err := worker.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if worker.ProcessState == nil {
+			_ = worker.Process.Kill()
+			_ = worker.Wait()
+		}
+	}()
+	identity, err := pidStartIdentity(worker.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := scheduler.Run{
+		Issue: 30, RunID: "raw-observations", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint,
+		PID: worker.Process.Pid, ProcessIdentity: identity, LogPath: logPath, WorkerLogOpen: true, StartedAt: time.Now(),
+	}
+	if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{
+		Version: state.CurrentVersion, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	supervision, err := establishRunnerSupervision(filepath.Join(repository, ".git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var output, diagnostics synchronizedBuffer
+	done := make(chan error, 1)
+	go func() {
+		done <- followCommand(ctx, []string{run.RunID, "--raw", "--repo-dir", repository, "--state-dir", stateDir}, &output, &diagnostics)
+	}()
+	waitForBuffer(t, &output, "record\n")
+	waitForBuffer(t, &diagnostics, "Runner supervision: SUPERVISED")
+	waitForBuffer(t, &diagnostics, "Worker liveness: alive")
+	if err := supervision.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.Wait(); err != nil && !strings.Contains(err.Error(), "signal: killed") {
+		t.Fatal(err)
+	}
+	waitForBuffer(t, &diagnostics, "Runner supervision changed to UNSUPERVISED")
+	waitForBuffer(t, &diagnostics, "Worker liveness changed to dead")
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); got != "record\n" {
+		t.Fatalf("raw JSONL changed while reporting observations: %q", got)
 	}
 }
 
@@ -798,7 +935,7 @@ func TestFollowRawCommandPropagatesResolvedIdentityOutputFailure(t *testing.T) {
 	}
 }
 
-func TestRepositoryFollowSourceReportsMalformedRunnerIdentity(t *testing.T) {
+func TestRepositoryFollowSourceReportsMalformedRunnerIdentityAsUnsupervised(t *testing.T) {
 	t.Parallel()
 
 	commonDirectory := t.TempDir()
@@ -808,6 +945,24 @@ func TestRepositoryFollowSourceReportsMalformedRunnerIdentity(t *testing.T) {
 	source := repositoryFollowSource{commonDirectory: commonDirectory}
 	if _, err := source.RunnerSupervised(); err == nil || !strings.Contains(err.Error(), "read Runner supervision marker") {
 		t.Fatalf("Runner supervision observation error = %v", err)
+	}
+	observation := observeFollowRun(source, scheduler.Run{Status: scheduler.StatusRunning})
+	if !strings.HasPrefix(observation.supervision, "UNSUPERVISED") {
+		t.Fatalf("Follow supervision with malformed Runner identity = %q", observation.supervision)
+	}
+}
+
+func TestRepositoryFollowSourceRejectsReusedRunnerPID(t *testing.T) {
+	t.Parallel()
+
+	commonDirectory := t.TempDir()
+	if err := writeRunnerProcessIdentity(filepath.Join(commonDirectory, runnerSupervisionFile), runnerProcessIdentity{
+		PID: os.Getpid(), ProcessIdentity: fmt.Sprintf("%d:different start", os.Getpid()),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if supervised, err := (repositoryFollowSource{commonDirectory: commonDirectory}).RunnerSupervised(); err != nil || supervised {
+		t.Fatalf("Runner supervision with reused PID = %t, %v", supervised, err)
 	}
 }
 
@@ -838,6 +993,21 @@ func TestRepositoryFollowSourceDoesNotTreatResetAsRunnerSupervision(t *testing.T
 	source := repositoryFollowSource{commonDirectory: commonDirectory}
 	if supervised, err := source.RunnerSupervised(); err != nil || supervised {
 		t.Fatalf("Runner supervision during Reset = %t, %v", supervised, err)
+	}
+}
+
+func TestResettingRunRemainsUnsupervisedWithActiveRunner(t *testing.T) {
+	t.Parallel()
+
+	commonDirectory := t.TempDir()
+	supervision, err := establishRunnerSupervision(commonDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer supervision.Release()
+	observation := observeFollowRun(repositoryFollowSource{commonDirectory: commonDirectory}, scheduler.Run{Status: scheduler.StatusResetting})
+	if observation.supervision != "UNSUPERVISED" {
+		t.Fatalf("resetting Run supervision = %q", observation.supervision)
 	}
 }
 
@@ -1558,7 +1728,7 @@ func (b *synchronizedBuffer) String() string {
 
 func waitForBuffer(t *testing.T, buffer *synchronizedBuffer, contains string) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if strings.Contains(buffer.String(), contains) {
 			return

@@ -20,7 +20,10 @@ import (
 	"github.com/robinjoseph08/backlog/internal/state"
 )
 
-const followPollInterval = 50 * time.Millisecond
+const (
+	followPollInterval        = 50 * time.Millisecond
+	followObservationInterval = time.Second
+)
 
 type followStateSource interface {
 	Preview() (state.State, bool, error)
@@ -78,11 +81,31 @@ func followCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 		if err != nil {
 			return err
 		}
-		observation := observeFollowRun(source, selected)
-		if _, err := fmt.Fprintf(stderr, "Run: %s\nRunner supervision: %s\nWorker liveness: %s\n", runID, observation.supervision, observation.worker); err != nil {
+		lastObservation := observeFollowRun(source, selected)
+		if _, err := fmt.Fprintf(stderr, "Run: %s\nRunner supervision: %s\nWorker liveness: %s\n", runID, lastObservation.supervision, lastObservation.workerLiveness); err != nil {
 			return err
 		}
-		return followRaw(ctx, source, runID, stdout, followPollInterval)
+		nextObservation := time.Now().Add(followObservationInterval)
+		return followRawObserved(ctx, source, runID, stdout, followPollInterval, func(run scheduler.Run) error {
+			observedAt := time.Now()
+			if !scheduler.IsTerminal(run.Status) && observedAt.Before(nextObservation) {
+				return nil
+			}
+			nextObservation = observedAt.Add(followObservationInterval)
+			observation := observeFollowRun(source, run)
+			if observation.supervision != lastObservation.supervision {
+				if _, err := fmt.Fprintln(stderr, "Runner supervision changed to "+observation.supervision); err != nil {
+					return err
+				}
+			}
+			if observation.workerLiveness != lastObservation.workerLiveness {
+				if _, err := fmt.Fprintln(stderr, "Worker liveness changed to "+observation.workerLiveness); err != nil {
+					return err
+				}
+			}
+			lastObservation = observation
+			return nil
+		})
 	}
 	return followNormalized(ctx, source, runID, stdout, stderr, followPollInterval, time.Now)
 }
@@ -113,6 +136,10 @@ func followFlagTakesValue(name string) bool {
 }
 
 func followRaw(ctx context.Context, source followStateSource, runID string, output io.Writer, pollInterval time.Duration) error {
+	return followRawObserved(ctx, source, runID, output, pollInterval, nil)
+}
+
+func followRawObserved(ctx context.Context, source followStateSource, runID string, output io.Writer, pollInterval time.Duration, observe func(scheduler.Run) error) error {
 	selected, err := loadFollowRun(source, runID)
 	if err != nil {
 		return err
@@ -127,6 +154,11 @@ func followRaw(ctx context.Context, source followStateSource, runID string, outp
 		selected, err = loadFollowRun(source, runID)
 		if err != nil {
 			return err
+		}
+		if observe != nil {
+			if err := observe(selected); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -148,6 +180,11 @@ func followRaw(ctx context.Context, source followStateSource, runID string, outp
 		selected, err = loadFollowRun(source, runID)
 		if err != nil {
 			return err
+		}
+		if observe != nil {
+			if err := observe(selected); err != nil {
+				return err
+			}
 		}
 		if selected.LogPath != logPath {
 			return fmt.Errorf("Run %q Worker log changed from %q to %q", runID, logPath, selected.LogPath)
@@ -216,8 +253,8 @@ func loadFollowRun(source followStateSource, runID string) (scheduler.Run, error
 }
 
 type followObservation struct {
-	supervision string
-	worker      string
+	supervision    string
+	workerLiveness string
 }
 
 type followSupervisionSource interface {
@@ -225,9 +262,13 @@ type followSupervisionSource interface {
 }
 
 func observeFollowRun(source followStateSource, run scheduler.Run) followObservation {
-	observation := followObservation{worker: followWorkerLiveness(run)}
+	observation := followObservation{workerLiveness: followWorkerLiveness(run)}
 	if scheduler.IsTerminal(run.Status) {
 		observation.supervision = "n/a (terminal Run)"
+		return observation
+	}
+	if run.Status == scheduler.StatusResetting {
+		observation.supervision = "UNSUPERVISED"
 		return observation
 	}
 	supervised := false
@@ -237,7 +278,7 @@ func observeFollowRun(source followStateSource, run scheduler.Run) followObserva
 	}
 	switch {
 	case err != nil:
-		observation.supervision = "UNKNOWN (coordination ownership could not be observed)"
+		observation.supervision = "UNSUPERVISED (Runner identity could not be verified)"
 	case supervised:
 		observation.supervision = "SUPERVISED"
 	default:
@@ -247,24 +288,35 @@ func observeFollowRun(source followStateSource, run scheduler.Run) followObserva
 }
 
 func followWorkerLiveness(run scheduler.Run) string {
-	if run.PID <= 0 || run.ProcessIdentity == "" {
-		return "absent"
+	pid := run.PID
+	if pid <= 0 {
+		if run.ProcessIdentity == "" {
+			return "absent"
+		}
+		var err error
+		pid, err = processIdentityPID(run.ProcessIdentity)
+		if err != nil {
+			return "unknown (persisted process-start identity has no valid PID)"
+		}
 	}
-	alive, err := signalZero(run.PID)
+	if run.ProcessIdentity == "" {
+		return fmt.Sprintf("unknown (PID %d has no persisted process-start identity)", pid)
+	}
+	alive, err := signalZero(pid)
 	if err != nil {
 		return "unknown (PID liveness could not be verified)"
 	}
 	if !alive {
-		return fmt.Sprintf("dead (recorded PID %d is absent)", run.PID)
+		return fmt.Sprintf("dead (recorded PID %d is absent)", pid)
 	}
-	identity, err := pidStartIdentity(run.PID)
+	identity, err := pidStartIdentity(pid)
 	if err != nil {
-		return fmt.Sprintf("unknown (PID %d process-start identity could not be verified)", run.PID)
+		return fmt.Sprintf("unknown (PID %d process-start identity could not be verified)", pid)
 	}
 	if identity != run.ProcessIdentity {
-		return fmt.Sprintf("dead (stale PID %d has a different process-start identity)", run.PID)
+		return fmt.Sprintf("dead (stale PID %d has a different process-start identity)", pid)
 	}
-	return fmt.Sprintf("alive (PID %d and process-start identity verified)", run.PID)
+	return fmt.Sprintf("alive (PID %d and process-start identity verified)", pid)
 }
 
 func waitToFollow(ctx context.Context, interval time.Duration) bool {
@@ -592,6 +644,7 @@ func followNormalized(
 		consumeActivity(&metrics, activitySource)
 	}
 	lastObservation := observeFollowRun(source, selected)
+	nextObservation := now().Add(followObservationInterval)
 	if err := printFollowSummary(output, selected, metrics, lastObservation, now()); err != nil {
 		return err
 	}
@@ -648,18 +701,22 @@ func followNormalized(
 			}
 			lastStatus = selected.Status
 		}
-		observation := observeFollowRun(source, selected)
-		if observation.supervision != lastObservation.supervision {
-			if err := printActivityEntry(output, activity.Entry{ObservedAt: now().UTC(), Description: "Runner supervision changed to " + observation.supervision}); err != nil {
-				return err
+		observationNow := now()
+		if scheduler.IsTerminal(selected.Status) || !observationNow.Before(nextObservation) {
+			observation := observeFollowRun(source, selected)
+			if observation.supervision != lastObservation.supervision {
+				if err := printActivityEntry(output, activity.Entry{ObservedAt: observationNow.UTC(), Description: "Runner supervision changed to " + observation.supervision}); err != nil {
+					return err
+				}
 			}
-		}
-		if observation.worker != lastObservation.worker {
-			if err := printActivityEntry(output, activity.Entry{ObservedAt: now().UTC(), Description: "Worker liveness changed to " + observation.worker}); err != nil {
-				return err
+			if observation.workerLiveness != lastObservation.workerLiveness {
+				if err := printActivityEntry(output, activity.Entry{ObservedAt: observationNow.UTC(), Description: "Worker liveness changed to " + observation.workerLiveness}); err != nil {
+					return err
+				}
 			}
+			lastObservation = observation
+			nextObservation = observationNow.Add(followObservationInterval)
 		}
-		lastObservation = observation
 		if scheduler.IsTerminal(selected.Status) && !selected.WorkerLogOpen {
 			if activitySource != nil {
 				if err := printNewActivity(output, &metrics, activitySource); err != nil {
@@ -713,7 +770,7 @@ func printFollowSummary(output io.Writer, run scheduler.Run, metrics followMetri
 		observedTokens = fmt.Sprintf("~%d", metrics.tokens+approximate)
 	}
 	if _, err := fmt.Fprintf(output, "Run: %s\nIssue: %s\nState: %s\nRunner supervision: %s\nWorker liveness: %s\nElapsed: %s\nActivity age: %s\nCurrent Worker operation: %s\nCompleted Worker turns: %d\nCompleted Worker tokens: %s\nSubagents: %d (%d active)\nDeepest current operation: %s\nApproximate Subagent turns: %s\nApproximate Subagent tool uses: %s\nApproximate Subagent tokens: %s\nObserved tokens: %s\n",
-		run.RunID, issue, run.Status, observation.supervision, observation.worker, elapsed, age, operation, metrics.turns, workerTokens, len(metrics.subagents), activeSubagents,
+		run.RunID, issue, run.Status, observation.supervision, observation.workerLiveness, elapsed, age, operation, metrics.turns, workerTokens, len(metrics.subagents), activeSubagents,
 		deepest, subagentTurns, subagentToolUses, subagentTokens, observedTokens); err != nil {
 		return err
 	}

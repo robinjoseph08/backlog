@@ -155,11 +155,6 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 		return err
 	}
 	defer func() { _ = lock.Release() }()
-	supervision, err := establishRunnerSupervision(commonDirectory)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = supervision.Release() }()
 	if err := bindStateDirectory(commonDirectory, resolvedStateDir); err != nil {
 		return err
 	}
@@ -198,6 +193,11 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 		Output:    stdout,
 		Signals:   runnerSignals,
 	}
+	supervision, err := establishRunnerSupervision(commonDirectory)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = supervision.Release() }()
 	if setupDone != nil {
 		close(setupDone)
 	}
