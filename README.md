@@ -115,13 +115,23 @@ backlog status
 backlog status --json
 ```
 
-Follow one Run's raw Worker JSONL without acquiring scheduling ownership or communicating with its Runner or Worker:
+Follow one exact Run through normalized Worker Activity without acquiring scheduling ownership or communicating with its Runner or Worker:
+
+```sh
+backlog follow <run-id>
+```
+
+Follow immediately prints the Run and issue identity, state, elapsed time, Activity age, current Worker operation, completed turns, and exact completed tokens. It shows at most the latest 20 semantic Activity entries, then streams new model, tool, turn, retry, compaction, and lifecycle Activity. Cosmetic refreshes and repeated snapshots are ignored. Reasoning, tool arguments, and tool results are omitted, while visible final assistant text may be shown. Missing usage and unavailable Activity age are reported as `n/a`.
+
+Backlog records normalized Activity and its local observation time in an append-only sidecar without rewriting lifecycle state for each event. Projection failures do not affect the Worker result. Follow reports a diagnostic and rebuilds privacy-safe semantic history from raw evidence when possible; replayed Activity without trustworthy observation times has an age of `n/a`.
+
+Use `--raw` to follow the verbatim Worker JSONL instead:
 
 ```sh
 backlog follow <run-id> --raw
 ```
 
-Follow writes existing complete records verbatim, waits for an unterminated record to receive its newline, and streams newly completed records in order. It exits after a terminal Run reaches `merged`, `failed`, `needs-human`, or `reset`, the Runner records the Worker log as closed, and all complete records are emitted. Historical terminal Runs without a log-open marker are treated as already closed. Ctrl-C only detaches the follower. A missing Run or unavailable Worker log is reported for the requested Run without changing runner state.
+Both modes retain an unterminated final record until its newline arrives and stream newly completed records in order. Follow exits after a terminal Run reaches `merged`, `failed`, `needs-human`, or `reset`, the Runner records the Worker log as closed, and all complete records are emitted. Historical terminal Runs without a log-open marker are treated as already closed. Ctrl-C only detaches the follower. A missing Run or unavailable Worker log is reported for the requested Run without changing runner state.
 
 Inspect the exact actions required to Reset an incomplete Run:
 

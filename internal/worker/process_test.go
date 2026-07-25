@@ -15,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/robinjoseph08/backlog/internal/activity"
 )
 
 func TestWorkersDoNotInheritHerdrPaneEnvironment(t *testing.T) {
@@ -298,6 +300,94 @@ while IFS= read -r ignored; do :; done
 	}
 	if result := process.Close(); result.Err != nil {
 		t.Fatal(result.Err)
+	}
+}
+
+func TestProcessProjectsObservedActivityWithoutChangingRawJSONL(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	pi := fakePi(t, `
+IFS= read -r command
+printf '%s\n' \
+  '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' \
+  '{"type":"agent_start"}' \
+  '{"type":"turn_start"}' \
+  '{"type":"message_start","message":{"role":"assistant"}}' \
+  '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"private reasoning"}}' \
+  '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"visible"}],"usage":{"totalTokens":41}}}' \
+  '{"type":"turn_end"}' \
+  '{"type":"agent_end"}' \
+  '{"type":"agent_settled"}'
+while IFS= read -r ignored; do :; done
+`)
+	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(
+		context.Background(), request(28, "activity-28", root, filepath.Join(root, "sessions", "activity-28")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if result := process.Wait(); result.Err != nil {
+		t.Fatal(result.Err)
+	}
+	if result := process.Close(); result.Err != nil {
+		t.Fatal(result.Err)
+	}
+	raw, err := os.ReadFile(process.logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "private reasoning") {
+		t.Fatalf("raw Worker JSONL was rewritten: %s", raw)
+	}
+	projection, err := os.ReadFile(activity.PathForLog(process.logPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(projection), "private reasoning") || !strings.Contains(string(projection), "visible") || !strings.Contains(string(projection), `"tokenDelta":41`) {
+		t.Fatalf("Activity projection privacy/usage = %s", projection)
+	}
+	for number, line := range strings.Split(strings.TrimSpace(string(projection)), "\n") {
+		var entry activity.Entry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil || entry.ObservedAt.IsZero() {
+			t.Fatalf("projection line %d lacks observation time: %q, err = %v", number+1, line, err)
+		}
+	}
+}
+
+func TestActivityProjectionCreationFailureDoesNotAlterWorkerResult(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	logsDir := filepath.Join(root, "logs")
+	if err := os.MkdirAll(filepath.Join(logsDir, "activity-failure.activity.jsonl"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pi := fakePi(t, `
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+while IFS= read -r ignored; do :; done
+`)
+	process, err := (Supervisor{Executable: pi, LogsDir: logsDir}).Start(
+		context.Background(), request(28, "activity-failure", root, filepath.Join(root, "sessions", "activity-failure")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if result := process.Wait(); result.Err != nil || !result.Settled {
+		t.Fatalf("projection failure changed Worker result: %#v", result)
+	}
+	if result := process.Close(); result.Err != nil {
+		t.Fatal(result.Err)
+	}
+	if _, err := os.Stat(activity.UnavailablePath(filepath.Join(logsDir, "activity-failure.activity.jsonl"))); err != nil {
+		t.Fatalf("projection failure diagnostic was not recorded: %v", err)
 	}
 }
 
