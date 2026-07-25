@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -166,16 +167,17 @@ func waitToFollow(ctx context.Context, interval time.Duration) bool {
 }
 
 type followMetrics struct {
-	entries       []activity.Entry
-	latest        time.Time
-	operation     string
-	turns         int
-	tokens        int64
-	tokensKnown   bool
-	usageMissing  bool
-	subagents     map[string]followSubagent
-	subagentOrder []string
-	sequence      int
+	entries             []activity.Entry
+	latest              time.Time
+	operation           string
+	turns               int
+	tokens              int64
+	tokensKnown         bool
+	usageMissing        bool
+	subagents           map[string]followSubagent
+	subagentOrder       []string
+	pendingSubagentFeed map[string]activity.Entry
+	sequence            int
 }
 
 type followSubagent struct {
@@ -185,10 +187,15 @@ type followSubagent struct {
 }
 
 func (m *followMetrics) apply(entry activity.Entry) {
-	if !entry.SuppressFeed {
-		m.entries = append(m.entries, entry)
-		if len(m.entries) > 20 {
-			m.entries = append([]activity.Entry(nil), m.entries[len(m.entries)-20:]...)
+	if entry.SuppressFeed && entry.Subagent != nil {
+		if m.pendingSubagentFeed == nil {
+			m.pendingSubagentFeed = make(map[string]activity.Entry)
+		}
+		m.pendingSubagentFeed[entry.Subagent.ID] = entry
+	} else {
+		m.appendFeedEntry(entry)
+		if entry.Subagent != nil {
+			delete(m.pendingSubagentFeed, entry.Subagent.ID)
 		}
 	}
 	if !entry.ObservedAt.IsZero() && entry.ObservedAt.After(m.latest) {
@@ -199,7 +206,7 @@ func (m *followMetrics) apply(entry activity.Entry) {
 	}
 	m.turns += entry.TurnDelta
 	if entry.ResponseCompleted {
-		if !entry.TokensKnown {
+		if !entry.TokensKnown || entry.TokenDelta < 0 || entry.TokenDelta > math.MaxInt64-m.tokens {
 			m.usageMissing = true
 			m.tokensKnown = false
 		} else {
@@ -217,6 +224,17 @@ func (m *followMetrics) apply(entry activity.Entry) {
 		m.sequence++
 		m.subagents[entry.Subagent.ID] = followSubagent{snapshot: *entry.Subagent, latest: entry.ObservedAt, sequence: m.sequence}
 	}
+}
+
+func (m *followMetrics) appendFeedEntry(entry activity.Entry) {
+	m.entries = append(m.entries, entry)
+	if len(m.entries) > 20 {
+		m.entries = append([]activity.Entry(nil), m.entries[len(m.entries)-20:]...)
+	}
+}
+
+func (m *followMetrics) clearPendingSubagentFeed() {
+	m.pendingSubagentFeed = nil
 }
 
 type completeRecordReader struct {
@@ -407,10 +425,32 @@ func printNewActivity(output io.Writer, metrics *followMetrics, source *normaliz
 		}
 		showSubagentSummary = showSubagentSummary || entry.Subagent != nil
 	}
-	if showSubagentSummary {
+	flushed, err := flushPendingSubagentActivity(output, metrics, source.now())
+	if err != nil {
+		return err
+	}
+	if showSubagentSummary || flushed {
 		return printActiveSubagentSummary(output, *metrics)
 	}
 	return nil
+}
+
+func flushPendingSubagentActivity(output io.Writer, metrics *followMetrics, now time.Time) (bool, error) {
+	flushed := false
+	for _, id := range metrics.subagentOrder {
+		entry, pending := metrics.pendingSubagentFeed[id]
+		if !pending || entry.ObservedAt.IsZero() || now.Sub(entry.ObservedAt) < time.Second {
+			continue
+		}
+		if err := printActivityEntry(output, entry); err != nil {
+			return false, err
+		}
+		entry.SuppressFeed = false
+		metrics.appendFeedEntry(entry)
+		delete(metrics.pendingSubagentFeed, id)
+		flushed = true
+	}
+	return flushed, nil
 }
 
 func printActiveSubagentSummary(output io.Writer, metrics followMetrics) error {
@@ -445,6 +485,7 @@ func followNormalized(
 	if err := printInitialActivity(output, metrics.entries); err != nil {
 		return err
 	}
+	metrics.clearPendingSubagentFeed()
 	if scheduler.IsTerminal(selected.Status) && !selected.WorkerLogOpen {
 		return nil
 	}
@@ -476,6 +517,12 @@ func followNormalized(
 						return err
 					}
 				}
+				if len(metrics.subagents) > 0 {
+					if err := printActiveSubagentSummary(output, metrics); err != nil {
+						return err
+					}
+				}
+				metrics.clearPendingSubagentFeed()
 			}
 		}
 		if selected.Status != lastStatus {
@@ -537,11 +584,7 @@ func printFollowSummary(output io.Writer, run scheduler.Run, metrics followMetri
 	observedTokens := "n/a"
 	if len(metrics.subagents) == 0 && metrics.tokensKnown {
 		observedTokens = fmt.Sprintf("%d", metrics.tokens)
-	} else if metrics.tokensKnown && subagentTokens != "n/a" {
-		var approximate int64
-		for _, subagent := range metrics.subagents {
-			approximate += *subagent.snapshot.ApproxTokens
-		}
+	} else if approximate, known := metrics.totalSubagentTokens(); metrics.tokensKnown && known && approximate <= math.MaxInt64-metrics.tokens {
 		observedTokens = fmt.Sprintf("~%d", metrics.tokens+approximate)
 	}
 	if _, err := fmt.Fprintf(output, "Run: %s\nIssue: %s\nState: %s\nElapsed: %s\nActivity age: %s\nCurrent Worker operation: %s\nCompleted Worker turns: %d\nCompleted Worker tokens: %s\nSubagents: %d (%d active)\nDeepest current operation: %s\nApproximate Subagent turns: %s\nApproximate Subagent tool uses: %s\nApproximate Subagent tokens: %s\nObserved tokens: %s\n",
@@ -590,27 +633,42 @@ func (m followMetrics) subagentTotals() (string, string, string) {
 }
 
 func totalIntIfKnown(subagents map[string]followSubagent, field func(activity.SubagentSnapshot) *int) string {
-	total := 0
+	var total int64
 	for _, subagent := range subagents {
 		value := field(subagent.snapshot)
-		if value == nil {
+		if value == nil || *value < 0 || int64(*value) > math.MaxInt64-total {
 			return "n/a"
 		}
-		total += *value
+		total += int64(*value)
 	}
 	return fmt.Sprintf("~%d", total)
 }
 
 func totalInt64IfKnown(subagents map[string]followSubagent, field func(activity.SubagentSnapshot) *int64) string {
+	total, known := totalInt64(subagents, field)
+	if !known {
+		return "n/a"
+	}
+	return fmt.Sprintf("~%d", total)
+}
+
+func totalInt64(subagents map[string]followSubagent, field func(activity.SubagentSnapshot) *int64) (int64, bool) {
 	var total int64
 	for _, subagent := range subagents {
 		value := field(subagent.snapshot)
-		if value == nil {
-			return "n/a"
+		if value == nil || *value < 0 || *value > math.MaxInt64-total {
+			return 0, false
 		}
 		total += *value
 	}
-	return fmt.Sprintf("~%d", total)
+	return total, true
+}
+
+func (m followMetrics) totalSubagentTokens() (int64, bool) {
+	if len(m.subagents) == 0 {
+		return 0, false
+	}
+	return totalInt64(m.subagents, func(snapshot activity.SubagentSnapshot) *int64 { return snapshot.ApproxTokens })
 }
 
 func approximateInt(value *int) string {
@@ -628,12 +686,16 @@ func approximateInt64(value *int64) string {
 }
 
 func displaySubagentDuration(milliseconds *int64, active bool, observedAt, now time.Time) string {
-	if milliseconds == nil {
+	if milliseconds == nil || *milliseconds < 0 || *milliseconds > math.MaxInt64/int64(time.Millisecond) {
 		return "n/a"
 	}
 	duration := time.Duration(*milliseconds) * time.Millisecond
 	if active && !observedAt.IsZero() && now.After(observedAt) {
-		duration += now.Sub(observedAt)
+		elapsed := now.Sub(observedAt)
+		if elapsed > time.Duration(math.MaxInt64)-duration {
+			return "n/a"
+		}
+		duration += elapsed
 	}
 	return duration.String()
 }

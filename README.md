@@ -121,7 +121,7 @@ Follow one exact Run through normalized Worker and Subagent Activity without acq
 backlog follow <run-id>
 ```
 
-Follow immediately prints the Run and issue identity, state, elapsed time, Activity age, current Worker operation, exact Worker turns and tokens, and separate approximate Subagent turns, tool uses, durations, and tokens. Each Subagent is tracked independently, and the summary shows the active count and deepest current operation. The compact observed-token total is prefixed with `~` whenever Subagent estimates contribute.
+Follow immediately prints the Run and issue identity, state, elapsed time, Activity age, current Worker operation, exact Worker turns and tokens, separate Subagent status and durations, and approximate Subagent turns, tool uses, and tokens. Each Subagent is tracked independently, and the summary shows the active count and deepest current operation. The compact observed-token total is prefixed with `~` whenever Subagent estimates contribute.
 
 Follow shows at most the latest 20 semantic Run Activity entries, then streams new model, tool, turn, retry, compaction, lifecycle, and Subagent Activity. Subagent feed updates are limited to one per second per Subagent, except that status transitions and turn milestones are always retained. Every meaningful update still refreshes Activity age. Spinner frames, durations alone, and repeated snapshots are ignored as Activity. Reasoning, full Subagent prompts, tool arguments, and tool results are omitted, while safe descriptions and visible final Worker assistant text may be shown. Missing or malformed telemetry is reported as `n/a`.
 

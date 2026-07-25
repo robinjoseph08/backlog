@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -143,10 +144,69 @@ func TestProjectorTracksSubagentMeaningfulChangesAndCoalescesOnlyFeedRendering(t
 		t.Fatalf("later activity entry = %#v, semantic = %t, err = %v", entry, semantic, err)
 	}
 
+	descriptionChanged := strings.Replace(laterActivity, "Implement Follow", "Review Follow", 1)
+	entry, semantic, err = projector.Observe([]byte(descriptionChanged), started.Add(1600*time.Millisecond))
+	if err != nil || !semantic || !entry.SuppressFeed || !strings.Contains(entry.Description, "description changed") {
+		t.Fatalf("description-only entry = %#v, semantic = %t, err = %v", entry, semantic, err)
+	}
+	toolUsesChanged := strings.Replace(descriptionChanged, `"toolUses":0`, `"toolUses":4`, 1)
+	entry, semantic, err = projector.Observe([]byte(toolUsesChanged), started.Add(1700*time.Millisecond))
+	if err != nil || !semantic || !entry.SuppressFeed || !strings.Contains(entry.Description, "tool uses: 4") {
+		t.Fatalf("tool-use-only entry = %#v, semantic = %t, err = %v", entry, semantic, err)
+	}
+	tokensChanged := strings.Replace(toolUsesChanged, `"tokens":"1.0k token"`, `"tokens":"1.9k token"`, 1)
+	entry, semantic, err = projector.Observe([]byte(tokensChanged), started.Add(1800*time.Millisecond))
+	if err != nil || !semantic || !entry.SuppressFeed || !strings.Contains(entry.Description, "approximate tokens: ~1900") {
+		t.Fatalf("token-only entry = %#v, semantic = %t, err = %v", entry, semantic, err)
+	}
+
 	completion := `{"type":"tool_execution_end","toolCallId":"agent-1","toolName":"Agent","result":{"content":[{"type":"text","text":"hidden result"}],"details":{"description":"Implement Follow","status":"completed","turnCount":2,"toolUses":3,"tokens":"2.0k tokens","durationMs":2000}},"isError":false}`
 	entry, semantic, err = projector.Observe([]byte(completion), started.Add(2*time.Second))
 	if err != nil || !semantic || !entry.OperationChanged || entry.Operation != "model" {
 		t.Fatalf("completed Subagent entry = %#v, semantic = %t, err = %v", entry, semantic, err)
+	}
+}
+
+func TestProjectorIgnoresMalformedSubagentContentChurn(t *testing.T) {
+	t.Parallel()
+
+	var projector Projector
+	observedAt := time.Date(2026, 4, 5, 6, 7, 8, 0, time.UTC)
+	if _, semantic, err := projector.Observe([]byte(`{"type":"tool_execution_start","toolCallId":"agent-malformed","toolName":"Agent"}`), observedAt); err != nil || !semantic {
+		t.Fatalf("start Agent tool: semantic = %t, err = %v", semantic, err)
+	}
+	first := `{"type":"tool_execution_update","toolCallId":"agent-malformed","toolName":"Agent","partialResult":{"content":{"spinnerFrame":1},"details":{"description":"Review","status":"running","activity":"reading","turnCount":1,"toolUses":0,"tokens":"100 tokens","durationMs":0}}}`
+	if _, semantic, err := projector.Observe([]byte(first), observedAt); err != nil || !semantic {
+		t.Fatalf("initial malformed content: semantic = %t, err = %v", semantic, err)
+	}
+	second := strings.Replace(first, `"spinnerFrame":1`, `"spinnerFrame":2`, 1)
+	if entry, semantic, err := projector.Observe([]byte(second), observedAt.Add(100*time.Millisecond)); err != nil || semantic {
+		t.Fatalf("malformed content churn entry = %#v, semantic = %t, err = %v", entry, semantic, err)
+	}
+}
+
+func TestProjectorRestoresParallelAgentOperationAndMarksFailures(t *testing.T) {
+	t.Parallel()
+
+	var projector Projector
+	observedAt := time.Date(2026, 4, 5, 6, 7, 8, 0, time.UTC)
+	for _, id := range []string{"agent-one", "agent-two"} {
+		record := fmt.Sprintf(`{"type":"tool_execution_start","toolCallId":%q,"toolName":"Agent"}`, id)
+		if _, semantic, err := projector.Observe([]byte(record), observedAt); err != nil || !semantic {
+			t.Fatalf("start %s: semantic = %t, err = %v", id, semantic, err)
+		}
+	}
+	update := `{"type":"tool_execution_update","toolCallId":"agent-one","toolName":"Agent","partialResult":{"details":{"description":"Implement","status":"running","activity":"testing","turnCount":1,"toolUses":1,"tokens":"100 tokens","durationMs":100}}}`
+	if _, semantic, err := projector.Observe([]byte(update), observedAt); err != nil || !semantic {
+		t.Fatalf("update first Agent: semantic = %t, err = %v", semantic, err)
+	}
+	failure := `{"type":"tool_execution_end","toolCallId":"agent-one","toolName":"Agent","result":{"details":{}},"isError":true}`
+	entry, semantic, err := projector.Observe([]byte(failure), observedAt.Add(time.Second))
+	if err != nil || !semantic || entry.Subagent == nil || entry.Subagent.Status != "failed" || entry.Subagent.Activity != "testing" || entry.Description != `Subagent [agent-one] "n/a" failed` {
+		t.Fatalf("failed Agent entry = %#v, semantic = %t, err = %v", entry, semantic, err)
+	}
+	if !entry.OperationChanged || entry.Operation != "Agent" {
+		t.Fatalf("failed parallel Agent operation = %#v", entry)
 	}
 }
 

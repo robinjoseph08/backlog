@@ -145,7 +145,7 @@ func (p *Projector) Observe(record []byte, observedAt time.Time) (Entry, bool, e
 		id := stringField(event, "toolCallId")
 		name := p.resolveToolName(id, stringField(event, "toolName"))
 		if isAgentTool(name) {
-			return p.observeSubagent(id, event["partialResult"], observedAt, true, false)
+			return p.observeSubagent(id, event["partialResult"], observedAt, true, false, false)
 		}
 		fingerprint, meaningful := semanticFingerprint(event["partialResult"])
 		if !meaningful || p.toolFingerprints[id] == fingerprint {
@@ -159,7 +159,7 @@ func (p *Projector) Observe(record []byte, observedAt time.Time) (Entry, bool, e
 		name := p.resolveToolName(id, stringField(event, "toolName"))
 		p.finishTool(id)
 		if isAgentTool(name) {
-			return p.observeSubagent(id, event["result"], observedAt, false, true)
+			return p.observeSubagent(id, event["result"], observedAt, false, true, boolField(event, "isError"))
 		}
 		description := "Tool " + name + " completed"
 		if boolField(event, "isError") {
@@ -214,7 +214,7 @@ func isAgentTool(name string) bool {
 	return strings.EqualFold(name, "Agent")
 }
 
-func (p *Projector) observeSubagent(id string, raw json.RawMessage, observedAt time.Time, active, completed bool) (Entry, bool, error) {
+func (p *Projector) observeSubagent(id string, raw json.RawMessage, observedAt time.Time, active, completed, failed bool) (Entry, bool, error) {
 	if id == "" {
 		id = "unknown"
 	}
@@ -228,8 +228,11 @@ func (p *Projector) observeSubagent(id string, raw json.RawMessage, observedAt t
 	}
 
 	snapshot, outputFingerprint, haveOutput := decodeSubagentSnapshot(id, raw)
-	if completed && snapshot.Description != "" && snapshot.Activity == "" {
+	if completed && snapshot.Activity == "" {
 		snapshot.Activity = state.snapshot.Activity
+	}
+	if failed {
+		snapshot.Status = "failed"
 	}
 	snapshot.Active = active
 	snapshot.Completed = completed
@@ -300,7 +303,7 @@ func decodeSubagentSnapshot(id string, raw json.RawMessage) (SubagentSnapshot, [
 			snapshot.ApproxTokens = parseApproxTokens(tokens)
 		}
 	}
-	fingerprint, haveOutput := canonicalFingerprint(result["content"])
+	fingerprint, haveOutput := visibleContentFingerprint(result["content"])
 	return snapshot, fingerprint, haveOutput
 }
 
@@ -313,6 +316,9 @@ func describeSubagentChange(current, previous SubagentSnapshot, hadPrevious, out
 	prefix := `Subagent [` + identity + `] "` + label + `"`
 	if current.Completed {
 		status := valueOrUnavailable(current.Status)
+		if status == "failed" {
+			return prefix + " failed"
+		}
 		return prefix + " completed (" + status + ")"
 	}
 	statusChanged := !hadPrevious || current.Status != previous.Status
@@ -536,6 +542,31 @@ func canonicalFingerprint(raw json.RawMessage) ([32]byte, bool) {
 		return [32]byte{}, false
 	}
 	encoded, err := json.Marshal(value)
+	if err != nil {
+		return [32]byte{}, false
+	}
+	return sha256.Sum256(encoded), true
+}
+
+func visibleContentFingerprint(raw json.RawMessage) ([32]byte, bool) {
+	var contents []json.RawMessage
+	if json.Unmarshal(raw, &contents) != nil {
+		return [32]byte{}, false
+	}
+	visible := make([]string, 0, len(contents))
+	for _, rawContent := range contents {
+		var content struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(rawContent, &content) == nil && content.Type == "text" && content.Text != "" {
+			visible = append(visible, content.Text)
+		}
+	}
+	if len(visible) == 0 {
+		return [32]byte{}, false
+	}
+	encoded, err := json.Marshal(visible)
 	if err != nil {
 		return [32]byte{}, false
 	}
