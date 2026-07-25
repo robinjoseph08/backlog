@@ -1573,8 +1573,19 @@ func request(issue int, runID, worktree, sessionDir string) Request {
 
 func fakePi(t *testing.T, body string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "pi")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\nset -eu\n"+body), 0o700); err != nil {
+	directory := t.TempDir()
+	source := filepath.Join(directory, "source")
+	path := filepath.Join(directory, "pi")
+	if err := os.WriteFile(source, []byte("#!/bin/sh\nset -eu\n"+body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A concurrent fork can briefly inherit a recently closed writable descriptor,
+	// causing Linux to reject execution with ETXTBSY. Let a child process create the
+	// executable so the parallel test process never opens its inode for writing.
+	if output, err := exec.Command("cp", source, path).CombinedOutput(); err != nil {
+		t.Fatalf("copy fake Pi executable: %v\n%s", err, output)
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	return path

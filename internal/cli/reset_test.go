@@ -1075,7 +1075,7 @@ func TestResetInspectionAcceptsRetainedIdentityAfterWorkerExit(t *testing.T) {
 	if err := worker.Start(); err != nil {
 		t.Fatal(err)
 	}
-	identity, err := resetPIDIdentity(worker.Process.Pid)
+	identity, err := pidStartIdentity(worker.Process.Pid)
 	if err != nil {
 		_ = worker.Process.Kill()
 		_ = worker.Wait()
@@ -1103,7 +1103,7 @@ func TestResetCommandRefusesLiveWorkerBeforeGitHubInspection(t *testing.T) {
 	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
 		t.Fatalf("git init: %v\n%s", err, output)
 	}
-	identity, err := resetPIDIdentity(os.Getpid())
+	identity, err := pidStartIdentity(os.Getpid())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1404,7 +1404,7 @@ func TestResetFinalizesArtifactFreeEligibleRunStatuses(t *testing.T) {
 				if err := worker.Start(); err != nil {
 					t.Fatal(err)
 				}
-				identity, err := resetPIDIdentity(worker.Process.Pid)
+				identity, err := pidStartIdentity(worker.Process.Pid)
 				if err != nil {
 					_ = worker.Process.Kill()
 					_ = worker.Wait()

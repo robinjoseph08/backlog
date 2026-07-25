@@ -627,6 +627,10 @@ while IFS= read -r ignored; do :; done
 	if err := firstFollower.Wait(); err != nil {
 		t.Fatalf("interrupted follower: %v, stderr = %q", err, firstStderr.String())
 	}
+	if !strings.Contains(firstStderr.String(), "Runner supervision: SUPERVISED\n") ||
+		!strings.Contains(firstStderr.String(), "Worker liveness: alive (PID") {
+		t.Fatalf("compiled Runner was not reported as supervising its live Worker: %q", firstStderr.String())
+	}
 	stillActive, err := (state.FileStore{Path: statePath}).Load()
 	if err != nil || len(stillActive.Runs) != 1 || stillActive.Runs[0].Status != scheduler.StatusRunning || stillActive.Runs[0].PID != workerPID {
 		t.Fatalf("Ctrl-C changed the active Run or Worker: state = %#v, err = %v", stillActive, err)
@@ -636,9 +640,9 @@ while IFS= read -r ignored; do :; done
 	}
 
 	secondFollower := exec.Command(binary, "follow", run.RunID, "--raw", "--repo-dir", repository, "--state-dir", stateDir)
-	var secondOutput bytes.Buffer
+	var secondOutput, secondDiagnostics bytes.Buffer
 	secondFollower.Stdout = &secondOutput
-	secondFollower.Stderr = &secondOutput
+	secondFollower.Stderr = &secondDiagnostics
 	if err := secondFollower.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -647,6 +651,9 @@ while IFS= read -r ignored; do :; done
 	}
 	if err := runnerCommand.Wait(); err != nil {
 		t.Fatalf("runner completion: %v\n%s", err, runnerOutput.String())
+	}
+	if supervised, err := runnerSupervised(filepath.Join(repository, ".git")); err != nil || supervised {
+		t.Fatalf("Runner supervision after compiled Runner exit = %t, %v", supervised, err)
 	}
 	if strings.Contains(runnerOutput.String(), "Drain:") || strings.Contains(runnerOutput.String(), "Suspension:") {
 		t.Fatalf("follower Ctrl-C affected Runner lifecycle:\n%s", runnerOutput.String())
@@ -669,6 +676,9 @@ while IFS= read -r ignored; do :; done
 	}, "\n")
 	if got := secondOutput.String(); got != want {
 		t.Fatalf("followed JSONL = %q, want %q", got, want)
+	}
+	if !strings.Contains(secondDiagnostics.String(), "Run: "+run.RunID+"\n") {
+		t.Fatalf("follower did not report resolved Run ID: %q", secondDiagnostics.String())
 	}
 }
 

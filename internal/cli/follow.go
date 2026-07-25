@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,17 +20,29 @@ import (
 	"github.com/robinjoseph08/backlog/internal/state"
 )
 
-const followPollInterval = 50 * time.Millisecond
+const (
+	followPollInterval        = 50 * time.Millisecond
+	followObservationInterval = time.Second
+)
 
 type followStateSource interface {
 	Preview() (state.State, bool, error)
+}
+
+type repositoryFollowSource struct {
+	followStateSource
+	commonDirectory string
+}
+
+func (s repositoryFollowSource) RunnerSupervised() (bool, error) {
+	return runnerSupervised(s.commonDirectory)
 }
 
 func followCommand(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("follow", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "Usage: backlog follow <run-id> [--raw] [flags]")
+		fmt.Fprintln(stderr, "Usage: backlog follow <run-id|positive-issue-number> [--raw] [flags]")
 		flags.PrintDefaults()
 	}
 	repoDir := flags.String("repo-dir", ".", "Git repository associated with the Run")
@@ -41,7 +54,7 @@ func followCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 			return flags.Parse([]string{arg})
 		}
 	}
-	runID, flagArgs, err := splitFollowArguments(args)
+	selector, flagArgs, err := splitFollowArguments(args)
 	if err != nil {
 		return err
 	}
@@ -51,20 +64,59 @@ func followCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected follow arguments: %s", strings.Join(flags.Args(), " "))
 	}
-	resolved, _, err := resolveStateFromFlags(ctx, *repoDir, *stateDir, *gitExecutable)
+	resolved, commonDirectory, err := resolveStateFromFlags(ctx, *repoDir, *stateDir, *gitExecutable)
 	if err != nil {
 		return err
 	}
-	source := state.FileStore{Path: filepath.Join(resolved, "state.json")}
+	source := repositoryFollowSource{
+		followStateSource: state.FileStore{Path: filepath.Join(resolved, "state.json")},
+		commonDirectory:   commonDirectory,
+	}
+	runID, err := resolveFollowSelector(source, selector)
+	if err != nil {
+		return err
+	}
 	if *raw {
-		return followRaw(ctx, source, runID, stdout, followPollInterval)
+		selected, err := loadFollowRun(source, runID)
+		if err != nil {
+			return err
+		}
+		lastObservation := observeFollowRun(source, selected)
+		if _, err := fmt.Fprintf(stderr, "Run: %s\nRunner supervision: %s\nWorker liveness: %s\n", runID, lastObservation.supervision, lastObservation.workerLiveness); err != nil {
+			return err
+		}
+		nextObservation := time.Now().Add(followObservationInterval)
+		lastStatus := selected.Status
+		return followRawObserved(ctx, source, runID, stdout, followPollInterval, func(run scheduler.Run) error {
+			observedAt := time.Now()
+			statusChanged := run.Status != lastStatus
+			observationDue := followObservationDue(run.Status, statusChanged, observedAt, nextObservation)
+			lastStatus = run.Status
+			if !observationDue {
+				return nil
+			}
+			nextObservation = observedAt.Add(followObservationInterval)
+			observation := observeFollowRun(source, run)
+			if observation.supervision != lastObservation.supervision {
+				if _, err := fmt.Fprintln(stderr, "Runner supervision changed to "+observation.supervision); err != nil {
+					return err
+				}
+			}
+			if observation.workerLiveness != lastObservation.workerLiveness {
+				if _, err := fmt.Fprintln(stderr, "Worker liveness changed to "+observation.workerLiveness); err != nil {
+					return err
+				}
+			}
+			lastObservation = observation
+			return nil
+		})
 	}
 	return followNormalized(ctx, source, runID, stdout, stderr, followPollInterval, time.Now)
 }
 
 func splitFollowArguments(args []string) (string, []string, error) {
 	if len(args) == 0 {
-		return "", nil, errors.New("usage: backlog follow <run-id> [--raw] [flags]")
+		return "", nil, errors.New("usage: backlog follow <run-id|positive-issue-number> [--raw] [flags]")
 	}
 	if !strings.HasPrefix(args[0], "-") {
 		return args[0], args[1:], nil
@@ -76,7 +128,7 @@ func splitFollowArguments(args []string) (string, []string, error) {
 			return value, remaining, nil
 		}
 	}
-	return "", nil, errors.New("follow requires a Run ID")
+	return "", nil, errors.New("follow requires a Run ID or positive issue number")
 }
 
 func followFlagTakesValue(name string) bool {
@@ -88,6 +140,10 @@ func followFlagTakesValue(name string) bool {
 }
 
 func followRaw(ctx context.Context, source followStateSource, runID string, output io.Writer, pollInterval time.Duration) error {
+	return followRawObserved(ctx, source, runID, output, pollInterval, nil)
+}
+
+func followRawObserved(ctx context.Context, source followStateSource, runID string, output io.Writer, pollInterval time.Duration, observe func(scheduler.Run) error) error {
 	selected, err := loadFollowRun(source, runID)
 	if err != nil {
 		return err
@@ -102,6 +158,11 @@ func followRaw(ctx context.Context, source followStateSource, runID string, outp
 		selected, err = loadFollowRun(source, runID)
 		if err != nil {
 			return err
+		}
+		if observe != nil {
+			if err := observe(selected); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -124,6 +185,11 @@ func followRaw(ctx context.Context, source followStateSource, runID string, outp
 		if err != nil {
 			return err
 		}
+		if observe != nil {
+			if err := observe(selected); err != nil {
+				return err
+			}
+		}
 		if selected.LogPath != logPath {
 			return fmt.Errorf("Run %q Worker log changed from %q to %q", runID, logPath, selected.LogPath)
 		}
@@ -142,6 +208,41 @@ func followRaw(ctx context.Context, source followStateSource, runID string, outp
 	}
 }
 
+func resolveFollowSelector(source followStateSource, selector string) (string, error) {
+	current, _, err := source.Preview()
+	if err != nil {
+		return "", fmt.Errorf("resolve Follow selector %q: read runner state: %w", selector, err)
+	}
+	for _, run := range current.Runs {
+		if run.RunID == selector {
+			return run.RunID, nil
+		}
+	}
+	issue, err := strconv.Atoi(selector)
+	if err != nil || issue <= 0 {
+		return "", fmt.Errorf("Run %q was not found", selector)
+	}
+	for _, lease := range current.Leases {
+		if lease.Issue == issue {
+			return lease.RunID, nil
+		}
+	}
+	var latest *scheduler.Run
+	for index := range current.Runs {
+		run := &current.Runs[index]
+		if run.Issue != issue {
+			continue
+		}
+		if latest == nil || run.StartedAt.After(latest.StartedAt) || run.StartedAt.Equal(latest.StartedAt) && run.RunID > latest.RunID {
+			latest = run
+		}
+	}
+	if latest == nil {
+		return "", fmt.Errorf("issue #%d has no Run to Follow", issue)
+	}
+	return latest.RunID, nil
+}
+
 func loadFollowRun(source followStateSource, runID string) (scheduler.Run, error) {
 	current, _, err := source.Preview()
 	if err != nil {
@@ -153,6 +254,77 @@ func loadFollowRun(source followStateSource, runID string) (scheduler.Run, error
 		}
 	}
 	return scheduler.Run{}, fmt.Errorf("Run %q was not found", runID)
+}
+
+type followObservation struct {
+	supervision    string
+	workerLiveness string
+}
+
+type followSupervisionSource interface {
+	RunnerSupervised() (bool, error)
+}
+
+func observeFollowRun(source followStateSource, run scheduler.Run) followObservation {
+	observation := followObservation{workerLiveness: followWorkerLiveness(run)}
+	if scheduler.IsTerminal(run.Status) {
+		observation.supervision = "n/a (terminal Run)"
+		return observation
+	}
+	if run.Status == scheduler.StatusResetting {
+		observation.supervision = "UNSUPERVISED"
+		return observation
+	}
+	supervised := false
+	var err error
+	if observer, ok := source.(followSupervisionSource); ok {
+		supervised, err = observer.RunnerSupervised()
+	}
+	switch {
+	case err != nil:
+		observation.supervision = "UNSUPERVISED (Runner identity could not be verified)"
+	case supervised:
+		observation.supervision = "SUPERVISED"
+	default:
+		observation.supervision = "UNSUPERVISED"
+	}
+	return observation
+}
+
+func followWorkerLiveness(run scheduler.Run) string {
+	pid := run.PID
+	if pid <= 0 {
+		if run.ProcessIdentity == "" {
+			return "absent"
+		}
+		var err error
+		pid, err = processIdentityPID(run.ProcessIdentity)
+		if err != nil {
+			return "unknown (persisted process-start identity has no valid PID)"
+		}
+	}
+	if run.ProcessIdentity == "" {
+		return fmt.Sprintf("unknown (PID %d has no persisted process-start identity)", pid)
+	}
+	alive, err := signalZero(pid)
+	if err != nil {
+		return "unknown (PID liveness could not be verified)"
+	}
+	if !alive {
+		return fmt.Sprintf("dead (recorded PID %d is absent)", pid)
+	}
+	identity, err := pidStartIdentity(pid)
+	if err != nil {
+		return fmt.Sprintf("unknown (PID %d process-start identity could not be verified)", pid)
+	}
+	if identity != run.ProcessIdentity {
+		return fmt.Sprintf("dead (stale PID %d has a different process-start identity)", pid)
+	}
+	return fmt.Sprintf("alive (PID %d and process-start identity verified)", pid)
+}
+
+func followObservationDue(status scheduler.Status, statusChanged bool, now, nextObservation time.Time) bool {
+	return scheduler.IsTerminal(status) && statusChanged || !now.Before(nextObservation)
 }
 
 func waitToFollow(ctx context.Context, interval time.Duration) bool {
@@ -479,7 +651,9 @@ func followNormalized(
 	if activitySource != nil {
 		consumeActivity(&metrics, activitySource)
 	}
-	if err := printFollowSummary(output, selected, metrics, now()); err != nil {
+	lastObservation := observeFollowRun(source, selected)
+	nextObservation := now().Add(followObservationInterval)
+	if err := printFollowSummary(output, selected, metrics, lastObservation, now()); err != nil {
 		return err
 	}
 	if err := printInitialActivity(output, metrics.entries); err != nil {
@@ -525,7 +699,8 @@ func followNormalized(
 				metrics.clearPendingSubagentFeed()
 			}
 		}
-		if selected.Status != lastStatus {
+		statusChanged := selected.Status != lastStatus
+		if statusChanged {
 			entry := activity.Entry{
 				Version: activity.CurrentVersion, ObservedAt: now().UTC(), Kind: "lifecycle",
 				Description: "Run state changed to " + string(selected.Status),
@@ -534,6 +709,22 @@ func followNormalized(
 				return err
 			}
 			lastStatus = selected.Status
+		}
+		observationNow := now()
+		if followObservationDue(selected.Status, statusChanged, observationNow, nextObservation) {
+			observation := observeFollowRun(source, selected)
+			if observation.supervision != lastObservation.supervision {
+				if err := printActivityEntry(output, activity.Entry{ObservedAt: observationNow.UTC(), Description: "Runner supervision changed to " + observation.supervision}); err != nil {
+					return err
+				}
+			}
+			if observation.workerLiveness != lastObservation.workerLiveness {
+				if err := printActivityEntry(output, activity.Entry{ObservedAt: observationNow.UTC(), Description: "Worker liveness changed to " + observation.workerLiveness}); err != nil {
+					return err
+				}
+			}
+			lastObservation = observation
+			nextObservation = observationNow.Add(followObservationInterval)
 		}
 		if scheduler.IsTerminal(selected.Status) && !selected.WorkerLogOpen {
 			if activitySource != nil {
@@ -544,7 +735,7 @@ func followNormalized(
 			if _, err := fmt.Fprintln(output, "\nTerminal Run summary:"); err != nil {
 				return err
 			}
-			return printFollowSummary(output, selected, metrics, now())
+			return printFollowSummary(output, selected, metrics, lastObservation, now())
 		}
 		if !waitToFollow(ctx, pollInterval) {
 			return nil
@@ -552,7 +743,7 @@ func followNormalized(
 	}
 }
 
-func printFollowSummary(output io.Writer, run scheduler.Run, metrics followMetrics, now time.Time) error {
+func printFollowSummary(output io.Writer, run scheduler.Run, metrics followMetrics, observation followObservation, now time.Time) error {
 	issue := fmt.Sprintf("#%d", run.Issue)
 	if run.IssueTitle != "" {
 		issue += "  " + run.IssueTitle
@@ -587,8 +778,8 @@ func printFollowSummary(output io.Writer, run scheduler.Run, metrics followMetri
 	} else if approximate, known := metrics.totalSubagentTokens(); metrics.tokensKnown && known && approximate <= math.MaxInt64-metrics.tokens {
 		observedTokens = fmt.Sprintf("~%d", metrics.tokens+approximate)
 	}
-	if _, err := fmt.Fprintf(output, "Run: %s\nIssue: %s\nState: %s\nElapsed: %s\nActivity age: %s\nCurrent Worker operation: %s\nCompleted Worker turns: %d\nCompleted Worker tokens: %s\nSubagents: %d (%d active)\nDeepest current operation: %s\nApproximate Subagent turns: %s\nApproximate Subagent tool uses: %s\nApproximate Subagent tokens: %s\nObserved tokens: %s\n",
-		run.RunID, issue, run.Status, elapsed, age, operation, metrics.turns, workerTokens, len(metrics.subagents), activeSubagents,
+	if _, err := fmt.Fprintf(output, "Run: %s\nIssue: %s\nState: %s\nRunner supervision: %s\nWorker liveness: %s\nElapsed: %s\nActivity age: %s\nCurrent Worker operation: %s\nCompleted Worker turns: %d\nCompleted Worker tokens: %s\nSubagents: %d (%d active)\nDeepest current operation: %s\nApproximate Subagent turns: %s\nApproximate Subagent tool uses: %s\nApproximate Subagent tokens: %s\nObserved tokens: %s\n",
+		run.RunID, issue, run.Status, observation.supervision, observation.workerLiveness, elapsed, age, operation, metrics.turns, workerTokens, len(metrics.subagents), activeSubagents,
 		deepest, subagentTurns, subagentToolUses, subagentTokens, observedTokens); err != nil {
 		return err
 	}
