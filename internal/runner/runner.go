@@ -303,6 +303,14 @@ func (r *Runner) Run(ctx context.Context) error {
 				for _, candidate := range plan.Starts {
 					process, startedDraining, err := r.startWhileObservingSignals(workerCtx, operationCtx, admission, &current, candidate, signalEvents, len(localWorkers))
 					draining = startedDraining || draining
+					if err != nil && operationCtx.Err() != nil && r.suspensionExit.Load() != 0 {
+						persisted, reloadErr := r.Store.Load()
+						if reloadErr != nil {
+							return errors.Join(err, fmt.Errorf("reload state after interrupted Worker launch: %w", reloadErr))
+						}
+						current = persisted
+						break
+					}
 					if err != nil {
 						shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after a worker launch error; worktree retained")
 						return errors.Join(err, shutdownErr)
@@ -357,22 +365,19 @@ func (r *Runner) Run(ctx context.Context) error {
 			closedBeforeReconciliation := false
 			var closed worker.Result
 			var workerControlErr error
-			var workerCommandErr error
 			if !completion.result.Settled {
 				if completion.result.StreamErr == nil {
 					completion.result.StreamErr = errors.New("Pi RPC worker ended without agent_settled")
 					completion.result.Err = errors.Join(completion.result.Err, completion.result.StreamErr)
 				}
 				if err := process.Abort(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-					workerCommandErr = errors.Join(workerCommandErr, fmt.Errorf("stop invalid Pi RPC worker: %w", err))
-					completion.result.Err = errors.Join(completion.result.Err, workerCommandErr)
+					workerControlErr = errors.Join(workerControlErr, fmt.Errorf("stop invalid Pi RPC worker: %w", err))
+					completion.result.Err = errors.Join(completion.result.Err, workerControlErr)
 				}
 				closed = process.Close()
-				if closed.Err != nil && !errors.Is(closed.Err, context.Canceled) {
-					workerCommandErr = errors.Join(workerCommandErr, fmt.Errorf("close invalid Pi RPC worker: %w", closed.Err))
-				}
+				workerControlErr = errors.Join(workerControlErr, closed.ControlErr)
 				if !closed.GroupExited {
-					workerControlErr = errors.Join(workerCommandErr, fmt.Errorf("invalid Pi RPC Worker process-group exit was not verified for issue #%d", completion.issue))
+					workerControlErr = errors.Join(workerControlErr, fmt.Errorf("invalid Pi RPC Worker process-group exit was not verified for issue #%d", completion.issue))
 				}
 				closedBeforeReconciliation = true
 				completion.result.ExitCode = closed.ExitCode
@@ -489,9 +494,9 @@ func (r *Runner) Run(ctx context.Context) error {
 				}
 			}
 			if !closedBeforeReconciliation && draining {
-				var settledControlErr error
+				settledControlErr := closed.ControlErr
 				if !closed.GroupExited && r.suspensionExit.Load() == 0 {
-					settledControlErr = errors.Join(closed.Err, fmt.Errorf("settled Worker process-group exit was not verified for issue #%d", completion.issue))
+					settledControlErr = errors.Join(settledControlErr, fmt.Errorf("settled Worker process-group exit was not verified for issue #%d", completion.issue))
 					settledControlErr = errors.Join(settledControlErr, r.retainUnverifiedWorker(&current, completedRun, settledControlErr.Error(), closed))
 				}
 				if settledControlErr != nil {

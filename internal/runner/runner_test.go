@@ -1050,6 +1050,38 @@ func TestRunnerDrainRemainsSuccessfulWhenCompletionRequiresAttention(t *testing.
 	}
 }
 
+func TestRunnerDrainReportsProcessControlFailureAfterVerifiedExit(t *testing.T) {
+	const issue = 32
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: issue, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	workers.abortClosesProcessGroup = true
+	workers.abortErr = errors.New("abort unavailable")
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	signals := make(chan os.Signal, 1)
+	output := newSynchronizedOutput()
+	runner := testRunner(github, workers, store, 1)
+	runner.Signals = signals
+	runner.Output = output
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, issue)
+	signals <- os.Interrupt
+	output.waitFor(t, "Drain: admission stopped; 1 Worker remaining")
+	streamErr := errors.New("malformed Pi RPC JSON")
+	workers.complete(issue, worker.Result{ExitCode: -1, StreamErr: streamErr, Err: streamErr})
+
+	err := <-done
+	if err == nil || !strings.Contains(err.Error(), "abort unavailable") {
+		t.Fatalf("Drain error = %v, want process-control failure", err)
+	}
+	got := store.LoadValue()
+	run := findRun(got.Runs, fmt.Sprintf("run-%d", issue))
+	if run.Status != scheduler.StatusFailed || run.PID != 0 || len(got.Leases) != 1 {
+		t.Fatalf("state after verified process exit = %#v", got)
+	}
+}
+
 func TestRunnerDrainFailsClosedWhenSettledWorkerExitIsUnverified(t *testing.T) {
 	const issue = 31
 	github := &fakeGitHub{
@@ -3298,8 +3330,8 @@ func TestRunnerSuspensionRequestBoundsCommittedWorkerPreparation(t *testing.T) {
 	<-prepareStarted
 	started := time.Now()
 	signals <- syscall.SIGTERM
-	if err := <-done; err == nil || !strings.Contains(err.Error(), "continuation boundary") {
-		t.Fatalf("run: %v, want failed-closed interrupted preparation", err)
+	if err := <-done; !isSignalExit(err, 143) {
+		t.Fatalf("run: %v, want failed-closed SIGTERM exit 143", err)
 	}
 	if elapsed := time.Since(started); elapsed > 120*time.Millisecond {
 		t.Fatalf("suspension request did not bound Worker preparation: %s", elapsed)
@@ -4087,6 +4119,7 @@ func (p *fakeProcess) Release() error {
 func (p *fakeProcess) Abort() error {
 	p.owner.mu.Lock()
 	p.owner.abortCount++
+	abortErr := p.owner.abortErr
 	if p.owner.abortClosesProcessGroup {
 		p.closeResult.LogClosed = true
 		p.closeResult.GroupExited = true
@@ -4096,7 +4129,7 @@ func (p *fakeProcess) Abort() error {
 	case p.done <- worker.Result{ExitCode: -1, Err: context.Canceled}:
 	default:
 	}
-	return nil
+	return abortErr
 }
 func (p *fakeProcess) Suspend(ctx context.Context, request worker.ContinuationRequest) (worker.Continuation, error) {
 	p.owner.mu.Lock()
@@ -4202,6 +4235,7 @@ type fakeWorkers struct {
 	startErr                error
 	omitLogPaths            bool
 	releaseErr              error
+	abortErr                error
 	startupCloseResult      worker.Result
 	suspendFunc             func(context.Context, int, worker.ContinuationRequest) (worker.Continuation, error)
 	startChanged            chan struct{}

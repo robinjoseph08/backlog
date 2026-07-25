@@ -1361,7 +1361,7 @@ func TestCompiledResetRefusesUnsafeRunsWithoutMutation(t *testing.T) {
 			_ = worker.Process.Kill()
 			_ = worker.Wait()
 		}()
-		identity, err := resetPIDIdentity(worker.Process.Pid)
+		identity, err := pidStartIdentity(worker.Process.Pid)
 		if err != nil {
 			t.Fatal(err)
 		}

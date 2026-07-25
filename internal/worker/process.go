@@ -62,6 +62,7 @@ type Result struct {
 	StderrPath   string
 	Settled      bool
 	StreamErr    error
+	ControlErr   error
 	cleanupErr   error
 	Err          error
 }
@@ -492,7 +493,8 @@ func (p *Process) CloseWithForceContext(ctx context.Context, authorizeKill func(
 	}
 	result := p.exitResult()
 	groupErr := waitForProcessGroupExit(p.PID(), p.processGroupGrace)
-	result.Err = errors.Join(result.Err, p.closeInputErr, gracefulErr, groupErr)
+	result.ControlErr = errors.Join(result.ControlErr, p.closeInputErr, gracefulErr, groupErr)
+	result.Err = errors.Join(result.Err, result.ControlErr)
 	result.GroupExited = groupErr == nil
 	return result
 }
@@ -514,11 +516,13 @@ func (p *Process) CloseContext(ctx context.Context, authorizeKill func() error) 
 		if err := waitForProcessGroupExitContext(ctx, p.PID()); err == nil {
 			result := p.exitResult()
 			result.GroupExited = true
-			result.Err = errors.Join(result.Err, p.closeInputErr)
+			result.ControlErr = errors.Join(result.ControlErr, p.closeInputErr)
+			result.Err = errors.Join(result.Err, result.ControlErr)
 			return result
 		} else if ctx.Err() == nil {
 			result := p.exitResult()
-			result.Err = errors.Join(result.Err, p.closeInputErr, err)
+			result.ControlErr = errors.Join(result.ControlErr, p.closeInputErr, err)
+			result.Err = errors.Join(result.Err, result.ControlErr)
 			return result
 		}
 	case <-ctx.Done():
@@ -530,7 +534,8 @@ func (p *Process) CloseContext(ctx context.Context, authorizeKill func() error) 
 func (p *Process) forceStop(authorizeKill func() error, triggerErr error) Result {
 	unauthorized := func(err error) Result {
 		result := p.exitResult()
-		result.Err = errors.Join(result.Err, p.closeInputErr, triggerErr, err)
+		result.ControlErr = errors.Join(result.ControlErr, p.closeInputErr, err)
+		result.Err = errors.Join(result.Err, triggerErr, result.ControlErr)
 		return result
 	}
 	if authorizeKill == nil {
@@ -561,14 +566,15 @@ func (p *Process) forceStop(authorizeKill func() error, triggerErr error) Result
 	result := p.exitResult()
 	result.GroupExited = true
 	result.ForceStopped = forceStopped
+	result.ControlErr = errors.Join(result.ControlErr, result.cleanupErr, p.closeInputErr)
 	if forceStopped {
 		// A SIGKILL exit and the context trigger are expected after an authorized
 		// force stop. Protocol, log cleanup, and input-close failures remain errors.
-		result.Err = errors.Join(result.StreamErr, result.cleanupErr, p.closeInputErr)
+		result.Err = errors.Join(result.StreamErr, result.ControlErr)
 	} else {
 		// The leader exited between authorization and signaling. Preserve its
 		// actual exit result instead of claiming that SIGKILL caused the exit.
-		result.Err = errors.Join(result.Err, p.closeInputErr)
+		result.Err = errors.Join(result.Err, result.ControlErr)
 	}
 	return result
 }
@@ -610,7 +616,7 @@ func (p *Process) reap() {
 	p.result = Result{
 		ExitCode: exitCode, LogClosed: true, LogPath: p.logPath, StderrPath: p.stderrPath,
 		Settled:   p.events.Settled() && streamErr == nil,
-		StreamErr: streamErr, cleanupErr: closeErr, Err: errors.Join(waitErr, streamErr, closeErr),
+		StreamErr: streamErr, ControlErr: closeErr, cleanupErr: closeErr, Err: errors.Join(waitErr, streamErr, closeErr),
 	}
 	p.resultMu.Unlock()
 	close(p.exitDone)
