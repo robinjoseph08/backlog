@@ -276,7 +276,7 @@ type resetExecutor struct {
 	commonDirectory string
 	stateDirectory  string
 	gitExecutable   string
-	syncDir         func(string) error
+	syncPath        func(string) error
 }
 
 func (e resetExecutor) inspect(ctx context.Context) (reset.Plan, error) {
@@ -604,7 +604,7 @@ func (e resetExecutor) apply(ctx context.Context, approved reset.Plan) error {
 				return err
 			}
 			session := before.Snapshot.Session
-			if err := archiveSession(session, e.stateDirectory, e.directorySync); err != nil {
+			if err := archiveSession(session, e.stateDirectory, e.filesystemSync); err != nil {
 				return err
 			}
 			after, err := e.inspect(ctx)
@@ -808,7 +808,7 @@ func deleteLocalBranch(ctx context.Context, gitExecutable, repositoryRoot string
 	return nil
 }
 
-func archiveSession(session reset.Session, stateDirectory string, syncDir func(string) error) error {
+func archiveSession(session reset.Session, stateDirectory string, syncPath func(string) error) error {
 	if !session.Present || session.Archived || session.Dir == "" || session.ArchiveDir == "" {
 		return errors.New("Pi session is not ready for atomic archival")
 	}
@@ -833,11 +833,34 @@ func archiveSession(session reset.Session, stateDirectory string, syncDir func(s
 	if err := os.Rename(session.Dir, session.ArchiveDir); err != nil {
 		return fmt.Errorf("atomically archive Pi session %s: %w", session.ID, err)
 	}
-	return syncArchivedSession(session, stateDirectory, syncDir)
+	return syncArchivedSession(session, stateDirectory, syncPath)
 }
 
-func syncArchivedSession(session reset.Session, stateDirectory string, syncDir func(string) error) error {
-	paths := []struct {
+func syncArchivedSession(session reset.Session, stateDirectory string, syncPath func(string) error) error {
+	archivePaths := make([]string, 0)
+	if err := filepath.WalkDir(session.ArchiveDir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() && !info.Mode().IsRegular() {
+			return fmt.Errorf("historical Pi session archive path %s is not a regular file or directory", path)
+		}
+		archivePaths = append(archivePaths, path)
+		return nil
+	}); err != nil {
+		return fmt.Errorf("inspect historical Pi session archive for durability: %w", err)
+	}
+	for index := len(archivePaths) - 1; index >= 0; index-- {
+		if err := syncPath(archivePaths[index]); err != nil {
+			return fmt.Errorf("sync historical Pi session archive payload %s: %w", archivePaths[index], err)
+		}
+	}
+
+	parents := []struct {
 		description string
 		path        string
 	}{
@@ -846,37 +869,37 @@ func syncArchivedSession(session reset.Session, stateDirectory string, syncDir f
 		{description: "state directory", path: stateDirectory},
 		{description: "active Pi session directory after archival", path: filepath.Dir(session.Dir)},
 	}
-	seen := make(map[string]bool, len(paths))
-	for _, directory := range paths {
+	seen := make(map[string]bool, len(parents))
+	for _, directory := range parents {
 		cleaned := filepath.Clean(directory.path)
 		if seen[cleaned] {
 			continue
 		}
 		seen[cleaned] = true
-		if err := syncDir(cleaned); err != nil {
+		if err := syncPath(cleaned); err != nil {
 			return fmt.Errorf("sync %s: %w", directory.description, err)
 		}
 	}
 	return nil
 }
 
-func (e resetExecutor) directorySync(path string) error {
-	if e.syncDir != nil {
-		return e.syncDir(path)
+func (e resetExecutor) filesystemSync(path string) error {
+	if e.syncPath != nil {
+		return e.syncPath(path)
 	}
-	return syncDirectory(path)
+	return syncFilesystemPath(path)
 }
 
-func syncDirectory(path string) error {
-	directory, err := os.Open(path)
+func syncFilesystemPath(path string) error {
+	file, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	if err := directory.Sync(); err != nil {
-		directory.Close()
+	if err := file.Sync(); err != nil {
+		file.Close()
 		return err
 	}
-	return directory.Close()
+	return file.Close()
 }
 
 func normalizedLabelSet(labels []string) map[string]bool {
@@ -970,7 +993,7 @@ func (e resetExecutor) finalize(ctx context.Context, verified reset.Plan) error 
 		return err
 	}
 	if verified.Snapshot.Session.Archived {
-		if err := syncArchivedSession(verified.Snapshot.Session, e.stateDirectory, e.directorySync); err != nil {
+		if err := syncArchivedSession(verified.Snapshot.Session, e.stateDirectory, e.filesystemSync); err != nil {
 			return fmt.Errorf("verify durable Pi session archive: %w", err)
 		}
 	}

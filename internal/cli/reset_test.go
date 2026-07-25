@@ -554,15 +554,23 @@ func TestArchiveSessionUsesAtomicRename(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := reset.Session{ID: "backlog-run-atomic", Dir: sessionDir, ArchiveDir: archiveDir, Present: true}
-	if err := archiveSession(session, stateDir, syncDirectory); err != nil {
+	synced := make(map[string]bool)
+	if err := archiveSession(session, stateDir, func(path string) error {
+		synced[filepath.Clean(path)] = true
+		return syncFilesystemPath(path)
+	}); err != nil {
 		t.Fatal(err)
 	}
-	after, err := os.Stat(filepath.Join(archiveDir, "session.jsonl"))
+	archiveFile := filepath.Join(archiveDir, "session.jsonl")
+	after, err := os.Stat(archiveFile)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !os.SameFile(before, after) {
 		t.Fatal("session archival replaced the session file instead of atomically renaming it")
+	}
+	if !synced[archiveFile] || !synced[archiveDir] {
+		t.Fatalf("archive payload syncs = %#v, want file and archive directory", synced)
 	}
 	if _, err := os.Stat(sessionFile); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("active session survived archival: %v", err)
@@ -579,12 +587,12 @@ func TestResetRerunsAfterSessionArchiveSyncFailure(t *testing.T) {
 	executor := resetExecutor{
 		store: fixture.store, github: ghadapter.Client{Executable: fixture.github, Dir: fixture.repository}, issue: 42,
 		repositoryRoot: fixture.repository, commonDirectory: commonDirectory, stateDirectory: fixture.stateDir, gitExecutable: fixture.git,
-		syncDir: func(path string) error {
+		syncPath: func(path string) error {
 			syncCalls++
 			if syncCalls == 1 {
 				return errors.New("injected directory sync failure")
 			}
-			return syncDirectory(path)
+			return syncFilesystemPath(path)
 		},
 	}
 	approved, err := executor.inspect(context.Background())
@@ -608,7 +616,7 @@ func TestResetRerunsAfterSessionArchiveSyncFailure(t *testing.T) {
 		t.Fatalf("sync failure released ownership: %#v", current)
 	}
 
-	executor.syncDir = nil
+	executor.syncPath = nil
 	approved, err = executor.inspect(context.Background())
 	if err != nil {
 		t.Fatal(err)
