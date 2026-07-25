@@ -94,7 +94,7 @@ Backlog submits `/skill:afk 123` as a correlated RPC `prompt` command. Standard 
 
 `agent_settled` is the normal completion trigger. An unexpected process exit triggers fail-closed reconciliation instead. While the idle Pi RPC process is still alive, the runner looks up the pull request by the Run's unique branch, verifies the issue state, and persists the reconciled Run. It then closes RPC input, escalates if orderly shutdown exceeds its grace period, confirms process-group exit, and releases Worker capacity. An armed open pull request becomes `waiting-for-merge`; other unverified outcomes require human attention.
 
-Only verified merged runs have their worktrees and local branches removed. Failed and ambiguous runs are retained.
+Normal completion cleanup removes worktrees and local branches only for verified merged Runs. Incomplete Runs retain them until an explicit Reset retires them.
 
 ## State and recovery
 
@@ -154,7 +154,7 @@ The first `SIGINT` enters Drain. Backlog atomically stops admitting new Leases, 
 
 A second `SIGINT`, or the first `SIGTERM`, starts bounded suspension directly. All Owned Workers share one 60-second wall-clock deadline. For each unfinished Run, Backlog requires a correlated successful RPC `abort` response and `agent_settled`, proves streaming, compaction, retry, tool, and message queues are idle, compares the exact RPC session and complete entry tree with the synced session file, and persists the continuation marker while RPC is still open. GitHub Completion and armed auto-merge outcomes take precedence. After verified process-group exit, one atomic state write records `suspended` and clears the PID. The Lease, branch, worktree, and Pi session remain in place.
 
-A third `SIGINT` bypasses the remaining deadline. Third-signal and timeout escalation use the same force-stop path, which reloads the current Run and rechecks Worker liveness, PID, and process-start identity immediately before signaling the process group. A mismatched or unverifiable process is not signaled and its Run becomes `needs-human` with its Lease retained. Verified merged, waiting-for-merge, and suspended outcomes are preserved. A force-stopped Run is classified as suspended only when its continuation marker was already durable; otherwise it becomes `needs-human`. Signal shutdown exits 130 when initiated by `SIGINT` and 143 when initiated by `SIGTERM`, including force escalation.
+A third `SIGINT` bypasses the remaining deadline. Third-signal and timeout escalation use the same force-stop path, which reloads the current Run and rechecks Worker liveness, PID, and process-start identity immediately before signaling the process group. A mismatched or unverifiable process is not signaled and its Run becomes `needs-human` with its Lease retained. Verified merged, waiting-for-merge, and suspended outcomes are preserved. A force-stopped Run is classified as suspended only when its continuation marker was already durable; otherwise it becomes `needs-human`. A completed first-`SIGINT` Drain exits successfully. Suspension initiated by a second `SIGINT`, including later force escalation, exits 130. Suspension initiated by `SIGTERM`, including force escalation, exits 143.
 
 Non-signal context cancellation retains the immediate failure shutdown behavior. Persisted live Workers discovered from an earlier runner are not killed because the new process does not own them.
 
@@ -163,8 +163,8 @@ Non-signal context cancellation retains the immediate failure shutdown behavior.
 - `0`: command succeeded, a dry-run completed, or interactive Reset was declined
 - `1`: an ownership or safety check refused the command, or an operational command failed
 - `2`: the top-level command was missing or unknown
-- `130`: signal shutdown was initiated by `SIGINT`
-- `143`: signal shutdown was initiated by `SIGTERM`
+- `130`: `backlog run` suspension was initiated by a second `SIGINT`
+- `143`: `backlog run` suspension was initiated by `SIGTERM`
 
 Flag parsing failures currently use status `1`. `retry` has the same status as the equivalent `reset` invocation and additionally prints its deprecation warning.
 

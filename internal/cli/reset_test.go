@@ -537,6 +537,134 @@ exec `+quote(fixture.git)+` "$@"
 	}
 }
 
+func TestArchiveSessionUsesAtomicRename(t *testing.T) {
+	t.Parallel()
+	stateDir := t.TempDir()
+	sessionDir := filepath.Join(stateDir, "sessions", "run-atomic")
+	archiveDir := filepath.Join(stateDir, "history", "sessions", "run-atomic")
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sessionFile := filepath.Join(sessionDir, "session.jsonl")
+	if err := os.WriteFile(sessionFile, []byte("session\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(sessionFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := reset.Session{ID: "backlog-run-atomic", Dir: sessionDir, ArchiveDir: archiveDir, Present: true}
+	if err := archiveSession(session, stateDir, syncDirectory); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(filepath.Join(archiveDir, "session.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("session archival replaced the session file instead of atomically renaming it")
+	}
+	if _, err := os.Stat(sessionFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("active session survived archival: %v", err)
+	}
+}
+
+func TestResetRerunsAfterSessionArchiveSyncFailure(t *testing.T) {
+	fixture := newLocalArtifactResetFixture(t, false)
+	commonDirectory, err := gitCommonDirectory(context.Background(), fixture.git, fixture.repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncCalls := 0
+	executor := resetExecutor{
+		store: fixture.store, github: ghadapter.Client{Executable: fixture.github, Dir: fixture.repository}, issue: 42,
+		repositoryRoot: fixture.repository, commonDirectory: commonDirectory, stateDirectory: fixture.stateDir, gitExecutable: fixture.git,
+		syncDir: func(path string) error {
+			syncCalls++
+			if syncCalls == 1 {
+				return errors.New("injected directory sync failure")
+			}
+			return syncDirectory(path)
+		},
+	}
+	approved, err := executor.inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.apply(context.Background(), approved); err == nil || !strings.Contains(err.Error(), "injected directory sync failure") {
+		t.Fatalf("archive sync error = %v", err)
+	}
+	if _, err := os.Stat(fixture.sessionDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("active session remains after rename: %v", err)
+	}
+	if info, err := os.Stat(fixture.archiveDir); err != nil || !info.IsDir() {
+		t.Fatalf("archive missing after sync failure: %v", err)
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusResetting || len(current.Leases) != 1 {
+		t.Fatalf("sync failure released ownership: %#v", current)
+	}
+
+	executor.syncDir = nil
+	approved, err = executor.inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.apply(context.Background(), approved); err != nil {
+		t.Fatalf("rerun after archive sync failure: %v", err)
+	}
+	current, err = fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusReset || len(current.Leases) != 0 {
+		t.Fatalf("rerun final state = %#v", current)
+	}
+}
+
+func TestResetRevalidatesWorktreeImmediatelyBeforeRemoval(t *testing.T) {
+	fixture := newLocalArtifactResetFixture(t, false)
+	countPath := filepath.Join(t.TempDir(), "worktree-inspections")
+	git := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  *" worktree list --porcelain -z")
+    count=0; if [ -f `+quote(countPath)+` ]; then count=$(cat `+quote(countPath)+`); fi
+    count=$((count + 1)); printf '%s' "$count" > `+quote(countPath)+`
+    if [ "$count" -eq 5 ]; then `+quote(fixture.git)+` -C `+quote(fixture.worktree)+` checkout -b foreign >/dev/null 2>&1; fi ;;
+esac
+exec `+quote(fixture.git)+` "$@"
+`)
+	commonDirectory, err := gitCommonDirectory(context.Background(), git, fixture.repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := resetExecutor{
+		store: fixture.store, github: ghadapter.Client{Executable: fixture.github, Dir: fixture.repository}, issue: 42,
+		repositoryRoot: fixture.repository, commonDirectory: commonDirectory, stateDirectory: fixture.stateDir, gitExecutable: git,
+	}
+	approved, err := executor.inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.apply(context.Background(), approved); err == nil || !strings.Contains(err.Error(), "unknown branch or commit identity") {
+		t.Fatalf("immediate worktree revalidation error = %v", err)
+	}
+	if _, err := os.Stat(fixture.worktree); err != nil {
+		t.Fatalf("reassigned worktree was removed: %v", err)
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusResetting || len(current.Leases) != 1 {
+		t.Fatalf("revalidation failure released ownership: %#v", current)
+	}
+}
+
 func TestResetStopsForChangedReassignedAndUnknownLocalStateWithLeaseRetained(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -709,19 +837,63 @@ func TestResetInspectionDistinguishesAbsentFromUnknownResources(t *testing.T) {
 }
 
 func TestResetRefusesSymlinkedManagedArtifactParents(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		link      string
+		configure func(scheduler.Run, string) scheduler.Run
+	}{
+		{
+			name: "worktrees", link: "worktrees",
+			configure: func(run scheduler.Run, stateDir string) scheduler.Run {
+				run.WorkerMode = scheduler.WorkerModePrint
+				run.Branch = "agent/issue-42-run-links"
+				run.Worktree = filepath.Join(stateDir, "worktrees", "issue-42-run-links")
+				return run
+			},
+		},
+		{
+			name: "active sessions", link: "sessions",
+			configure: func(run scheduler.Run, stateDir string) scheduler.Run {
+				run.WorkerMode = scheduler.WorkerModeRPC
+				run.SessionID = "backlog-run-links"
+				run.SessionDir = filepath.Join(stateDir, "sessions", "run-links")
+				return run
+			},
+		},
+		{
+			name: "historical sessions", link: "history",
+			configure: func(run scheduler.Run, stateDir string) scheduler.Run {
+				run.WorkerMode = scheduler.WorkerModeRPC
+				run.SessionID = "backlog-run-links"
+				run.SessionDir = filepath.Join(stateDir, "sessions", "run-links")
+				return run
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			stateDir := t.TempDir()
+			repository := t.TempDir()
+			run := test.configure(scheduler.Run{Issue: 42, RunID: "run-links"}, stateDir)
+			if err := os.Symlink(t.TempDir(), filepath.Join(stateDir, test.link)); err != nil {
+				t.Fatal(err)
+			}
+			if err := validateOwnedPaths(run, stateDir, repository, "main"); err == nil || !strings.Contains(err.Error(), "is a symlink") {
+				t.Fatalf("symlinked %s ownership error = %v", test.name, err)
+			}
+		})
+	}
+}
+
+func TestResetRefusesRunIDsThatEscapeManagedPaths(t *testing.T) {
 	t.Parallel()
 	stateDir := t.TempDir()
-	repository := t.TempDir()
 	run := scheduler.Run{
-		Issue: 42, RunID: "run-links", WorkerMode: scheduler.WorkerModeRPC,
-		SessionID: "backlog-run-links", SessionDir: filepath.Join(stateDir, "sessions", "run-links"),
+		Issue: 42, RunID: "../logs", WorkerMode: scheduler.WorkerModeRPC,
+		SessionID: "backlog-../logs", SessionDir: filepath.Join(stateDir, "sessions", "../logs"),
 	}
-	outside := t.TempDir()
-	if err := os.Symlink(outside, filepath.Join(stateDir, "history")); err != nil {
-		t.Fatal(err)
-	}
-	if err := validateOwnedPaths(run, stateDir, repository, "main"); err == nil || !strings.Contains(err.Error(), "is a symlink") {
-		t.Fatalf("symlinked archive ownership error = %v", err)
+	if err := validateOwnedPaths(run, stateDir, t.TempDir(), "main"); err == nil || !strings.Contains(err.Error(), "safe managed path component") {
+		t.Fatalf("unsafe Run id error = %v", err)
 	}
 }
 
@@ -850,6 +1022,26 @@ func TestInspectSessionRefusesMismatchedIdentityAndMissingContinuation(t *testin
 	}
 }
 
+func TestInspectSessionRefusesMismatchedHistoricalArchive(t *testing.T) {
+	t.Parallel()
+	stateDir := t.TempDir()
+	worktree := filepath.Join(stateDir, "worktrees", "run-4")
+	archiveDir := filepath.Join(stateDir, "history", "sessions", "run-4")
+	if err := os.MkdirAll(archiveDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(archiveDir, "session.jsonl"), []byte(`{"type":"session","id":"other","cwd":"`+worktree+`"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run := scheduler.Run{
+		RunID: "run-4", WorkerMode: scheduler.WorkerModeRPC, Worktree: worktree,
+		SessionID: "backlog-run-4", SessionDir: filepath.Join(stateDir, "sessions", "run-4"),
+	}
+	if _, err := inspectSession(run, stateDir); err == nil || !strings.Contains(err.Error(), "identity does not match") {
+		t.Fatalf("mismatched historical archive error = %v", err)
+	}
+}
+
 func TestResetDryRunRefusesLiveWorker(t *testing.T) {
 	t.Parallel()
 
@@ -971,6 +1163,7 @@ type artifactFreeResetFixture struct {
 	repository  string
 	stateDir    string
 	logPath     string
+	stderrPath  string
 	store       state.FileStore
 	githubState string
 	git         string
@@ -986,10 +1179,14 @@ func newArtifactFreeResetFixture(t *testing.T, labels []string) artifactFreeRese
 	}
 	stateDir := filepath.Join(root, "state")
 	logPath := filepath.Join(stateDir, "logs", "run-42.jsonl")
+	stderrPath := filepath.Join(stateDir, "logs", "run-42.stderr.log")
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(logPath, []byte("preserved Worker log\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stderrPath, []byte("preserved Worker diagnostics\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
@@ -997,7 +1194,7 @@ func newArtifactFreeResetFixture(t *testing.T, labels []string) artifactFreeRese
 		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
 		Runs: []scheduler.Run{{
 			Issue: 42, RunID: "run-42", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint,
-			LogPath: logPath, Error: "preserved diagnostic",
+			LogPath: logPath, StderrPath: stderrPath, Error: "preserved diagnostic",
 		}},
 		Leases: []scheduler.Lease{{LeaseID: "lease-42", Issue: 42, RunID: "run-42"}},
 	}); err != nil {
@@ -1031,7 +1228,7 @@ case "$*" in
 esac
 `)
 	return artifactFreeResetFixture{
-		repository: repository, stateDir: stateDir, logPath: logPath, store: store, githubState: githubState,
+		repository: repository, stateDir: stateDir, logPath: logPath, stderrPath: stderrPath, store: store, githubState: githubState,
 		git: githubGit(t), gh: gh,
 	}
 }
@@ -1262,25 +1459,97 @@ func TestResetFinalizationPersistsRunAndLeaseTogether(t *testing.T) {
 	}
 }
 
-func TestResetFinalizationRequiresDurableRecordedLogs(t *testing.T) {
+func TestResetFinalizationRejectsHistoricalMetadataChanges(t *testing.T) {
 	t.Parallel()
-	fixture := newArtifactFreeResetFixture(t, []string{"ready-for-agent", "spec"})
-	if err := os.Remove(fixture.logPath); err != nil {
-		t.Fatal(err)
+	verifiedAt := time.Now().UTC()
+	expected := scheduler.Run{
+		Issue: 42, RunID: "run-metadata", Status: scheduler.StatusResetting, WorkerMode: scheduler.WorkerModeRPC,
+		PID: 123, ProcessIdentity: "123:start", Branch: "agent/issue-42-run-metadata", Worktree: "/worktree",
+		SessionID: "backlog-run-metadata", SessionDir: "/sessions/run-metadata",
+		Continuation: &scheduler.ContinuationBoundary{SessionID: "backlog-run-metadata", SessionFile: "/sessions/run-metadata/session.jsonl", Worktree: "/worktree", LeafID: "leaf", EntryCount: 1, SHA256: strings.Repeat("a", 64), VerifiedAt: verifiedAt},
 	}
-	var stdout, stderr bytes.Buffer
-	if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit != 1 {
-		t.Fatalf("exit = %d, want 1; stderr = %q", exit, stderr.String())
+	for _, test := range []struct {
+		name   string
+		mutate func(*scheduler.Run)
+	}{
+		{name: "branch", mutate: func(run *scheduler.Run) { run.Branch = "other" }},
+		{name: "process identity", mutate: func(run *scheduler.Run) { run.ProcessIdentity = "123:other" }},
+		{name: "session directory", mutate: func(run *scheduler.Run) { run.SessionDir = "/other" }},
+		{name: "continuation", mutate: func(run *scheduler.Run) { run.Continuation.SHA256 = strings.Repeat("b", 64) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			actual := expected
+			boundary := *expected.Continuation
+			actual.Continuation = &boundary
+			actual.Status = scheduler.StatusReset
+			now := verifiedAt.Add(time.Minute)
+			actual.UpdatedAt = now
+			actual.CompletedAt = &now
+			test.mutate(&actual)
+			if err := verifyResetFinalState(state.State{Runs: []scheduler.Run{actual}}, expected); err == nil || !strings.Contains(err.Error(), "historical metadata") {
+				t.Fatalf("metadata mismatch error = %v", err)
+			}
+		})
 	}
-	if !strings.Contains(stderr.String(), "verify durable Worker JSONL log") {
-		t.Fatalf("stderr = %q", stderr.String())
-	}
-	current, err := fixture.store.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if current.Runs[0].Status == scheduler.StatusReset || len(current.Leases) != 1 {
-		t.Fatalf("missing log released ownership: %#v", current)
+}
+
+func TestResetFinalizationRequiresDurableRecordedLogs(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		stderr      bool
+		replacement string
+	}{
+		{name: "missing JSONL", replacement: "missing"},
+		{name: "symlinked JSONL", replacement: "symlink"},
+		{name: "directory JSONL", replacement: "directory"},
+		{name: "missing stderr", stderr: true, replacement: "missing"},
+		{name: "symlinked stderr", stderr: true, replacement: "symlink"},
+		{name: "directory stderr", stderr: true, replacement: "directory"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newArtifactFreeResetFixture(t, []string{"ready-for-agent", "spec"})
+			path := fixture.logPath
+			want := "Worker JSONL log"
+			if test.stderr {
+				path = fixture.stderrPath
+				want = "Worker standard-error log"
+			}
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			switch test.replacement {
+			case "missing":
+			case "symlink":
+				target := filepath.Join(t.TempDir(), "target")
+				if err := os.WriteFile(target, []byte("replacement\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+			case "directory":
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				t.Fatalf("unknown replacement %q", test.replacement)
+			}
+			var stdout, stderr bytes.Buffer
+			if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit != 1 {
+				t.Fatalf("exit = %d, want 1; stderr = %q", exit, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), want) {
+				t.Fatalf("stderr = %q", stderr.String())
+			}
+			current, err := fixture.store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if current.Runs[0].Status == scheduler.StatusReset || len(current.Leases) != 1 {
+				t.Fatalf("invalid log released ownership: %#v", current)
+			}
+		})
 	}
 }
 

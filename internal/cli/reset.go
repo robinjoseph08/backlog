@@ -276,6 +276,7 @@ type resetExecutor struct {
 	commonDirectory string
 	stateDirectory  string
 	gitExecutable   string
+	syncDir         func(string) error
 }
 
 func (e resetExecutor) inspect(ctx context.Context) (reset.Plan, error) {
@@ -603,7 +604,7 @@ func (e resetExecutor) apply(ctx context.Context, approved reset.Plan) error {
 				return err
 			}
 			session := before.Snapshot.Session
-			if err := archiveSession(session); err != nil {
+			if err := archiveSession(session, e.stateDirectory, e.directorySync); err != nil {
 				return err
 			}
 			after, err := e.inspect(ctx)
@@ -679,7 +680,7 @@ func (e resetExecutor) revalidatePlan(ctx context.Context, current, approved res
 
 func verifyGitHubIdentityContinuity(expected, actual reset.Snapshot) error {
 	if expected.Run.RunID != actual.Run.RunID || expected.Lease != actual.Lease {
-		return fmt.Errorf("Run or Lease identity changed while resetting GitHub artifacts")
+		return fmt.Errorf("Run or Lease identity changed while resetting Run artifacts")
 	}
 	expectedPulls := make(map[int]reset.PullRequest, len(expected.PullRequests))
 	for _, pull := range expected.PullRequests {
@@ -807,12 +808,11 @@ func deleteLocalBranch(ctx context.Context, gitExecutable, repositoryRoot string
 	return nil
 }
 
-func archiveSession(session reset.Session) error {
+func archiveSession(session reset.Session, stateDirectory string, syncDir func(string) error) error {
 	if !session.Present || session.Archived || session.Dir == "" || session.ArchiveDir == "" {
 		return errors.New("Pi session is not ready for atomic archival")
 	}
 	archiveParent := filepath.Dir(session.ArchiveDir)
-	stateDirectory := filepath.Dir(filepath.Dir(filepath.Dir(session.ArchiveDir)))
 	if err := rejectSymlinkedManagedParents(stateDirectory, session.Dir); err != nil {
 		return fmt.Errorf("active Pi session ownership changed before archival: %w", err)
 	}
@@ -833,13 +833,38 @@ func archiveSession(session reset.Session) error {
 	if err := os.Rename(session.Dir, session.ArchiveDir); err != nil {
 		return fmt.Errorf("atomically archive Pi session %s: %w", session.ID, err)
 	}
-	if err := syncDirectory(filepath.Dir(session.Dir)); err != nil {
-		return fmt.Errorf("sync active Pi session directory after archival: %w", err)
+	return syncArchivedSession(session, stateDirectory, syncDir)
+}
+
+func syncArchivedSession(session reset.Session, stateDirectory string, syncDir func(string) error) error {
+	paths := []struct {
+		description string
+		path        string
+	}{
+		{description: "historical Pi session archive", path: filepath.Dir(session.ArchiveDir)},
+		{description: "historical Pi session parent", path: filepath.Dir(filepath.Dir(session.ArchiveDir))},
+		{description: "state directory", path: stateDirectory},
+		{description: "active Pi session directory after archival", path: filepath.Dir(session.Dir)},
 	}
-	if err := syncDirectory(archiveParent); err != nil {
-		return fmt.Errorf("sync historical Pi session archive: %w", err)
+	seen := make(map[string]bool, len(paths))
+	for _, directory := range paths {
+		cleaned := filepath.Clean(directory.path)
+		if seen[cleaned] {
+			continue
+		}
+		seen[cleaned] = true
+		if err := syncDir(cleaned); err != nil {
+			return fmt.Errorf("sync %s: %w", directory.description, err)
+		}
 	}
 	return nil
+}
+
+func (e resetExecutor) directorySync(path string) error {
+	if e.syncDir != nil {
+		return e.syncDir(path)
+	}
+	return syncDirectory(path)
 }
 
 func syncDirectory(path string) error {
@@ -943,6 +968,11 @@ func (e resetExecutor) finalize(ctx context.Context, verified reset.Plan) error 
 	}
 	if err := verifyOwnedFinalState(verified.Snapshot); err != nil {
 		return err
+	}
+	if verified.Snapshot.Session.Archived {
+		if err := syncArchivedSession(verified.Snapshot.Session, e.stateDirectory, e.directorySync); err != nil {
+			return fmt.Errorf("verify durable Pi session archive: %w", err)
+		}
 	}
 	current, _, err := e.store.Preview()
 	if err != nil {
@@ -1238,6 +1268,9 @@ func resetPIDIdentity(pid int) (string, error) {
 }
 
 func validateOwnedPaths(run scheduler.Run, stateDir, repositoryRoot, defaultBranch string) error {
+	if !isManagedPathComponent(run.RunID) {
+		return fmt.Errorf("Run ID %q is not a safe managed path component", run.RunID)
+	}
 	if (run.Branch == "") != (run.Worktree == "") {
 		return fmt.Errorf("Run %s has incomplete branch/worktree ownership", run.RunID)
 	}
@@ -1270,6 +1303,10 @@ func validateOwnedPaths(run scheduler.Run, stateDir, repositoryRoot, defaultBran
 		return fmt.Errorf("print-mode Run %s has uncertain Pi session identity", run.RunID)
 	}
 	return nil
+}
+
+func isManagedPathComponent(value string) bool {
+	return value != "" && value != "." && value != ".." && filepath.Base(value) == value
 }
 
 func rejectSymlinkedManagedParents(root, target string) error {
