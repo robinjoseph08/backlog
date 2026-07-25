@@ -536,7 +536,7 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "Usage:")
 	fmt.Fprintln(writer, "  backlog run [flags]")
 	fmt.Fprintln(writer, "  backlog status [flags]")
-	fmt.Fprintln(writer, "  backlog follow <run-id> [--raw] [flags]")
+	fmt.Fprintln(writer, "  backlog follow <run-id|positive-issue-number> [--raw] [flags]")
 	fmt.Fprintln(writer, "  backlog reset <issue-number> [--dry-run | --yes] [flags]")
 	fmt.Fprintln(writer, "  backlog retry <issue-number> [--dry-run | --yes] [flags]  (deprecated alias for reset)")
 	fmt.Fprintln(writer, "")

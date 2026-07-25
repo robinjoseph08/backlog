@@ -1233,7 +1233,7 @@ func inspectWorkerAbsent(run scheduler.Run) error {
 	if !processAlive || !groupAlive {
 		return fmt.Errorf("Worker PID/process-group liveness is uncertain for Run %s", run.RunID)
 	}
-	identity, err := resetPIDIdentity(pid)
+	identity, err := pidStartIdentity(pid)
 	if err != nil {
 		return fmt.Errorf("verify live Worker identity: %w", err)
 	}
@@ -1277,7 +1277,7 @@ func signalZero(pid int) (bool, error) {
 	}
 }
 
-func resetPIDIdentity(pid int) (string, error) {
+func pidStartIdentity(pid int) (string, error) {
 	command := exec.Command("ps", "-p", fmt.Sprint(pid), "-o", "lstart=") // #nosec G204 -- validated numeric PID
 	output, err := command.CombinedOutput()
 	if err != nil {

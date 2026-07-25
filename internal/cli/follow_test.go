@@ -317,6 +317,278 @@ func TestFollowCommandUnknownRunDoesNotChangeState(t *testing.T) {
 	}
 }
 
+func TestFollowCommandResolvesIssueToActiveLeaseAndLatestHistoricalRun(t *testing.T) {
+	t.Parallel()
+
+	repository := initializeFollowRepository(t)
+	started := time.Date(2026, 4, 5, 6, 7, 8, 0, time.UTC)
+	tests := []struct {
+		name  string
+		issue string
+		state state.State
+		want  string
+	}{
+		{
+			name:  "active Lease",
+			issue: "30",
+			state: state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{
+				{Issue: 30, RunID: "historical", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint, StartedAt: started.Add(time.Hour)},
+				{Issue: 30, RunID: "leased", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, StartedAt: started},
+			}, Leases: []scheduler.Lease{{LeaseID: "lease-30", Issue: 30, RunID: "leased"}}},
+			want: "Run: leased",
+		},
+		{
+			name:  "latest history with Run ID tie breaker",
+			issue: "31",
+			state: state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{
+				{Issue: 31, RunID: "older", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint, StartedAt: started.Add(-time.Second)},
+				{Issue: 31, RunID: "tie-a", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, StartedAt: started},
+				{Issue: 31, RunID: "tie-z", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint, StartedAt: started},
+			}},
+			want: "Run: tie-z",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(test.state); err != nil {
+				t.Fatal(err)
+			}
+			var output bytes.Buffer
+			if err := followCommand(context.Background(), []string{test.issue, "--repo-dir", repository, "--state-dir", stateDir}, &output, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			if got := output.String(); !strings.Contains(got, test.want) {
+				t.Fatalf("issue Follow output = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestFollowCommandIssueWithoutRunDoesNotChangeState(t *testing.T) {
+	t.Parallel()
+
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
+	if err := store.Save(state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{{
+		Issue: 29, RunID: "other", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	err = followCommand(context.Background(), []string{"30", "--repo-dir", repository, "--state-dir", stateDir}, &output, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "issue #30 has no Run to Follow") {
+		t.Fatalf("missing issue Run error = %v", err)
+	}
+	after, err := os.ReadFile(store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) || output.Len() != 0 {
+		t.Fatalf("missing issue Run changed state or printed output: before=%s after=%s output=%q", before, after, output.String())
+	}
+}
+
+func TestFollowCommandPrefersExactNumericRunIDOverIssueSelection(t *testing.T) {
+	t.Parallel()
+
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
+	if err := store.Save(state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{
+		{Issue: 1, RunID: "42", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint},
+		{Issue: 42, RunID: "issue-42", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := followCommand(context.Background(), []string{"42", "--repo-dir", repository, "--state-dir", stateDir}, &output, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, "Run: 42\n") || strings.Contains(got, "Run: issue-42") {
+		t.Fatalf("numeric exact Run-ID output = %q", got)
+	}
+}
+
+func TestFollowCommandIssueSelectionRemainsOnResolvedRunWhenReplacementAppears(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
+	identity, err := pidStartIdentity(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := scheduler.Run{
+		Issue: 30, RunID: "selected-once", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint,
+		PID: os.Getpid(), ProcessIdentity: identity, StartedAt: time.Now(),
+	}
+	if err := store.Save(state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{selected}, Leases: []scheduler.Lease{{
+		LeaseID: "selected-once", Issue: selected.Issue, RunID: selected.RunID,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	var output synchronizedBuffer
+	done := make(chan error, 1)
+	go func() {
+		done <- followCommand(context.Background(), []string{"30", "--repo-dir", repository, "--state-dir", stateDir}, &output, io.Discard)
+	}()
+	waitForBuffer(t, &output, "Run: selected-once")
+	selected.Status = scheduler.StatusFailed
+	replacement := scheduler.Run{
+		Issue: 30, RunID: "replacement", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint,
+		PID: os.Getpid(), ProcessIdentity: identity, StartedAt: time.Now().Add(time.Second),
+	}
+	if err := store.Save(state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{selected, replacement}, Leases: []scheduler.Lease{{
+		LeaseID: "replacement", Issue: replacement.Issue, RunID: replacement.RunID,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("issue follower did not finish selected terminal Run")
+	}
+	if got := output.String(); strings.Contains(got, "Run: replacement") || !strings.Contains(got, "Terminal Run summary:\nRun: selected-once") {
+		t.Fatalf("stable issue attachment output = %q", got)
+	}
+}
+
+func TestFollowCommandReportsVerifiedWorkerLivenessAndRunnerSupervision(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	identity, err := pidStartIdentity(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name            string
+		identity        string
+		supervise       bool
+		wantLiveness    string
+		wantSupervision string
+	}{
+		{name: "live Worker and supervised Run", identity: identity, supervise: true, wantLiveness: "alive (PID", wantSupervision: "SUPERVISED"},
+		{name: "reused PID and unsupervised Run", identity: fmt.Sprintf("%d:different start", os.Getpid()), wantLiveness: "dead (stale PID", wantSupervision: "UNSUPERVISED"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			run := scheduler.Run{
+				Issue: 30, RunID: "observed", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint,
+				PID: os.Getpid(), ProcessIdentity: test.identity, StartedAt: time.Now(),
+			}
+			if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{
+				Version: state.CurrentVersion, Runs: []scheduler.Run{run},
+				Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var lock *repositoryLock
+			if test.supervise {
+				lock, err = acquireRepositoryLock(filepath.Join(repository, ".git"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer lock.Release()
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			var output synchronizedBuffer
+			done := make(chan error, 1)
+			go func() {
+				done <- followCommand(ctx, []string{run.RunID, "--repo-dir", repository, "--state-dir", stateDir}, &output, io.Discard)
+			}()
+			waitForBuffer(t, &output, "Worker liveness:")
+			cancel()
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			got := output.String()
+			if !strings.Contains(got, "Worker liveness: "+test.wantLiveness) || !strings.Contains(got, "Runner supervision: "+test.wantSupervision) {
+				t.Fatalf("observed Follow output = %q", got)
+			}
+			if strings.Contains(strings.ToLower(got), "stalled") {
+				t.Fatalf("quiet Activity was labeled stalled: %q", got)
+			}
+		})
+	}
+}
+
+func TestFollowCommandKeepsObservingUnsupervisedRunAndReportsReturningSupervision(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	identity, err := pidStartIdentity(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := scheduler.Run{
+		Issue: 30, RunID: "supervision-returns", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint,
+		PID: os.Getpid(), ProcessIdentity: identity, StartedAt: time.Now(),
+	}
+	if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{
+		Version: state.CurrentVersion, Runs: []scheduler.Run{run},
+		Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var output synchronizedBuffer
+	done := make(chan error, 1)
+	go func() {
+		done <- followCommand(ctx, []string{run.RunID, "--repo-dir", repository, "--state-dir", stateDir}, &output, io.Discard)
+	}()
+	waitForBuffer(t, &output, "Runner supervision: UNSUPERVISED")
+	lock, err := acquireRepositoryLock(filepath.Join(repository, ".git"))
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	waitForBuffer(t, &output, "Runner supervision changed to SUPERVISED")
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFollowRawCommandPrintsResolvedIssueRunIDWithoutChangingJSONL(t *testing.T) {
+	t.Parallel()
+
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	logPath := filepath.Join(stateDir, "raw.jsonl")
+	if err := os.WriteFile(logPath, []byte("record\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{{
+		Issue: 30, RunID: "raw-by-issue", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint, LogPath: logPath,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	var output, diagnostics bytes.Buffer
+	if err := followCommand(context.Background(), []string{"30", "--raw", "--repo-dir", repository, "--state-dir", stateDir}, &output, &diagnostics); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "record\n" || !strings.Contains(diagnostics.String(), "Run: raw-by-issue\n") {
+		t.Fatalf("raw output = %q, diagnostics = %q", output.String(), diagnostics.String())
+	}
+}
+
+func initializeFollowRepository(t *testing.T) string {
+	t.Helper()
+	repository := filepath.Join(t.TempDir(), "repo")
+	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, output)
+	}
+	return repository
+}
+
 func TestFollowRawDetachesOnCancellation(t *testing.T) {
 	t.Parallel()
 
@@ -499,10 +771,47 @@ func TestFollowRawPropagatesStateAndOutputFailuresWithRunContext(t *testing.T) {
 	}
 }
 
+func TestResolveFollowSelectorReportsStateFailure(t *testing.T) {
+	t.Parallel()
+
+	_, err := resolveFollowSelector(failingFollowSource{err: errors.New("state denied")}, "30")
+	if err == nil || !strings.Contains(err.Error(), `resolve Follow selector "30": read runner state: state denied`) {
+		t.Fatalf("selector state error = %v", err)
+	}
+}
+
+func TestFollowRawCommandPropagatesResolvedIdentityOutputFailure(t *testing.T) {
+	t.Parallel()
+
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	logPath := filepath.Join(stateDir, "raw.jsonl")
+	if err := os.WriteFile(logPath, []byte("record\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{{
+		Issue: 30, RunID: "raw-output-failure", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint, LogPath: logPath,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := followCommand(context.Background(), []string{"30", "--raw", "--repo-dir", repository, "--state-dir", stateDir}, io.Discard, failingWriter{}); err == nil || !strings.Contains(err.Error(), "output denied") {
+		t.Fatalf("raw identity output error = %v", err)
+	}
+}
+
+func TestRepositoryFollowSourceReportsUnavailableCoordinationDirectory(t *testing.T) {
+	t.Parallel()
+
+	source := repositoryFollowSource{commonDirectory: filepath.Join(t.TempDir(), "missing")}
+	if _, err := source.RunnerSupervised(); err == nil || !strings.Contains(err.Error(), "open repository coordination directory") {
+		t.Fatalf("coordination observation error = %v", err)
+	}
+}
+
 func TestFollowRequiresRunID(t *testing.T) {
 	t.Parallel()
 
-	if _, _, err := splitFollowArguments(nil); err == nil || !strings.Contains(err.Error(), "backlog follow <run-id> [--raw]") {
+	if _, _, err := splitFollowArguments(nil); err == nil || !strings.Contains(err.Error(), "backlog follow <run-id|positive-issue-number> [--raw]") {
 		t.Fatalf("missing-Run error = %v", err)
 	}
 }
@@ -821,6 +1130,9 @@ func TestFollowNormalizedLimitsInitialProjectionToLatestTwentyAndReportsAge(t *t
 	if !strings.Contains(got, "Activity age: 5s") || !strings.Contains(got, "Completed Worker turns: 25") || !strings.Contains(got, "Completed Worker tokens: n/a") {
 		t.Fatalf("projection summary is incomplete:\n%s", got)
 	}
+	if strings.Contains(strings.ToLower(got), "stalled") {
+		t.Fatalf("quiet Activity age was labeled stalled:\n%s", got)
+	}
 }
 
 func TestFollowSummaryStopsElapsedAtTerminalUpdateWithoutCompletionTime(t *testing.T) {
@@ -834,7 +1146,7 @@ func TestFollowSummaryStopsElapsedAtTerminalUpdateWithoutCompletionTime(t *testi
 			t.Parallel()
 			run := scheduler.Run{Issue: 28, RunID: "terminal-elapsed", Status: status, StartedAt: startedAt, UpdatedAt: updatedAt}
 			var output bytes.Buffer
-			if err := printFollowSummary(&output, run, followMetrics{}, updatedAt.Add(24*time.Hour)); err != nil {
+			if err := printFollowSummary(&output, run, followMetrics{}, followObservation{}, updatedAt.Add(24*time.Hour)); err != nil {
 				t.Fatal(err)
 			}
 			if got := output.String(); !strings.Contains(got, "Elapsed: 1h0m0s") {

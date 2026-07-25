@@ -115,13 +115,16 @@ backlog status
 backlog status --json
 ```
 
-Follow one exact Run through normalized Worker and Subagent Activity without acquiring scheduling ownership or communicating with its Runner or Worker:
+Follow one Run through normalized Worker and Subagent Activity without acquiring scheduling ownership or communicating with its Runner or Worker:
 
 ```sh
 backlog follow <run-id>
+backlog follow <positive-issue-number>
 ```
 
-Follow immediately prints the Run and issue identity, state, elapsed time, Activity age, current Worker operation, exact Worker turns and tokens, separate Subagent status and durations, and approximate Subagent turns, tool uses, and tokens. Each Subagent is tracked independently, and the summary shows the active count and deepest current operation. The compact observed-token total is prefixed with `~` whenever Subagent estimates contribute.
+An exact Run ID is selected as-is, including a numeric Run ID. Otherwise, a positive issue number resolves once to the Run referenced by its active Lease, or to its latest historical Run by start time and Run ID. Follow never switches to a replacement Run.
+
+Follow immediately prints the resolved Run ID and issue identity, durable state, local Runner supervision, verified Worker liveness, elapsed time, Activity age, current Worker operation, exact Worker turns and tokens, separate Subagent status and durations, and approximate Subagent turns, tool uses, and tokens. Worker liveness is `alive` only when both the PID exists and its process-start identity matches persisted state. A nonterminal Run without detected local Runner coordination is prominently `UNSUPERVISED`; Follow keeps observing it until it becomes terminal or the operator detaches. Quiet Activity remains described by age and is never automatically called stalled. Each Subagent is tracked independently, and the summary shows the active count and deepest current operation. The compact observed-token total is prefixed with `~` whenever Subagent estimates contribute.
 
 Follow shows at most the latest 20 semantic Run Activity entries, then streams new model, tool, turn, retry, compaction, lifecycle, and Subagent Activity. Subagent feed updates are limited to one per second per Subagent, except that status transitions and turn milestones are always retained. Every meaningful update still refreshes Activity age. Spinner frames, durations alone, and repeated snapshots are ignored as Activity. Reasoning, full Subagent prompts, tool arguments, and tool results are omitted, while safe descriptions and visible final Worker assistant text may be shown. Missing or malformed telemetry is reported as `n/a`.
 
@@ -130,10 +133,10 @@ Backlog records normalized Activity and its local observation time in an append-
 Use `--raw` to follow the verbatim Worker JSONL instead:
 
 ```sh
-backlog follow <run-id> --raw
+backlog follow <run-id|positive-issue-number> --raw
 ```
 
-Both modes retain an unterminated final record until its newline arrives and stream newly completed records in order. Follow exits after a terminal Run reaches `merged`, `failed`, `needs-human`, or `reset`, the Runner records the Worker log as closed, and all complete records are emitted. Historical terminal Runs without a log-open marker are treated as already closed. Ctrl-C only detaches the follower. A missing Run or unavailable Worker log is reported for the requested Run without changing runner state.
+Both modes retain an unterminated final record until its newline arrives and stream newly completed records in order. Raw mode writes the resolved Run ID and observation summary to standard error so standard output remains verbatim JSONL. Follow exits after a terminal Run reaches `merged`, `failed`, `needs-human`, or `reset`, the Runner records the Worker log as closed, and all complete records are emitted. Historical terminal Runs without a log-open marker are treated as already closed. Ctrl-C only detaches the follower. A missing Run, an issue without Run history, or an unavailable Worker log is reported for the requested selection without changing runner state.
 
 Inspect the exact actions required to Reset an incomplete Run:
 

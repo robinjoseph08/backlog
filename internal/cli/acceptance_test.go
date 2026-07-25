@@ -636,9 +636,9 @@ while IFS= read -r ignored; do :; done
 	}
 
 	secondFollower := exec.Command(binary, "follow", run.RunID, "--raw", "--repo-dir", repository, "--state-dir", stateDir)
-	var secondOutput bytes.Buffer
+	var secondOutput, secondDiagnostics bytes.Buffer
 	secondFollower.Stdout = &secondOutput
-	secondFollower.Stderr = &secondOutput
+	secondFollower.Stderr = &secondDiagnostics
 	if err := secondFollower.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -669,6 +669,9 @@ while IFS= read -r ignored; do :; done
 	}, "\n")
 	if got := secondOutput.String(); got != want {
 		t.Fatalf("followed JSONL = %q, want %q", got, want)
+	}
+	if !strings.Contains(secondDiagnostics.String(), "Run: "+run.RunID+"\n") {
+		t.Fatalf("follower did not report resolved Run ID: %q", secondDiagnostics.String())
 	}
 }
 
