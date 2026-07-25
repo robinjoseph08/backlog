@@ -781,7 +781,8 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 	transitionStatus(&run, scheduler.StatusRunning)
 	run.PID = process.PID()
 	run.ProcessIdentity = identity
-	run.UpdatedAt = r.Now().UTC()
+	run.WorkerStartedAt = r.Now().UTC()
+	run.UpdatedAt = run.WorkerStartedAt
 	replaceRun(current, run)
 	if err := r.Store.Save(*current); err != nil {
 		failureErr := r.failAfterWorkerStart(current, candidate.Number, process, fmt.Sprintf("persist worker identity before release: %v", err))
@@ -883,7 +884,7 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 	run.ResumePending = false
 	run.PID = process.PID()
 	run.ProcessIdentity = identity
-	run.StartedAt = now
+	run.WorkerStartedAt = now
 	run.UpdatedAt = now
 	run.Error = ""
 	replaceRun(current, run)
@@ -1152,7 +1153,11 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 					changed = true
 					continue
 				}
-				if r.Now().Sub(run.StartedAt) > r.Config.MaxWorkerAge {
+				workerStartedAt := run.WorkerStartedAt
+				if workerStartedAt.IsZero() {
+					workerStartedAt = run.StartedAt
+				}
+				if r.Now().Sub(workerStartedAt) > r.Config.MaxWorkerAge {
 					r.needsHumanWithLiveWorker(current, run.Issue, "recorded worker exceeded the maximum age; verify process identity before Reset")
 					changed = true
 					continue

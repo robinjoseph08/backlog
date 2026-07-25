@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/robinjoseph08/backlog/internal/activity"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 )
@@ -26,7 +28,7 @@ func followCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 	flags := flag.NewFlagSet("follow", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "Usage: backlog follow <run-id> --raw [flags]")
+		fmt.Fprintln(stderr, "Usage: backlog follow <run-id> [--raw] [flags]")
 		flags.PrintDefaults()
 	}
 	repoDir := flags.String("repo-dir", ".", "Git repository associated with the Run")
@@ -48,20 +50,20 @@ func followCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected follow arguments: %s", strings.Join(flags.Args(), " "))
 	}
-	if !*raw {
-		return errors.New("follow currently requires --raw")
-	}
 	resolved, _, err := resolveStateFromFlags(ctx, *repoDir, *stateDir, *gitExecutable)
 	if err != nil {
 		return err
 	}
 	source := state.FileStore{Path: filepath.Join(resolved, "state.json")}
-	return followRaw(ctx, source, runID, stdout, followPollInterval)
+	if *raw {
+		return followRaw(ctx, source, runID, stdout, followPollInterval)
+	}
+	return followNormalized(ctx, source, runID, stdout, stderr, followPollInterval, time.Now)
 }
 
 func splitFollowArguments(args []string) (string, []string, error) {
 	if len(args) == 0 {
-		return "", nil, errors.New("usage: backlog follow <run-id> --raw [flags]")
+		return "", nil, errors.New("usage: backlog follow <run-id> [--raw] [flags]")
 	}
 	if !strings.HasPrefix(args[0], "-") {
 		return args[0], args[1:], nil
@@ -161,6 +163,377 @@ func waitToFollow(ctx context.Context, interval time.Duration) bool {
 	case <-ctx.Done():
 		return false
 	}
+}
+
+type followMetrics struct {
+	entries      []activity.Entry
+	latest       time.Time
+	operation    string
+	turns        int
+	tokens       int64
+	tokensKnown  bool
+	usageMissing bool
+}
+
+func (m *followMetrics) apply(entry activity.Entry) {
+	m.entries = append(m.entries, entry)
+	if len(m.entries) > 20 {
+		m.entries = append([]activity.Entry(nil), m.entries[len(m.entries)-20:]...)
+	}
+	if !entry.ObservedAt.IsZero() && entry.ObservedAt.After(m.latest) {
+		m.latest = entry.ObservedAt
+	}
+	if entry.OperationChanged {
+		m.operation = entry.Operation
+	}
+	m.turns += entry.TurnDelta
+	if entry.ResponseCompleted {
+		if !entry.TokensKnown {
+			m.usageMissing = true
+			m.tokensKnown = false
+			return
+		}
+		m.tokens += entry.TokenDelta
+		m.tokensKnown = !m.usageMissing
+	}
+}
+
+type completeRecordReader struct {
+	path    string
+	offset  int64
+	pending []byte
+}
+
+func (r *completeRecordReader) read() ([][]byte, error) {
+	file, err := os.Open(r.path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() < r.offset {
+		return nil, errors.New("Activity source was truncated while being followed")
+	}
+	if _, err := file.Seek(r.offset, io.SeekStart); err != nil {
+		return nil, err
+	}
+	appended, err := io.ReadAll(file)
+	if err != nil {
+		return nil, err
+	}
+	r.offset += int64(len(appended))
+	r.pending = append(r.pending, appended...)
+	lastNewline := bytes.LastIndexByte(r.pending, '\n')
+	if lastNewline < 0 {
+		return nil, nil
+	}
+	complete := r.pending[:lastNewline]
+	r.pending = append([]byte(nil), r.pending[lastNewline+1:]...)
+	if len(complete) == 0 {
+		return nil, nil
+	}
+	lines := bytes.Split(complete, []byte{'\n'})
+	for index := range lines {
+		lines[index] = bytes.TrimSuffix(lines[index], []byte{'\r'})
+	}
+	return lines, nil
+}
+
+type normalizedActivitySource struct {
+	reader         completeRecordReader
+	rawPath        string
+	projectionPath string
+	projected      bool
+	projector      activity.Projector
+	now            func() time.Time
+	stderr         io.Writer
+	initial        bool
+	semanticRead   int
+}
+
+func openNormalizedActivitySource(run scheduler.Run, stderr io.Writer, now func() time.Time) (*normalizedActivitySource, error) {
+	if run.LogPath == "" {
+		return nil, nil
+	}
+	projectionPath := activity.PathForLog(run.LogPath)
+	projectionUsable := true
+	if diagnostic, err := os.ReadFile(activity.UnavailablePath(projectionPath)); err == nil {
+		projectionUsable = false
+		fmt.Fprintf(stderr, "Follow diagnostic for Run %q: Activity projection unavailable: %s", run.RunID, diagnostic)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		projectionUsable = false
+		fmt.Fprintf(stderr, "Follow diagnostic for Run %q: Activity projection diagnostic unavailable: %v\n", run.RunID, err)
+	}
+	if projectionUsable {
+		if _, err := os.Stat(projectionPath); err == nil {
+			return &normalizedActivitySource{
+				reader: completeRecordReader{path: projectionPath}, rawPath: run.LogPath, projectionPath: projectionPath,
+				projected: true, now: now, stderr: stderr, initial: true,
+			}, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(stderr, "Follow diagnostic for Run %q: Activity projection unavailable: %v\n", run.RunID, err)
+		}
+	}
+	if _, err := os.Stat(run.LogPath); err != nil {
+		return nil, fmt.Errorf("Run %q Worker Activity is unavailable: %w", run.RunID, err)
+	}
+	fmt.Fprintf(stderr, "Follow diagnostic for Run %q: Activity projection unavailable; replayed Activity age is n/a\n", run.RunID)
+	return &normalizedActivitySource{
+		reader: completeRecordReader{path: run.LogPath}, rawPath: run.LogPath, projectionPath: projectionPath,
+		now: now, stderr: stderr, initial: true,
+	}, nil
+}
+
+func (s *normalizedActivitySource) read() ([]activity.Entry, int, bool) {
+	replayed, reset := s.fallbackIfProjectionFailed()
+	lines, err := s.reader.read()
+	if err != nil {
+		if s.projected {
+			fmt.Fprintf(s.stderr, "Follow diagnostic: Activity projection unavailable: %v; replaying raw Worker Activity\n", err)
+			fmt.Fprintln(s.stderr, "Follow diagnostic: replayed Activity age is n/a")
+			replayed = s.switchToRaw()
+			replayedEntries, _, _ := s.read()
+			return replayedEntries, replayed, true
+		}
+		fmt.Fprintf(s.stderr, "Follow diagnostic: Worker Activity unavailable: %v\n", err)
+		return nil, replayed, reset
+	}
+	entries := make([]activity.Entry, 0, len(lines))
+	for _, line := range lines {
+		if s.projected {
+			var entry activity.Entry
+			if err := json.Unmarshal(line, &entry); err != nil || entry.Version != activity.CurrentVersion || entry.Kind == "" || entry.Description == "" {
+				fmt.Fprintln(s.stderr, "Follow diagnostic: unusable Activity projection record; replaying raw Worker Activity")
+				fmt.Fprintln(s.stderr, "Follow diagnostic: replayed Activity age is n/a")
+				replayed = s.switchToRaw()
+				replayedEntries, _, _ := s.read()
+				return replayedEntries, replayed, true
+			}
+			entries = append(entries, entry)
+			continue
+		}
+		observedAt := time.Time{}
+		if !s.initial {
+			observedAt = s.now()
+		}
+		entry, semantic, err := s.projector.Observe(line, observedAt)
+		if err != nil {
+			fmt.Fprintf(s.stderr, "Follow diagnostic: ignored unusable Worker telemetry: %v\n", err)
+			continue
+		}
+		if semantic {
+			entries = append(entries, entry)
+		}
+	}
+	s.initial = false
+	s.semanticRead += len(entries)
+	return entries, replayed, reset
+}
+
+func (s *normalizedActivitySource) fallbackIfProjectionFailed() (int, bool) {
+	if !s.projected {
+		return 0, false
+	}
+	diagnostic, err := os.ReadFile(activity.UnavailablePath(s.projectionPath))
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, false
+	}
+	if err == nil {
+		fmt.Fprintf(s.stderr, "Follow diagnostic: Activity projection unavailable: %s", diagnostic)
+	} else {
+		fmt.Fprintf(s.stderr, "Follow diagnostic: Activity projection diagnostic unavailable: %v\n", err)
+	}
+	fmt.Fprintln(s.stderr, "Follow diagnostic: replayed Activity age is n/a")
+	return s.switchToRaw(), true
+}
+
+func (s *normalizedActivitySource) switchToRaw() int {
+	replayed := s.semanticRead
+	s.reader = completeRecordReader{path: s.rawPath}
+	s.projected = false
+	s.projector = activity.Projector{}
+	s.initial = true
+	s.semanticRead = 0
+	return replayed
+}
+
+func consumeActivity(metrics *followMetrics, source *normalizedActivitySource) []activity.Entry {
+	entries, replayed, reset := source.read()
+	if !reset {
+		for _, entry := range entries {
+			metrics.apply(entry)
+		}
+		return entries
+	}
+	*metrics = followMetrics{}
+	for _, entry := range entries {
+		metrics.apply(entry)
+	}
+	return entries[min(replayed, len(entries)):]
+}
+
+func printNewActivity(output io.Writer, metrics *followMetrics, source *normalizedActivitySource) error {
+	for _, entry := range consumeActivity(metrics, source) {
+		if err := printActivityEntry(output, entry); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func followNormalized(
+	ctx context.Context,
+	source followStateSource,
+	runID string,
+	output, diagnostics io.Writer,
+	pollInterval time.Duration,
+	now func() time.Time,
+) error {
+	selected, err := loadFollowRun(source, runID)
+	if err != nil {
+		return err
+	}
+	activitySource, err := openNormalizedActivitySource(selected, diagnostics, now)
+	if err != nil {
+		fmt.Fprintln(diagnostics, "Follow diagnostic:", err)
+	}
+	metrics := followMetrics{}
+	if activitySource != nil {
+		consumeActivity(&metrics, activitySource)
+	}
+	if err := printFollowSummary(output, selected, metrics, now()); err != nil {
+		return err
+	}
+	if err := printInitialActivity(output, metrics.entries); err != nil {
+		return err
+	}
+	if scheduler.IsTerminal(selected.Status) && !selected.WorkerLogOpen {
+		return nil
+	}
+
+	lastStatus := selected.Status
+	lastLogPath := selected.LogPath
+	for {
+		if activitySource != nil {
+			if err := printNewActivity(output, &metrics, activitySource); err != nil {
+				return err
+			}
+		}
+		selected, err = loadFollowRun(source, runID)
+		if err != nil {
+			return err
+		}
+		if lastLogPath != "" && selected.LogPath != lastLogPath {
+			return fmt.Errorf("Run %q Worker log changed from %q to %q", runID, lastLogPath, selected.LogPath)
+		}
+		if activitySource == nil && selected.LogPath != "" {
+			activitySource, err = openNormalizedActivitySource(selected, diagnostics, now)
+			if err != nil {
+				fmt.Fprintln(diagnostics, "Follow diagnostic:", err)
+			} else {
+				lastLogPath = selected.LogPath
+				newEntries := consumeActivity(&metrics, activitySource)
+				start := max(0, len(newEntries)-20)
+				for _, entry := range newEntries[start:] {
+					if err := printActivityEntry(output, entry); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if selected.Status != lastStatus {
+			entry := activity.Entry{
+				Version: activity.CurrentVersion, ObservedAt: now().UTC(), Kind: "lifecycle",
+				Description: "Run state changed to " + string(selected.Status),
+			}
+			if err := printActivityEntry(output, entry); err != nil {
+				return err
+			}
+			lastStatus = selected.Status
+		}
+		if scheduler.IsTerminal(selected.Status) && !selected.WorkerLogOpen {
+			if activitySource != nil {
+				if err := printNewActivity(output, &metrics, activitySource); err != nil {
+					return err
+				}
+			}
+			if _, err := fmt.Fprintln(output, "\nTerminal Run summary:"); err != nil {
+				return err
+			}
+			return printFollowSummary(output, selected, metrics, now())
+		}
+		if !waitToFollow(ctx, pollInterval) {
+			return nil
+		}
+	}
+}
+
+func printFollowSummary(output io.Writer, run scheduler.Run, metrics followMetrics, now time.Time) error {
+	issue := fmt.Sprintf("#%d", run.Issue)
+	if run.IssueTitle != "" {
+		issue += "  " + run.IssueTitle
+	}
+	if run.IssueURL != "" {
+		issue += "  " + run.IssueURL
+	}
+	elapsedEnd := now
+	if run.CompletedAt != nil {
+		elapsedEnd = *run.CompletedAt
+	} else if scheduler.IsTerminal(run.Status) && !run.UpdatedAt.IsZero() {
+		elapsedEnd = run.UpdatedAt
+	}
+	elapsed := "n/a"
+	if !run.StartedAt.IsZero() {
+		elapsed = displayDuration(elapsedEnd.Sub(run.StartedAt))
+	}
+	age := "n/a"
+	if !metrics.latest.IsZero() {
+		age = displayDuration(now.Sub(metrics.latest))
+	}
+	operation := valueOr(metrics.operation, "n/a")
+	tokens := "n/a"
+	if metrics.tokensKnown {
+		tokens = fmt.Sprintf("%d", metrics.tokens)
+	}
+	_, err := fmt.Fprintf(output, "Run: %s\nIssue: %s\nState: %s\nElapsed: %s\nActivity age: %s\nCurrent Worker operation: %s\nCompleted Worker turns: %d\nCompleted Worker tokens: %s\n",
+		run.RunID, issue, run.Status, elapsed, age, operation, metrics.turns, tokens)
+	return err
+}
+
+func printInitialActivity(output io.Writer, entries []activity.Entry) error {
+	if _, err := fmt.Fprintln(output, "\nWorker Activity (latest 20):"); err != nil {
+		return err
+	}
+	start := max(0, len(entries)-20)
+	if start == len(entries) {
+		_, err := fmt.Fprintln(output, "  n/a")
+		return err
+	}
+	for _, entry := range entries[start:] {
+		if err := printActivityEntry(output, entry); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func printActivityEntry(output io.Writer, entry activity.Entry) error {
+	observed := "time n/a"
+	if !entry.ObservedAt.IsZero() {
+		observed = entry.ObservedAt.Format(time.RFC3339)
+	}
+	_, err := fmt.Fprintf(output, "  %s  %s\n", observed, entry.Description)
+	return err
+}
+
+func displayDuration(duration time.Duration) string {
+	if duration < 0 {
+		duration = 0
+	}
+	return duration.Truncate(time.Second).String()
 }
 
 type rawLogStream struct {

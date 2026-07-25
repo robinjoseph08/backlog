@@ -19,6 +19,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/robinjoseph08/backlog/internal/activity"
 )
 
 const promptCommandID = "backlog-afk-prompt"
@@ -79,6 +81,7 @@ type Process struct {
 	stdin              io.WriteCloser
 	stdout             *os.File
 	stderr             *os.File
+	activity           *activity.Writer
 	events             *rpcWriter
 	stdinMu            sync.Mutex
 	terminate          func() error
@@ -189,7 +192,10 @@ func (s Supervisor) Start(ctx context.Context, request Request) (*Process, error
 		})
 		return terminateErr
 	}
-	events := newRPCWriter(stdoutLog, promptCommandID, request.Issue)
+	// Activity is a best-effort observational sidecar. Failure to create or
+	// append it must never affect the raw transcript or Worker result.
+	activityWriter, _ := activity.NewWriter(activity.PathForLog(logPath), request.Resume)
+	events := newRPCWriter(stdoutLog, activityWriter, promptCommandID, request.Issue)
 	command.Dir = request.Worktree
 	command.Stdout = events
 	command.Stderr = stderrLog
@@ -200,11 +206,14 @@ func (s Supervisor) Start(ctx context.Context, request Request) (*Process, error
 		stdin.Close()
 		stdoutLog.Close()
 		stderrLog.Close()
+		if activityWriter != nil {
+			_ = activityWriter.Close()
+		}
 		return nil, fmt.Errorf("start Pi gate: %w", err)
 	}
 	process := &Process{
 		command: command, logPath: logPath, stderrPath: stderrPath, gatePath: gatePath,
-		stdin: stdin, stdout: stdoutLog, stderr: stderrLog, events: events, terminate: terminate,
+		stdin: stdin, stdout: stdoutLog, stderr: stderrLog, activity: activityWriter, events: events, terminate: terminate,
 		terminationStarted: terminationStarted, terminationDone: terminationDone, processGroupGrace: grace, exitDone: make(chan struct{}),
 		resume: request.Resume,
 	}
@@ -586,6 +595,10 @@ func (p *Process) reap() {
 	}
 	streamErr := p.events.Finish()
 	closeErr := errors.Join(p.stdout.Close(), p.stderr.Close())
+	if p.activity != nil {
+		// Projection closure is observational and cannot change the Worker result.
+		_ = p.activity.Close()
+	}
 	_ = os.Remove(p.gatePath)
 	exitCode := 0
 	if p.command.ProcessState != nil {
@@ -1192,6 +1205,7 @@ type responseWaiter struct {
 type rpcWriter struct {
 	mu                        sync.Mutex
 	destination               io.Writer
+	observer                  *activity.Writer
 	buffer                    []byte
 	lineNumber                int
 	issue                     int
@@ -1214,9 +1228,9 @@ type rpcWriter struct {
 	failedOnce                sync.Once
 }
 
-func newRPCWriter(destination io.Writer, commandID string, issue int) *rpcWriter {
+func newRPCWriter(destination io.Writer, observer *activity.Writer, commandID string, issue int) *rpcWriter {
 	return &rpcWriter{
-		destination: destination, commandID: commandID, issue: issue,
+		destination: destination, observer: observer, commandID: commandID, issue: issue,
 		state: rpcAwaitingResponse, openTools: make(map[string]struct{}), responses: make(map[string]responseWaiter),
 		settled: make(chan struct{}), failed: make(chan struct{}),
 	}
@@ -1238,6 +1252,9 @@ func (w *rpcWriter) Write(data []byte) (int, error) {
 		line := w.buffer[:newline]
 		if len(line) > 0 && line[len(line)-1] == '\r' {
 			line = line[:len(line)-1]
+		}
+		if w.observer != nil {
+			_ = w.observer.Observe(line)
 		}
 		w.validate(line)
 		w.buffer = w.buffer[newline+1:]

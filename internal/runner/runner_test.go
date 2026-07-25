@@ -1726,6 +1726,7 @@ func TestRunnerResumesSuspendedRunBeforeNewCandidateWithSameIdentity(t *testing.
 	t.Parallel()
 
 	run := resumableRun(t, 61, "resume-61")
+	originalStartedAt := run.StartedAt
 	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 62, CreatedAt: time.Now()}}}
 	workers := newFakeWorkers()
 	store := &memoryStore{value: state.State{
@@ -1775,7 +1776,8 @@ func TestRunnerResumesSuspendedRunBeforeNewCandidateWithSameIdentity(t *testing.
 	})
 	persisted := store.LoadValue()
 	resumed := findActiveRun(&persisted, 61)
-	if resumed.Status != scheduler.StatusRunning || resumed.PID != 1061 || resumed.ProcessIdentity == "" || resumed.Branch != run.Branch || len(persisted.Leases) != 1 || persisted.Leases[0].LeaseID != "lease-61" {
+	if resumed.Status != scheduler.StatusRunning || resumed.PID != 1061 || resumed.ProcessIdentity == "" || resumed.Branch != run.Branch ||
+		!resumed.StartedAt.Equal(originalStartedAt) || resumed.WorkerStartedAt.IsZero() || len(persisted.Leases) != 1 || persisted.Leases[0].LeaseID != "lease-61" {
 		t.Fatalf("resumed Run and Lease = %#v / %#v", resumed, persisted.Leases)
 	}
 
