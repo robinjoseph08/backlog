@@ -344,7 +344,11 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 		} else if draining && len(localWorkers) == 0 {
 			if drainOperationalErr != nil {
-				r.logf("Drain complete: 0 Workers remaining; exiting after an operational failure")
+				if unverified := persistedWorkerCount(&current); unverified > 0 {
+					r.logf("Drain incomplete: 0 supervised Workers remaining; %s retained with unverified liveness", workerSummary(unverified))
+				} else {
+					r.logf("Drain complete: 0 Workers remaining; exiting after an operational failure")
+				}
 				return drainOperationalErr
 			}
 			r.logf("Drain complete: 0 Workers remaining; exiting successfully")
@@ -1203,6 +1207,23 @@ func (r *Runner) handleWorkerCompletion(ctx context.Context, current *state.Stat
 
 func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[int]WorkerProcess) error {
 	changed := false
+	for _, historical := range append([]scheduler.Run(nil), current.Runs...) {
+		if !historical.CleanupPending {
+			continue
+		}
+		assignment := worktree.Assignment{Path: historical.Worktree, Branch: historical.Branch}
+		if assignment.Path != "" && assignment.Branch != "" {
+			if err := r.verifyAndCleanupWorktree(ctx, assignment); err != nil {
+				return fmt.Errorf("retry pending Completion cleanup for issue #%d: %w", historical.Issue, err)
+			}
+		}
+		historical.CleanupPending = false
+		historical.Error = ""
+		historical.UpdatedAt = r.Now().UTC()
+		replaceRun(current, historical)
+		changed = true
+		r.logf("completed pending worktree cleanup for merged issue #%d", historical.Issue)
+	}
 	for _, lease := range append([]scheduler.Lease(nil), current.Leases...) {
 		run := findRun(current.Runs, lease.RunID)
 		if run.Issue == 0 || run.Issue != lease.Issue {
@@ -1495,7 +1516,12 @@ func (r *Runner) finalizeSettledWorker(ctx context.Context, current *state.State
 	}
 	if cleanupErr != nil {
 		if ctx.Err() != nil {
-			return fmt.Errorf("cleanup issue #%d worktree within lifecycle deadline: %w", run.Issue, ctx.Err())
+			run.CleanupPending = true
+			run.Error = fmt.Sprintf("completion verified; worktree cleanup remains pending after lifecycle deadline: %v", ctx.Err())
+			run.UpdatedAt = r.Now().UTC()
+			replaceRun(current, run)
+			saveErr := r.Store.Save(*current)
+			return errors.Join(fmt.Errorf("cleanup issue #%d worktree within lifecycle deadline: %w", run.Issue, ctx.Err()), saveErr)
 		}
 		r.retainProvisionalCompletion(current, &run, fmt.Sprintf("completion verified but worktree cleanup failed: %v", cleanupErr))
 		if saveErr := r.Store.Save(*current); saveErr != nil {
@@ -1682,7 +1708,9 @@ func (r *Runner) authorizeSuspensionKill(runID string, process WorkerProcess) fu
 func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess, exitCode int) error {
 	if len(local) == 0 {
 		if r.suspensionFailed.Load() {
-			return &SignalExit{Code: exitCode, Cause: errors.New("suspension could not establish a continuation boundary for every admitted Run")}
+			cause := errors.New("suspension could not establish a continuation boundary for every admitted Run")
+			r.logf("Suspension incomplete: %v", cause)
+			return &SignalExit{Code: exitCode, Cause: cause}
 		}
 		r.logf("Suspension complete: 0 Workers remaining")
 		return &SignalExit{Code: exitCode}

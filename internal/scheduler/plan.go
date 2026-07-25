@@ -72,6 +72,7 @@ type Run struct {
 	LogPath         string                `json:"logPath,omitempty"`
 	StderrPath      string                `json:"stderrPath,omitempty"`
 	WorkerLogOpen   bool                  `json:"workerLogOpen,omitempty"`
+	CleanupPending  bool                  `json:"cleanupPending,omitempty"`
 	PullRequest     string                `json:"pullRequest,omitempty"`
 	Error           string                `json:"error,omitempty"`
 	StartedAt       time.Time             `json:"startedAt"`

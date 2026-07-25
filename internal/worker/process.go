@@ -486,13 +486,27 @@ func (p *Process) CloseWithForceContext(ctx context.Context, authorizeKill func(
 		return p.forceStop(authorizeKill, ctx.Err())
 	case <-grace.C:
 		gracefulErr = errors.New("Pi RPC process did not exit after input closed")
-		if err := p.terminate(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			gracefulErr = errors.Join(gracefulErr, fmt.Errorf("terminate Pi RPC process group: %w", err))
+		terminationResult := make(chan error, 1)
+		go func() { terminationResult <- p.terminate() }()
+		select {
+		case err := <-terminationResult:
+			if err != nil && !errors.Is(err, os.ErrProcessDone) {
+				gracefulErr = errors.Join(gracefulErr, fmt.Errorf("terminate Pi RPC process group: %w", err))
+			}
+		case <-ctx.Done():
+			return p.forceStop(authorizeKill, ctx.Err())
 		}
-		<-p.exitDone
+		select {
+		case <-p.exitDone:
+		case <-ctx.Done():
+			return p.forceStop(authorizeKill, ctx.Err())
+		}
 	}
 	result := p.exitResult()
-	groupErr := waitForProcessGroupExit(p.PID(), p.processGroupGrace)
+	groupErr := waitForProcessGroupExitContext(ctx, p.PID())
+	if groupErr != nil && ctx.Err() != nil {
+		return p.forceStop(authorizeKill, ctx.Err())
+	}
 	result.ControlErr = errors.Join(result.ControlErr, p.closeInputErr, gracefulErr, groupErr)
 	result.Err = errors.Join(result.Err, result.ControlErr)
 	result.GroupExited = groupErr == nil
@@ -1108,34 +1122,6 @@ func waitForProcessGroupExitContext(ctx context.Context, pid int) error {
 			return errors.Join(ctx.Err(), errors.New("Worker process-group exit was not verified"))
 		}
 	}
-}
-
-func waitForProcessGroupExit(pid int, grace time.Duration) error {
-	if pid <= 0 {
-		return nil
-	}
-	exited, err := waitForProcessGroup(pid, grace)
-	if err != nil || exited {
-		return err
-	}
-	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return fmt.Errorf("terminate surviving Worker process group: %w", err)
-	}
-	exited, err = waitForProcessGroup(pid, grace)
-	if err != nil || exited {
-		return err
-	}
-	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return fmt.Errorf("kill surviving Worker process group: %w", err)
-	}
-	exited, err = waitForProcessGroup(pid, grace)
-	if err != nil {
-		return err
-	}
-	if !exited {
-		return fmt.Errorf("Worker process group %d survived shutdown escalation", pid)
-	}
-	return nil
 }
 
 func waitForProcessGroup(pid int, grace time.Duration) (bool, error) {

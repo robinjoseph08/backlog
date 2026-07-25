@@ -48,6 +48,26 @@ func TestRunnerStartupClosesOrphanedWorkerLogMarkers(t *testing.T) {
 	}
 }
 
+func TestRunnerStartupRetriesPendingMergedCleanup(t *testing.T) {
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion,
+		Runs: []scheduler.Run{{
+			Issue: 28, RunID: "run-28", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModeRPC,
+			Branch: "agent/issue-28-run-28", Worktree: "/tmp/run-28", CleanupPending: true,
+			Error: "completion verified; worktree cleanup remains pending",
+		}},
+	}}
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+	worktrees := runner.Worktrees.(*fakeWorktrees)
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatalf("restart Runner: %v", err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].CleanupPending || got.Runs[0].Error != "" || worktrees.cleanupCount() != 1 {
+		t.Fatalf("pending merged cleanup after restart = %#v, cleanup count = %d", got, worktrees.cleanupCount())
+	}
+}
+
 func TestRunnerFillsSlotsAndImmediatelyRefillsAfterCompletion(t *testing.T) {
 	t.Parallel()
 
@@ -1082,6 +1102,34 @@ func TestRunnerDrainReportsProcessControlFailureAfterVerifiedExit(t *testing.T) 
 	}
 }
 
+func TestRunnerDrainReportsSettledCloseControlFailureAfterVerifiedExit(t *testing.T) {
+	const issue = 33
+	github := &fakeGitHub{
+		candidates:  []scheduler.Candidate{{Number: issue, CreatedAt: time.Now()}},
+		completions: map[int]ghadapter.CompletionOutcome{issue: mergedOutcome(issue)},
+	}
+	workers := newFakeWorkers()
+	workers.startupCloseResult = worker.Result{GroupExited: true, ControlErr: errors.New("close control failure"), Err: errors.New("close control failure")}
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	signals := make(chan os.Signal, 1)
+	output := newSynchronizedOutput()
+	runner := testRunner(github, workers, store, 1)
+	runner.Signals = signals
+	runner.Output = output
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, issue)
+	signals <- os.Interrupt
+	output.waitFor(t, "Drain: admission stopped; 1 Worker remaining")
+	workers.complete(issue, worker.Result{ExitCode: 0})
+
+	err := <-done
+	if err == nil || !strings.Contains(err.Error(), "close control failure") {
+		t.Fatalf("Drain error = %v, want settled close control failure", err)
+	}
+}
+
 func TestRunnerDrainFailsClosedWhenSettledWorkerExitIsUnverified(t *testing.T) {
 	const issue = 31
 	github := &fakeGitHub{
@@ -1108,6 +1156,7 @@ func TestRunnerDrainFailsClosedWhenSettledWorkerExitIsUnverified(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "settled Worker process-group exit was not verified") {
 		t.Fatalf("Drain error = %v, want unverified settled Worker exit", err)
 	}
+	output.waitFor(t, "Drain incomplete: 0 supervised Workers remaining; 1 Worker retained with unverified liveness")
 	got := store.LoadValue()
 	run := findRun(got.Runs, fmt.Sprintf("run-%d", issue))
 	if run.Status != scheduler.StatusNeedsHuman || run.PID != 1000+issue || run.ProcessIdentity == "" || len(got.Leases) != 1 {
@@ -1138,6 +1187,7 @@ func TestRunnerDrainFailsClosedWhenMalformedWorkerExitIsUnverified(t *testing.T)
 	if err == nil || !strings.Contains(err.Error(), "process-group exit was not verified") {
 		t.Fatalf("Drain error = %v, want unverified Worker exit", err)
 	}
+	output.waitFor(t, "Drain incomplete: 0 supervised Workers remaining; 1 Worker retained with unverified liveness")
 	got := store.LoadValue()
 	run := findRun(got.Runs, fmt.Sprintf("run-%d", issue))
 	if run.Status != scheduler.StatusNeedsHuman || run.PID != 1000+issue || run.ProcessIdentity == "" || len(got.Leases) != 1 {
@@ -1181,6 +1231,72 @@ func TestRunnerDrainSettlesRemainingWorkersAfterCompletionStateFailure(t *testin
 	got := store.LoadValue()
 	if findRun(got.Runs, "run-28").Status != scheduler.StatusNeedsHuman || findRun(got.Runs, "run-29").Status != scheduler.StatusMerged {
 		t.Fatalf("state after draining through persistence failure = %#v", got)
+	}
+}
+
+func TestRunnerDrainReportsSecondOrderCompletionRecoveryFailures(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		configure func(*memoryStore)
+		validate  func(*testing.T, error)
+	}{
+		{
+			name: "reload",
+			configure: func(store *memoryStore) {
+				store.failAtLoad = 2
+				store.failNext()
+			},
+			validate: func(t *testing.T, err error) {
+				if !strings.Contains(err.Error(), "injected state load failure") {
+					t.Fatalf("Drain error = %v, want recovery reload failure", err)
+				}
+			},
+		},
+		{
+			name: "recovery save",
+			configure: func(store *memoryStore) {
+				store.failNextN(2)
+			},
+			validate: func(t *testing.T, err error) {
+				if strings.Count(err.Error(), "injected state save failure") < 2 {
+					t.Fatalf("Drain error = %v, want initial and recovery save failures", err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			github := &fakeGitHub{
+				candidates:  []scheduler.Candidate{{Number: 34, CreatedAt: time.Now()}, {Number: 35, CreatedAt: time.Now().Add(time.Second)}},
+				completions: map[int]ghadapter.CompletionOutcome{34: mergedOutcome(34), 35: mergedOutcome(35)},
+			}
+			workers := newFakeWorkers()
+			workers.abortClosesProcessGroup = true
+			store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+			signals := make(chan os.Signal, 1)
+			output := newSynchronizedOutput()
+			runner := testRunner(github, workers, store, 2)
+			runner.Signals = signals
+			runner.Output = output
+
+			done := make(chan error, 1)
+			go func() { done <- runner.Run(context.Background()) }()
+			workers.waitForStarts(t, 34, 35)
+			signals <- os.Interrupt
+			output.waitFor(t, "Drain: admission stopped; 2 Workers remaining")
+			test.configure(store)
+			workers.complete(34, worker.Result{ExitCode: 0})
+			output.waitFor(t, "Drain: 1 Worker remaining")
+			workers.complete(35, worker.Result{ExitCode: 0})
+
+			err := <-done
+			if err == nil {
+				t.Fatal("Drain succeeded despite recovery failure")
+			}
+			test.validate(t, err)
+			if got := store.LoadValue(); findRun(got.Runs, "run-35").Status != scheduler.StatusMerged {
+				t.Fatalf("remaining Worker did not settle after recovery failure: %#v", got)
+			}
+		})
 	}
 }
 
@@ -2848,7 +2964,8 @@ func TestRunnerBoundsCleanupWhenSuspensionStartsAfterCleanup(t *testing.T) {
 		t.Fatalf("cleanup outlived shared suspension deadline: %s", elapsed)
 	}
 	got := store.LoadValue()
-	if got.Runs[0].Status != scheduler.StatusMerged || got.Runs[0].CompletedAt == nil || len(got.Leases) != 0 {
+	if got.Runs[0].Status != scheduler.StatusMerged || got.Runs[0].CompletedAt == nil || !got.Runs[0].CleanupPending ||
+		!strings.Contains(got.Runs[0].Error, "cleanup remains pending") || len(got.Leases) != 0 {
 		t.Fatalf("merged outcome after bounded cleanup = %#v", got)
 	}
 }
@@ -3280,7 +3397,8 @@ func TestRunnerRecoversPersistedContinuationAfterFinalSuspensionSaveFails(t *tes
 		t.Fatalf("reconcile restart: %v", err)
 	}
 	got := store.LoadValue()
-	if got.Runs[0].Status != scheduler.StatusSuspended || got.Runs[0].PID != 0 || got.Runs[0].ProcessIdentity != "" || got.Runs[0].Continuation == nil || len(got.Leases) != 1 {
+	if got.Runs[0].Status != scheduler.StatusSuspended || got.Runs[0].PID != 0 || got.Runs[0].ProcessIdentity != "" || got.Runs[0].Continuation == nil ||
+		got.Runs[0].SuspendedAt == nil || !got.Runs[0].SuspendedAt.Equal(restarted.Now()) || !got.Runs[0].UpdatedAt.Equal(*got.Runs[0].SuspendedAt) || len(got.Leases) != 1 {
 		t.Fatalf("recovered continuation = %#v", got)
 	}
 }
@@ -3323,6 +3441,8 @@ func TestRunnerSuspensionRequestBoundsCommittedWorkerPreparation(t *testing.T) {
 	runner := testRunner(github, workers, store, 1)
 	runner.Config.SuspensionTimeout = 40 * time.Millisecond
 	runner.Signals = signals
+	output := newSynchronizedOutput()
+	runner.Output = output
 	runner.Worktrees = &blockingWorktrees{prepareStarted: prepareStarted, finishPrepare: make(chan struct{})}
 
 	done := make(chan error, 1)
@@ -3330,9 +3450,10 @@ func TestRunnerSuspensionRequestBoundsCommittedWorkerPreparation(t *testing.T) {
 	<-prepareStarted
 	started := time.Now()
 	signals <- syscall.SIGTERM
-	if err := <-done; !isSignalExit(err, 143) {
-		t.Fatalf("run: %v, want failed-closed SIGTERM exit 143", err)
+	if err := <-done; !isSignalExit(err, 143) || !strings.Contains(err.Error(), "continuation boundary") {
+		t.Fatalf("run: %v, want failed-closed SIGTERM exit 143 with continuation cause", err)
 	}
+	output.waitFor(t, "Suspension incomplete: suspension could not establish a continuation boundary")
 	if elapsed := time.Since(started); elapsed > 120*time.Millisecond {
 		t.Fatalf("suspension request did not bound Worker preparation: %s", elapsed)
 	}
@@ -3816,25 +3937,33 @@ func testRunner(github *fakeGitHub, workers *fakeWorkers, store *memoryStore, ma
 }
 
 type memoryStore struct {
-	mu           sync.Mutex
-	value        state.State
-	saveHistory  []state.State
-	saveCount    int
-	failAtSave   int
-	failNextSave bool
+	mu                 sync.Mutex
+	value              state.State
+	saveHistory        []state.State
+	saveCount          int
+	loadCount          int
+	failAtSave         int
+	failAtLoad         int
+	failSavesRemaining int
 }
 
 func (s *memoryStore) Load() (state.State, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.loadCount++
+	if s.failAtLoad > 0 && s.loadCount == s.failAtLoad {
+		return state.State{}, errors.New("injected state load failure")
+	}
 	return cloneState(s.value), nil
 }
 func (s *memoryStore) Save(value state.State) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.saveCount++
-	if s.failNextSave || s.failAtSave > 0 && s.saveCount == s.failAtSave {
-		s.failNextSave = false
+	if s.failSavesRemaining > 0 || s.failAtSave > 0 && s.saveCount == s.failAtSave {
+		if s.failSavesRemaining > 0 {
+			s.failSavesRemaining--
+		}
 		return errors.New("injected state save failure")
 	}
 	s.value = cloneState(value)
@@ -3851,9 +3980,12 @@ func (s *memoryStore) SaveHistory() []state.State {
 	return history
 }
 func (s *memoryStore) failNext() {
+	s.failNextN(1)
+}
+func (s *memoryStore) failNextN(count int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.failNextSave = true
+	s.failSavesRemaining = count
 }
 func (s *memoryStore) runStatus(issue int) scheduler.Status {
 	s.mu.Lock()

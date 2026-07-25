@@ -405,6 +405,9 @@ func validateRun(run scheduler.Run, requireWorkerMode, recoverUnsafeContinuation
 	if run.WorkerLogOpen && run.LogPath == "" {
 		return fmt.Errorf("state contains Run %q with an open Worker log but no log path", run.RunID)
 	}
+	if run.CleanupPending && run.Status != scheduler.StatusMerged {
+		return fmt.Errorf("state contains non-merged Run %q with pending Completion cleanup", run.RunID)
+	}
 	if run.Status == scheduler.StatusRunning {
 		if run.PID <= 0 || run.StartedAt.IsZero() || run.ProcessIdentity == "" {
 			return fmt.Errorf("state contains running issue #%d without durable process identity", run.Issue)

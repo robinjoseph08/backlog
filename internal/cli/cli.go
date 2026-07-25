@@ -13,7 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"syscall"
 	"time"
 
@@ -91,13 +91,15 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 	setupCtx := ctx
 	runnerSignals := signals
 	var cancelSetup context.CancelFunc
-	var setupDone, relayDone chan struct{}
-	var setupSignalExit atomic.Int32
+	var relayDone chan struct{}
+	var setupMu sync.Mutex
+	setupActive := signals != nil
+	setupSignalExit := setupSignalNone
+	runnerEntered := false
 	if signals != nil {
 		setupCtx, cancelSetup = context.WithCancel(ctx)
 		forwarded := make(chan os.Signal, 16)
 		runnerSignals = forwarded
-		setupDone = make(chan struct{})
 		relayDone = make(chan struct{})
 		go func() {
 			for {
@@ -111,26 +113,19 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 					case <-relayDone:
 						return
 					}
-					select {
-					case <-setupDone:
-					default:
-						for {
-							previous := setupSignalExit.Load()
-							next := previous
-							switch {
-							case signal == syscall.SIGTERM && previous != setupSignalInterruptSuspension && previous != setupSignalTermSuspension:
-								next = setupSignalTermSuspension
-							case previous == setupSignalNone:
-								next = setupSignalDrainAccepted
-							case previous == setupSignalDrainAccepted:
-								next = setupSignalInterruptSuspension
-							}
-							if setupSignalExit.CompareAndSwap(previous, next) {
-								break
-							}
+					setupMu.Lock()
+					if setupActive {
+						switch {
+						case signal == syscall.SIGTERM && setupSignalExit != setupSignalInterruptSuspension && setupSignalExit != setupSignalTermSuspension:
+							setupSignalExit = setupSignalTermSuspension
+						case setupSignalExit == setupSignalNone:
+							setupSignalExit = setupSignalDrainAccepted
+						case setupSignalExit == setupSignalDrainAccepted:
+							setupSignalExit = setupSignalInterruptSuspension
 						}
 						cancelSetup()
 					}
+					setupMu.Unlock()
 				case <-relayDone:
 					return
 				}
@@ -139,7 +134,14 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 		defer func() {
 			close(relayDone)
 			cancelSetup()
-			switch setupSignalExit.Load() {
+			setupMu.Lock()
+			setupExit := setupSignalExit
+			entered := runnerEntered
+			setupMu.Unlock()
+			if entered {
+				return
+			}
+			switch setupExit {
 			case setupSignalDrainAccepted:
 				fmt.Fprintln(stdout, "Drain: admission stopped during setup; 0 Workers remaining")
 				fmt.Fprintln(stdout, "Drain complete: 0 Workers remaining; exiting successfully")
@@ -236,8 +238,17 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 		return err
 	}
 	defer func() { _ = supervision.Release() }()
-	if setupDone != nil {
-		close(setupDone)
+	if signals != nil {
+		setupMu.Lock()
+		setupActive = false
+		setupExit := setupSignalExit
+		if setupExit == setupSignalNone {
+			runnerEntered = true
+		}
+		setupMu.Unlock()
+		if setupExit != setupSignalNone {
+			return setupCtx.Err()
+		}
 	}
 	return backlogRunner.Run(ctx)
 }
@@ -317,6 +328,7 @@ func statusCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 		encoder.SetIndent("", "  ")
 		return encoder.Encode(current)
 	}
+	runnerSupervised, _ := (repositoryFollowSource{commonDirectory: commonDirectory}).RunnerSupervised()
 	fmt.Fprintf(stdout, "Repository: %s\n", valueOr(current.Repo, "not initialized"))
 	fmt.Fprintf(stdout, "Runs: %d\n", len(current.Runs))
 	fmt.Fprintf(stdout, "Active Leases: %d\n", len(current.Leases))
@@ -326,7 +338,7 @@ func statusCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 			issue += "  " + run.IssueTitle
 		}
 		status := run.Status
-		if status == scheduler.StatusRunning && run.SuspendingAt != nil {
+		if status == scheduler.StatusRunning && run.SuspendingAt != nil && runnerSupervised {
 			status = scheduler.Status("suspending")
 		}
 		fmt.Fprintf(stdout, "  %s  %-17s  %s", issue, status, run.Branch)
