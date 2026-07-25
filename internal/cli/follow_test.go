@@ -664,7 +664,7 @@ func TestFollowNormalizedStreamsProjectionAndPrintsTerminalSummary(t *testing.T)
 	waitForBuffer(t, &output, "Worker started")
 	writeActivityEntries(t, projectionPath, activity.Entry{
 		Version: activity.CurrentVersion, ObservedAt: observedAt.Add(9 * time.Second), Kind: "model",
-		Description: "Assistant response completed: done", TokensKnown: true, TokenDelta: 77,
+		Description: "Assistant response completed: done", ResponseCompleted: true, TokensKnown: true, TokenDelta: 77,
 	})
 	waitForBuffer(t, &output, "Assistant response completed: done")
 	run.Status = scheduler.StatusFailed
@@ -685,6 +685,96 @@ func TestFollowNormalizedStreamsProjectionAndPrintsTerminalSummary(t *testing.T)
 		if !strings.Contains(got, want) {
 			t.Fatalf("live normalized output missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestFollowNormalizedReportsMissingUsageWhenAnyCompletedResponseOmitsIt(t *testing.T) {
+	directory := t.TempDir()
+	logPath := filepath.Join(directory, "missing-usage.jsonl")
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeActivityEntries(t, activity.PathForLog(logPath),
+		activity.Entry{
+			Version: activity.CurrentVersion, ObservedAt: time.Now(), Kind: "model", Description: "Assistant response completed: known",
+			ResponseCompleted: true, TokensKnown: true, TokenDelta: 41,
+		},
+		activity.Entry{
+			Version: activity.CurrentVersion, ObservedAt: time.Now(), Kind: "model", Description: "Assistant response completed: missing",
+			ResponseCompleted: true,
+		},
+	)
+	run := scheduler.Run{Issue: 28, RunID: "missing-usage", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModeRPC, LogPath: logPath}
+	var output bytes.Buffer
+	if err := followNormalized(context.Background(), &sequenceFollowSource{runs: []scheduler.Run{run}}, run.RunID, &output, io.Discard, time.Millisecond, time.Now); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, "Completed Worker tokens: n/a") {
+		t.Fatalf("missing usage output = %q", got)
+	}
+}
+
+func TestFollowNormalizedFallsBackWhenLiveProjectionBecomesUnavailable(t *testing.T) {
+	directory := t.TempDir()
+	logPath := filepath.Join(directory, "live-fallback.jsonl")
+	if err := os.WriteFile(logPath, []byte("{\"type\":\"agent_start\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projectionPath := activity.PathForLog(logPath)
+	writeActivityEntries(t, projectionPath, activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: time.Now(), Kind: "lifecycle", Description: "Worker started",
+		Operation: "starting", OperationChanged: true,
+	})
+	store := state.FileStore{Path: filepath.Join(directory, "state.json")}
+	run := scheduler.Run{
+		Issue: 28, RunID: "live-fallback", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModeRPC,
+		PID: 2828, ProcessIdentity: "2828:start", LogPath: logPath, WorkerLogOpen: true, StartedAt: time.Now().Add(-time.Minute),
+		SessionID: "session-live-fallback", SessionDir: filepath.Join(directory, "session"),
+	}
+	if err := store.Save(state.State{
+		Version: state.CurrentVersion, Runs: []scheduler.Run{run},
+		Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var output, diagnostics synchronizedBuffer
+	done := make(chan error, 1)
+	go func() {
+		done <- followNormalized(context.Background(), store, run.RunID, &output, &diagnostics, 5*time.Millisecond, time.Now)
+	}()
+	waitForBuffer(t, &output, "Worker started")
+	log, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(log, "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"usage\":{\"totalTokens\":55}}}\n"); err != nil {
+		log.Close()
+		t.Fatal(err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(activity.UnavailablePath(projectionPath), []byte("append failed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitForBuffer(t, &diagnostics, "Activity projection unavailable: append failed")
+	waitForBuffer(t, &output, "Assistant response completed: done")
+	run.Status = scheduler.StatusFailed
+	run.WorkerLogOpen = false
+	if err := store.Save(state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{run}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("normalized fallback follower did not exit at terminal state")
+	}
+	got := output.String()
+	if strings.Count(got, "Worker started") != 1 || !strings.Contains(got, "Completed Worker tokens: 55") || !strings.Contains(diagnostics.String(), "replayed Activity age is n/a") {
+		t.Fatalf("live fallback output = %q, diagnostics = %q", got, diagnostics.String())
 	}
 }
 

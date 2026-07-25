@@ -15,15 +15,16 @@ const CurrentVersion = 1
 // Entry is one semantic Worker change. It deliberately excludes reasoning,
 // tool arguments, and tool results.
 type Entry struct {
-	Version          int       `json:"version"`
-	ObservedAt       time.Time `json:"observedAt"`
-	Kind             string    `json:"kind"`
-	Description      string    `json:"description"`
-	Operation        string    `json:"operation,omitempty"`
-	OperationChanged bool      `json:"operationChanged,omitempty"`
-	TurnDelta        int       `json:"turnDelta,omitempty"`
-	TokenDelta       int64     `json:"tokenDelta,omitempty"`
-	TokensKnown      bool      `json:"tokensKnown,omitempty"`
+	Version           int       `json:"version"`
+	ObservedAt        time.Time `json:"observedAt"`
+	Kind              string    `json:"kind"`
+	Description       string    `json:"description"`
+	Operation         string    `json:"operation,omitempty"`
+	OperationChanged  bool      `json:"operationChanged,omitempty"`
+	TurnDelta         int       `json:"turnDelta,omitempty"`
+	ResponseCompleted bool      `json:"responseCompleted,omitempty"`
+	TokenDelta        int64     `json:"tokenDelta,omitempty"`
+	TokensKnown       bool      `json:"tokensKnown,omitempty"`
 }
 
 // PathForLog returns the observational sidecar path for a raw Worker log.
@@ -42,6 +43,7 @@ type Projector struct {
 	haveMessage        bool
 	toolFingerprints   map[string][32]byte
 	toolNames          map[string]string
+	toolOrder          []string
 }
 
 // Observe ignores unknown fields and event types. Malformed known or unknown
@@ -89,6 +91,7 @@ func (p *Projector) Observe(record []byte, observedAt time.Time) (Entry, bool, e
 			return Entry{}, false, nil
 		}
 		entry.Kind, entry.Description = "model", "Assistant response completed"
+		entry.ResponseCompleted = true
 		if text := visibleText(message.Content); text != "" {
 			entry.Description += ": " + text
 		}
@@ -98,23 +101,18 @@ func (p *Projector) Observe(record []byte, observedAt time.Time) (Entry, bool, e
 		}
 		entry.Operation, entry.OperationChanged = "model completed", true
 	case "tool_execution_start":
-		id, name := stringField(event, "toolCallId"), stringField(event, "toolName")
-		if name == "" {
-			name = "unknown"
-		}
+		id := stringField(event, "toolCallId")
 		p.ensureTools()
+		if _, active := p.toolNames[id]; !active {
+			p.toolOrder = append(p.toolOrder, id)
+		}
+		name := p.resolveToolName(id, stringField(event, "toolName"))
 		p.toolNames[id] = name
 		entry.Kind, entry.Description = "tool", "Tool "+name+" started"
 		entry.Operation, entry.OperationChanged = name, true
 	case "tool_execution_update":
-		id, name := stringField(event, "toolCallId"), stringField(event, "toolName")
-		p.ensureTools()
-		if name == "" {
-			name = p.toolNames[id]
-		}
-		if name == "" {
-			name = "unknown"
-		}
+		id := stringField(event, "toolCallId")
+		name := p.resolveToolName(id, stringField(event, "toolName"))
 		fingerprint, meaningful := semanticFingerprint(event["partialResult"])
 		if !meaningful || p.toolFingerprints[id] == fingerprint {
 			return Entry{}, false, nil
@@ -123,22 +121,19 @@ func (p *Projector) Observe(record []byte, observedAt time.Time) (Entry, bool, e
 		entry.Kind, entry.Description = "tool", "Tool "+name+" output changed"
 		entry.Operation, entry.OperationChanged = name, true
 	case "tool_execution_end":
-		id, name := stringField(event, "toolCallId"), stringField(event, "toolName")
-		p.ensureTools()
-		if name == "" {
-			name = p.toolNames[id]
-		}
-		if name == "" {
-			name = "unknown"
-		}
+		id := stringField(event, "toolCallId")
+		name := p.resolveToolName(id, stringField(event, "toolName"))
 		description := "Tool " + name + " completed"
 		if boolField(event, "isError") {
 			description = "Tool " + name + " failed"
 		}
-		delete(p.toolNames, id)
-		delete(p.toolFingerprints, id)
+		p.finishTool(id)
+		operation := "model"
+		if active := p.activeToolName(); active != "" {
+			operation = active
+		}
 		entry.Kind, entry.Description = "tool", description
-		entry.Operation, entry.OperationChanged = "model", true
+		entry.Operation, entry.OperationChanged = operation, true
 	case "auto_retry_start":
 		entry.Kind = "retry"
 		entry.Description = fmt.Sprintf("Worker retry %d started", intField(event, "attempt"))
@@ -183,6 +178,37 @@ func (p *Projector) ensureTools() {
 		p.toolFingerprints = make(map[string][32]byte)
 		p.toolNames = make(map[string]string)
 	}
+}
+
+func (p *Projector) resolveToolName(id, name string) string {
+	p.ensureTools()
+	if name == "" {
+		name = p.toolNames[id]
+	}
+	if name == "" {
+		name = "unknown"
+	}
+	return name
+}
+
+func (p *Projector) finishTool(id string) {
+	delete(p.toolNames, id)
+	delete(p.toolFingerprints, id)
+	for index, activeID := range p.toolOrder {
+		if activeID == id {
+			p.toolOrder = append(p.toolOrder[:index], p.toolOrder[index+1:]...)
+			return
+		}
+	}
+}
+
+func (p *Projector) activeToolName() string {
+	for index := len(p.toolOrder) - 1; index >= 0; index-- {
+		if name := p.toolNames[p.toolOrder[index]]; name != "" {
+			return name
+		}
+	}
+	return ""
 }
 
 type assistantMessage struct {

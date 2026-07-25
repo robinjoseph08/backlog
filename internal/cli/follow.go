@@ -166,12 +166,13 @@ func waitToFollow(ctx context.Context, interval time.Duration) bool {
 }
 
 type followMetrics struct {
-	entries     []activity.Entry
-	latest      time.Time
-	operation   string
-	turns       int
-	tokens      int64
-	tokensKnown bool
+	entries      []activity.Entry
+	latest       time.Time
+	operation    string
+	turns        int
+	tokens       int64
+	tokensKnown  bool
+	usageMissing bool
 }
 
 func (m *followMetrics) apply(entry activity.Entry) {
@@ -183,9 +184,14 @@ func (m *followMetrics) apply(entry activity.Entry) {
 		m.operation = entry.Operation
 	}
 	m.turns += entry.TurnDelta
-	if entry.TokensKnown {
-		m.tokensKnown = true
+	if entry.ResponseCompleted {
+		if !entry.TokensKnown {
+			m.usageMissing = true
+			m.tokensKnown = false
+			return
+		}
 		m.tokens += entry.TokenDelta
+		m.tokensKnown = !m.usageMissing
 	}
 }
 
@@ -220,12 +226,15 @@ func (r *completeRecordReader) read() ([][]byte, error) {
 }
 
 type normalizedActivitySource struct {
-	reader    completeRecordReader
-	projected bool
-	projector activity.Projector
-	now       func() time.Time
-	stderr    io.Writer
-	initial   bool
+	reader         completeRecordReader
+	rawPath        string
+	projectionPath string
+	projected      bool
+	projector      activity.Projector
+	now            func() time.Time
+	stderr         io.Writer
+	initial        bool
+	semanticRead   int
 }
 
 func openNormalizedActivitySource(run scheduler.Run, stderr io.Writer, now func() time.Time) (*normalizedActivitySource, error) {
@@ -244,7 +253,8 @@ func openNormalizedActivitySource(run scheduler.Run, stderr io.Writer, now func(
 	if projectionUsable {
 		if _, err := os.Stat(projectionPath); err == nil {
 			return &normalizedActivitySource{
-				reader: completeRecordReader{path: projectionPath}, projected: true, now: now, stderr: stderr, initial: true,
+				reader: completeRecordReader{path: projectionPath}, rawPath: run.LogPath, projectionPath: projectionPath,
+				projected: true, now: now, stderr: stderr, initial: true,
 			}, nil
 		} else if !errors.Is(err, os.ErrNotExist) {
 			fmt.Fprintf(stderr, "Follow diagnostic for Run %q: Activity projection unavailable: %v\n", run.RunID, err)
@@ -255,15 +265,17 @@ func openNormalizedActivitySource(run scheduler.Run, stderr io.Writer, now func(
 	}
 	fmt.Fprintf(stderr, "Follow diagnostic for Run %q: Activity projection unavailable; replayed Activity age is n/a\n", run.RunID)
 	return &normalizedActivitySource{
-		reader: completeRecordReader{path: run.LogPath}, now: now, stderr: stderr, initial: true,
+		reader: completeRecordReader{path: run.LogPath}, rawPath: run.LogPath, projectionPath: projectionPath,
+		now: now, stderr: stderr, initial: true,
 	}, nil
 }
 
-func (s *normalizedActivitySource) read() []activity.Entry {
+func (s *normalizedActivitySource) read() ([]activity.Entry, int, bool) {
+	replayed, reset := s.fallbackIfProjectionFailed()
 	lines, err := s.reader.read()
 	if err != nil {
 		fmt.Fprintf(s.stderr, "Follow diagnostic: Worker Activity unavailable: %v\n", err)
-		return nil
+		return nil, replayed, reset
 	}
 	entries := make([]activity.Entry, 0, len(lines))
 	for _, line := range lines {
@@ -290,7 +302,55 @@ func (s *normalizedActivitySource) read() []activity.Entry {
 		}
 	}
 	s.initial = false
-	return entries
+	s.semanticRead += len(entries)
+	return entries, replayed, reset
+}
+
+func (s *normalizedActivitySource) fallbackIfProjectionFailed() (int, bool) {
+	if !s.projected {
+		return 0, false
+	}
+	diagnostic, err := os.ReadFile(activity.UnavailablePath(s.projectionPath))
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, false
+	}
+	if err == nil {
+		fmt.Fprintf(s.stderr, "Follow diagnostic: Activity projection unavailable: %s", diagnostic)
+	} else {
+		fmt.Fprintf(s.stderr, "Follow diagnostic: Activity projection diagnostic unavailable: %v\n", err)
+	}
+	fmt.Fprintln(s.stderr, "Follow diagnostic: replayed Activity age is n/a")
+	replayed := s.semanticRead
+	s.reader = completeRecordReader{path: s.rawPath}
+	s.projected = false
+	s.projector = activity.Projector{}
+	s.initial = true
+	s.semanticRead = 0
+	return replayed, true
+}
+
+func consumeActivity(metrics *followMetrics, source *normalizedActivitySource) []activity.Entry {
+	entries, replayed, reset := source.read()
+	if !reset {
+		for _, entry := range entries {
+			metrics.apply(entry)
+		}
+		return entries
+	}
+	*metrics = followMetrics{}
+	for _, entry := range entries {
+		metrics.apply(entry)
+	}
+	return entries[min(replayed, len(entries)):]
+}
+
+func printNewActivity(output io.Writer, metrics *followMetrics, source *normalizedActivitySource) error {
+	for _, entry := range consumeActivity(metrics, source) {
+		if err := printActivityEntry(output, entry); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func followNormalized(
@@ -311,9 +371,7 @@ func followNormalized(
 	}
 	metrics := followMetrics{}
 	if activitySource != nil {
-		for _, entry := range activitySource.read() {
-			metrics.apply(entry)
-		}
+		consumeActivity(&metrics, activitySource)
 	}
 	if err := printFollowSummary(output, selected, metrics, now()); err != nil {
 		return err
@@ -329,11 +387,8 @@ func followNormalized(
 	lastLogPath := selected.LogPath
 	for {
 		if activitySource != nil {
-			for _, entry := range activitySource.read() {
-				metrics.apply(entry)
-				if err := printActivityEntry(output, entry); err != nil {
-					return err
-				}
+			if err := printNewActivity(output, &metrics, activitySource); err != nil {
+				return err
 			}
 		}
 		selected, err = loadFollowRun(source, runID)
@@ -349,11 +404,8 @@ func followNormalized(
 				fmt.Fprintln(diagnostics, "Follow diagnostic:", err)
 			} else {
 				lastLogPath = selected.LogPath
-				newEntries := activitySource.read()
+				newEntries := consumeActivity(&metrics, activitySource)
 				start := max(0, len(newEntries)-20)
-				for _, entry := range newEntries {
-					metrics.apply(entry)
-				}
 				for _, entry := range newEntries[start:] {
 					if err := printActivityEntry(output, entry); err != nil {
 						return err
@@ -374,11 +426,8 @@ func followNormalized(
 		}
 		if scheduler.IsTerminal(selected.Status) && !selected.WorkerLogOpen {
 			if activitySource != nil {
-				for _, entry := range activitySource.read() {
-					metrics.apply(entry)
-					if err := printActivityEntry(output, entry); err != nil {
-						return err
-					}
+				if err := printNewActivity(output, &metrics, activitySource); err != nil {
+					return err
 				}
 			}
 			if _, err := fmt.Fprintln(output, "\nTerminal Run summary:"); err != nil {

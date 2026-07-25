@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestWriterIgnoresUnknownRecordsAndMarksObservationFailure(t *testing.T) {
@@ -55,6 +56,32 @@ func TestWriterMarksAppendAndCloseFailures(t *testing.T) {
 	}
 	if _, err := os.Stat(UnavailablePath(path)); err != nil {
 		t.Fatalf("append/close failure marker: %v", err)
+	}
+}
+
+func TestProjectorMarksCompletedResponsesAndKeepsParallelToolOperation(t *testing.T) {
+	t.Parallel()
+
+	var projector Projector
+	observedAt := time.Now()
+	completed, semantic, err := projector.Observe([]byte(`{"type":"message_end","message":{"role":"assistant","content":[]}}`), observedAt)
+	if err != nil || !semantic || !completed.ResponseCompleted || completed.TokensKnown {
+		t.Fatalf("completed response = %#v, semantic = %t, err = %v", completed, semantic, err)
+	}
+	for _, record := range []string{
+		`{"type":"tool_execution_start","toolCallId":"first","toolName":"read"}`,
+		`{"type":"tool_execution_start","toolCallId":"second","toolName":"bash"}`,
+	} {
+		if _, semantic, err := projector.Observe([]byte(record), observedAt); err != nil || !semantic {
+			t.Fatalf("observe %s: semantic = %t, err = %v", record, semantic, err)
+		}
+	}
+	ended, semantic, err := projector.Observe([]byte(`{"type":"tool_execution_end","toolCallId":"second","isError":false}`), observedAt)
+	if err != nil || !semantic {
+		t.Fatalf("end parallel tool: semantic = %t, err = %v", semantic, err)
+	}
+	if ended.Operation != "read" {
+		t.Fatalf("operation after parallel tool ended = %q, want read", ended.Operation)
 	}
 }
 
