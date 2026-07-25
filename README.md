@@ -108,7 +108,7 @@ On restart, the runner reconciles persisted Leases with process liveness and Git
 
 A continuation marker persisted before a crash can recover a dead Worker into Resume. Missing, changed, malformed, or uncertain continuation state on a Suspended Run becomes `needs-human` with its Lease retained. Legacy print-mode Runs never Resume automatically. The runner compares each recovered PID with its persisted operating-system process start identity, so PID reuse becomes `needs-human` instead of being mistaken for the Worker. A live matching Worker is never launched twice. A recovered live RPC Worker becomes `needs-human` because a replacement runner cannot restore its prompt and event pipes. Its process identity remains durable and consumes Worker capacity. Recovered Workers older than `--max-worker-age` also become `needs-human`.
 
-Inspect state. Plain status includes each snapshotted issue title when available and falls back to its issue number for older history. Reading version 1 state performs the version 2 migration under the repository lock before printing status:
+Inspect state. Plain status includes each snapshotted issue title when available, falls back to its issue number for older history, and reports `suspending` while bounded suspension is in progress. JSON status records `suspendingAt` and `suspendedAt` timestamps for the corresponding lifecycle transitions. Reading version 1 state performs the version 2 migration under the repository lock before printing status:
 
 ```sh
 backlog status
@@ -189,6 +189,8 @@ Run the fast lint, test, and build checks:
 
 ```sh
 mise run check
+# Equivalent compatibility entry point:
+make check
 ```
 
 Run the complete CI suite, including the race detector:

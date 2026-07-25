@@ -32,6 +32,10 @@ _Avoid_: Past failed Run, historical failure
 A runner shutdown phase that stops creating Leases while allowing every Owned Worker to finish before the runner exits.
 _Avoid_: Pause, cancellation
 
+**Suspending Run**:
+A running Run whose Owned Worker is establishing a verified continuation boundary during bounded shutdown.
+_Avoid_: Pausing Run, paused Worker
+
 **Suspended Run**:
 A Run with no live Worker whose retained continuation state allows a replacement Worker to continue it.
 _Avoid_: Paused Worker, failed Run

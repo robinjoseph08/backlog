@@ -13,11 +13,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
 	"github.com/robinjoseph08/backlog/internal/herdr"
 	"github.com/robinjoseph08/backlog/internal/runner"
+	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 	"github.com/robinjoseph08/backlog/internal/worker"
 	"github.com/robinjoseph08/backlog/internal/worktree"
@@ -77,11 +80,19 @@ func MainWithSignals(ctx context.Context, args []string, stdout, stderr io.Write
 	return 0
 }
 
-func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan os.Signal) error {
+const (
+	setupSignalNone                int32 = 0
+	setupSignalDrainAccepted       int32 = 1
+	setupSignalInterruptSuspension int32 = 130
+	setupSignalTermSuspension      int32 = 143
+)
+
+func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan os.Signal) (resultErr error) {
 	setupCtx := ctx
 	runnerSignals := signals
 	var cancelSetup context.CancelFunc
 	var setupDone, relayDone chan struct{}
+	var setupSignalExit atomic.Int32
 	if signals != nil {
 		setupCtx, cancelSetup = context.WithCancel(ctx)
 		forwarded := make(chan os.Signal, 16)
@@ -103,6 +114,21 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 					select {
 					case <-setupDone:
 					default:
+						for {
+							previous := setupSignalExit.Load()
+							next := previous
+							switch {
+							case signal == syscall.SIGTERM && previous != setupSignalInterruptSuspension && previous != setupSignalTermSuspension:
+								next = setupSignalTermSuspension
+							case previous == setupSignalNone:
+								next = setupSignalDrainAccepted
+							case previous == setupSignalDrainAccepted:
+								next = setupSignalInterruptSuspension
+							}
+							if setupSignalExit.CompareAndSwap(previous, next) {
+								break
+							}
+						}
 						cancelSetup()
 					}
 				case <-relayDone:
@@ -113,6 +139,18 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 		defer func() {
 			close(relayDone)
 			cancelSetup()
+			switch setupSignalExit.Load() {
+			case setupSignalDrainAccepted:
+				fmt.Fprintln(stdout, "Drain: admission stopped during setup; 0 Workers remaining")
+				fmt.Fprintln(stdout, "Drain complete: 0 Workers remaining; exiting successfully")
+				resultErr = nil
+			case setupSignalInterruptSuspension:
+				fmt.Fprintln(stdout, "Suspension: repeated SIGINT accepted during setup; 0 Workers remaining")
+				resultErr = &runner.SignalExit{Code: int(setupSignalInterruptSuspension)}
+			case setupSignalTermSuspension:
+				fmt.Fprintln(stdout, "Suspension: SIGTERM accepted during setup; 0 Workers remaining")
+				resultErr = &runner.SignalExit{Code: int(setupSignalTermSuspension)}
+			}
 		}()
 	}
 
@@ -287,7 +325,11 @@ func statusCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 		if run.IssueTitle != "" {
 			issue += "  " + run.IssueTitle
 		}
-		fmt.Fprintf(stdout, "  %s  %-17s  %s", issue, run.Status, run.Branch)
+		status := run.Status
+		if status == scheduler.StatusRunning && run.SuspendingAt != nil {
+			status = scheduler.Status("suspending")
+		}
+		fmt.Fprintf(stdout, "  %s  %-17s  %s", issue, status, run.Branch)
 		if run.Error != "" {
 			fmt.Fprintf(stdout, "  (%s)", run.Error)
 		}
