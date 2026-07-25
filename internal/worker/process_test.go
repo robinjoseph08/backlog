@@ -239,6 +239,55 @@ printf '`+test.output+`'
 	}
 }
 
+func TestRPCEntryAppendedDoesNotChangeLifecycleState(t *testing.T) {
+	t.Parallel()
+
+	type lifecycleState struct {
+		state                     rpcAgentState
+		turnOpen                  bool
+		completedTurns            int
+		messageOpen               bool
+		compactionOpen            bool
+		retryOpen                 bool
+		retryAttempt              int
+		summarizationRetryOpen    bool
+		summarizationRetryAttempt int
+		toolOpen                  bool
+		openToolCount             int
+	}
+	events := newRPCWriter(&strings.Builder{}, nil, "backlog-afk-prompt", 31)
+	events.state = rpcAgentRunning
+	events.turnOpen = true
+	events.completedTurns = 2
+	events.messageOpen = true
+	events.compactionOpen = true
+	events.retryOpen = true
+	events.retryAttempt = 3
+	events.summarizationRetryOpen = true
+	events.summarizationRetryAttempt = 4
+	events.openTools["subagent-1"] = struct{}{}
+	snapshot := func() lifecycleState {
+		_, toolOpen := events.openTools["subagent-1"]
+		return lifecycleState{
+			state: events.state, turnOpen: events.turnOpen, completedTurns: events.completedTurns,
+			messageOpen: events.messageOpen, compactionOpen: events.compactionOpen,
+			retryOpen: events.retryOpen, retryAttempt: events.retryAttempt,
+			summarizationRetryOpen:    events.summarizationRetryOpen,
+			summarizationRetryAttempt: events.summarizationRetryAttempt,
+			toolOpen:                  toolOpen, openToolCount: len(events.openTools),
+		}
+	}
+
+	before := snapshot()
+	events.validate([]byte(`{"type":"entry_appended"}`))
+	if after := snapshot(); after != before {
+		t.Fatalf("entry_appended changed lifecycle state from %#v to %#v", before, after)
+	}
+	if err := events.Err(); err != nil {
+		t.Fatalf("entry_appended was rejected: %v", err)
+	}
+}
+
 func TestProcessAcceptsEntryAppendedDuringToolExecution(t *testing.T) {
 	t.Parallel()
 
@@ -484,30 +533,41 @@ while IFS= read -r ignored; do :; done
 	}
 }
 
-func TestCloseReportsProtocolFailureAfterSettlement(t *testing.T) {
+func TestCloseReportsProtocolFailuresAfterSettlement(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
-	pi := fakePi(t, `
+	tests := []struct {
+		name  string
+		event string
+	}{
+		{name: "unknown event", event: `{"type":"surprise"}`},
+		{name: "entry appended", event: `{"type":"entry_appended","entry":{"type":"custom"}}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			pi := fakePi(t, `
 IFS= read -r command
 printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 sleep 0.05
-printf '%s\n' '{"type":"surprise"}'
+printf '%s\n' '`+test.event+`'
 `)
-	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(
-		context.Background(), request(13, "run-13", root, filepath.Join(root, "sessions", "run-13")),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := process.Release(); err != nil {
-		t.Fatal(err)
-	}
-	if result := process.Wait(); result.Err != nil || !result.Settled {
-		t.Fatalf("wait = %#v", result)
-	}
-	if result := process.Close(); result.Err == nil || !strings.Contains(result.Err.Error(), "followed agent_settled") {
-		t.Fatalf("close error = %v, want post-settlement protocol failure", result.Err)
+			process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(
+				context.Background(), request(13, "run-13", root, filepath.Join(root, "sessions", "run-13")),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := process.Release(); err != nil {
+				t.Fatal(err)
+			}
+			if result := process.Wait(); result.Err != nil || !result.Settled {
+				t.Fatalf("wait = %#v", result)
+			}
+			if result := process.Close(); result.Err == nil || !strings.Contains(result.Err.Error(), "followed agent_settled") {
+				t.Fatalf("close error = %v, want post-settlement protocol failure", result.Err)
+			}
+		})
 	}
 }
 
