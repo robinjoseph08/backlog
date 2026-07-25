@@ -1,3 +1,7 @@
+## Development
+
+Use `mise` instead of `make` for project tasks.
+
 ## Agent skills
 
 ### Issue tracker

@@ -189,8 +189,6 @@ Run the fast lint, test, and build checks:
 
 ```sh
 mise run check
-# Equivalent compatibility entry point:
-make check
 ```
 
 Run the complete CI suite, including the race detector:

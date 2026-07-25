@@ -31,4 +31,4 @@ jobs:
           cache: true
 
       - name: Run validation
-        run: make ci
+        run: mise run ci
