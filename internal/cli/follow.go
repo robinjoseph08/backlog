@@ -86,9 +86,13 @@ func followCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 			return err
 		}
 		nextObservation := time.Now().Add(followObservationInterval)
+		lastStatus := selected.Status
 		return followRawObserved(ctx, source, runID, stdout, followPollInterval, func(run scheduler.Run) error {
 			observedAt := time.Now()
-			if !scheduler.IsTerminal(run.Status) && observedAt.Before(nextObservation) {
+			statusChanged := run.Status != lastStatus
+			observationDue := followObservationDue(run.Status, statusChanged, observedAt, nextObservation)
+			lastStatus = run.Status
+			if !observationDue {
 				return nil
 			}
 			nextObservation = observedAt.Add(followObservationInterval)
@@ -317,6 +321,10 @@ func followWorkerLiveness(run scheduler.Run) string {
 		return fmt.Sprintf("dead (stale PID %d has a different process-start identity)", pid)
 	}
 	return fmt.Sprintf("alive (PID %d and process-start identity verified)", pid)
+}
+
+func followObservationDue(status scheduler.Status, statusChanged bool, now, nextObservation time.Time) bool {
+	return scheduler.IsTerminal(status) && statusChanged || !now.Before(nextObservation)
 }
 
 func waitToFollow(ctx context.Context, interval time.Duration) bool {
@@ -691,7 +699,8 @@ func followNormalized(
 				metrics.clearPendingSubagentFeed()
 			}
 		}
-		if selected.Status != lastStatus {
+		statusChanged := selected.Status != lastStatus
+		if statusChanged {
 			entry := activity.Entry{
 				Version: activity.CurrentVersion, ObservedAt: now().UTC(), Kind: "lifecycle",
 				Description: "Run state changed to " + string(selected.Status),
@@ -702,7 +711,7 @@ func followNormalized(
 			lastStatus = selected.Status
 		}
 		observationNow := now()
-		if scheduler.IsTerminal(selected.Status) || !observationNow.Before(nextObservation) {
+		if followObservationDue(selected.Status, statusChanged, observationNow, nextObservation) {
 			observation := observeFollowRun(source, selected)
 			if observation.supervision != lastObservation.supervision {
 				if err := printActivityEntry(output, activity.Entry{ObservedAt: observationNow.UTC(), Description: "Runner supervision changed to " + observation.supervision}); err != nil {

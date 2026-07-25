@@ -1011,6 +1011,22 @@ func TestResettingRunRemainsUnsupervisedWithActiveRunner(t *testing.T) {
 	}
 }
 
+func TestFollowObservationThrottleForTerminalRunWithOpenLog(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 27, 1, 2, 3, 0, time.UTC)
+	nextObservation := now.Add(time.Second)
+	if !followObservationDue(scheduler.StatusFailed, true, now, nextObservation) {
+		t.Fatal("terminal transition did not trigger an immediate observation")
+	}
+	if followObservationDue(scheduler.StatusFailed, false, now.Add(50*time.Millisecond), nextObservation) {
+		t.Fatal("terminal Run with an open log bypassed the observation throttle")
+	}
+	if !followObservationDue(scheduler.StatusFailed, false, nextObservation, nextObservation) {
+		t.Fatal("terminal Run was not observed when the throttle elapsed")
+	}
+}
+
 func TestFollowRequiresRunID(t *testing.T) {
 	t.Parallel()
 
@@ -1226,7 +1242,7 @@ func TestFollowSummaryRejectsOverflowingTelemetry(t *testing.T) {
 	metrics.apply(activity.Entry{Subagent: &activity.SubagentSnapshot{ID: "one", Turns: &turns, ToolUses: &tools, ApproxTokens: &maxTokens}})
 	metrics.apply(activity.Entry{Subagent: &activity.SubagentSnapshot{ID: "two", Turns: &turns, ToolUses: &tools, ApproxTokens: &one}})
 	var output bytes.Buffer
-	if err := printFollowSummary(&output, scheduler.Run{RunID: "overflow"}, metrics, time.Time{}); err != nil {
+	if err := printFollowSummary(&output, scheduler.Run{RunID: "overflow"}, metrics, followObservation{}, time.Time{}); err != nil {
 		t.Fatal(err)
 	}
 	got := output.String()
