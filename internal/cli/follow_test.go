@@ -490,13 +490,12 @@ func TestFollowCommandReportsVerifiedWorkerLivenessAndRunnerSupervision(t *testi
 			}); err != nil {
 				t.Fatal(err)
 			}
-			var lock *repositoryLock
 			if test.supervise {
-				lock, err = acquireRepositoryLock(filepath.Join(repository, ".git"))
+				supervision, err := establishRunnerSupervision(filepath.Join(repository, ".git"))
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer lock.Release()
+				defer supervision.Release()
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			var output synchronizedBuffer
@@ -544,12 +543,12 @@ func TestFollowCommandKeepsObservingUnsupervisedRunAndReportsReturningSupervisio
 		done <- followCommand(ctx, []string{run.RunID, "--repo-dir", repository, "--state-dir", stateDir}, &output, io.Discard)
 	}()
 	waitForBuffer(t, &output, "Runner supervision: UNSUPERVISED")
-	lock, err := acquireRepositoryLock(filepath.Join(repository, ".git"))
+	supervision, err := establishRunnerSupervision(filepath.Join(repository, ".git"))
 	if err != nil {
 		cancel()
 		t.Fatal(err)
 	}
-	defer lock.Release()
+	defer supervision.Release()
 	waitForBuffer(t, &output, "Runner supervision changed to SUPERVISED")
 	cancel()
 	if err := <-done; err != nil {
@@ -799,12 +798,46 @@ func TestFollowRawCommandPropagatesResolvedIdentityOutputFailure(t *testing.T) {
 	}
 }
 
-func TestRepositoryFollowSourceReportsUnavailableCoordinationDirectory(t *testing.T) {
+func TestRepositoryFollowSourceReportsMalformedRunnerIdentity(t *testing.T) {
 	t.Parallel()
 
-	source := repositoryFollowSource{commonDirectory: filepath.Join(t.TempDir(), "missing")}
-	if _, err := source.RunnerSupervised(); err == nil || !strings.Contains(err.Error(), "open repository coordination directory") {
-		t.Fatalf("coordination observation error = %v", err)
+	commonDirectory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(commonDirectory, runnerSupervisionFile), []byte("not JSON"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source := repositoryFollowSource{commonDirectory: commonDirectory}
+	if _, err := source.RunnerSupervised(); err == nil || !strings.Contains(err.Error(), "read Runner supervision marker") {
+		t.Fatalf("Runner supervision observation error = %v", err)
+	}
+}
+
+func TestRepositoryFollowSourceDoesNotBlockRunnerCoordination(t *testing.T) {
+	t.Parallel()
+
+	commonDirectory := t.TempDir()
+	source := repositoryFollowSource{commonDirectory: commonDirectory}
+	if supervised, err := source.RunnerSupervised(); err != nil || supervised {
+		t.Fatalf("initial Runner supervision = %t, %v", supervised, err)
+	}
+	lock, err := acquireRepositoryLock(commonDirectory)
+	if err != nil {
+		t.Fatalf("passive Follow observation blocked Runner coordination: %v", err)
+	}
+	defer lock.Release()
+}
+
+func TestRepositoryFollowSourceDoesNotTreatResetAsRunnerSupervision(t *testing.T) {
+	t.Parallel()
+
+	commonDirectory := t.TempDir()
+	lock, err := acquireResetReadLock(commonDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	source := repositoryFollowSource{commonDirectory: commonDirectory}
+	if supervised, err := source.RunnerSupervised(); err != nil || supervised {
+		t.Fatalf("Runner supervision during Reset = %t, %v", supervised, err)
 	}
 }
 

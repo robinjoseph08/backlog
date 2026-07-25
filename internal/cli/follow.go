@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/robinjoseph08/backlog/internal/activity"
@@ -33,21 +32,7 @@ type repositoryFollowSource struct {
 }
 
 func (s repositoryFollowSource) RunnerSupervised() (bool, error) {
-	directory, err := os.Open(s.commonDirectory)
-	if err != nil {
-		return false, fmt.Errorf("open repository coordination directory: %w", err)
-	}
-	defer directory.Close()
-	if err := syscall.Flock(int(directory.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
-		if errors.Is(err, syscall.EWOULDBLOCK) {
-			return true, nil
-		}
-		return false, fmt.Errorf("observe repository coordination ownership: %w", err)
-	}
-	if err := syscall.Flock(int(directory.Fd()), syscall.LOCK_UN); err != nil {
-		return false, fmt.Errorf("release repository coordination observation: %w", err)
-	}
-	return false, nil
+	return runnerSupervised(s.commonDirectory)
 }
 
 func followCommand(ctx context.Context, args []string, stdout, stderr io.Writer) error {
