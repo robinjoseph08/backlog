@@ -115,13 +115,15 @@ backlog status
 backlog status --json
 ```
 
-Follow one exact Run through normalized Worker Activity without acquiring scheduling ownership or communicating with its Runner or Worker:
+Follow one exact Run through normalized Worker and Subagent Activity without acquiring scheduling ownership or communicating with its Runner or Worker:
 
 ```sh
 backlog follow <run-id>
 ```
 
-Follow immediately prints the Run and issue identity, state, elapsed time, Activity age, current Worker operation, completed turns, and exact completed tokens. It shows at most the latest 20 semantic Activity entries, then streams new model, tool, turn, retry, compaction, and lifecycle Activity. Cosmetic refreshes and repeated snapshots are ignored. Reasoning, tool arguments, and tool results are omitted, while visible final assistant text may be shown. Missing usage and unavailable Activity age are reported as `n/a`.
+Follow immediately prints the Run and issue identity, state, elapsed time, Activity age, current Worker operation, exact Worker turns and tokens, separate Subagent status and durations, and approximate Subagent turns, tool uses, and tokens. Each Subagent is tracked independently, and the summary shows the active count and deepest current operation. The compact observed-token total is prefixed with `~` whenever Subagent estimates contribute.
+
+Follow shows at most the latest 20 semantic Run Activity entries, then streams new model, tool, turn, retry, compaction, lifecycle, and Subagent Activity. Subagent feed updates are limited to one per second per Subagent, except that status transitions and turn milestones are always retained. Every meaningful update still refreshes Activity age. Spinner frames, durations alone, and repeated snapshots are ignored as Activity. Reasoning, full Subagent prompts, tool arguments, and tool results are omitted, while safe descriptions and visible final Worker assistant text may be shown. Missing or malformed telemetry is reported as `n/a`.
 
 Backlog records normalized Activity and its local observation time in an append-only sidecar without rewriting lifecycle state for each event. Projection failures do not affect the Worker result. Follow reports a diagnostic and rebuilds privacy-safe semantic history from raw evidence when possible; replayed Activity without trustworthy observation times has an age of `n/a`.
 

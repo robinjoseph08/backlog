@@ -316,6 +316,9 @@ printf '%s\n' \
   '{"type":"message_start","message":{"role":"assistant"}}' \
   '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"private reasoning"}}' \
   '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"visible"}],"usage":{"totalTokens":41}}}' \
+  '{"type":"tool_execution_start","toolCallId":"subagent-malformed","toolName":"Agent","args":{"prompt":"private Subagent prompt"}}' \
+  '{"type":"tool_execution_update","toolCallId":"subagent-malformed","toolName":"Agent","partialResult":{"content":[{"type":"text","text":"private Subagent output"}],"details":{"description":42,"status":[],"turnCount":"many","toolUses":-1,"tokens":"unknown","spinnerFrame":4,"durationMs":10}}}' \
+  '{"type":"tool_execution_end","toolCallId":"subagent-malformed","toolName":"Agent","result":{"content":[{"type":"text","text":"private Subagent result"}],"details":"unavailable"},"isError":false}' \
   '{"type":"turn_end"}' \
   '{"type":"agent_end"}' \
   '{"type":"agent_settled"}'
@@ -347,7 +350,12 @@ while IFS= read -r ignored; do :; done
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(projection), "private reasoning") || !strings.Contains(string(projection), "visible") || !strings.Contains(string(projection), `"tokenDelta":41`) {
+	for _, private := range []string{"private reasoning", "private Subagent prompt", "private Subagent output", "private Subagent result"} {
+		if strings.Contains(string(projection), private) {
+			t.Fatalf("Activity projection exposed %q: %s", private, projection)
+		}
+	}
+	if !strings.Contains(string(projection), "visible") || !strings.Contains(string(projection), `"tokenDelta":41`) || !strings.Contains(string(projection), `"kind":"subagent"`) || !strings.Contains(string(projection), `"description":"Subagent [subagent-malf`) {
 		t.Fatalf("Activity projection privacy/usage = %s", projection)
 	}
 	for number, line := range strings.Split(strings.TrimSpace(string(projection)), "\n") {

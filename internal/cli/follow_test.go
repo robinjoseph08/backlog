@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -271,7 +272,7 @@ func TestFollowCommandUsesNormalizedActivityByDefault(t *testing.T) {
 	if err := followCommand(context.Background(), []string{"default-normalized", "--repo-dir", repository, "--state-dir", stateDir}, &output, io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	if got := output.String(); !strings.Contains(got, "Run: default-normalized") || !strings.Contains(got, "Worker Activity (latest 20)") || !strings.Contains(got, "Worker settled") {
+	if got := output.String(); !strings.Contains(got, "Run: default-normalized") || !strings.Contains(got, "Run Activity (latest 20)") || !strings.Contains(got, "Worker settled") {
 		t.Fatalf("default Follow output = %q", got)
 	}
 }
@@ -579,7 +580,7 @@ func TestFollowNormalizedReplaysSemanticWorkerActivityWithUsageAndPrivacy(t *tes
 	for _, want := range []string{
 		"Run: run-28", "Issue: #28  Normalized Worker Activity  https://example.test/issues/28", "State: merged",
 		"Elapsed: 1h0m0s", "Activity age: n/a", "Current Worker operation: n/a",
-		"Completed Worker turns: 1", "Completed Worker tokens: 200", "Visible final answer", "Second visible answer",
+		"Completed Worker turns: 1", "Completed Worker tokens: 200", "Observed tokens: 200", "Visible final answer", "Second visible answer",
 		"Tool bash started", "Tool bash output changed", "Tool bash completed", "Worker retry 1 started: temporary failure",
 		"Worker retry 1 ended", "Context compaction started", "Compaction retry 2 scheduled", "Compaction retry started",
 		"Compaction retry finished", "Context compaction ended", "Worker settled",
@@ -601,6 +602,187 @@ func TestFollowNormalizedReplaysSemanticWorkerActivityWithUsageAndPrivacy(t *tes
 	}
 	if !strings.Contains(diagnostics.String(), "replayed Activity age is n/a") {
 		t.Fatalf("diagnostics = %q", diagnostics.String())
+	}
+}
+
+func TestFollowNormalizedShowsDistinctCoalescedSubagentActivityAndApproximateUsage(t *testing.T) {
+	directory := t.TempDir()
+	logPath := filepath.Join(directory, "subagents.jsonl")
+	records := []string{
+		`{"type":"agent_start"}`,
+		`{"type":"turn_start"}`,
+		`{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"totalTokens":100}}}`,
+		`{"type":"turn_end"}`,
+		`{"type":"tool_execution_start","toolCallId":"agent-one-identity","toolName":"Agent","args":{"prompt":"full private implementation prompt"}}`,
+		`{"type":"tool_execution_update","toolCallId":"agent-one-identity","toolName":"Agent","partialResult":{"content":[{"type":"text","text":"private partial output"}],"details":{"description":"Implement Follow metrics","status":"running","activity":"thinking","turnCount":1,"toolUses":0,"tokens":"1.0k token","durationMs":0,"spinnerFrame":0}}}`,
+		`{"type":"tool_execution_update","toolCallId":"agent-one-identity","toolName":"Agent","partialResult":{"content":[{"type":"text","text":"private partial output"}],"details":{"description":"Implement Follow metrics","status":"running","activity":"thinking","turnCount":1,"toolUses":0,"tokens":"1.0k token","durationMs":500,"spinnerFrame":7}}}`,
+		`{"type":"tool_execution_update","toolCallId":"agent-one-identity","toolName":"Agent","partialResult":{"content":[{"type":"text","text":"different private output"}],"details":{"description":"Implement Follow metrics","status":"running","activity":"editing","turnCount":1,"toolUses":1,"tokens":"1.2k token","durationMs":600,"spinnerFrame":8}}}`,
+		`{"type":"tool_execution_update","toolCallId":"agent-one-identity","toolName":"Agent","partialResult":{"content":[{"type":"text","text":"different private output"}],"details":{"description":"Implement Follow metrics","status":"running","activity":"testing","turnCount":2,"toolUses":3,"tokens":"1.8k token","durationMs":700,"spinnerFrame":9}}}`,
+		`{"type":"tool_execution_start","toolCallId":"agent-two-identity","toolName":"Agent","args":{"prompt":"full private review prompt"}}`,
+		`{"type":"tool_execution_update","toolCallId":"agent-two-identity","toolName":"Agent","partialResult":{"content":[{"type":"text","text":"private review output"}],"details":{"description":"Review Follow changes","status":"running","activity":"reviewing","turnCount":1,"toolUses":1,"tokens":"500 token","durationMs":100}}}`,
+		`{"type":"tool_execution_end","toolCallId":"agent-one-identity","toolName":"Agent","result":{"content":[{"type":"text","text":"full private implementation result"}],"details":{"description":"Implement Follow metrics","status":"completed","turnCount":3,"toolUses":5,"tokens":"2.5k token","durationMs":2500}},"isError":false}`,
+		`{"type":"tool_execution_end","toolCallId":"agent-two-identity","toolName":"Agent","result":{"content":[{"type":"text","text":"full private review result"}],"details":{"description":"Review Follow changes","status":"completed","turnCount":2,"toolUses":3,"tokens":"1.5k token","durationMs":1500}},"isError":false}`,
+		`{"type":"agent_settled"}`,
+	}
+	if err := os.WriteFile(logPath, []byte(strings.Join(records, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run := scheduler.Run{Issue: 29, RunID: "subagents", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModeRPC, LogPath: logPath}
+	var output bytes.Buffer
+	if err := followNormalized(context.Background(), &sequenceFollowSource{runs: []scheduler.Run{run}}, run.RunID, &output, io.Discard, time.Millisecond, time.Now); err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	for _, want := range []string{
+		"Completed Worker turns: 1", "Completed Worker tokens: 100", "Subagents: 2 (0 active)",
+		"Approximate Subagent turns: ~5", "Approximate Subagent tool uses: ~8", "Approximate Subagent tokens: ~4000", "Observed tokens: ~4100",
+		"Subagent 1 [agent-one-identi]: Implement Follow metrics | status: completed | operation: testing | turns: ~3 | tool uses: ~5 | duration: 2.5s | tokens: ~2500",
+		"Subagent 2 [agent-two-identi]: Review Follow changes | status: completed", "reached turn 2", "completed (completed)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("Subagent output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "activity: editing") || strings.Contains(got, "private") || strings.Contains(got, "spinner") {
+		t.Fatalf("Subagent output exposed coalesced or private telemetry:\n%s", got)
+	}
+	if count := strings.Count(got, `Subagent [agent-one-identi] "Implement Follow metrics" status: running`); count != 1 {
+		t.Fatalf("initial Subagent snapshots = %d, want 1:\n%s", count, got)
+	}
+}
+
+func TestFollowMetricsSelectsMostRecentlyActiveSubagentIncludingSuppressedUpdates(t *testing.T) {
+	t.Parallel()
+
+	turns, tools := 1, 1
+	tokens := int64(100)
+	observedAt := time.Date(2026, 4, 5, 6, 7, 8, 0, time.UTC)
+	metrics := followMetrics{}
+	metrics.apply(activity.Entry{ObservedAt: observedAt, Description: "first", Subagent: &activity.SubagentSnapshot{
+		ID: "first", Description: "First", Status: "running", Activity: "reading", Turns: &turns, ToolUses: &tools, ApproxTokens: &tokens, Active: true,
+	}})
+	metrics.apply(activity.Entry{ObservedAt: observedAt.Add(time.Second), Description: "second", Subagent: &activity.SubagentSnapshot{
+		ID: "second", Description: "Second", Status: "running", Activity: "testing", Turns: &turns, ToolUses: &tools, ApproxTokens: &tokens, Active: true,
+	}})
+	if active, deepest := metrics.activeSubagentSummary(); active != 2 || deepest != `Subagent "Second": testing` {
+		t.Fatalf("initial active summary = %d, %q", active, deepest)
+	}
+	metrics.apply(activity.Entry{ObservedAt: observedAt.Add(1100 * time.Millisecond), Description: "first suppressed", SuppressFeed: true, Subagent: &activity.SubagentSnapshot{
+		ID: "first", Description: "First", Status: "running", Activity: "writing", Turns: &turns, ToolUses: &tools, ApproxTokens: &tokens, Active: true,
+	}})
+	if active, deepest := metrics.activeSubagentSummary(); active != 2 || deepest != `Subagent "First": writing` {
+		t.Fatalf("suppressed active summary = %d, %q", active, deepest)
+	}
+}
+
+func TestFlushPendingSubagentActivityEventuallyPrintsLatestOperation(t *testing.T) {
+	t.Parallel()
+
+	turns, tools := 1, 1
+	tokens := int64(100)
+	observedAt := time.Date(2026, 4, 5, 6, 7, 8, 0, time.UTC)
+	metrics := followMetrics{}
+	metrics.apply(activity.Entry{ObservedAt: observedAt, Description: "Subagent reading", Subagent: &activity.SubagentSnapshot{
+		ID: "pending", Description: "Pending", Status: "running", Activity: "reading", Turns: &turns, ToolUses: &tools, ApproxTokens: &tokens, Active: true,
+	}})
+	metrics.apply(activity.Entry{ObservedAt: observedAt.Add(100 * time.Millisecond), Description: "Subagent writing", SuppressFeed: true, Subagent: &activity.SubagentSnapshot{
+		ID: "pending", Description: "Pending", Status: "running", Activity: "writing", Turns: &turns, ToolUses: &tools, ApproxTokens: &tokens, Active: true,
+	}})
+	var output bytes.Buffer
+	if flushed, err := flushPendingSubagentActivity(&output, &metrics, observedAt.Add(time.Second)); err != nil || flushed {
+		t.Fatalf("early flush = %t, err = %v, output = %q", flushed, err, output.String())
+	}
+	if flushed, err := flushPendingSubagentActivity(&output, &metrics, observedAt.Add(1200*time.Millisecond)); err != nil || !flushed {
+		t.Fatalf("due flush = %t, err = %v", flushed, err)
+	}
+	if got := output.String(); !strings.Contains(got, "Subagent writing") {
+		t.Fatalf("flushed Activity = %q", got)
+	}
+	if flushed, err := flushPendingSubagentActivity(&output, &metrics, observedAt.Add(2*time.Second)); err != nil || flushed {
+		t.Fatalf("duplicate flush = %t, err = %v", flushed, err)
+	}
+}
+
+func TestFollowSummaryRejectsOverflowingTelemetry(t *testing.T) {
+	t.Parallel()
+
+	maxTokens, one := int64(math.MaxInt64), int64(1)
+	turns, tools := 1, 1
+	metrics := followMetrics{}
+	metrics.apply(activity.Entry{ResponseCompleted: true, TokensKnown: true, TokenDelta: math.MaxInt64})
+	metrics.apply(activity.Entry{ResponseCompleted: true, TokensKnown: true, TokenDelta: 1})
+	metrics.apply(activity.Entry{Subagent: &activity.SubagentSnapshot{ID: "one", Turns: &turns, ToolUses: &tools, ApproxTokens: &maxTokens}})
+	metrics.apply(activity.Entry{Subagent: &activity.SubagentSnapshot{ID: "two", Turns: &turns, ToolUses: &tools, ApproxTokens: &one}})
+	var output bytes.Buffer
+	if err := printFollowSummary(&output, scheduler.Run{RunID: "overflow"}, metrics, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	for _, want := range []string{"Completed Worker tokens: n/a", "Approximate Subagent tokens: n/a", "Observed tokens: n/a"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("overflow summary missing %q:\n%s", want, got)
+		}
+	}
+	if duration := displaySubagentDuration(&maxTokens, false, time.Time{}, time.Time{}); duration != "n/a" {
+		t.Fatalf("overflow duration = %q", duration)
+	}
+}
+
+func TestFollowNormalizedRefreshesAgeForSuppressedSubagentActivityAndRetainsMilestones(t *testing.T) {
+	directory := t.TempDir()
+	logPath := filepath.Join(directory, "coalesced.jsonl")
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Date(2026, 4, 5, 6, 7, 8, 0, time.UTC)
+	turnOne, turnTwo, tools := 1, 2, 3
+	tokens := int64(1200)
+	writeActivityEntries(t, activity.PathForLog(logPath),
+		activity.Entry{Version: activity.CurrentVersion, ObservedAt: started, Kind: "subagent", Description: "Subagent started", Subagent: &activity.SubagentSnapshot{ID: "rapid", Description: "Implement rapidly", Status: "running", Activity: "reading", Turns: &turnOne, ToolUses: &tools, ApproxTokens: &tokens, Active: true}},
+		activity.Entry{Version: activity.CurrentVersion, ObservedAt: started.Add(100 * time.Millisecond), Kind: "subagent", Description: "coalesced editing", SuppressFeed: true, Subagent: &activity.SubagentSnapshot{ID: "rapid", Description: "Implement rapidly", Status: "running", Activity: "editing", Turns: &turnOne, ToolUses: &tools, ApproxTokens: &tokens, Active: true}},
+		activity.Entry{Version: activity.CurrentVersion, ObservedAt: started.Add(200 * time.Millisecond), Kind: "subagent", Description: "Subagent reached turn 2", Subagent: &activity.SubagentSnapshot{ID: "rapid", Description: "Implement rapidly", Status: "running", Activity: "testing", Turns: &turnTwo, ToolUses: &tools, ApproxTokens: &tokens, Active: true}},
+		activity.Entry{Version: activity.CurrentVersion, ObservedAt: started.Add(900 * time.Millisecond), Kind: "subagent", Description: "coalesced final operation", SuppressFeed: true, Subagent: &activity.SubagentSnapshot{ID: "rapid", Description: "Implement rapidly", Status: "running", Activity: "writing", Turns: &turnTwo, ToolUses: &tools, ApproxTokens: &tokens, Active: true}},
+	)
+	run := scheduler.Run{Issue: 29, RunID: "rapid", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModeRPC, LogPath: logPath}
+	var output bytes.Buffer
+	if err := followNormalized(context.Background(), &sequenceFollowSource{runs: []scheduler.Run{run}}, run.RunID, &output, io.Discard, time.Millisecond, func() time.Time { return started.Add(1300 * time.Millisecond) }); err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	for _, want := range []string{"Activity age: 0s", "Subagent reached turn 2", `Deepest current operation: Subagent "Implement rapidly": writing`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("coalesced output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "coalesced editing") || strings.Contains(got, "coalesced final operation") {
+		t.Fatalf("suppressed entries reached the feed:\n%s", got)
+	}
+}
+
+func TestFollowNormalizedDisplaysMalformedSubagentTelemetryAsUnavailable(t *testing.T) {
+	directory := t.TempDir()
+	logPath := filepath.Join(directory, "unavailable-subagent.jsonl")
+	records := []string{
+		`{"type":"tool_execution_start","toolCallId":"malformed-agent","toolName":"Agent"}`,
+		`{"type":"tool_execution_update","toolCallId":"malformed-agent","toolName":"Agent","partialResult":{"content":"hidden output","details":{"description":42,"status":[],"activity":{},"turnCount":"many","toolUses":-1,"tokens":"unknown","durationMs":"long","spinnerFrame":4}}}`,
+		`{"type":"tool_execution_end","toolCallId":"malformed-agent","toolName":"Agent","result":{"content":"hidden full result","details":"unavailable"},"isError":false}`,
+	}
+	if err := os.WriteFile(logPath, []byte(strings.Join(records, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run := scheduler.Run{Issue: 29, RunID: "unavailable-subagent", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModeRPC, LogPath: logPath}
+	var output bytes.Buffer
+	if err := followNormalized(context.Background(), &sequenceFollowSource{runs: []scheduler.Run{run}}, run.RunID, &output, io.Discard, time.Millisecond, time.Now); err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	for _, want := range []string{"Subagents: 1 (0 active)", "Subagent 1 [malformed-agent]: n/a | status: n/a | operation: n/a | turns: n/a | tool uses: n/a | duration: n/a | tokens: n/a", "Approximate Subagent tokens: n/a"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("unavailable output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "hidden output") || strings.Contains(got, "hidden full result") {
+		t.Fatalf("unavailable telemetry leaked tool output:\n%s", got)
 	}
 }
 
@@ -694,6 +876,15 @@ func TestFollowNormalizedStreamsProjectionAndPrintsTerminalSummary(t *testing.T)
 		})
 	}()
 	waitForBuffer(t, &output, "Worker started")
+	turns, tools := 1, 2
+	tokens, duration := int64(1200), int64(800)
+	writeActivityEntries(t, projectionPath, activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: observedAt.Add(8 * time.Second), Kind: "subagent",
+		Description: `Subagent [live-review] "Review changes" status: running; activity: reviewing; reached turn 1`,
+		Subagent: &activity.SubagentSnapshot{ID: "live-review", Description: "Review changes", Status: "running", Activity: "reviewing",
+			Turns: &turns, ToolUses: &tools, ApproxTokens: &tokens, DurationMillis: &duration, Active: true},
+	})
+	waitForBuffer(t, &output, `Subagent summary: 1 (1 active) | Deepest current operation: Subagent "Review changes": reviewing`)
 	writeActivityEntries(t, projectionPath, activity.Entry{
 		Version: activity.CurrentVersion, ObservedAt: observedAt.Add(9 * time.Second), Kind: "model",
 		Description: "Assistant response completed: done", ResponseCompleted: true, TokensKnown: true, TokenDelta: 77,
@@ -713,7 +904,7 @@ func TestFollowNormalizedStreamsProjectionAndPrintsTerminalSummary(t *testing.T)
 		t.Fatal("normalized follower did not exit at terminal state")
 	}
 	got := output.String()
-	for _, want := range []string{"Current Worker operation: starting", "Run state changed to failed", "Terminal Run summary:", "State: failed", "Activity age: 1s", "Completed Worker tokens: 77"} {
+	for _, want := range []string{"Current Worker operation: starting", `Subagent summary: 1 (1 active) | Deepest current operation: Subagent "Review changes": reviewing`, "duration: 2.8s", "Run state changed to failed", "Terminal Run summary:", "State: failed", "Activity age: 1s", "Completed Worker tokens: 77"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("live normalized output missing %q:\n%s", want, got)
 		}

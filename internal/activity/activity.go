@@ -5,26 +5,47 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"math"
 	"path/filepath"
+	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const CurrentVersion = 1
 
-// Entry is one semantic Worker change. It deliberately excludes reasoning,
-// tool arguments, and tool results.
+// Entry is one semantic Worker or Subagent change. It deliberately excludes
+// reasoning, tool arguments, and tool results.
 type Entry struct {
-	Version           int       `json:"version"`
-	ObservedAt        time.Time `json:"observedAt"`
-	Kind              string    `json:"kind"`
-	Description       string    `json:"description"`
-	Operation         string    `json:"operation,omitempty"`
-	OperationChanged  bool      `json:"operationChanged,omitempty"`
-	TurnDelta         int       `json:"turnDelta,omitempty"`
-	ResponseCompleted bool      `json:"responseCompleted,omitempty"`
-	TokenDelta        int64     `json:"tokenDelta,omitempty"`
-	TokensKnown       bool      `json:"tokensKnown,omitempty"`
+	Version           int               `json:"version"`
+	ObservedAt        time.Time         `json:"observedAt"`
+	Kind              string            `json:"kind"`
+	Description       string            `json:"description"`
+	Operation         string            `json:"operation,omitempty"`
+	OperationChanged  bool              `json:"operationChanged,omitempty"`
+	TurnDelta         int               `json:"turnDelta,omitempty"`
+	ResponseCompleted bool              `json:"responseCompleted,omitempty"`
+	TokenDelta        int64             `json:"tokenDelta,omitempty"`
+	TokensKnown       bool              `json:"tokensKnown,omitempty"`
+	Subagent          *SubagentSnapshot `json:"subagent,omitempty"`
+	SuppressFeed      bool              `json:"suppressFeed,omitempty"`
+}
+
+// SubagentSnapshot is the latest privacy-safe telemetry for one Agent tool
+// call. Pointer counters distinguish a reported zero from unavailable data.
+type SubagentSnapshot struct {
+	ID             string `json:"id"`
+	Description    string `json:"description,omitempty"`
+	Status         string `json:"status,omitempty"`
+	Activity       string `json:"activity,omitempty"`
+	Turns          *int   `json:"turns,omitempty"`
+	ToolUses       *int   `json:"toolUses,omitempty"`
+	ApproxTokens   *int64 `json:"approxTokens,omitempty"`
+	DurationMillis *int64 `json:"durationMillis,omitempty"`
+	Active         bool   `json:"active,omitempty"`
+	Completed      bool   `json:"completed,omitempty"`
 }
 
 // PathForLog returns the observational sidecar path for a raw Worker log.
@@ -44,6 +65,16 @@ type Projector struct {
 	toolFingerprints   map[string][32]byte
 	toolNames          map[string]string
 	toolOrder          []string
+	subagents          map[string]*subagentState
+}
+
+type subagentState struct {
+	snapshot          SubagentSnapshot
+	haveSnapshot      bool
+	outputFingerprint [32]byte
+	haveOutput        bool
+	lastFeed          time.Time
+	haveFeed          bool
 }
 
 // Observe ignores unknown fields and event types. Malformed known or unknown
@@ -113,6 +144,9 @@ func (p *Projector) Observe(record []byte, observedAt time.Time) (Entry, bool, e
 	case "tool_execution_update":
 		id := stringField(event, "toolCallId")
 		name := p.resolveToolName(id, stringField(event, "toolName"))
+		if isAgentTool(name) {
+			return p.observeSubagent(id, event["partialResult"], observedAt, true, false, false)
+		}
 		fingerprint, meaningful := semanticFingerprint(event["partialResult"])
 		if !meaningful || p.toolFingerprints[id] == fingerprint {
 			return Entry{}, false, nil
@@ -123,11 +157,14 @@ func (p *Projector) Observe(record []byte, observedAt time.Time) (Entry, bool, e
 	case "tool_execution_end":
 		id := stringField(event, "toolCallId")
 		name := p.resolveToolName(id, stringField(event, "toolName"))
+		p.finishTool(id)
+		if isAgentTool(name) {
+			return p.observeSubagent(id, event["result"], observedAt, false, true, boolField(event, "isError"))
+		}
 		description := "Tool " + name + " completed"
 		if boolField(event, "isError") {
 			description = "Tool " + name + " failed"
 		}
-		p.finishTool(id)
 		operation := "model"
 		if active := p.activeToolName(); active != "" {
 			operation = active
@@ -171,6 +208,222 @@ func (p *Projector) Observe(record []byte, observedAt time.Time) (Entry, bool, e
 		return Entry{}, false, nil
 	}
 	return entry, true, nil
+}
+
+func isAgentTool(name string) bool {
+	return strings.EqualFold(name, "Agent")
+}
+
+func (p *Projector) observeSubagent(id string, raw json.RawMessage, observedAt time.Time, active, completed, failed bool) (Entry, bool, error) {
+	if id == "" {
+		id = "unknown"
+	}
+	if p.subagents == nil {
+		p.subagents = make(map[string]*subagentState)
+	}
+	state := p.subagents[id]
+	if state == nil {
+		state = &subagentState{}
+		p.subagents[id] = state
+	}
+
+	snapshot, outputFingerprint, haveOutput := decodeSubagentSnapshot(id, raw)
+	if completed && snapshot.Activity == "" {
+		snapshot.Activity = state.snapshot.Activity
+	}
+	if failed {
+		snapshot.Status = "failed"
+	}
+	snapshot.Active = active
+	snapshot.Completed = completed
+	meaningfulSnapshot := subagentSemanticSnapshot(snapshot)
+	previousSnapshot := subagentSemanticSnapshot(state.snapshot)
+	outputChanged := haveOutput && (!state.haveOutput || outputFingerprint != state.outputFingerprint)
+	meaningful := !state.haveSnapshot || !reflect.DeepEqual(meaningfulSnapshot, previousSnapshot) || outputChanged
+
+	previous := state.snapshot
+	state.snapshot = snapshot
+	state.haveSnapshot = true
+	if haveOutput {
+		state.outputFingerprint = outputFingerprint
+		state.haveOutput = true
+	}
+	if !meaningful {
+		return Entry{}, false, nil
+	}
+
+	statusChanged := previous.Status != snapshot.Status
+	turnChanged := !equalInt(previous.Turns, snapshot.Turns)
+	entry := Entry{
+		Version: CurrentVersion, ObservedAt: observedAt.UTC(), Kind: "subagent",
+		Description: describeSubagentChange(snapshot, previous, state.haveFeed, outputChanged),
+		Subagent:    &snapshot,
+	}
+	if completed {
+		entry.Operation = "model"
+		if operation := p.activeToolName(); operation != "" {
+			entry.Operation = operation
+		}
+		entry.OperationChanged = true
+	}
+	retainMilestone := !state.haveFeed || statusChanged || turnChanged || completed
+	if !retainMilestone && observedAt.Sub(state.lastFeed) < time.Second {
+		entry.SuppressFeed = true
+	} else {
+		state.lastFeed = observedAt
+		state.haveFeed = true
+	}
+	return entry, true, nil
+}
+
+func subagentSemanticSnapshot(snapshot SubagentSnapshot) SubagentSnapshot {
+	snapshot.DurationMillis = nil
+	return snapshot
+}
+
+func equalInt(left, right *int) bool {
+	return left == nil && right == nil || left != nil && right != nil && *left == *right
+}
+
+func decodeSubagentSnapshot(id string, raw json.RawMessage) (SubagentSnapshot, [32]byte, bool) {
+	snapshot := SubagentSnapshot{ID: id}
+	var result map[string]json.RawMessage
+	if len(raw) == 0 || json.Unmarshal(raw, &result) != nil {
+		return snapshot, [32]byte{}, false
+	}
+	var details map[string]json.RawMessage
+	if json.Unmarshal(result["details"], &details) == nil {
+		snapshot.Description = safeString(details["description"], 120)
+		snapshot.Status = safeString(details["status"], 40)
+		snapshot.Activity = safeString(details["activity"], 120)
+		snapshot.Turns = nonnegativeInt(details["turnCount"])
+		snapshot.ToolUses = nonnegativeInt(details["toolUses"])
+		snapshot.DurationMillis = nonnegativeInt64(details["durationMs"])
+		if tokens := safeString(details["tokens"], 40); tokens != "" {
+			snapshot.ApproxTokens = parseApproxTokens(tokens)
+		}
+	}
+	fingerprint, haveOutput := visibleContentFingerprint(result["content"])
+	return snapshot, fingerprint, haveOutput
+}
+
+func describeSubagentChange(current, previous SubagentSnapshot, hadPrevious, outputChanged bool) string {
+	label := valueOrUnavailable(current.Description)
+	identity := current.ID
+	if len(identity) > 16 {
+		identity = identity[:16]
+	}
+	prefix := `Subagent [` + identity + `] "` + label + `"`
+	if current.Completed {
+		status := valueOrUnavailable(current.Status)
+		if status == "failed" {
+			return prefix + " failed"
+		}
+		return prefix + " completed (" + status + ")"
+	}
+	statusChanged := !hadPrevious || current.Status != previous.Status
+	turnChanged := !hadPrevious || !equalInt(current.Turns, previous.Turns)
+	activityChanged := !hadPrevious || current.Activity != previous.Activity
+	if statusChanged || turnChanged {
+		changes := make([]string, 0, 3)
+		if statusChanged {
+			changes = append(changes, "status: "+valueOrUnavailable(current.Status))
+		}
+		if activityChanged {
+			changes = append(changes, "activity: "+valueOrUnavailable(current.Activity))
+		}
+		if turnChanged {
+			if current.Turns == nil {
+				changes = append(changes, "turns: n/a")
+			} else {
+				changes = append(changes, fmt.Sprintf("reached turn %d", *current.Turns))
+			}
+		}
+		return prefix + " " + strings.Join(changes, "; ")
+	}
+	if current.Activity != previous.Activity {
+		return prefix + " activity: " + valueOrUnavailable(current.Activity)
+	}
+	if current.Description != previous.Description {
+		return prefix + " description changed to " + label
+	}
+	if !equalInt(current.ToolUses, previous.ToolUses) {
+		if current.ToolUses == nil {
+			return prefix + " tool uses: n/a"
+		}
+		return fmt.Sprintf("%s tool uses: %d", prefix, *current.ToolUses)
+	}
+	if !equalInt64(current.ApproxTokens, previous.ApproxTokens) {
+		if current.ApproxTokens == nil {
+			return prefix + " approximate tokens: n/a"
+		}
+		return fmt.Sprintf("%s approximate tokens: ~%d", prefix, *current.ApproxTokens)
+	}
+	if outputChanged {
+		return prefix + " visible output changed"
+	}
+	return prefix + " telemetry changed"
+}
+
+func valueOrUnavailable(value string) string {
+	if value == "" {
+		return "n/a"
+	}
+	return value
+}
+
+func safeString(raw json.RawMessage, limit int) string {
+	var value string
+	if json.Unmarshal(raw, &value) != nil {
+		return ""
+	}
+	return shortText(value, limit)
+}
+
+func nonnegativeInt(raw json.RawMessage) *int {
+	var value int
+	if json.Unmarshal(raw, &value) != nil || value < 0 {
+		return nil
+	}
+	return &value
+}
+
+func nonnegativeInt64(raw json.RawMessage) *int64 {
+	var value int64
+	if json.Unmarshal(raw, &value) != nil || value < 0 {
+		return nil
+	}
+	return &value
+}
+
+func equalInt64(left, right *int64) bool {
+	return left == nil && right == nil || left != nil && right != nil && *left == *right
+}
+
+var approximateTokensPattern = regexp.MustCompile(`^([0-9]+(?:\.[0-9]+)?)([kM]?) tokens?$`)
+
+func parseApproxTokens(value string) *int64 {
+	matches := approximateTokensPattern.FindStringSubmatch(value)
+	if matches == nil {
+		return nil
+	}
+	number, err := strconv.ParseFloat(matches[1], 64)
+	if err != nil {
+		return nil
+	}
+	multiplier := float64(1)
+	switch matches[2] {
+	case "k":
+		multiplier = 1_000
+	case "M":
+		multiplier = 1_000_000
+	}
+	tokens := number * multiplier
+	if tokens > math.MaxInt64 {
+		return nil
+	}
+	result := int64(math.Round(tokens))
+	return &result
 }
 
 func (p *Projector) ensureTools() {
@@ -289,6 +542,31 @@ func canonicalFingerprint(raw json.RawMessage) ([32]byte, bool) {
 		return [32]byte{}, false
 	}
 	encoded, err := json.Marshal(value)
+	if err != nil {
+		return [32]byte{}, false
+	}
+	return sha256.Sum256(encoded), true
+}
+
+func visibleContentFingerprint(raw json.RawMessage) ([32]byte, bool) {
+	var contents []json.RawMessage
+	if json.Unmarshal(raw, &contents) != nil {
+		return [32]byte{}, false
+	}
+	visible := make([]string, 0, len(contents))
+	for _, rawContent := range contents {
+		var content struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(rawContent, &content) == nil && content.Type == "text" && content.Text != "" {
+			visible = append(visible, content.Text)
+		}
+	}
+	if len(visible) == 0 {
+		return [32]byte{}, false
+	}
+	encoded, err := json.Marshal(visible)
 	if err != nil {
 		return [32]byte{}, false
 	}
