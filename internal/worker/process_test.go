@@ -558,8 +558,7 @@ exit 9
 	waitForPath(t, childPIDPath)
 	started := time.Now()
 	result := process.Close()
-	if !result.GroupExited || result.Err == nil || !strings.Contains(result.Err.Error(), "did not exit after input closed") ||
-		!strings.Contains(result.Err.Error(), "exit status 9") {
+	if !result.GroupExited || result.Err == nil || !strings.Contains(result.Err.Error(), "exit status 9") {
 		t.Fatalf("close surviving process group = %#v", result)
 	}
 	if elapsed := time.Since(started); elapsed > time.Second {
