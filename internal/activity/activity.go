@@ -256,6 +256,13 @@ func (p *Projector) observeSubagent(id string, raw json.RawMessage, observedAt t
 		Description: describeSubagentChange(snapshot, previous, state.haveFeed, outputChanged),
 		Subagent:    &snapshot,
 	}
+	if completed {
+		entry.Operation = "model"
+		if operation := p.activeToolName(); operation != "" {
+			entry.Operation = operation
+		}
+		entry.OperationChanged = true
+	}
 	retainMilestone := !state.haveFeed || statusChanged || turnChanged || completed
 	if !retainMilestone && observedAt.Sub(state.lastFeed) < time.Second {
 		entry.SuppressFeed = true
@@ -308,14 +315,25 @@ func describeSubagentChange(current, previous SubagentSnapshot, hadPrevious, out
 		status := valueOrUnavailable(current.Status)
 		return prefix + " completed (" + status + ")"
 	}
-	if !hadPrevious || current.Status != previous.Status {
-		return prefix + " status: " + valueOrUnavailable(current.Status)
-	}
-	if !equalInt(current.Turns, previous.Turns) {
-		if current.Turns == nil {
-			return prefix + " turns: n/a"
+	statusChanged := !hadPrevious || current.Status != previous.Status
+	turnChanged := !hadPrevious || !equalInt(current.Turns, previous.Turns)
+	activityChanged := !hadPrevious || current.Activity != previous.Activity
+	if statusChanged || turnChanged {
+		changes := make([]string, 0, 3)
+		if statusChanged {
+			changes = append(changes, "status: "+valueOrUnavailable(current.Status))
 		}
-		return fmt.Sprintf("%s reached turn %d", prefix, *current.Turns)
+		if activityChanged {
+			changes = append(changes, "activity: "+valueOrUnavailable(current.Activity))
+		}
+		if turnChanged {
+			if current.Turns == nil {
+				changes = append(changes, "turns: n/a")
+			} else {
+				changes = append(changes, fmt.Sprintf("reached turn %d", *current.Turns))
+			}
+		}
+		return prefix + " " + strings.Join(changes, "; ")
 	}
 	if current.Activity != previous.Activity {
 		return prefix + " activity: " + valueOrUnavailable(current.Activity)

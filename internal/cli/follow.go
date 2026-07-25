@@ -397,6 +397,7 @@ func consumeActivity(metrics *followMetrics, source *normalizedActivitySource) [
 }
 
 func printNewActivity(output io.Writer, metrics *followMetrics, source *normalizedActivitySource) error {
+	showSubagentSummary := false
 	for _, entry := range consumeActivity(metrics, source) {
 		if entry.SuppressFeed {
 			continue
@@ -404,8 +405,18 @@ func printNewActivity(output io.Writer, metrics *followMetrics, source *normaliz
 		if err := printActivityEntry(output, entry); err != nil {
 			return err
 		}
+		showSubagentSummary = showSubagentSummary || entry.Subagent != nil
+	}
+	if showSubagentSummary {
+		return printActiveSubagentSummary(output, *metrics)
 	}
 	return nil
+}
+
+func printActiveSubagentSummary(output io.Writer, metrics followMetrics) error {
+	active, deepest := metrics.activeSubagentSummary()
+	_, err := fmt.Fprintf(output, "  Subagent summary: %d (%d active) | Deepest current operation: %s\n", len(metrics.subagents), active, deepest)
+	return err
 }
 
 func followNormalized(

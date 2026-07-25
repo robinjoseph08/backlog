@@ -798,6 +798,15 @@ func TestFollowNormalizedStreamsProjectionAndPrintsTerminalSummary(t *testing.T)
 		})
 	}()
 	waitForBuffer(t, &output, "Worker started")
+	turns, tools := 1, 2
+	tokens, duration := int64(1200), int64(800)
+	writeActivityEntries(t, projectionPath, activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: observedAt.Add(8 * time.Second), Kind: "subagent",
+		Description: `Subagent [live-review] "Review changes" status: running; activity: reviewing; reached turn 1`,
+		Subagent: &activity.SubagentSnapshot{ID: "live-review", Description: "Review changes", Status: "running", Activity: "reviewing",
+			Turns: &turns, ToolUses: &tools, ApproxTokens: &tokens, DurationMillis: &duration, Active: true},
+	})
+	waitForBuffer(t, &output, `Subagent summary: 1 (1 active) | Deepest current operation: Subagent "Review changes": reviewing`)
 	writeActivityEntries(t, projectionPath, activity.Entry{
 		Version: activity.CurrentVersion, ObservedAt: observedAt.Add(9 * time.Second), Kind: "model",
 		Description: "Assistant response completed: done", ResponseCompleted: true, TokensKnown: true, TokenDelta: 77,
@@ -817,7 +826,7 @@ func TestFollowNormalizedStreamsProjectionAndPrintsTerminalSummary(t *testing.T)
 		t.Fatal("normalized follower did not exit at terminal state")
 	}
 	got := output.String()
-	for _, want := range []string{"Current Worker operation: starting", "Run state changed to failed", "Terminal Run summary:", "State: failed", "Activity age: 1s", "Completed Worker tokens: 77"} {
+	for _, want := range []string{"Current Worker operation: starting", `Subagent summary: 1 (1 active) | Deepest current operation: Subagent "Review changes": reviewing`, "Run state changed to failed", "Terminal Run summary:", "State: failed", "Activity age: 1s", "Completed Worker tokens: 77"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("live normalized output missing %q:\n%s", want, got)
 		}

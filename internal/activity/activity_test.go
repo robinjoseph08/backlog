@@ -101,6 +101,11 @@ func TestProjectorTracksSubagentMeaningfulChangesAndCoalescesOnlyFeedRendering(t
 	if err != nil || !semantic || entry.SuppressFeed || entry.Subagent == nil || entry.Subagent.ApproxTokens == nil || *entry.Subagent.ApproxTokens != 1000 {
 		t.Fatalf("initial Subagent entry = %#v, semantic = %t, err = %v", entry, semantic, err)
 	}
+	for _, milestone := range []string{"status: queued", "activity: thinking", "reached turn 1"} {
+		if !strings.Contains(entry.Description, milestone) {
+			t.Fatalf("initial Subagent entry omitted %q: %#v", milestone, entry)
+		}
+	}
 
 	cosmetic := `{"type":"tool_execution_update","toolCallId":"agent-1","toolName":"Agent","partialResult":{"content":[{"type":"text","text":"first hidden output"}],"details":{"description":"Implement Follow","status":"queued","activity":"thinking","turnCount":1,"toolUses":0,"tokens":"1.0k token","durationMs":100,"spinnerFrame":7}}}`
 	if entry, semantic, err := projector.Observe([]byte(cosmetic), started.Add(100*time.Millisecond)); err != nil || semantic {
@@ -136,6 +141,12 @@ func TestProjectorTracksSubagentMeaningfulChangesAndCoalescesOnlyFeedRendering(t
 	entry, semantic, err = projector.Observe([]byte(laterActivity), started.Add(1500*time.Millisecond))
 	if err != nil || !semantic || entry.SuppressFeed {
 		t.Fatalf("later activity entry = %#v, semantic = %t, err = %v", entry, semantic, err)
+	}
+
+	completion := `{"type":"tool_execution_end","toolCallId":"agent-1","toolName":"Agent","result":{"content":[{"type":"text","text":"hidden result"}],"details":{"description":"Implement Follow","status":"completed","turnCount":2,"toolUses":3,"tokens":"2.0k tokens","durationMs":2000}},"isError":false}`
+	entry, semantic, err = projector.Observe([]byte(completion), started.Add(2*time.Second))
+	if err != nil || !semantic || !entry.OperationChanged || entry.Operation != "model" {
+		t.Fatalf("completed Subagent entry = %#v, semantic = %t, err = %v", entry, semantic, err)
 	}
 }
 
