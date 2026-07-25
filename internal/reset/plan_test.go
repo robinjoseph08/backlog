@@ -16,7 +16,7 @@ func TestBuildTailorsOrderedResetActions(t *testing.T) {
 		RemoteBranch: Branch{Name: "agent/issue-42-run-42", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Present: true},
 		LocalBranch:  Branch{Name: "agent/issue-42-run-42", Commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Present: true},
 		Worktree:     Worktree{Path: "/state/worktrees/issue-42-run-42", Branch: "agent/issue-42-run-42", Commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Present: true},
-		Session:      Session{ID: "backlog-run-42", Dir: "/state/sessions/run-42", Present: true},
+		Session:      Session{ID: "backlog-run-42", Dir: "/state/sessions/run-42", ArchiveDir: "/state/history/sessions/run-42", Present: true},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -29,7 +29,7 @@ func TestBuildTailorsOrderedResetActions(t *testing.T) {
 		"delete remote branch agent/issue-42-run-42 at aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"remove local worktree /state/worktrees/issue-42-run-42 for agent/issue-42-run-42 at bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		"delete local branch agent/issue-42-run-42 at bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		"retire Pi session backlog-run-42 in /state/sessions/run-42",
+		"archive Pi session backlog-run-42 from /state/sessions/run-42 to /state/history/sessions/run-42",
 		"remove issue label in-progress from https://github.com/acme/widgets/issues/42",
 		"add issue label ready-for-agent to https://github.com/acme/widgets/issues/42",
 		"mark Run run-42 reset and release Lease lease-42",
@@ -183,7 +183,13 @@ func TestBuildRefusesUnsafeStates(t *testing.T) {
 			s.PullRequests = []PullRequest{{Number: 7, URL: "https://example.test/pull/7", Branch: "other", Commit: "abc", State: PullRequestOpen}}
 		},
 		"mismatched Pi session": func(s *Snapshot) {
-			s.Session = Session{ID: "other", Dir: "/other", Present: true}
+			s.Session = Session{ID: "other", Dir: "/other", ArchiveDir: "/archive", Present: true}
+		},
+		"duplicate active and archived Pi session": func(s *Snapshot) {
+			s.Run.WorkerMode = scheduler.WorkerModeRPC
+			s.Run.SessionID = "backlog-run-42"
+			s.Run.SessionDir = "/state/sessions/run-42"
+			s.Session = Session{ID: "backlog-run-42", Dir: "/state/sessions/run-42", ArchiveDir: "/state/history/sessions/run-42", Present: true, Archived: true}
 		},
 	}
 	for name, mutate := range tests {

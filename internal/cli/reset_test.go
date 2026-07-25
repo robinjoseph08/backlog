@@ -30,9 +30,19 @@ func TestResetHelpShowsMutationAndDryRunFlags(t *testing.T) {
 	if exit := Main(context.Background(), []string{"reset", "--help"}, &stdout, &stderr); exit != 0 {
 		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "Usage: backlog reset <issue-number> [flags]") ||
-		!strings.Contains(stderr.String(), "confirm Reset without an interactive prompt") {
-		t.Fatalf("help = %q", stderr.String())
+	for _, text := range []string{
+		"Usage: backlog reset <issue-number> [flags]",
+		"confirm Reset without an interactive prompt",
+		"retires its",
+		"active Pi session artifacts",
+		"preserves logs and history",
+		"idempotent",
+		"deprecated retry command",
+		"Exit statuses: 0 success or interactive cancellation; 1 refusal or failure.",
+	} {
+		if !strings.Contains(stderr.String(), text) {
+			t.Fatalf("help omitted %q: %q", text, stderr.String())
+		}
 	}
 }
 
@@ -91,7 +101,7 @@ esac
 		!strings.Contains(output, "Dry-run: no changes made.") {
 		t.Fatalf("stdout = %q", output)
 	}
-	if strings.Contains(output, "delete remote branch") || strings.Contains(output, "retire Pi session") {
+	if strings.Contains(output, "delete remote branch") || strings.Contains(output, "archive Pi session") {
 		t.Fatalf("plan included already-absent resources: %q", output)
 	}
 	if got := fileDigest(t, store.Path); got != beforeState {
@@ -111,7 +121,7 @@ esac
 	}
 }
 
-func TestResetDryRunInspectsEveryOwnedResourceWithoutMutation(t *testing.T) {
+func TestCompiledResetCoversFullOwnedArtifactLifecycle(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -163,33 +173,62 @@ func TestResetDryRunInspectsEveryOwnedResourceWithoutMutation(t *testing.T) {
 	if err := os.WriteFile(sessionPath, []byte(sessionHeader), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	logsDir := filepath.Join(stateDir, "logs")
+	if err := os.MkdirAll(logsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(logsDir, runID+".jsonl")
+	stderrPath := filepath.Join(logsDir, runID+".stderr.log")
+	if err := os.WriteFile(logPath, []byte("{\"type\":\"agent_settled\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stderrPath, []byte("preserved diagnostic log\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	statePath := filepath.Join(stateDir, "state.json")
 	store := state.FileStore{Path: statePath}
 	if err := store.Save(state.State{
 		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
 		Runs: []scheduler.Run{{
-			Issue: 42, RunID: runID, Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModeRPC,
+			Issue: 42, IssueTitle: "Rich Reset", IssueURL: "https://github.com/acme/widgets/issues/42",
+			RunID: runID, Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModeRPC,
 			Branch: branch, Worktree: worktreePath, SessionID: sessionID, SessionDir: sessionDir,
-			PullRequest: "https://github.com/acme/widgets/pull/99",
+			LogPath: logPath, StderrPath: stderrPath, PullRequest: "https://github.com/acme/widgets/pull/99", Error: "preserved diagnostic",
 		}},
 		Leases: []scheduler.Lease{{LeaseID: "lease-rich", Issue: 42, RunID: runID}},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	githubState := filepath.Join(root, "github-rich.json")
-	if err := os.WriteFile(githubState, []byte(`{"issue":"OPEN","labels":["in-progress","spec"],"pr":"OPEN","autoMerge":true}`), 0o600); err != nil {
+	head := strings.TrimSpace(gitOutput(t, repository, "rev-parse", "refs/remotes/origin/"+branch))
+	githubInitial := fmt.Sprintf(`{"issue":"OPEN","labels":["in-progress","spec"],"pr":"OPEN","autoMerge":true,"comments":[],"head":%q}`, head)
+	if err := os.WriteFile(githubState, []byte(githubInitial), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	gh := writeExecutable(t, `#!/bin/sh
 set -eu
+state=`+quote(githubState)+`
 case "$*" in
   "repo view --json nameWithOwner,defaultBranchRef") printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
   "issue view 42 --repo acme/widgets --json number,url,state,labels")
-    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"},{"name":"spec"}]}' ;;
+    labels=$(jq -c '[.labels[] | {name:.}]' "$state")
+    issue=$(jq -r .issue "$state")
+    printf '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"%s","labels":%s}\n' "$issue" "$labels" ;;
   "pr list --repo acme/widgets --state all --head `+branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
-    printf '%s\n' '[{"number":99,"url":"https://github.com/acme/widgets/pull/99","state":"OPEN","mergedAt":null,"autoMergeRequest":{"mergeMethod":"SQUASH"},"isDraft":false,"headRefName":"`+branch+`","headRefOid":"`+strings.TrimSpace(gitOutput(t, repository, "rev-parse", "refs/remotes/origin/"+branch))+`","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+    jq -c --arg branch `+quote(branch)+` '[{number:99,url:"https://github.com/acme/widgets/pull/99",state:.pr,mergedAt:null,autoMergeRequest:(if .autoMerge then {mergeMethod:"SQUASH"} else null end),isDraft:false,headRefName:$branch,headRefOid:.head,headRepositoryOwner:{login:"acme"},headRepository:{nameWithOwner:"acme/widgets"}}]' "$state" ;;
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/99/comments?per_page=100 --paginate --slurp")
-    printf '%s\n' '[[]]' ;;
+    jq -c '[.comments | map({body:.})]' "$state" ;;
+  "pr merge 99 --repo acme/widgets --disable-auto")
+    temporary="$state.tmp"; jq '.autoMerge=false' "$state" > "$temporary"; mv "$temporary" "$state" ;;
+  pr\ comment\ 99\ --repo\ acme/widgets\ --body\ *)
+    body=''; for value in "$@"; do body=$value; done
+    temporary="$state.tmp"; jq --arg body "$body" '.comments += [$body]' "$state" > "$temporary"; mv "$temporary" "$state" ;;
+  "pr close 99 --repo acme/widgets")
+    temporary="$state.tmp"; jq '.pr="CLOSED"' "$state" > "$temporary"; mv "$temporary" "$state" ;;
+  "issue edit 42 --repo acme/widgets --remove-label in-progress")
+    temporary="$state.tmp"; jq '.labels = [.labels[] | select(. != "in-progress")]' "$state" > "$temporary"; mv "$temporary" "$state" ;;
+  "issue edit 42 --repo acme/widgets --add-label ready-for-agent")
+    temporary="$state.tmp"; jq '.labels += ["ready-for-agent"] | .labels |= unique' "$state" > "$temporary"; mv "$temporary" "$state" ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
 `)
@@ -199,6 +238,8 @@ esac
 	beforeState := fileDigest(t, statePath)
 	beforeSession := fileDigest(t, sessionPath)
 	beforeGitHub := fileDigest(t, githubState)
+	beforeLog := fileDigest(t, logPath)
+	beforeStderr := fileDigest(t, stderrPath)
 	beforeRefs := gitSnapshot(t, repository)
 	beforeRemoteRefs := gitSnapshot(t, remote)
 	beforeWorktrees := gitOutput(t, repository, "worktree", "list", "--porcelain")
@@ -218,7 +259,7 @@ esac
 		"  5. delete remote branch " + branch + " at " + strings.TrimSpace(gitOutput(t, repository, "rev-parse", "refs/remotes/origin/"+branch)) + "\n" +
 		"  6. remove local worktree " + worktreePath + " for " + branch + " at " + strings.TrimSpace(gitOutput(t, repository, "rev-parse", branch)) + "\n" +
 		"  7. delete local branch " + branch + " at " + strings.TrimSpace(gitOutput(t, repository, "rev-parse", branch)) + "\n" +
-		"  8. retire Pi session " + sessionID + " in " + sessionDir + "\n" +
+		"  8. archive Pi session " + sessionID + " from " + sessionDir + " to " + filepath.Join(stateDir, "history", "sessions", runID) + "\n" +
 		"  9. remove issue label in-progress from https://github.com/acme/widgets/issues/42\n" +
 		"  10. add issue label ready-for-agent to https://github.com/acme/widgets/issues/42\n" +
 		"  11. mark Run " + runID + " reset and release Lease lease-rich\n" +
@@ -238,12 +279,365 @@ esac
 
 	mutation := exec.Command(binary, "reset", "42", "--yes", "--repo-dir", repository, "--state-dir", stateDir, "--git", git, "--gh", gh)
 	mutationOutput, mutationErr := mutation.CombinedOutput()
-	if mutationErr == nil || !strings.Contains(string(mutationOutput), "requires the owned local branch, worktree, and Pi session to be absent") {
-		t.Fatalf("artifact-bearing mutation error = %v, output = %q", mutationErr, mutationOutput)
+	if mutationErr != nil {
+		t.Fatalf("compiled full Reset: %v\n%s", mutationErr, mutationOutput)
 	}
-	if fileDigest(t, statePath) != beforeState || fileDigest(t, sessionPath) != beforeSession || fileDigest(t, githubState) != beforeGitHub ||
-		gitSnapshot(t, repository) != beforeRefs || gitSnapshot(t, remote) != beforeRemoteRefs || filesystemSnapshot(t, worktreePath) != beforeWorktreeFilesystem {
-		t.Fatal("artifact-bearing mutation changed resources")
+	if !strings.Contains(string(mutationOutput), "Reset complete for issue #42") {
+		t.Fatalf("mutation output = %q", mutationOutput)
+	}
+	current, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.Runs) != 1 || len(current.Leases) != 0 || current.Runs[0].Status != scheduler.StatusReset {
+		t.Fatalf("final historical state = %#v", current)
+	}
+	historical := current.Runs[0]
+	if historical.IssueTitle != "Rich Reset" || historical.IssueURL != "https://github.com/acme/widgets/issues/42" ||
+		historical.LogPath != logPath || historical.StderrPath != stderrPath || historical.Error != "preserved diagnostic" || historical.PullRequest != "https://github.com/acme/widgets/pull/99" {
+		t.Fatalf("historical metadata changed: %#v", historical)
+	}
+	if fileDigest(t, logPath) != beforeLog || fileDigest(t, stderrPath) != beforeStderr {
+		t.Fatal("Worker logs changed during finalization")
+	}
+	if _, err := os.Stat(worktreePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("worktree survived Reset: %v", err)
+	}
+	if output, err := exec.Command("git", "-C", repository, "show-ref", "--verify", "--quiet", "refs/heads/"+branch).CombinedOutput(); err == nil {
+		t.Fatalf("local branch survived Reset: %s", output)
+	}
+	if output, err := exec.Command("git", "--git-dir", remote, "show-ref", "--verify", "--quiet", "refs/heads/"+branch).CombinedOutput(); err == nil {
+		t.Fatalf("remote branch survived Reset: %s", output)
+	}
+	archivePath := filepath.Join(stateDir, "history", "sessions", runID, "session.jsonl")
+	if _, err := os.Stat(sessionPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("active Pi session remains resumable: %v", err)
+	}
+	if fileDigest(t, archivePath) != beforeSession {
+		t.Fatal("historical Pi session archive changed")
+	}
+	var githubFinal struct {
+		Labels    []string `json:"labels"`
+		PR        string   `json:"pr"`
+		AutoMerge bool     `json:"autoMerge"`
+		Comments  []string `json:"comments"`
+	}
+	githubData, err := os.ReadFile(githubState)
+	if err != nil || json.Unmarshal(githubData, &githubFinal) != nil {
+		t.Fatalf("read final GitHub fixture: %v", err)
+	}
+	sort.Strings(githubFinal.Labels)
+	if githubFinal.PR != "CLOSED" || githubFinal.AutoMerge || len(githubFinal.Comments) != 1 || strings.Join(githubFinal.Labels, ",") != "ready-for-agent,spec" {
+		t.Fatalf("final GitHub state = %#v", githubFinal)
+	}
+
+	rerun := exec.Command(binary, "reset", "42", "--yes", "--repo-dir", repository, "--state-dir", stateDir, "--git", git, "--gh", gh)
+	rerunOutput, err := rerun.CombinedOutput()
+	if err != nil || !strings.Contains(string(rerunOutput), "Required actions:\n  None.") {
+		t.Fatalf("idempotent compiled Reset: %v\n%s", err, rerunOutput)
+	}
+}
+
+type localArtifactResetFixture struct {
+	repository string
+	stateDir   string
+	store      state.FileStore
+	branch     string
+	worktree   string
+	sessionDir string
+	archiveDir string
+	github     string
+	git        string
+}
+
+func newLocalArtifactResetFixture(t *testing.T, failLabelOnce bool) localArtifactResetFixture {
+	t.Helper()
+	root := t.TempDir()
+	repository := filepath.Join(root, "repo")
+	remote := filepath.Join(root, "remote.git")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", "-b", "main", repository)
+	runGit(t, repository, "config", "user.name", "Reset Test")
+	runGit(t, repository, "config", "user.email", "reset@example.test")
+	if err := os.WriteFile(filepath.Join(repository, "tracked"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repository, "add", "tracked")
+	runGit(t, repository, "commit", "-m", "base")
+	runGit(t, repository, "remote", "add", "origin", remote)
+	runGit(t, repository, "push", "-u", "origin", "main")
+
+	runID := "run-local"
+	branch := "agent/issue-42-" + runID
+	stateDir := filepath.Join(root, "state")
+	worktreePath := filepath.Join(stateDir, "worktrees", "issue-42-"+runID)
+	if err := os.MkdirAll(filepath.Dir(worktreePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repository, "worktree", "add", "-b", branch, worktreePath, "HEAD")
+	if err := os.WriteFile(filepath.Join(worktreePath, "unfinished"), []byte("unfinished\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, worktreePath, "add", "unfinished")
+	runGit(t, worktreePath, "commit", "-m", "unfinished")
+
+	sessionDir := filepath.Join(stateDir, "sessions", runID)
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sessionID := "backlog-" + runID
+	if err := os.WriteFile(filepath.Join(sessionDir, "session.jsonl"), []byte(fmt.Sprintf("{\"type\":\"session\",\"id\":%q,\"cwd\":%q}\n", sessionID, worktreePath)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
+	if err := store.Save(state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
+		Runs: []scheduler.Run{{
+			Issue: 42, RunID: runID, Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModeRPC,
+			Branch: branch, Worktree: worktreePath, SessionID: sessionID, SessionDir: sessionDir,
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "lease-local", Issue: 42, RunID: runID}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	githubState := filepath.Join(root, "labels.json")
+	if err := os.WriteFile(githubState, []byte(`{"labels":["spec"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	failed := filepath.Join(root, "label-failed")
+	failValue := "false"
+	if failLabelOnce {
+		failValue = "true"
+	}
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+state=`+quote(githubState)+`
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef") printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    labels=$(jq -c '[.labels[] | {name:.}]' "$state")
+    printf '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":%s}\n' "$labels" ;;
+  "pr list --repo acme/widgets --state all --head `+branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository") printf '%s\n' '[]' ;;
+  "issue edit 42 --repo acme/widgets --add-label ready-for-agent")
+    if `+failValue+` && [ ! -e `+quote(failed)+` ]; then touch `+quote(failed)+`; echo 'failure after session archival' >&2; exit 1; fi
+    temporary="$state.tmp"; jq '.labels += ["ready-for-agent"] | .labels |= unique' "$state" > "$temporary"; mv "$temporary" "$state" ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	return localArtifactResetFixture{
+		repository: repository, stateDir: stateDir, store: store, branch: branch, worktree: worktreePath,
+		sessionDir: sessionDir, archiveDir: filepath.Join(stateDir, "history", "sessions", runID), github: gh, git: githubGit(t),
+	}
+}
+
+func (f localArtifactResetFixture) args(git string, extra ...string) []string {
+	arguments := []string{"reset", "42", "--repo-dir", f.repository, "--state-dir", f.stateDir, "--git", git, "--gh", f.github}
+	return append(arguments, extra...)
+}
+
+func TestResetRerunsAfterEachLocalArtifactRetirementBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		failLabel       bool
+		wrapGit         func(*testing.T, localArtifactResetFixture) string
+		completedAbsent []string
+		remaining       []string
+	}{
+		{
+			name: "worktree removal", completedAbsent: []string{"remove local worktree"}, remaining: []string{"delete local branch", "archive Pi session"},
+			wrapGit: func(t *testing.T, fixture localArtifactResetFixture) string {
+				failed := filepath.Join(t.TempDir(), "failed")
+				return writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  *" worktree remove --force "*)
+    if [ ! -e `+quote(failed)+` ]; then touch `+quote(failed)+`; `+quote(fixture.git)+` "$@"; echo 'failure after worktree removal' >&2; exit 1; fi ;;
+esac
+exec `+quote(fixture.git)+` "$@"
+`)
+			},
+		},
+		{
+			name: "branch deletion", completedAbsent: []string{"remove local worktree", "delete local branch"}, remaining: []string{"archive Pi session"},
+			wrapGit: func(t *testing.T, fixture localArtifactResetFixture) string {
+				failed := filepath.Join(t.TempDir(), "failed")
+				return writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  *" update-ref -d refs/heads/`+fixture.branch+` "*)
+    if [ ! -e `+quote(failed)+` ]; then touch `+quote(failed)+`; `+quote(fixture.git)+` "$@"; echo 'failure after branch deletion' >&2; exit 1; fi ;;
+esac
+exec `+quote(fixture.git)+` "$@"
+`)
+			},
+		},
+		{
+			name: "session archival", failLabel: true,
+			completedAbsent: []string{"remove local worktree", "delete local branch", "archive Pi session"},
+			remaining:       []string{"add issue label ready-for-agent"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newLocalArtifactResetFixture(t, test.failLabel)
+			git := fixture.git
+			if test.wrapGit != nil {
+				git = test.wrapGit(t, fixture)
+			}
+			var stdout, stderr bytes.Buffer
+			if exit := Main(context.Background(), fixture.args(git, "--yes"), &stdout, &stderr); exit == 0 || !strings.Contains(stderr.String(), "failure after") {
+				t.Fatalf("first exit = %d, stderr = %q", exit, stderr.String())
+			}
+			partial, err := fixture.store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if partial.Runs[0].Status != scheduler.StatusResetting || len(partial.Leases) != 1 {
+				t.Fatalf("partial Reset released ownership: %#v", partial)
+			}
+
+			stdout.Reset()
+			stderr.Reset()
+			if exit := Main(context.Background(), fixture.args(fixture.git, "--dry-run"), &stdout, &stderr); exit != 0 {
+				t.Fatalf("partial plan exit = %d, stderr = %q", exit, stderr.String())
+			}
+			plan := stdout.String()
+			for _, absent := range test.completedAbsent {
+				if strings.Contains(plan, absent) {
+					t.Fatalf("partial plan repeated completed %s action:\n%s", absent, plan)
+				}
+			}
+			for _, remaining := range test.remaining {
+				if !strings.Contains(plan, remaining) {
+					t.Fatalf("partial plan omitted remaining %s action:\n%s", remaining, plan)
+				}
+			}
+
+			stdout.Reset()
+			stderr.Reset()
+			if exit := Main(context.Background(), fixture.args(fixture.git, "--yes"), &stdout, &stderr); exit != 0 {
+				t.Fatalf("rerun exit = %d, stderr = %q", exit, stderr.String())
+			}
+			final, err := fixture.store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if final.Runs[0].Status != scheduler.StatusReset || len(final.Leases) != 0 {
+				t.Fatalf("rerun final state = %#v", final)
+			}
+			if _, err := os.Stat(fixture.worktree); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("worktree remains: %v", err)
+			}
+			if _, err := os.Stat(fixture.sessionDir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("active session remains: %v", err)
+			}
+			if info, err := os.Stat(fixture.archiveDir); err != nil || !info.IsDir() {
+				t.Fatalf("session archive missing: %v", err)
+			}
+		})
+	}
+}
+
+func TestResetStopsForChangedReassignedAndUnknownLocalStateWithLeaseRetained(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, localArtifactResetFixture) string
+		want   string
+	}{
+		{
+			name: "changed commit",
+			mutate: func(t *testing.T, fixture localArtifactResetFixture) string {
+				if err := os.WriteFile(filepath.Join(fixture.worktree, "changed"), []byte("changed\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				runGit(t, fixture.worktree, "add", "changed")
+				runGit(t, fixture.worktree, "commit", "-m", "changed identity")
+				return fixture.git
+			},
+			want: "Plan changed",
+		},
+		{
+			name: "reassigned worktree",
+			mutate: func(t *testing.T, fixture localArtifactResetFixture) string {
+				runGit(t, fixture.worktree, "checkout", "-b", "foreign")
+				return fixture.git
+			},
+			want: "unknown branch or commit identity",
+		},
+		{
+			name: "unknown branch inspection",
+			mutate: func(t *testing.T, fixture localArtifactResetFixture) string {
+				return writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  *" for-each-ref --format=%(objectname) refs/heads/`+fixture.branch+`") echo uncertain >&2; exit 2 ;;
+esac
+exec `+quote(fixture.git)+` "$@"
+`)
+			},
+			want: "unknown output",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newLocalArtifactResetFixture(t, false)
+			commonDirectory, err := gitCommonDirectory(context.Background(), fixture.git, fixture.repository)
+			if err != nil {
+				t.Fatal(err)
+			}
+			executor := resetExecutor{
+				store: fixture.store, github: ghadapter.Client{Executable: fixture.github, Dir: fixture.repository}, issue: 42,
+				repositoryRoot: fixture.repository, commonDirectory: commonDirectory, stateDirectory: fixture.stateDir, gitExecutable: fixture.git,
+			}
+			approved, err := executor.inspect(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			executor.gitExecutable = test.mutate(t, fixture)
+			err = executor.apply(context.Background(), approved)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("changed local state error = %v", err)
+			}
+			current, loadErr := fixture.store.Load()
+			if loadErr != nil {
+				t.Fatal(loadErr)
+			}
+			if current.Runs[0].Status != scheduler.StatusFailed || len(current.Leases) != 1 {
+				t.Fatalf("local identity refusal changed ownership: %#v", current)
+			}
+		})
+	}
+}
+
+func TestDeleteLocalBranchUsesExpectedCommit(t *testing.T) {
+	t.Parallel()
+	repository := filepath.Join(t.TempDir(), "repo")
+	runGit(t, t.TempDir(), "init", "-b", "main", repository)
+	runGit(t, repository, "config", "user.name", "Reset Test")
+	runGit(t, repository, "config", "user.email", "reset@example.test")
+	if err := os.WriteFile(filepath.Join(repository, "tracked"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repository, "add", "tracked")
+	runGit(t, repository, "commit", "-m", "base")
+	branchName := "agent/issue-42-local-cas"
+	runGit(t, repository, "branch", branchName)
+	expected := strings.TrimSpace(gitOutput(t, repository, "rev-parse", branchName))
+	runGit(t, repository, "commit", "--allow-empty", "-m", "advanced")
+	advanced := strings.TrimSpace(gitOutput(t, repository, "rev-parse", "HEAD"))
+	runGit(t, repository, "update-ref", "refs/heads/"+branchName, advanced)
+	branch := reset.Branch{Name: branchName, Commit: expected, Present: true}
+	if err := deleteLocalBranch(context.Background(), "git", repository, branch); err == nil || !strings.Contains(err.Error(), "expected commit") {
+		t.Fatalf("stale local branch deletion error = %v", err)
+	}
+	if got := strings.TrimSpace(gitOutput(t, repository, "rev-parse", branchName)); got != advanced {
+		t.Fatalf("stale deletion changed branch to %s, want %s", got, advanced)
+	}
+	branch.Commit = advanced
+	if err := deleteLocalBranch(context.Background(), "git", repository, branch); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("git", "-C", repository, "show-ref", "--verify", "--quiet", "refs/heads/"+branchName)
+	if err := command.Run(); err == nil {
+		t.Fatal("expected-commit deletion left local branch present")
 	}
 }
 
@@ -289,7 +683,7 @@ func TestResetInspectionDistinguishesAbsentFromUnknownResources(t *testing.T) {
 		Branch: "agent/issue-4-run-4", Worktree: filepath.Join(t.TempDir(), "worktree"),
 		SessionID: "backlog-run-4", SessionDir: filepath.Join(t.TempDir(), "missing-session"),
 	}
-	session, err := inspectSession(run)
+	session, err := inspectSession(run, t.TempDir())
 	if err != nil || session.Present {
 		t.Fatalf("absent session = %#v, %v", session, err)
 	}
@@ -299,7 +693,7 @@ func TestResetInspectionDistinguishesAbsentFromUnknownResources(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(run.SessionDir, "unknown.txt"), []byte("unknown"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := inspectSession(run); err == nil || !strings.Contains(err.Error(), "unknown resource") {
+	if _, err := inspectSession(run, t.TempDir()); err == nil || !strings.Contains(err.Error(), "unknown resource") {
 		t.Fatalf("unknown session error = %v", err)
 	}
 
@@ -311,6 +705,23 @@ func TestResetInspectionDistinguishesAbsentFromUnknownResources(t *testing.T) {
 	unknownGit := writeExecutable(t, "#!/bin/sh\necho uncertain >&2\nexit 2\n")
 	if _, err := inspectRemoteBranch(context.Background(), unknownGit, t.TempDir(), run.Branch); err == nil || !strings.Contains(err.Error(), "unknown") {
 		t.Fatalf("unknown remote branch error = %v", err)
+	}
+}
+
+func TestResetRefusesSymlinkedManagedArtifactParents(t *testing.T) {
+	t.Parallel()
+	stateDir := t.TempDir()
+	repository := t.TempDir()
+	run := scheduler.Run{
+		Issue: 42, RunID: "run-links", WorkerMode: scheduler.WorkerModeRPC,
+		SessionID: "backlog-run-links", SessionDir: filepath.Join(stateDir, "sessions", "run-links"),
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(stateDir, "history")); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateOwnedPaths(run, stateDir, repository, "main"); err == nil || !strings.Contains(err.Error(), "is a symlink") {
+		t.Fatalf("symlinked archive ownership error = %v", err)
 	}
 }
 
@@ -414,7 +825,7 @@ func TestInspectSessionRefusesMismatchedIdentityAndMissingContinuation(t *testin
 				t.Fatal(err)
 			}
 			run := scheduler.Run{RunID: "run-4", WorkerMode: scheduler.WorkerModeRPC, Worktree: worktree, SessionID: "backlog-run-4", SessionDir: sessionDir}
-			if _, err := inspectSession(run); err == nil || !strings.Contains(err.Error(), "identity does not match") {
+			if _, err := inspectSession(run, root); err == nil || !strings.Contains(err.Error(), "identity does not match") {
 				t.Fatalf("error = %v", err)
 			}
 		})
@@ -434,7 +845,7 @@ func TestInspectSessionRefusesMismatchedIdentityAndMissingContinuation(t *testin
 		RunID: "run-4", WorkerMode: scheduler.WorkerModeRPC, Worktree: worktree, SessionID: "backlog-run-4", SessionDir: sessionDir,
 		Continuation: &scheduler.ContinuationBoundary{SessionFile: filepath.Join(sessionDir, "missing.jsonl")},
 	}
-	if _, err := inspectSession(run); err == nil || !strings.Contains(err.Error(), "continuation file") {
+	if _, err := inspectSession(run, root); err == nil || !strings.Contains(err.Error(), "continuation file") {
 		t.Fatalf("error = %v", err)
 	}
 }

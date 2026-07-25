@@ -378,6 +378,17 @@ func TestCommandHelpExitsSuccessfully(t *testing.T) {
 	t.Parallel()
 
 	var stdout, stderr bytes.Buffer
+	if exit := Main(context.Background(), []string{"help"}, &stdout, &stderr); exit != 0 {
+		t.Fatalf("top-level help exit = %d, stderr = %q", exit, stderr.String())
+	}
+	for _, text := range []string{"First SIGINT", "first SIGTERM", "resumes verified Suspended Runs", "Reset retires verified artifacts", "deprecated alias for reset", "130 for SIGINT", "143 for SIGTERM", "legacy print-mode Runs cannot Resume", "newer unsupported version"} {
+		if !strings.Contains(stdout.String(), text) {
+			t.Fatalf("top-level help omitted %q: %q", text, stdout.String())
+		}
+	}
+
+	stdout.Reset()
+	stderr.Reset()
 	if exit := Main(context.Background(), []string{"run", "--help"}, &stdout, &stderr); exit != 0 {
 		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
 	}

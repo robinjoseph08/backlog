@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,7 +40,17 @@ func resetCommandWithInput(ctx context.Context, args []string, stdin io.Reader, 
 	flags.SetOutput(stderr)
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: backlog reset <issue-number> [flags]")
+		fmt.Fprintln(stderr, "")
+		fmt.Fprintln(stderr, "Reset abandons an incomplete Run after verifying ownership, retires its")
+		fmt.Fprintln(stderr, "GitHub, local Git, and active Pi session artifacts, restores managed")
+		fmt.Fprintln(stderr, "labels, preserves logs and history, then releases the Lease.")
+		fmt.Fprintln(stderr, "Dry-run only inspects and prints remaining actions. Mutating Reset is")
+		fmt.Fprintln(stderr, "idempotent, and partial progress can be resumed by running Reset again.")
+		fmt.Fprintln(stderr, "The deprecated retry command is an alias for this command.")
+		fmt.Fprintln(stderr, "")
 		flags.PrintDefaults()
+		fmt.Fprintln(stderr, "")
+		fmt.Fprintln(stderr, "Exit statuses: 0 success or interactive cancellation; 1 refusal or failure.")
 	}
 	repoDir := flags.String("repo-dir", ".", "Git repository associated with the Run")
 	stateDir := flags.String("state-dir", "", "runner state directory")
@@ -311,7 +322,7 @@ func (e resetExecutor) inspect(ctx context.Context) (reset.Plan, error) {
 	if err != nil {
 		return reset.Plan{}, err
 	}
-	session, err := inspectSession(run)
+	session, err := inspectSession(run, e.stateDirectory)
 	if err != nil {
 		return reset.Plan{}, err
 	}
@@ -353,13 +364,9 @@ func validateInspectedGitHubIdentity(snapshot reset.Snapshot) error {
 }
 
 func validateOwnedGitHubMutation(plan reset.Plan) error {
-	snapshot := plan.Snapshot
-	if snapshot.LocalBranch.Present || snapshot.Worktree.Present || snapshot.Session.Present {
-		return errors.New("mutating Reset currently requires the owned local branch, worktree, and Pi session to be absent; inspect remaining actions with --dry-run")
-	}
-	if snapshot.Run.Status == scheduler.StatusReset {
-		if err := verifyOwnedGitHubFinalState(snapshot); err != nil {
-			return fmt.Errorf("historical reset Run has incomplete GitHub final state: %w", err)
+	if plan.Snapshot.Run.Status == scheduler.StatusReset {
+		if err := verifyOwnedFinalState(plan.Snapshot); err != nil {
+			return fmt.Errorf("historical reset Run has incomplete final state: %w", err)
 		}
 	}
 	return nil
@@ -434,7 +441,8 @@ func (e resetExecutor) apply(ctx context.Context, approved reset.Plan) error {
 
 		pull, hasOpenPull := reset.NextPullRequestForReset(plan.Snapshot)
 		labels := normalizedLabelSet(plan.Snapshot.Issue.Labels)
-		needsProgress := hasOpenPull || plan.Snapshot.RemoteBranch.Present || labels["in-progress"] || !labels["ready-for-agent"]
+		needsProgress := hasOpenPull || plan.Snapshot.RemoteBranch.Present || plan.Snapshot.LocalBranch.Present ||
+			plan.Snapshot.Worktree.Present || plan.Snapshot.Session.Present || labels["in-progress"] || !labels["ready-for-agent"]
 		if plan.Snapshot.Run.Status == scheduler.StatusWaitingForMerge && (!hasOpenPull || !pull.AutoMergeArmed) {
 			if err := verifyWaitingForMergeDisarmed(plan); err != nil {
 				return err
@@ -551,6 +559,60 @@ func (e resetExecutor) apply(ctx context.Context, approved reset.Plan) error {
 			if after.Snapshot.RemoteBranch.Present {
 				return fmt.Errorf("owned remote branch %s is still present after deletion", branch.Name)
 			}
+		case plan.Snapshot.Worktree.Present:
+			before, err := e.revalidatePlan(ctx, plan, approved, "removing local worktree")
+			if err != nil {
+				return err
+			}
+			worktree := before.Snapshot.Worktree
+			if !before.Snapshot.LocalBranch.Present || before.Snapshot.LocalBranch.Name != worktree.Branch || before.Snapshot.LocalBranch.Commit != worktree.Commit {
+				return fmt.Errorf("local branch commit and worktree association changed immediately before removing %s", worktree.Path)
+			}
+			if err := removeLocalWorktree(ctx, e.gitExecutable, e.repositoryRoot, worktree); err != nil {
+				return err
+			}
+			after, err := e.inspect(ctx)
+			if err != nil {
+				return err
+			}
+			if after.Snapshot.Worktree.Present {
+				return fmt.Errorf("owned local worktree %s is still present after removal", worktree.Path)
+			}
+		case plan.Snapshot.LocalBranch.Present:
+			before, err := e.revalidatePlan(ctx, plan, approved, "deleting local branch")
+			if err != nil {
+				return err
+			}
+			branch := before.Snapshot.LocalBranch
+			if before.Snapshot.Worktree.Present {
+				return fmt.Errorf("owned local branch %s remains assigned to worktree %s", branch.Name, before.Snapshot.Worktree.Path)
+			}
+			if err := deleteLocalBranch(ctx, e.gitExecutable, e.repositoryRoot, branch); err != nil {
+				return err
+			}
+			after, err := e.inspect(ctx)
+			if err != nil {
+				return err
+			}
+			if after.Snapshot.LocalBranch.Present {
+				return fmt.Errorf("owned local branch %s is still present after deletion", branch.Name)
+			}
+		case plan.Snapshot.Session.Present:
+			before, err := e.revalidatePlan(ctx, plan, approved, "archiving Pi session")
+			if err != nil {
+				return err
+			}
+			session := before.Snapshot.Session
+			if err := archiveSession(session); err != nil {
+				return err
+			}
+			after, err := e.inspect(ctx)
+			if err != nil {
+				return err
+			}
+			if after.Snapshot.Session.Present || !after.Snapshot.Session.Archived {
+				return fmt.Errorf("Pi session %s was not verified in its non-resumable historical archive", session.ID)
+			}
 		case labels["in-progress"]:
 			before, err := e.revalidatePlan(ctx, plan, approved, "removing issue label in-progress")
 			if err != nil {
@@ -632,12 +694,41 @@ func verifyGitHubIdentityContinuity(expected, actual reset.Snapshot) error {
 			return fmt.Errorf("pull request #%d branch or expected commit identity changed while resetting", pull.Number)
 		}
 	}
-	if actual.RemoteBranch.Present {
-		if !expected.RemoteBranch.Present || actual.RemoteBranch.Name != expected.RemoteBranch.Name || actual.RemoteBranch.Commit != expected.RemoteBranch.Commit {
-			return fmt.Errorf("owned remote branch identity changed while resetting Run %s", expected.Run.RunID)
+	if err := verifyBranchIdentityContinuity("remote", expected.RemoteBranch, actual.RemoteBranch, expected.Run.RunID); err != nil {
+		return err
+	}
+	if err := verifyBranchIdentityContinuity("local", expected.LocalBranch, actual.LocalBranch, expected.Run.RunID); err != nil {
+		return err
+	}
+	if actual.Worktree.Present {
+		if !expected.Worktree.Present || actual.Worktree != expected.Worktree {
+			return fmt.Errorf("owned local worktree identity changed while resetting Run %s", expected.Run.RunID)
 		}
-	} else if actual.RemoteBranch.Name != expected.RemoteBranch.Name {
-		return fmt.Errorf("owned remote branch name changed while resetting Run %s", expected.Run.RunID)
+	} else if actual.Worktree.Path != expected.Worktree.Path || actual.Worktree.Branch != expected.Worktree.Branch {
+		return fmt.Errorf("owned local worktree assignment changed while resetting Run %s", expected.Run.RunID)
+	}
+	if actual.Session.Present {
+		if !expected.Session.Present || actual.Session.ID != expected.Session.ID || actual.Session.Dir != expected.Session.Dir || actual.Session.ArchiveDir != expected.Session.ArchiveDir {
+			return fmt.Errorf("active Pi session identity changed while resetting Run %s", expected.Run.RunID)
+		}
+	}
+	if actual.Session.Archived {
+		if (!expected.Session.Present && !expected.Session.Archived) || actual.Session.ID != expected.Session.ID || actual.Session.Dir != expected.Session.Dir || actual.Session.ArchiveDir != expected.Session.ArchiveDir {
+			return fmt.Errorf("historical Pi session identity changed while resetting Run %s", expected.Run.RunID)
+		}
+	} else if expected.Session.Archived || expected.Session.Present && !actual.Session.Present {
+		return fmt.Errorf("Pi session archive disappeared while resetting Run %s", expected.Run.RunID)
+	}
+	return nil
+}
+
+func verifyBranchIdentityContinuity(location string, expected, actual reset.Branch, runID string) error {
+	if actual.Present {
+		if !expected.Present || actual.Name != expected.Name || actual.Commit != expected.Commit {
+			return fmt.Errorf("owned %s branch identity changed while resetting Run %s", location, runID)
+		}
+	} else if actual.Name != expected.Name {
+		return fmt.Errorf("owned %s branch name changed while resetting Run %s", location, runID)
 	}
 	return nil
 }
@@ -683,6 +774,84 @@ func deleteRemoteBranch(ctx context.Context, gitExecutable, repositoryRoot strin
 		return fmt.Errorf("delete owned remote branch %s at expected commit %s: %s", branch.Name, branch.Commit, message)
 	}
 	return nil
+}
+
+func removeLocalWorktree(ctx context.Context, gitExecutable, repositoryRoot string, worktree reset.Worktree) error {
+	output, exit, err := runGitInspection(ctx, gitExecutable, repositoryRoot, "worktree", "remove", "--force", worktree.Path)
+	if err != nil {
+		return fmt.Errorf("remove owned local worktree %s: %w", worktree.Path, err)
+	}
+	if exit != 0 {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			message = fmt.Sprintf("git exited %d", exit)
+		}
+		return fmt.Errorf("remove owned local worktree %s for %s at %s: %s", worktree.Path, worktree.Branch, worktree.Commit, message)
+	}
+	return nil
+}
+
+func deleteLocalBranch(ctx context.Context, gitExecutable, repositoryRoot string, branch reset.Branch) error {
+	ref := "refs/heads/" + branch.Name
+	output, exit, err := runGitInspection(ctx, gitExecutable, repositoryRoot, "update-ref", "-d", ref, branch.Commit)
+	if err != nil {
+		return fmt.Errorf("delete owned local branch %s at %s: %w", branch.Name, branch.Commit, err)
+	}
+	if exit != 0 {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			message = fmt.Sprintf("git exited %d", exit)
+		}
+		return fmt.Errorf("delete owned local branch %s at expected commit %s: %s", branch.Name, branch.Commit, message)
+	}
+	return nil
+}
+
+func archiveSession(session reset.Session) error {
+	if !session.Present || session.Archived || session.Dir == "" || session.ArchiveDir == "" {
+		return errors.New("Pi session is not ready for atomic archival")
+	}
+	archiveParent := filepath.Dir(session.ArchiveDir)
+	stateDirectory := filepath.Dir(filepath.Dir(filepath.Dir(session.ArchiveDir)))
+	if err := rejectSymlinkedManagedParents(stateDirectory, session.Dir); err != nil {
+		return fmt.Errorf("active Pi session ownership changed before archival: %w", err)
+	}
+	if err := rejectSymlinkedManagedParents(stateDirectory, session.ArchiveDir); err != nil {
+		return fmt.Errorf("historical Pi session archive ownership changed before archival: %w", err)
+	}
+	if err := os.MkdirAll(archiveParent, 0o700); err != nil {
+		return fmt.Errorf("create Pi session archive: %w", err)
+	}
+	if err := rejectSymlinkedManagedParents(stateDirectory, session.ArchiveDir); err != nil {
+		return fmt.Errorf("historical Pi session archive ownership changed before archival: %w", err)
+	}
+	if _, err := os.Lstat(session.ArchiveDir); err == nil {
+		return fmt.Errorf("historical Pi session archive %s already exists", session.ArchiveDir)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect historical Pi session archive: %w", err)
+	}
+	if err := os.Rename(session.Dir, session.ArchiveDir); err != nil {
+		return fmt.Errorf("atomically archive Pi session %s: %w", session.ID, err)
+	}
+	if err := syncDirectory(filepath.Dir(session.Dir)); err != nil {
+		return fmt.Errorf("sync active Pi session directory after archival: %w", err)
+	}
+	if err := syncDirectory(archiveParent); err != nil {
+		return fmt.Errorf("sync historical Pi session archive: %w", err)
+	}
+	return nil
+}
+
+func syncDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := directory.Sync(); err != nil {
+		directory.Close()
+		return err
+	}
+	return directory.Close()
 }
 
 func normalizedLabelSet(labels []string) map[string]bool {
@@ -772,7 +941,7 @@ func (e resetExecutor) finalize(ctx context.Context, verified reset.Plan) error 
 	if err := validateOwnedGitHubMutation(verified); err != nil {
 		return err
 	}
-	if err := verifyOwnedGitHubFinalState(verified.Snapshot); err != nil {
+	if err := verifyOwnedFinalState(verified.Snapshot); err != nil {
 		return err
 	}
 	current, _, err := e.store.Preview()
@@ -787,7 +956,7 @@ func (e resetExecutor) finalize(ctx context.Context, verified reset.Plan) error 
 		return fmt.Errorf("active Run changed from %s to %s before finalization", verified.Snapshot.Run.RunID, run.RunID)
 	}
 	if run.Status == scheduler.StatusReset {
-		return verifyResetFinalState(current, run.RunID)
+		return verifyResetFinalState(current, run)
 	}
 	if lease != verified.Snapshot.Lease {
 		return fmt.Errorf("Lease for Run %s changed before finalization", run.RunID)
@@ -818,10 +987,10 @@ func (e resetExecutor) finalize(ctx context.Context, verified reset.Plan) error 
 	if err != nil {
 		return fmt.Errorf("verify finalized Reset state: %w", err)
 	}
-	return verifyResetFinalState(persisted, run.RunID)
+	return verifyResetFinalState(persisted, run)
 }
 
-func verifyOwnedGitHubFinalState(snapshot reset.Snapshot) error {
+func verifyOwnedFinalState(snapshot reset.Snapshot) error {
 	for _, pull := range snapshot.PullRequests {
 		if pull.State != reset.PullRequestClosed || pull.AutoMergeArmed {
 			return fmt.Errorf("pull request #%d final state is not verified closed, unmerged, and auto-merge unarmed", pull.Number)
@@ -830,25 +999,42 @@ func verifyOwnedGitHubFinalState(snapshot reset.Snapshot) error {
 	if snapshot.RemoteBranch.Present {
 		return fmt.Errorf("owned remote branch %s remains present at %s", snapshot.RemoteBranch.Name, snapshot.RemoteBranch.Commit)
 	}
+	if snapshot.Worktree.Present {
+		return fmt.Errorf("owned local worktree %s remains present", snapshot.Worktree.Path)
+	}
+	if snapshot.LocalBranch.Present {
+		return fmt.Errorf("owned local branch %s remains present at %s", snapshot.LocalBranch.Name, snapshot.LocalBranch.Commit)
+	}
+	if snapshot.Session.Present {
+		return fmt.Errorf("active Pi session %s remains resumable in %s", snapshot.Session.ID, snapshot.Session.Dir)
+	}
 	return nil
 }
 
-func verifyResetFinalState(current state.State, runID string) error {
+func verifyResetFinalState(current state.State, expected scheduler.Run) error {
 	found := false
 	for _, run := range current.Runs {
-		if run.RunID == runID {
+		if run.RunID == expected.RunID {
 			found = true
 			if run.Status != scheduler.StatusReset {
-				return fmt.Errorf("Run %s final status is %s, not reset", runID, run.Status)
+				return fmt.Errorf("Run %s final status is %s, not reset", expected.RunID, run.Status)
+			}
+			metadata := run
+			metadata.Status = expected.Status
+			metadata.WorkerLogOpen = expected.WorkerLogOpen
+			metadata.UpdatedAt = expected.UpdatedAt
+			metadata.CompletedAt = expected.CompletedAt
+			if !reflect.DeepEqual(metadata, expected) {
+				return fmt.Errorf("historical metadata for Run %s changed during finalization", expected.RunID)
 			}
 		}
 	}
 	if !found {
-		return fmt.Errorf("historical Run %s is absent after Reset", runID)
+		return fmt.Errorf("historical Run %s is absent after Reset", expected.RunID)
 	}
 	for _, lease := range current.Leases {
-		if lease.RunID == runID {
-			return fmt.Errorf("old Lease %s for reset Run %s is still active", lease.LeaseID, runID)
+		if lease.RunID == expected.RunID {
+			return fmt.Errorf("old Lease %s for reset Run %s is still active", lease.LeaseID, expected.RunID)
 		}
 	}
 	return nil
@@ -1038,14 +1224,50 @@ func validateOwnedPaths(run scheduler.Run, stateDir, repositoryRoot, defaultBran
 		if run.Branch != expected.Branch || filepath.Clean(run.Worktree) != filepath.Clean(expected.Path) {
 			return fmt.Errorf("Run %s branch/worktree identity is not Backlog-owned", run.RunID)
 		}
+		if err := rejectSymlinkedManagedParents(stateDir, run.Worktree); err != nil {
+			return fmt.Errorf("Run %s worktree ownership is uncertain: %w", run.RunID, err)
+		}
 	}
 	if run.WorkerMode == scheduler.WorkerModeRPC {
 		expectedSessionDir := filepath.Join(stateDir, "sessions", run.RunID)
 		if run.SessionID != "backlog-"+run.RunID || filepath.Clean(run.SessionDir) != filepath.Clean(expectedSessionDir) {
 			return fmt.Errorf("Run %s Pi session identity is not Backlog-owned", run.RunID)
 		}
+		if err := rejectSymlinkedManagedParents(stateDir, run.SessionDir); err != nil {
+			return fmt.Errorf("Run %s Pi session ownership is uncertain: %w", run.RunID, err)
+		}
+		archiveDir := filepath.Join(stateDir, "history", "sessions", run.RunID)
+		if err := rejectSymlinkedManagedParents(stateDir, archiveDir); err != nil {
+			return fmt.Errorf("Run %s Pi session archive ownership is uncertain: %w", run.RunID, err)
+		}
 	} else if run.SessionID != "" || run.SessionDir != "" || run.Continuation != nil {
 		return fmt.Errorf("print-mode Run %s has uncertain Pi session identity", run.RunID)
+	}
+	return nil
+}
+
+func rejectSymlinkedManagedParents(root, target string) error {
+	relative, err := filepath.Rel(root, target)
+	if err != nil || relative == "." || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("path %s is outside managed state directory %s", target, root)
+	}
+	current := filepath.Clean(root)
+	components := strings.Split(relative, string(filepath.Separator))
+	for _, component := range components[:len(components)-1] {
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("inspect managed path component %s: %w", current, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("managed path component %s is a symlink", current)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("managed path component %s is not a directory", current)
+		}
 	}
 	return nil
 }
@@ -1297,26 +1519,58 @@ func validObjectID(value string) bool {
 	return err == nil
 }
 
-func inspectSession(run scheduler.Run) (reset.Session, error) {
+func inspectSession(run scheduler.Run, stateDirectory string) (reset.Session, error) {
 	if run.WorkerMode != scheduler.WorkerModeRPC {
 		return reset.Session{}, nil
 	}
-	info, err := os.Lstat(run.SessionDir)
+	result := reset.Session{
+		ID: run.SessionID, Dir: run.SessionDir,
+		ArchiveDir: filepath.Join(stateDirectory, "history", "sessions", run.RunID),
+	}
+	activeFiles, active, err := inspectSessionDirectory(run.SessionDir, run)
+	if err != nil {
+		return reset.Session{}, err
+	}
+	_, archived, err := inspectSessionDirectory(result.ArchiveDir, run)
+	if err != nil {
+		return reset.Session{}, fmt.Errorf("inspect historical Pi session archive: %w", err)
+	}
+	if active && archived {
+		return reset.Session{}, fmt.Errorf("Pi session %s exists in both active and historical storage", run.SessionID)
+	}
+	if active && run.Continuation != nil {
+		found := false
+		for _, path := range activeFiles {
+			if filepath.Clean(path) == filepath.Clean(run.Continuation.SessionFile) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return reset.Session{}, fmt.Errorf("Pi continuation file %s is not present in the owned session", run.Continuation.SessionFile)
+		}
+	}
+	result.Present, result.Archived = active, archived
+	return result, nil
+}
+
+func inspectSessionDirectory(directory string, run scheduler.Run) ([]string, bool, error) {
+	info, err := os.Lstat(directory)
 	if errors.Is(err, os.ErrNotExist) {
-		return reset.Session{ID: run.SessionID, Dir: run.SessionDir}, nil
+		return nil, false, nil
 	}
 	if err != nil {
-		return reset.Session{}, fmt.Errorf("inspect Pi session directory: %w", err)
+		return nil, false, fmt.Errorf("inspect Pi session directory: %w", err)
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return reset.Session{}, fmt.Errorf("Pi session path %s has unknown filesystem identity", run.SessionDir)
+		return nil, false, fmt.Errorf("Pi session path %s has unknown filesystem identity", directory)
 	}
 	files := make([]string, 0)
-	err = filepath.WalkDir(run.SessionDir, func(path string, entry os.DirEntry, walkErr error) error {
+	err = filepath.WalkDir(directory, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if path == run.SessionDir {
+		if path == directory {
 			return nil
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
@@ -1332,27 +1586,15 @@ func inspectSession(run scheduler.Run) (reset.Session, error) {
 		return nil
 	})
 	if err != nil {
-		return reset.Session{}, fmt.Errorf("inspect Pi session directory: %w", err)
+		return nil, false, fmt.Errorf("inspect Pi session directory: %w", err)
 	}
 	sort.Strings(files)
 	for _, path := range files {
 		if err := verifySessionHeader(path, run); err != nil {
-			return reset.Session{}, err
+			return nil, false, err
 		}
 	}
-	if run.Continuation != nil {
-		found := false
-		for _, path := range files {
-			if filepath.Clean(path) == filepath.Clean(run.Continuation.SessionFile) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return reset.Session{}, fmt.Errorf("Pi continuation file %s is not present in the owned session", run.Continuation.SessionFile)
-		}
-	}
-	return reset.Session{ID: run.SessionID, Dir: run.SessionDir, Present: true}, nil
+	return files, true, nil
 }
 
 func verifySessionHeader(path string, run scheduler.Run) error {
@@ -1400,9 +1642,11 @@ func printResetPlan(writer io.Writer, plan reset.Plan) {
 		fmt.Fprintln(writer, "Local worktree: absent (not assigned)")
 	}
 	if snapshot.Session.Present {
-		fmt.Fprintf(writer, "Pi session: %s in %s\n", snapshot.Session.ID, snapshot.Session.Dir)
+		fmt.Fprintf(writer, "Pi session: %s in %s (active; archive: %s)\n", snapshot.Session.ID, snapshot.Session.Dir, snapshot.Session.ArchiveDir)
+	} else if snapshot.Session.Archived {
+		fmt.Fprintf(writer, "Pi session: %s in %s (archived; active storage absent)\n", snapshot.Session.ID, snapshot.Session.ArchiveDir)
 	} else if snapshot.Session.ID != "" {
-		fmt.Fprintf(writer, "Pi session: %s in %s (absent)\n", snapshot.Session.ID, snapshot.Session.Dir)
+		fmt.Fprintf(writer, "Pi session: %s in %s (absent; archive absent)\n", snapshot.Session.ID, snapshot.Session.Dir)
 	} else {
 		fmt.Fprintln(writer, "Pi session: absent (not assigned)")
 	}
