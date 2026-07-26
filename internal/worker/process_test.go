@@ -1062,7 +1062,8 @@ func TestProcessSuspendRequiresCorrelatedAbortResponseAndCompleteToolTail(t *tes
 		abortLine string
 		want      string
 	}{
-		{name: "mismatched abort response", abortLine: `{"id":"wrong","type":"response","command":"abort","success":true}`, want: "unexpected or mismatched"},
+		{name: "mismatched abort response id", abortLine: `{"id":"wrong","type":"response","command":"abort","success":true}`, want: "unexpected or mismatched"},
+		{name: "mismatched abort response command", abortLine: `{"id":"backlog-suspend-abort","type":"response","command":"get_state","success":true}`, want: "unexpected or mismatched"},
 		{name: "rejected correlated abort", abortLine: `{"id":"backlog-suspend-abort","type":"response","command":"abort","success":false,"error":"not active"}`, want: "not active"},
 		{name: "missing tool result", abortLine: `{"id":"backlog-suspend-abort","type":"response","command":"abort","success":true}`, want: "without durable results"},
 	}
@@ -1101,7 +1102,7 @@ while IFS= read -r ignored; do :; done
 				t.Fatal(err)
 			}
 			waitForPath(t, started)
-			_, suspendErr := process.Suspend(context.Background(), ContinuationRequest{SessionID: "backlog-run-51", SessionDir: sessionDir, Worktree: worktree})
+			suspendErr := suspendWithWatchdog(t, process, ContinuationRequest{SessionID: "backlog-run-51", SessionDir: sessionDir, Worktree: worktree})
 			if suspendErr == nil || !strings.Contains(suspendErr.Error(), test.want) {
 				t.Fatalf("suspend error = %v, want %q", suspendErr, test.want)
 			}
@@ -1203,7 +1204,7 @@ while IFS= read -r ignored; do :; done
 				t.Fatal(err)
 			}
 			waitForPath(t, started)
-			_, suspendErr := process.Suspend(context.Background(), ContinuationRequest{SessionID: "backlog-run-52", SessionDir: sessionDir, Worktree: worktree})
+			suspendErr := suspendWithWatchdog(t, process, ContinuationRequest{SessionID: "backlog-run-52", SessionDir: sessionDir, Worktree: worktree})
 			if suspendErr == nil || !strings.Contains(suspendErr.Error(), test.want) {
 				t.Fatalf("suspend error = %v, want %q", suspendErr, test.want)
 			}
@@ -1219,6 +1220,7 @@ func TestProcessSuspendStopsWaitingForMissingSettlementWhenContextCanceled(t *te
 	sessionDir := filepath.Join(root, "sessions")
 	started := filepath.Join(root, "started")
 	abortReceived := filepath.Join(root, "abort-received")
+	abortCommand := filepath.Join(root, "abort-command")
 	releaseAbort := filepath.Join(root, "release-abort")
 	if err := os.MkdirAll(worktree, 0o700); err != nil {
 		t.Fatal(err)
@@ -1228,6 +1230,7 @@ IFS= read -r prompt
 touch `+shellQuote(started)+`
 printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
 IFS= read -r abort
+printf '%s' "$abort" > `+shellQuote(abortCommand)+`
 touch `+shellQuote(abortReceived)+`
 while [ ! -f `+shellQuote(releaseAbort)+` ]; do sleep 0.001; done
 printf '%s\n' '{"id":"backlog-suspend-abort","type":"response","command":"abort","success":true}' '{"type":"turn_end"}' '{"type":"agent_end"}'
@@ -1256,6 +1259,13 @@ while IFS= read -r ignored; do :; done
 		suspendErr <- err
 	}()
 	waitForPath(t, abortReceived)
+	command, err := os.ReadFile(abortCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(command), `{"id":"backlog-suspend-abort","type":"abort"}`; got != want {
+		t.Fatalf("abort command = %q, want %q", got, want)
+	}
 	abortResponse := rpcResponseResult(t, process.events, "backlog-suspend-abort")
 	if err := os.WriteFile(releaseAbort, nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -1263,7 +1273,7 @@ while IFS= read -r ignored; do :; done
 	waitForRPCState(t, process.events, rpcBetweenAgentRuns)
 	waitForRPCResponseConsumption(t, abortResponse)
 	cancel()
-	if err := <-suspendErr; err == nil || !strings.Contains(err.Error(), "wait for agent_settled: context canceled") {
+	if err := waitForSuspendError(t, process, suspendErr); err == nil || !strings.Contains(err.Error(), "wait for agent_settled: context canceled") {
 		t.Fatalf("suspend error = %v, want canceled settlement wait", err)
 	}
 }
@@ -1674,6 +1684,29 @@ func waitForPath(t *testing.T, path string) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("path %s was not created", path)
+}
+
+func suspendWithWatchdog(t *testing.T, process *Process, request ContinuationRequest) error {
+	t.Helper()
+	result := make(chan error, 1)
+	go func() {
+		_, err := process.Suspend(context.Background(), request)
+		result <- err
+	}()
+	return waitForSuspendError(t, process, result)
+}
+
+func waitForSuspendError(t *testing.T, process *Process, result <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(10 * time.Second):
+		_ = process.Abort()
+		_ = process.Close()
+		t.Fatal("Suspend did not return within test watchdog")
+		return nil
+	}
 }
 
 func rpcResponseResult(t *testing.T, events *rpcWriter, id string) <-chan rpcResponse {
