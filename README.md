@@ -53,7 +53,7 @@ Useful options:
 
 The concurrency limit counts top-level issues. Each AFK worker may itself launch implementation and review subagents.
 
-After a complete Candidate snapshot succeeds, the foreground runner exits when no unfinished leased Run remains and no eligible Candidate starts a Worker. Blocked Candidates do not keep it alive unless `--watch` is set.
+After a complete Candidate snapshot succeeds, the foreground runner exits when no leased Run remains capable of autonomous progress and no eligible Candidate starts a Worker. Before this natural one-shot exit, it prints a final aggregate summary with Active and Attention Required sections. The exit is unsuccessful when any Intervention-required Run retains its Lease, including unresolved Runs loaded at startup or produced during the invocation. Historical failed Runs without Leases do not affect the result. Blocked Candidates do not keep the runner alive unless `--watch` is set, and Attention Required alone never ends watch mode.
 
 Candidate discovery fails closed for admission. If a discovery pass fails, the runner creates no Leases from that pass, reports the underlying GitHub error, continues supervising existing Workers, and retries after `--poll` in every runner state. This includes initial startup and idle non-watch invocations. A later successful snapshot restores normal admission or one-shot exit behavior.
 
@@ -177,8 +177,8 @@ Non-signal context cancellation retains the immediate failure shutdown behavior.
 
 ## Exit statuses
 
-- `0`: command succeeded, a dry-run completed, or interactive Reset was declined
-- `1`: an ownership or safety check refused the command, or an operational command failed
+- `0`: command succeeded, natural one-shot exhaustion found no unresolved intervention, a first-signal Drain completed, a dry-run completed, or interactive Reset was declined
+- `1`: natural one-shot exhaustion left an Intervention-required Run with its Lease, an ownership or safety check refused the command, or an operational command failed
 - `2`: the top-level command was missing or unknown
 - `130`: `backlog run` suspension was initiated by a second `SIGINT`
 - `143`: `backlog run` suspension was initiated by `SIGTERM`

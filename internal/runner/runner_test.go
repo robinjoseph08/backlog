@@ -25,6 +25,103 @@ import (
 	"github.com/robinjoseph08/backlog/internal/worktree"
 )
 
+func TestRunnerNaturalExhaustionReportsStartupAttentionAndIgnoresReleasedHistory(t *testing.T) {
+	t.Parallel()
+
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion,
+		Runs: []scheduler.Run{
+			{Issue: 1, RunID: "retained-failure", Status: scheduler.StatusFailed},
+			{Issue: 2, RunID: "released-failure", Status: scheduler.StatusFailed},
+			{Issue: 3, RunID: "incomplete-reset", Status: scheduler.StatusResetting},
+		},
+		Leases: []scheduler.Lease{
+			{LeaseID: "retained-failure", Issue: 1, RunID: "retained-failure"},
+			{LeaseID: "incomplete-reset", Issue: 3, RunID: "incomplete-reset"},
+		},
+	}}
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+	var summary state.State
+	runner.FinalSummary = func(current state.State) error {
+		summary = current
+		return nil
+	}
+
+	err := runner.Run(context.Background())
+	assertInterventionRequired(t, err, 2)
+	if len(summary.Runs) != 3 || len(summary.Leases) != 2 {
+		t.Fatalf("final summary state = %#v, want complete aggregate state", summary)
+	}
+}
+
+func TestRunnerNaturalExhaustionSucceedsWithoutAttention(t *testing.T) {
+	t.Parallel()
+
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion,
+		Runs:    []scheduler.Run{{Issue: 1, RunID: "released-failure", Status: scheduler.StatusFailed}},
+	}}
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+	summaries := 0
+	runner.FinalSummary = func(state.State) error {
+		summaries++
+		return nil
+	}
+
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatalf("natural exhaustion: %v", err)
+	}
+	if summaries != 1 {
+		t.Fatalf("final summaries = %d, want 1", summaries)
+	}
+}
+
+func TestRunnerNaturalExhaustionReturnsSummaryFailureAsOperationalError(t *testing.T) {
+	t.Parallel()
+
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+	runner.FinalSummary = func(state.State) error { return errors.New("output unavailable") }
+	err := runner.Run(context.Background())
+	var intervention *InterventionRequired
+	if err == nil || errors.As(err, &intervention) || !strings.Contains(err.Error(), "print final aggregate summary: output unavailable") {
+		t.Fatalf("natural exhaustion error = %v, want distinguishable summary output failure", err)
+	}
+}
+
+func TestRunnerWatchDoesNotExhaustWhenAttentionRemains(t *testing.T) {
+	t.Parallel()
+
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion,
+		Runs:    []scheduler.Run{{Issue: 1, RunID: "retained-failure", Status: scheduler.StatusFailed}},
+		Leases:  []scheduler.Lease{{LeaseID: "retained-failure", Issue: 1, RunID: "retained-failure"}},
+	}}
+	github := &fakeGitHub{candidateChanged: make(chan struct{}, 2)}
+	runner := testRunner(github, newFakeWorkers(), store, 1)
+	runner.Config.Watch = true
+	summaries := 0
+	runner.FinalSummary = func(state.State) error {
+		summaries++
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	github.waitForCandidateCalls(t, 1)
+	select {
+	case err := <-done:
+		t.Fatalf("watch exited with Attention Required: %v", err)
+	default:
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("watch cancellation: %v", err)
+	}
+	if summaries != 0 {
+		t.Fatalf("watch printed %d final summaries, want none", summaries)
+	}
+}
+
 func TestRunnerStartupClosesOrphanedWorkerLogMarkers(t *testing.T) {
 	t.Parallel()
 
@@ -92,9 +189,7 @@ func TestRunnerFillsSlotsAndImmediatelyRefillsAfterCompletion(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if err != nil {
-			t.Fatalf("run: %v", err)
-		}
+		assertInterventionRequired(t, err, 1)
 	case <-time.After(2 * time.Second):
 		t.Fatal("runner did not stop after runnable backlog was exhausted")
 	}
@@ -119,9 +214,7 @@ func TestRunnerRetainsMergedWorkWhenPiEventStreamIsMalformed(t *testing.T) {
 	github.setCompletion(9, mergedOutcome(9))
 	streamErr := errors.New("malformed Pi RPC JSON on line 2")
 	workers.complete(9, worker.Result{ExitCode: 0, StreamErr: streamErr, Err: streamErr})
-	if err := <-done; err != nil {
-		t.Fatalf("run: %v", err)
-	}
+	assertInterventionRequired(t, <-done, 1)
 	if got := store.runStatus(9); got != scheduler.StatusNeedsHuman {
 		t.Fatalf("issue 9 status = %q, want needs-human", got)
 	}
@@ -145,9 +238,7 @@ func TestRunnerStopsInvalidWorkerBeforeGitHubReconciliation(t *testing.T) {
 	workers.waitForStarts(t, 6)
 	streamErr := errors.New("malformed Pi RPC JSON")
 	workers.complete(6, worker.Result{ExitCode: -1, StreamErr: streamErr, Err: streamErr})
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
+	assertInterventionRequired(t, <-done, 1)
 	if got := store.runStatus(6); got != scheduler.StatusFailed {
 		t.Fatalf("issue 6 status = %q, want failed after stopped-Worker reconciliation", got)
 	}
@@ -168,9 +259,7 @@ func TestRunnerFailsClosedWhenGitHubReconciliationFails(t *testing.T) {
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 8)
 	workers.complete(8, worker.Result{ExitCode: 0})
-	if err := <-done; err != nil {
-		t.Fatalf("run: %v", err)
-	}
+	assertInterventionRequired(t, <-done, 1)
 	if got := store.runStatus(8); got != scheduler.StatusNeedsHuman {
 		t.Fatalf("issue 8 status = %q, want needs-human", got)
 	}
@@ -306,9 +395,7 @@ func TestRunnerFailsClosedWhenRPCOutputBreaksAfterSettlement(t *testing.T) {
 	github.setCompletion(10, mergedOutcome(10))
 	workers.setCloseResult(10, worker.Result{Err: errors.New("message followed agent_settled")})
 	workers.complete(10, worker.Result{ExitCode: 0})
-	if err := <-done; err != nil {
-		t.Fatalf("run: %v", err)
-	}
+	assertInterventionRequired(t, <-done, 1)
 	if got := store.runStatus(10); got != scheduler.StatusNeedsHuman {
 		t.Fatalf("issue 10 status = %q, want needs-human", got)
 	}
@@ -336,9 +423,7 @@ func TestRunnerRetainsFailedWorktree(t *testing.T) {
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 11)
 	workers.complete(11, worker.Result{ExitCode: 1, Err: errors.New("failed")})
-	if err := <-done; err != nil {
-		t.Fatalf("run: %v", err)
-	}
+	assertInterventionRequired(t, <-done, 1)
 	if worktrees.cleanupCount() != 0 {
 		t.Fatalf("cleanup count = %d, want failed worktree retained", worktrees.cleanupCount())
 	}
@@ -379,9 +464,7 @@ func TestRunnerPersistsObservableWorkerContextBeforeRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	workers.complete(7, worker.Result{ExitCode: 1, Err: errors.New("failed")})
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
+	assertInterventionRequired(t, <-done, 1)
 	var admitted scheduler.Run
 	for _, saved := range store.SaveHistory() {
 		if len(saved.Runs) == 1 && len(saved.Leases) == 1 && saved.Runs[0].Status == scheduler.StatusClaimed {
@@ -428,9 +511,7 @@ func TestRunnerPersistsLogIdentitiesBeforeInspectingWorkerPID(t *testing.T) {
 
 	close(inspectIdentity)
 	workers.complete(21, worker.Result{ExitCode: 1, Err: errors.New("failed")})
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
+	assertInterventionRequired(t, <-done, 1)
 }
 
 func TestRunnerDoesNotCommitInMemoryLeaseWhenAdmissionSaveFails(t *testing.T) {
@@ -442,8 +523,9 @@ func TestRunnerDoesNotCommitInMemoryLeaseWhenAdmissionSaveFails(t *testing.T) {
 	runner := testRunner(github, workers, store, 1)
 
 	err := runner.Run(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "persist lease for issue #15") {
-		t.Fatalf("run error = %v, want Lease persistence failure", err)
+	var intervention *InterventionRequired
+	if err == nil || errors.As(err, &intervention) || !strings.Contains(err.Error(), "persist lease for issue #15") {
+		t.Fatalf("run error = %v, want distinct Lease persistence failure", err)
 	}
 	got := store.LoadValue()
 	if len(got.Runs) != 0 || len(got.Leases) != 0 {
@@ -511,9 +593,7 @@ func TestRunnerRetainsLogIdentitiesWhenPIDInspectionFails(t *testing.T) {
 	runner := testRunner(github, workers, store, 1)
 	runner.PIDIdentity = func(context.Context, int) (string, error) { return "", errors.New("identity unavailable") }
 
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	assertInterventionRequired(t, runner.Run(context.Background()), 1)
 	run := store.LoadValue().Runs[0]
 	if run.Status != scheduler.StatusFailed || run.LogPath != "/logs/run-17.jsonl" || run.StderrPath != "/logs/run-17.stderr.log" {
 		t.Fatalf("Run after PID inspection failure = %#v", run)
@@ -530,9 +610,7 @@ func TestRunnerRetainsLogIdentitiesWhenWorkerReleaseFails(t *testing.T) {
 	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
 	runner := testRunner(github, workers, store, 1)
 
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	assertInterventionRequired(t, runner.Run(context.Background()), 1)
 	run := store.LoadValue().Runs[0]
 	if run.Status != scheduler.StatusFailed || run.LogPath != "/logs/run-18.jsonl" || run.StderrPath != "/logs/run-18.stderr.log" {
 		t.Fatalf("Run after Worker release failure = %#v", run)
@@ -552,9 +630,7 @@ func TestRunnerFailsRunWhenWorkerOmitsLogIdentity(t *testing.T) {
 	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
 	runner := testRunner(github, workers, store, 1)
 
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	assertInterventionRequired(t, runner.Run(context.Background()), 1)
 	run := store.LoadValue().Runs[0]
 	if run.Status != scheduler.StatusFailed || !strings.Contains(run.Error, "omitted a JSONL or standard-error log identity") {
 		t.Fatalf("Run after incomplete Worker startup = %#v", run)
@@ -602,9 +678,7 @@ func TestRunnerNeverStartsBlockedCandidate(t *testing.T) {
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 2)
 	workers.complete(2, worker.Result{ExitCode: 1, Err: errors.New("failed")})
-	if err := <-done; err != nil {
-		t.Fatalf("run: %v", err)
-	}
+	assertInterventionRequired(t, <-done, 1)
 	if workers.wasStarted(1) {
 		t.Fatal("blocked issue #1 was started")
 	}
@@ -655,6 +729,54 @@ func TestAdmissionGateSerializesDrainAcceptanceWithLeasePersistence(t *testing.T
 	}
 	if admitted || savedAfterDrain {
 		t.Fatal("Lease persisted after Drain was accepted")
+	}
+}
+
+func TestAdmissionGateSerializesNaturalExhaustionWithDrain(t *testing.T) {
+	t.Parallel()
+
+	gate := &admissionGate{}
+	if first := gate.stop(); !first {
+		t.Fatal("Drain was not accepted")
+	}
+	called := false
+	finished, err := gate.finishNatural(func() error {
+		called = true
+		return nil
+	})
+	if err != nil || finished || called {
+		t.Fatalf("natural exhaustion after Drain = finished %t, called %t, err %v", finished, called, err)
+	}
+
+	gate = &admissionGate{}
+	finishStarted := make(chan struct{})
+	releaseFinish := make(chan struct{})
+	finishDone := make(chan bool, 1)
+	go func() {
+		finished, finishErr := gate.finishNatural(func() error {
+			close(finishStarted)
+			<-releaseFinish
+			return nil
+		})
+		if finishErr != nil {
+			panic(finishErr)
+		}
+		finishDone <- finished
+	}()
+	<-finishStarted
+	stopDone := make(chan bool, 1)
+	go func() { stopDone <- gate.stop() }()
+	select {
+	case <-stopDone:
+		t.Fatal("Drain was accepted before the natural-exhaustion decision completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseFinish)
+	if finished := <-finishDone; !finished {
+		t.Fatal("natural exhaustion lost after it was accepted first")
+	}
+	if firstDrain := <-stopDone; !firstDrain {
+		t.Fatal("later Drain request was not the first signal transition")
 	}
 }
 
@@ -1052,6 +1174,11 @@ func TestRunnerDrainRemainsSuccessfulWhenCompletionRequiresAttention(t *testing.
 			runner := testRunner(test.github, workers, store, 1)
 			runner.Signals = signals
 			runner.Output = output
+			summaries := 0
+			runner.FinalSummary = func(state.State) error {
+				summaries++
+				return nil
+			}
 
 			done := make(chan error, 1)
 			go func() { done <- runner.Run(context.Background()) }()
@@ -1065,6 +1192,9 @@ func TestRunnerDrainRemainsSuccessfulWhenCompletionRequiresAttention(t *testing.
 			}
 			if got := store.runStatus(28); got != test.wantStatus {
 				t.Fatalf("Run status = %q, want %q", got, test.wantStatus)
+			}
+			if summaries != 0 {
+				t.Fatalf("Drain printed %d natural-exhaustion summaries, want none", summaries)
 			}
 		})
 	}
@@ -1572,9 +1702,7 @@ func TestRunnerRetriesInitialCandidateDiscoveryAndResumesAdmission(t *testing.T)
 	}
 
 	workers.complete(7, worker.Result{ExitCode: 1, Err: errors.New("failed")})
-	if err := <-done; err != nil {
-		t.Fatalf("run: %v", err)
-	}
+	assertInterventionRequired(t, <-done, 1)
 }
 
 func TestRunnerWaitsPollIntervalAfterCandidateDiscoveryFailureReturns(t *testing.T) {
@@ -1608,9 +1736,7 @@ func TestRunnerWaitsPollIntervalAfterCandidateDiscoveryFailureReturns(t *testing
 		t.Fatalf("candidate discovery retry happened %s after failure returned, want no sooner than %s", elapsed, pollInterval)
 	}
 	workers.complete(7, worker.Result{ExitCode: 1, Err: errors.New("failed")})
-	if err := <-done; err != nil {
-		t.Fatalf("run: %v", err)
-	}
+	assertInterventionRequired(t, <-done, 1)
 }
 
 func TestRunnerRetriesInitialCandidateDiscoveryUntilEmptySnapshotSucceeds(t *testing.T) {
@@ -1787,9 +1913,7 @@ func TestRunnerFailsClosedInsteadOfReleasingRecoveredRPCWorker(t *testing.T) {
 	}}
 	runner := testRunner(github, workers, store, 1)
 	runner.PIDAlive = func(pid int) bool { return pid == 1235 }
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	assertInterventionRequired(t, runner.Run(context.Background()), 1)
 	got := store.LoadValue()
 	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID != 1235 || len(got.Leases) != 1 {
 		t.Fatalf("recovered RPC Run/Lease = %#v/%#v", got.Runs[0], got.Leases)
@@ -1817,9 +1941,7 @@ func TestRunnerDoesNotTrustRecoveredPIDIndefinitely(t *testing.T) {
 	runner.PIDAlive = func(int) bool { return true }
 	runner.Config.MaxWorkerAge = 24 * time.Hour
 
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatalf("run: %v", err)
-	}
+	assertInterventionRequired(t, runner.Run(context.Background()), 1)
 	if got := store.runStatus(1); got != scheduler.StatusNeedsHuman {
 		t.Fatalf("stale PID status = %q, want needs-human", got)
 	}
@@ -1980,9 +2102,7 @@ func TestRunnerReconcilesClaimedRunWithoutLookingUpAnEmptyBranch(t *testing.T) {
 	}}
 	runner := testRunner(github, workers, store, 1)
 
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatalf("run: %v", err)
-	}
+	assertInterventionRequired(t, runner.Run(context.Background()), 1)
 	if got := store.runStatus(1); got != scheduler.StatusFailed {
 		t.Fatalf("claimed run status = %q, want failed", got)
 	}
@@ -2087,9 +2207,7 @@ func TestRunnerResumesSuspendedRunBeforeNewCandidateWithSameIdentity(t *testing.
 	workers.complete(61, worker.Result{ExitCode: 0})
 	workers.waitForStarts(t, 62)
 	workers.complete(62, worker.Result{ExitCode: 1, Err: errors.New("stop fixture")})
-	if err := <-done; err != nil {
-		t.Fatalf("run: %v", err)
-	}
+	assertInterventionRequired(t, <-done, 1)
 }
 
 func TestRunnerFailsClosedAfterCrashDuringReplacementLaunch(t *testing.T) {
@@ -2105,9 +2223,7 @@ func TestRunnerFailsClosedAfterCrashDuringReplacementLaunch(t *testing.T) {
 	}}
 	runner := testRunner(github, workers, store, 1)
 
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	assertInterventionRequired(t, runner.Run(context.Background()), 1)
 	got := store.LoadValue()
 	resumed := findActiveRun(&got, 64)
 	if resumed.Status != scheduler.StatusNeedsHuman || !resumed.ResumePending || !strings.Contains(resumed.Error, "launch was interrupted") || len(got.Leases) != 1 || workers.wasStarted(64) {
@@ -2188,9 +2304,7 @@ func TestRunnerRefusesCompletionCleanupForReplacedResumedWorktree(t *testing.T) 
 	runner := testRunner(github, workers, store, 1)
 	runner.Worktrees = worktrees
 
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	assertInterventionRequired(t, runner.Run(context.Background()), 1)
 	got := store.LoadValue()
 	if got.Runs[0].Status != scheduler.StatusNeedsHuman || !strings.Contains(got.Runs[0].Error, "worktree identity changed") || len(got.Leases) != 1 || worktrees.cleanupCount() != 0 || workers.wasStarted(66) {
 		t.Fatalf("changed completed worktree = %#v, cleanup=%d, starts=%v", got, worktrees.cleanupCount(), workers.startedSnapshot())
@@ -2214,9 +2328,7 @@ func TestRunnerRefusesCompletionCleanupWhenWorktreeInspectionIsUncertain(t *test
 	runner.Worktrees = worktrees
 	runner.Lstat = func(string) (os.FileInfo, error) { return nil, errors.New("worktree inspection unavailable") }
 
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	assertInterventionRequired(t, runner.Run(context.Background()), 1)
 	got := store.LoadValue()
 	if got.Runs[0].Status != scheduler.StatusNeedsHuman || !strings.Contains(got.Runs[0].Error, "inspection unavailable") || len(got.Leases) != 1 || worktrees.cleanupCount() != 0 || workers.wasStarted(67) {
 		t.Fatalf("uncertain completed worktree = %#v, cleanup=%d, starts=%v", got, worktrees.cleanupCount(), workers.startedSnapshot())
@@ -2285,9 +2397,7 @@ func TestRunnerRecoversPersistedContinuationMarkerBeforeFinalSuspendedState(t *t
 		return run.Status == scheduler.StatusRunning && run.PID == 1063 && run.ProcessIdentity != "999999:old"
 	})
 	workers.complete(63, worker.Result{ExitCode: 1, Err: errors.New("stop fixture")})
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
+	assertInterventionRequired(t, <-done, 1)
 }
 
 func TestRunnerDoesNotResumeBeyondCapacityConsumedByRecoveredLiveWorker(t *testing.T) {
@@ -2344,9 +2454,7 @@ func TestRunnerRejectsCrashRecoveryWhileOldWorkerProcessGroupRemains(t *testing.
 	runner := testRunner(github, workers, store, 1)
 	runner.PIDAlive = func(int) bool { return false }
 	runner.ProcessGroupAlive = func(int) (bool, error) { return true, nil }
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	assertInterventionRequired(t, runner.Run(context.Background()), 1)
 	got := store.LoadValue()
 	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID != 999999 || got.Runs[0].ProcessIdentity != "999999:old" || len(got.Leases) != 1 || workers.wasStarted(64) {
 		t.Fatalf("surviving old Worker process group = %#v", got)
@@ -2369,9 +2477,7 @@ func TestRunnerRejectsCrashRecoveryWhenProcessGroupInspectionIsUncertain(t *test
 	runner := testRunner(github, workers, store, 1)
 	runner.PIDAlive = func(int) bool { return false }
 	runner.ProcessGroupAlive = func(int) (bool, error) { return false, errors.New("inspection unavailable") }
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	assertInterventionRequired(t, runner.Run(context.Background()), 1)
 	got := store.LoadValue()
 	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID != 999999 || !strings.Contains(got.Runs[0].Error, "uncertain") || len(got.Leases) != 1 || workers.wasStarted(67) {
 		t.Fatalf("uncertain old Worker process group = %#v", got)
@@ -2414,9 +2520,7 @@ func TestRunnerClassifiesStructurallyMalformedPersistedRunningContinuationAsNeed
 		GitHub: github, Store: state.FileStore{Path: statePath}, Worktrees: &fakeWorktrees{}, Workers: workers,
 		PIDAlive: func(int) bool { return false }, ProcessGroupAlive: func(int) (bool, error) { return false, nil },
 	}
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	assertInterventionRequired(t, runner.Run(context.Background()), 1)
 	got, err := (state.FileStore{Path: statePath}).Load()
 	if err != nil {
 		t.Fatal(err)
@@ -2459,9 +2563,7 @@ func TestRunnerClassifiesMissingContinuationVerificationTimeAsNeedsHuman(t *test
 				GitHub: &fakeGitHub{}, Store: state.FileStore{Path: statePath}, Worktrees: &fakeWorktrees{}, Workers: workers,
 				PIDAlive: func(int) bool { return false }, ProcessGroupAlive: func(int) (bool, error) { return false, nil },
 			}
-			if err := runner.Run(context.Background()); err != nil {
-				t.Fatal(err)
-			}
+			assertInterventionRequired(t, runner.Run(context.Background()), 1)
 			got, err := (state.FileStore{Path: statePath}).Load()
 			if err != nil {
 				t.Fatal(err)
@@ -2499,9 +2601,7 @@ func TestRunnerClassifiesPersistedRunningRPCWithMissingSessionIdentityAsNeedsHum
 		GitHub: &fakeGitHub{}, Store: state.FileStore{Path: statePath}, Worktrees: &fakeWorktrees{}, Workers: workers,
 		PIDAlive: func(int) bool { return false }, ProcessGroupAlive: func(int) (bool, error) { return false, nil },
 	}
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	assertInterventionRequired(t, runner.Run(context.Background()), 1)
 	got, err := (state.FileStore{Path: statePath}).Load()
 	if err != nil {
 		t.Fatal(err)
@@ -2576,9 +2676,7 @@ func TestRunnerRejectsUnsafeSuspendedContinuationAndRetainsLease(t *testing.T) {
 			}}
 			runner := testRunner(github, workers, store, 1)
 			runner.Worktrees = worktrees
-			if err := runner.Run(context.Background()); err != nil {
-				t.Fatalf("run: %v", err)
-			}
+			assertInterventionRequired(t, runner.Run(context.Background()), 1)
 			got := store.LoadValue()
 			if got.Runs[0].Status != scheduler.StatusNeedsHuman || !strings.Contains(got.Runs[0].Error, test.wantError) || len(got.Leases) != 1 || workers.wasStarted(run.Issue) {
 				t.Fatalf("unsafe continuation result = %#v, starts = %v", got, workers.startedSnapshot())
@@ -2630,9 +2728,7 @@ func TestRunnerReverifiesContinuationAtReplacementReleaseGate(t *testing.T) {
 		workers.mu.Unlock()
 		return fmt.Sprintf("identity-%d", pid), nil
 	}
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	assertInterventionRequired(t, runner.Run(context.Background()), 1)
 	got := store.LoadValue()
 	if got.Runs[0].Status != scheduler.StatusNeedsHuman || !strings.Contains(got.Runs[0].Error, "reverify") || got.Runs[0].PID != 0 || len(got.Leases) != 1 || workers.releases != 0 || workers.abortedCount() == 0 {
 		t.Fatalf("changed continuation at release gate = %#v, releases=%d aborts=%d", got, workers.releases, workers.abortedCount())
@@ -2666,9 +2762,7 @@ func TestRunnerFailsClosedWhenReplacementWorkerCannotLaunchSafely(t *testing.T) 
 			}}
 			runner := testRunner(github, workers, store, 1)
 			test.configure(runner, workers)
-			if err := runner.Run(context.Background()); err != nil {
-				t.Fatalf("run: %v", err)
-			}
+			assertInterventionRequired(t, runner.Run(context.Background()), 1)
 			got := store.LoadValue()
 			if got.Runs[0].Status != scheduler.StatusNeedsHuman || !strings.Contains(got.Runs[0].Error, test.wantError) || (got.Runs[0].PID != 0) != test.wantPID || len(got.Leases) != 1 {
 				t.Fatalf("unsafe replacement launch = %#v", got)
@@ -2806,9 +2900,7 @@ func TestRunnerReconcilesSuspendedMergedOpenIssueAsNeedsHuman(t *testing.T) {
 		Leases: []scheduler.Lease{{LeaseID: "suspended-open", Issue: 25, RunID: "suspended-open"}},
 	}}
 	runner := testRunner(github, workers, store, 1)
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatalf("run: %v", err)
-	}
+	assertInterventionRequired(t, runner.Run(context.Background()), 1)
 	got := store.LoadValue()
 	if got.Runs[0].Status != scheduler.StatusNeedsHuman || !strings.Contains(got.Runs[0].Error, "issue remains open") || len(got.Leases) != 1 {
 		t.Fatalf("reconciled merged-open suspended Run = %#v", got)
@@ -2830,9 +2922,7 @@ func TestRunnerRefusesSuspendedCompletionWhileOldWorkerAbsenceIsUnproven(t *test
 	runner := testRunner(github, workers, store, 1)
 	worktrees := runner.Worktrees.(*fakeWorktrees)
 
-	if err := runner.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	assertInterventionRequired(t, runner.Run(context.Background()), 1)
 	got := store.LoadValue()
 	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID != 999999 || !strings.Contains(got.Runs[0].Error, "absence is not proven") || len(got.Leases) != 1 || worktrees.cleanupCount() != 0 {
 		t.Fatalf("unsafe suspended Completion = %#v, cleanup=%d", got, worktrees.cleanupCount())
@@ -3871,6 +3961,14 @@ func TestRunnerGitHubWaitingOutcomeWinsOverSuspension(t *testing.T) {
 	got := store.LoadValue()
 	if got.Runs[0].Status != scheduler.StatusWaitingForMerge || got.Runs[0].PID != 0 || got.Runs[0].Continuation == nil || len(got.Leases) != 1 {
 		t.Fatalf("waiting outcome after suspension = %#v", got)
+	}
+}
+
+func assertInterventionRequired(t *testing.T, err error, count int) {
+	t.Helper()
+	var intervention *InterventionRequired
+	if !errors.As(err, &intervention) || intervention.Count != count {
+		t.Fatalf("run error = %v, want InterventionRequired count %d", err, count)
 	}
 }
 

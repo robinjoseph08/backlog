@@ -309,6 +309,13 @@ func TestStatusJSONRemainsLifecycleStateWithoutObservationCounters(t *testing.T)
 	}
 }
 
+func TestPrintRunFinalSummaryReturnsOutputFailure(t *testing.T) {
+	err := printRunFinalSummary(failingStatusWriter{}, state.State{Version: state.CurrentVersion}, &sequenceFollowSource{}, time.Now())
+	if err == nil || !strings.Contains(err.Error(), "status output failed") {
+		t.Fatalf("final summary output error = %v", err)
+	}
+}
+
 func TestPrintPlainStatusReturnsOutputFailure(t *testing.T) {
 	err := printPlainStatus(failingStatusWriter{}, state.State{Version: state.CurrentVersion}, &sequenceFollowSource{}, time.Now())
 	if err == nil || !strings.Contains(err.Error(), "status output failed") {

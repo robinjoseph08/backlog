@@ -132,8 +132,71 @@ while IFS= read -r ignored; do :; done
 	if _, err := os.Stat(persisted.Runs[0].Worktree); !os.IsNotExist(err) {
 		t.Fatalf("successful worktree still exists, stat error = %v", err)
 	}
-	if !strings.Contains(stdout.String(), "verified merged completion for issue #42") {
-		t.Fatalf("stdout = %q", stdout.String())
+	for _, want := range []string{"verified merged completion for issue #42", "Final aggregate summary", "Active (0)", "Attention Required (0)"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout missing %q: %q", want, stdout.String())
+		}
+	}
+}
+
+func TestRunCommandPrintsFinalAggregateSummaryAndUsesAttentionExitResult(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		retained bool
+		wantExit int
+		wantRuns string
+	}{
+		{name: "startup attention", retained: true, wantExit: 1, wantRuns: "Attention Required (1)"},
+		{name: "released historical failure", retained: false, wantExit: 0, wantRuns: "Attention Required (0)"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repository := initializeFollowRepository(t)
+			stateDir := t.TempDir()
+			run := scheduler.Run{
+				Issue: 32, IssueTitle: "Needs \x1breview", IssueURL: "https://example.test/issues/\r32",
+				RunID: "run-32", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, Error: "inspect\tworker failure",
+			}
+			current := state.State{
+				Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run},
+			}
+			if test.retained {
+				current.Leases = []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}
+			}
+			if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(current); err != nil {
+				t.Fatal(err)
+			}
+			gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef")
+    printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
+    printf '%s\n' '[]' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+			var stdout, stderr bytes.Buffer
+			exit := Main(context.Background(), []string{
+				"run", "--repo-dir", repository, "--state-dir", stateDir, "--poll", "5ms", "--gh", gh,
+			}, &stdout, &stderr)
+			if exit != test.wantExit {
+				t.Fatalf("exit = %d, want %d, stderr = %q", exit, test.wantExit, stderr.String())
+			}
+			for _, want := range []string{"Final aggregate summary", "Active (0)", test.wantRuns} {
+				if !strings.Contains(stdout.String(), want) {
+					t.Fatalf("final summary missing %q:\n%s", want, stdout.String())
+				}
+			}
+			if test.retained && (!strings.Contains(stdout.String(), "#32  Needs review  failed") || !strings.Contains(stdout.String(), "inspectworker failure")) {
+				t.Fatalf("Attention Required omitted retained failure:\n%s", stdout.String())
+			}
+			if strings.Contains(stdout.String(), "History (") || strings.ContainsAny(stdout.String(), "\x1b\r\t") {
+				t.Fatalf("plain final summary was not append-only sanitized output: %q", stdout.String())
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("natural exhaustion wrote operational error output: %q", stderr.String())
+			}
+		})
 	}
 }
 
@@ -439,7 +502,7 @@ func TestCommandHelpExitsSuccessfully(t *testing.T) {
 	if exit := Main(context.Background(), []string{"help"}, &stdout, &stderr); exit != 0 {
 		t.Fatalf("top-level help exit = %d, stderr = %q", exit, stderr.String())
 	}
-	for _, text := range []string{"backlog run lifecycle", "First SIGINT", "first SIGTERM", "resumes verified Suspended Runs", "Reset retires verified artifacts", "deprecated alias for reset", "first-SIGINT Drain exits 0", "second-SIGINT suspension exits 130", "SIGTERM suspension exits 143", "legacy print-mode Runs cannot Resume", "newer unsupported version"} {
+	for _, text := range []string{"backlog run lifecycle", "First SIGINT", "first SIGTERM", "resumes verified Suspended Runs", "Reset retires verified artifacts", "deprecated alias for reset", "unresolved intervention", "first-SIGINT Drain exits 0", "second-SIGINT suspension exits 130", "SIGTERM suspension exits 143", "legacy print-mode Runs cannot Resume", "newer unsupported version"} {
 		if !strings.Contains(stdout.String(), text) {
 			t.Fatalf("top-level help omitted %q: %q", text, stdout.String())
 		}

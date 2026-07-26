@@ -73,6 +73,10 @@ func MainWithSignals(ctx context.Context, args []string, stdout, stderr io.Write
 		if errors.As(err, &signalExit) {
 			return signalExit.Code
 		}
+		var intervention *runner.InterventionRequired
+		if errors.As(err, &intervention) {
+			return 1
+		}
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
 	}
@@ -219,6 +223,8 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 		LogsDir:    filepath.Join(resolvedStateDir, "logs"),
 		Approve:    *approve,
 	}
+	store := state.FileStore{Path: filepath.Join(resolvedStateDir, "state.json")}
+	summarySource := repositoryFollowSource{followStateSource: store, commonDirectory: commonDirectory}
 	backlogRunner := &runner.Runner{
 		Config: runner.Config{
 			Repo: repository.Slug, DefaultBranch: repository.DefaultBranch,
@@ -226,11 +232,14 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 			SessionsDir: filepath.Join(resolvedStateDir, "sessions"),
 		},
 		GitHub:    github,
-		Store:     state.FileStore{Path: filepath.Join(resolvedStateDir, "state.json")},
+		Store:     store,
 		Worktrees: worktrees,
 		Workers:   workerAdapter{supervisor: supervisor},
 		Output:    stdout,
 		Signals:   runnerSignals,
+		FinalSummary: func(current state.State) error {
+			return printRunFinalSummary(stdout, current, summarySource, time.Now())
+		},
 	}
 	supervision, err := establishRunnerSupervision(commonDirectory)
 	if err != nil {
@@ -589,7 +598,7 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "  restores Candidate labels, and releases the Lease only after all postconditions pass.")
 	fmt.Fprintln(writer, "")
 	fmt.Fprintln(writer, "Exit statuses:")
-	fmt.Fprintln(writer, "  0 success; 1 command refusal or operational failure; 2 missing or unknown command.")
+	fmt.Fprintln(writer, "  0 success; 1 unresolved intervention, command refusal, or operational failure; 2 missing or unknown command.")
 	fmt.Fprintln(writer, "  A completed first-SIGINT Drain exits 0; second-SIGINT suspension exits 130.")
 	fmt.Fprintln(writer, "  SIGTERM suspension exits 143, including later force escalation.")
 	fmt.Fprintln(writer, "")
