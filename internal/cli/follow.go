@@ -261,6 +261,16 @@ type followObservation struct {
 	workerLiveness string
 }
 
+// runObservation is the shared one-shot observation model used by Follow and
+// status. Lifecycle state remains in scheduler.Run; progress is reconstructed
+// from the same normalized Activity evidence used by Follow.
+type runObservation struct {
+	run      scheduler.Run
+	metrics  followMetrics
+	process  followObservation
+	observed time.Time
+}
+
 type followSupervisionSource interface {
 	RunnerSupervised() (bool, error)
 }
@@ -586,6 +596,23 @@ func consumeActivity(metrics *followMetrics, source *normalizedActivitySource) [
 	return entries[min(replayed, len(entries)):]
 }
 
+func observeRunOnce(source followStateSource, run scheduler.Run, diagnostics io.Writer, observed time.Time) (runObservation, *normalizedActivitySource) {
+	if diagnostics == nil {
+		diagnostics = io.Discard
+	}
+	activitySource, err := openNormalizedActivitySource(run, diagnostics, func() time.Time { return observed })
+	if err != nil {
+		fmt.Fprintln(diagnostics, "Run observation diagnostic:", err)
+	}
+	metrics := followMetrics{}
+	if activitySource != nil {
+		consumeActivity(&metrics, activitySource)
+	}
+	return runObservation{
+		run: run, metrics: metrics, process: observeFollowRun(source, run), observed: observed,
+	}, activitySource
+}
+
 func printNewActivity(output io.Writer, metrics *followMetrics, source *normalizedActivitySource) error {
 	showSubagentSummary := false
 	for _, entry := range consumeActivity(metrics, source) {
@@ -643,17 +670,11 @@ func followNormalized(
 	if err != nil {
 		return err
 	}
-	activitySource, err := openNormalizedActivitySource(selected, diagnostics, now)
-	if err != nil {
-		fmt.Fprintln(diagnostics, "Follow diagnostic:", err)
-	}
-	metrics := followMetrics{}
-	if activitySource != nil {
-		consumeActivity(&metrics, activitySource)
-	}
-	lastObservation := observeFollowRun(source, selected)
-	nextObservation := now().Add(followObservationInterval)
-	if err := printFollowSummary(output, selected, metrics, lastObservation, now()); err != nil {
+	initial, activitySource := observeRunOnce(source, selected, diagnostics, now())
+	metrics := initial.metrics
+	lastObservation := initial.process
+	nextObservation := initial.observed.Add(followObservationInterval)
+	if err := printFollowSummary(output, selected, metrics, lastObservation, initial.observed); err != nil {
 		return err
 	}
 	if err := printInitialActivity(output, metrics.entries); err != nil {
@@ -743,6 +764,52 @@ func followNormalized(
 	}
 }
 
+type runProgress struct {
+	elapsed          string
+	activityAge      string
+	workerOperation  string
+	workerTokens     string
+	activeSubagents  int
+	deepestOperation string
+	subagentTurns    string
+	subagentToolUses string
+	subagentTokens   string
+	observedTokens   string
+}
+
+func summarizeRunProgress(run scheduler.Run, metrics followMetrics, now time.Time) runProgress {
+	elapsedEnd := now
+	if run.CompletedAt != nil {
+		elapsedEnd = *run.CompletedAt
+	} else if scheduler.IsTerminal(run.Status) && !run.UpdatedAt.IsZero() {
+		elapsedEnd = run.UpdatedAt
+	}
+	progress := runProgress{
+		elapsed: "n/a", activityAge: "n/a", workerOperation: valueOr(metrics.operation, "n/a"), workerTokens: "n/a",
+	}
+	if !run.StartedAt.IsZero() {
+		progress.elapsed = displayDuration(elapsedEnd.Sub(run.StartedAt))
+	}
+	if !metrics.latest.IsZero() {
+		progress.activityAge = displayDuration(now.Sub(metrics.latest))
+	}
+	if metrics.tokensKnown {
+		progress.workerTokens = fmt.Sprintf("%d", metrics.tokens)
+	}
+	progress.activeSubagents, progress.deepestOperation = metrics.activeSubagentSummary()
+	if progress.activeSubagents == 0 {
+		progress.deepestOperation = progress.workerOperation
+	}
+	progress.subagentTurns, progress.subagentToolUses, progress.subagentTokens = metrics.subagentTotals()
+	progress.observedTokens = "n/a"
+	if len(metrics.subagents) == 0 && metrics.tokensKnown {
+		progress.observedTokens = fmt.Sprintf("%d", metrics.tokens)
+	} else if approximate, known := metrics.totalSubagentTokens(); metrics.tokensKnown && known && approximate <= math.MaxInt64-metrics.tokens {
+		progress.observedTokens = fmt.Sprintf("~%d", metrics.tokens+approximate)
+	}
+	return progress
+}
+
 func printFollowSummary(output io.Writer, run scheduler.Run, metrics followMetrics, observation followObservation, now time.Time) error {
 	issue := fmt.Sprintf("#%d", run.Issue)
 	if run.IssueTitle != "" {
@@ -751,36 +818,10 @@ func printFollowSummary(output io.Writer, run scheduler.Run, metrics followMetri
 	if run.IssueURL != "" {
 		issue += "  " + run.IssueURL
 	}
-	elapsedEnd := now
-	if run.CompletedAt != nil {
-		elapsedEnd = *run.CompletedAt
-	} else if scheduler.IsTerminal(run.Status) && !run.UpdatedAt.IsZero() {
-		elapsedEnd = run.UpdatedAt
-	}
-	elapsed := "n/a"
-	if !run.StartedAt.IsZero() {
-		elapsed = displayDuration(elapsedEnd.Sub(run.StartedAt))
-	}
-	age := "n/a"
-	if !metrics.latest.IsZero() {
-		age = displayDuration(now.Sub(metrics.latest))
-	}
-	operation := valueOr(metrics.operation, "n/a")
-	workerTokens := "n/a"
-	if metrics.tokensKnown {
-		workerTokens = fmt.Sprintf("%d", metrics.tokens)
-	}
-	activeSubagents, deepest := metrics.activeSubagentSummary()
-	subagentTurns, subagentToolUses, subagentTokens := metrics.subagentTotals()
-	observedTokens := "n/a"
-	if len(metrics.subagents) == 0 && metrics.tokensKnown {
-		observedTokens = fmt.Sprintf("%d", metrics.tokens)
-	} else if approximate, known := metrics.totalSubagentTokens(); metrics.tokensKnown && known && approximate <= math.MaxInt64-metrics.tokens {
-		observedTokens = fmt.Sprintf("~%d", metrics.tokens+approximate)
-	}
+	progress := summarizeRunProgress(run, metrics, now)
 	if _, err := fmt.Fprintf(output, "Run: %s\nIssue: %s\nState: %s\nRunner supervision: %s\nWorker liveness: %s\nElapsed: %s\nActivity age: %s\nCurrent Worker operation: %s\nCompleted Worker turns: %d\nCompleted Worker tokens: %s\nSubagents: %d (%d active)\nDeepest current operation: %s\nApproximate Subagent turns: %s\nApproximate Subagent tool uses: %s\nApproximate Subagent tokens: %s\nObserved tokens: %s\n",
-		run.RunID, issue, run.Status, observation.supervision, observation.workerLiveness, elapsed, age, operation, metrics.turns, workerTokens, len(metrics.subagents), activeSubagents,
-		deepest, subagentTurns, subagentToolUses, subagentTokens, observedTokens); err != nil {
+		run.RunID, issue, run.Status, observation.supervision, observation.workerLiveness, progress.elapsed, progress.activityAge, progress.workerOperation, metrics.turns, progress.workerTokens, len(metrics.subagents), progress.activeSubagents,
+		progress.deepestOperation, progress.subagentTurns, progress.subagentToolUses, progress.subagentTokens, progress.observedTokens); err != nil {
 		return err
 	}
 	for index, id := range metrics.subagentOrder {
