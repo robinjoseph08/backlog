@@ -20,7 +20,6 @@ import (
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
 	"github.com/robinjoseph08/backlog/internal/herdr"
 	"github.com/robinjoseph08/backlog/internal/runner"
-	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 	"github.com/robinjoseph08/backlog/internal/worker"
 	"github.com/robinjoseph08/backlog/internal/worktree"
@@ -328,26 +327,8 @@ func statusCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 		encoder.SetIndent("", "  ")
 		return encoder.Encode(current)
 	}
-	runnerSupervised, _ := (repositoryFollowSource{commonDirectory: commonDirectory}).RunnerSupervised()
-	fmt.Fprintf(stdout, "Repository: %s\n", valueOr(current.Repo, "not initialized"))
-	fmt.Fprintf(stdout, "Runs: %d\n", len(current.Runs))
-	fmt.Fprintf(stdout, "Active Leases: %d\n", len(current.Leases))
-	for _, run := range current.Runs {
-		issue := fmt.Sprintf("#%d", run.Issue)
-		if run.IssueTitle != "" {
-			issue += "  " + run.IssueTitle
-		}
-		status := run.Status
-		if status == scheduler.StatusRunning && run.SuspendingAt != nil && runnerSupervised {
-			status = scheduler.Status("suspending")
-		}
-		fmt.Fprintf(stdout, "  %s  %-17s  %s", issue, status, run.Branch)
-		if run.Error != "" {
-			fmt.Fprintf(stdout, "  (%s)", run.Error)
-		}
-		fmt.Fprintln(stdout)
-	}
-	return nil
+	source := repositoryFollowSource{followStateSource: store, commonDirectory: commonDirectory}
+	return printPlainStatus(stdout, current, source, time.Now())
 }
 
 func resolveStateFromFlags(ctx context.Context, repoDir, stateDir, gitExecutable string) (string, string, error) {

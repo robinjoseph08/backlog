@@ -1707,6 +1707,36 @@ func TestFollowNormalizedDiagnosesBadProjectionWithoutFailingRunObservation(t *t
 	}
 }
 
+func TestObserveRunOnceRetainsLiveClockForFollowUpdates(t *testing.T) {
+	stateDir := t.TempDir()
+	logPath := filepath.Join(stateDir, "running.jsonl")
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projectionPath := activity.PathForLog(logPath)
+	clock := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	writeActivityEntries(t, projectionPath, activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: clock, Kind: "lifecycle", Description: "Worker started",
+	})
+	run := scheduler.Run{Issue: 31, RunID: "live-clock", Status: scheduler.StatusRunning, LogPath: logPath}
+	observed, source := observeRunOnce(&sequenceFollowSource{}, run, io.Discard, func() time.Time { return clock })
+	if source == nil {
+		t.Fatal("one-shot observation did not retain its Activity source")
+	}
+	writeActivityEntries(t, projectionPath, activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: clock, Kind: "subagent", Description: "Subagent still working", SuppressFeed: true,
+		Subagent: &activity.SubagentSnapshot{ID: "clock", Description: "Clock", Status: "running", Active: true},
+	})
+	clock = clock.Add(2 * time.Second)
+	var output bytes.Buffer
+	if err := printNewActivity(&output, &observed.metrics, source); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "Subagent still working") {
+		t.Fatalf("Follow Activity source retained a frozen clock: %q", output.String())
+	}
+}
+
 func writeActivityEntries(t *testing.T, path string, entries ...activity.Entry) {
 	t.Helper()
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
