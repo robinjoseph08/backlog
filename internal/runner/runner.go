@@ -117,9 +117,9 @@ type SignalExit struct {
 	Cause error
 }
 
-// InterventionRequired reports natural one-shot exhaustion with retained
-// Leases that the Runner cannot advance autonomously. It is distinct from
-// candidate-discovery, implementation, and process-control failures.
+// InterventionRequired reports the aggregate result of natural one-shot
+// exhaustion when retained Leases cannot advance autonomously. Diagnostics
+// for the individual Run outcomes remain persisted in state.
 type InterventionRequired struct {
 	Count int
 }

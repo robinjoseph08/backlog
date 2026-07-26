@@ -780,6 +780,35 @@ func TestAdmissionGateSerializesNaturalExhaustionWithDrain(t *testing.T) {
 	}
 }
 
+func TestRunnerNaturalExhaustionAcceptedBeforeDrainWins(t *testing.T) {
+	t.Parallel()
+
+	signals := make(chan os.Signal)
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+	runner.Signals = signals
+	summaryStarted := make(chan struct{})
+	releaseSummary := make(chan struct{})
+	runner.FinalSummary = func(state.State) error {
+		close(summaryStarted)
+		<-releaseSummary
+		return nil
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	<-summaryStarted
+	signalReceived := make(chan struct{})
+	go func() {
+		signals <- os.Interrupt
+		close(signalReceived)
+	}()
+	<-signalReceived
+	close(releaseSummary)
+	if err := <-done; err != nil {
+		t.Fatalf("natural exhaustion accepted before Drain: %v", err)
+	}
+}
+
 func TestRunnerStartRejectsLeaseAfterDrainIsAccepted(t *testing.T) {
 	t.Parallel()
 
@@ -828,6 +857,11 @@ func TestRunnerAcceptsIdleDrainWhileInitialReconciliationIsBlocked(t *testing.T)
 	runner := testRunner(github, workers, store, 1)
 	runner.Signals = signals
 	runner.Output = output
+	summaries := 0
+	runner.FinalSummary = func(state.State) error {
+		summaries++
+		return nil
+	}
 
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
@@ -840,6 +874,9 @@ func TestRunnerAcceptsIdleDrainWhileInitialReconciliationIsBlocked(t *testing.T)
 	got := store.LoadValue()
 	if len(got.Runs) != 1 || got.Runs[0].Status != scheduler.StatusWaitingForMerge || len(got.Leases) != 1 {
 		t.Fatalf("state after idle Drain = %#v, want waiting Run and Lease unchanged", got)
+	}
+	if summaries != 0 {
+		t.Fatalf("Drain printed %d natural-exhaustion summaries, want none", summaries)
 	}
 	output.waitFor(t, "Drain complete: 0 Workers remaining; exiting successfully")
 }

@@ -598,7 +598,7 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "  restores Candidate labels, and releases the Lease only after all postconditions pass.")
 	fmt.Fprintln(writer, "")
 	fmt.Fprintln(writer, "Exit statuses:")
-	fmt.Fprintln(writer, "  0 success; 1 unresolved intervention, command refusal, or operational failure; 2 missing or unknown command.")
+	fmt.Fprintln(writer, "  0 success; 1 natural one-shot exhaustion with Intervention-required Runs, command refusal, or operational failure; 2 missing or unknown command.")
 	fmt.Fprintln(writer, "  A completed first-SIGINT Drain exits 0; second-SIGINT suspension exits 130.")
 	fmt.Fprintln(writer, "  SIGTERM suspension exits 143, including later force escalation.")
 	fmt.Fprintln(writer, "")
