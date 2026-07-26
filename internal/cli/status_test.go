@@ -309,6 +309,41 @@ func TestStatusJSONRemainsLifecycleStateWithoutObservationCounters(t *testing.T)
 	}
 }
 
+func TestPrintRunFinalSummaryUsesSharedAttentionPresentation(t *testing.T) {
+	runs := []scheduler.Run{
+		{Issue: 1, RunID: "failed", Status: scheduler.StatusFailed, Error: "inspect failure"},
+		{Issue: 2, RunID: "needs-human", Status: scheduler.StatusNeedsHuman, Error: "verify outcome"},
+		{Issue: 3, RunID: "resetting", Status: scheduler.StatusResetting, Error: "finish Reset"},
+	}
+	leases := make([]scheduler.Lease, 0, len(runs))
+	for _, run := range runs {
+		leases = append(leases, scheduler.Lease{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID})
+	}
+	current := state.State{Version: state.CurrentVersion, Runs: runs, Leases: leases}
+	var output bytes.Buffer
+	if err := printRunFinalSummary(&output, current, &sequenceFollowSource{}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Attention Required (3)", "#1  failed", "inspect failure", "#2  needs-human",
+		"human judgment required", "#3  resetting", "rerun backlog reset",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("final summary missing %q:\n%s", want, output.String())
+		}
+	}
+	if strings.Contains(output.String(), "History (") {
+		t.Fatalf("final summary included History:\n%s", output.String())
+	}
+}
+
+func TestPrintRunFinalSummaryReturnsOutputFailure(t *testing.T) {
+	err := printRunFinalSummary(failingStatusWriter{}, state.State{Version: state.CurrentVersion}, &sequenceFollowSource{}, time.Now())
+	if err == nil || !strings.Contains(err.Error(), "status output failed") {
+		t.Fatalf("final summary output error = %v", err)
+	}
+}
+
 func TestPrintPlainStatusReturnsOutputFailure(t *testing.T) {
 	err := printPlainStatus(failingStatusWriter{}, state.State{Version: state.CurrentVersion}, &sequenceFollowSource{}, time.Now())
 	if err == nil || !strings.Contains(err.Error(), "status output failed") {

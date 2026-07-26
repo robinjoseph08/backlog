@@ -27,6 +27,26 @@ func TestRequiresLeaseCoversEveryStatus(t *testing.T) {
 	}
 }
 
+func TestActiveAndInterventionRequiredPartitionEveryStatus(t *testing.T) {
+	t.Parallel()
+
+	active := map[Status]bool{
+		StatusClaimed: true, StatusWorktreeReady: true, StatusRunning: true,
+		StatusWaitingForMerge: true, StatusSuspended: true,
+	}
+	for _, status := range []Status{
+		StatusClaimed, StatusWorktreeReady, StatusRunning, StatusWaitingForMerge, StatusSuspended,
+		StatusResetting, StatusReset, StatusMerged, StatusFailed, StatusNeedsHuman,
+	} {
+		if got := IsActive(status); got != active[status] {
+			t.Errorf("IsActive(%q) = %t, want %t", status, got, active[status])
+		}
+		if got := RequiresIntervention(status); got == active[status] {
+			t.Errorf("RequiresIntervention(%q) = %t, want %t", status, got, !active[status])
+		}
+	}
+}
+
 func TestIsTerminalCoversEveryStatus(t *testing.T) {
 	t.Parallel()
 

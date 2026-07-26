@@ -1086,8 +1086,14 @@ exit 9
 
 	output, err := exec.Command(binary, "run", "--repo-dir", repository, "--state-dir", stateDir,
 		"--max-workers", "1", "--poll", "5ms", "--gh", gh, "--git", git, "--pi", pi).CombinedOutput()
-	if err != nil {
-		t.Fatalf("compiled run with Worker setup failure: %v\n%s", err, output)
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ExitCode() != 1 {
+		t.Fatalf("compiled natural exhaustion exit = %v, want 1\n%s", err, output)
+	}
+	for _, want := range []string{"Final aggregate summary", "Active (0)", "Attention Required (1)", "#6  Setup failure context  failed"} {
+		if !strings.Contains(string(output), want) {
+			t.Fatalf("compiled final summary missing %q:\n%s", want, output)
+		}
 	}
 	current, err := (state.FileStore{Path: statePath}).Load()
 	if err != nil {

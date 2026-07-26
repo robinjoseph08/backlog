@@ -79,6 +79,10 @@ type Runner struct {
 	Output    io.Writer
 	Signals   <-chan os.Signal
 
+	// FinalSummary presents the aggregate state immediately before natural
+	// one-shot exhaustion. Signal shutdown and watch mode do not call it.
+	FinalSummary func(state.State) error
+
 	Now               func() time.Time
 	NewRunID          func(issue int) string
 	PIDAlive          func(pid int) bool
@@ -111,6 +115,21 @@ type workerStart struct {
 type SignalExit struct {
 	Code  int
 	Cause error
+}
+
+// InterventionRequired reports the aggregate result of natural one-shot
+// exhaustion when retained Leases cannot advance autonomously. Diagnostics
+// for the individual Run outcomes remain persisted in state.
+type InterventionRequired struct {
+	Count int
+}
+
+func (e *InterventionRequired) Error() string {
+	noun := "Runs"
+	if e.Count == 1 {
+		noun = "Run"
+	}
+	return fmt.Sprintf("natural exhaustion left %d Intervention-required %s", e.Count, noun)
 }
 
 func (e *SignalExit) Error() string {
@@ -150,6 +169,18 @@ func (g *admissionGate) stopped() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.draining
+}
+
+// finishNatural linearizes one-shot exhaustion with Drain acceptance. A
+// signal accepted first prevents natural-exhaustion presentation and policy;
+// otherwise the complete final decision precedes any later Drain request.
+func (g *admissionGate) finishNatural(finish func() error) (bool, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.draining {
+		return false, nil
+	}
+	return true, finish()
 }
 
 type signalEvent struct {
@@ -330,16 +361,27 @@ func (r *Runner) Run(ctx context.Context) error {
 				if startedWorker {
 					continue
 				}
-				if unfinishedRunCount(&current) == 0 && !r.Config.Watch {
-					if admission.stopped() {
-						if r.suspensionExit.Load() != 0 {
-							continue
+				if activeRunCount(&current) == 0 && !r.Config.Watch {
+					finished, exhaustionErr := admission.finishNatural(func() error {
+						if r.FinalSummary != nil {
+							if err := r.FinalSummary(current); err != nil {
+								return fmt.Errorf("print final aggregate summary: %w", err)
+							}
 						}
-						event := <-signalEvents
-						draining = r.handleSignal(event, len(localWorkers)) || draining
+						if count := interventionRequiredCount(&current); count > 0 {
+							return &InterventionRequired{Count: count}
+						}
+						return nil
+					})
+					if finished {
+						return exhaustionErr
+					}
+					if r.suspensionExit.Load() != 0 {
 						continue
 					}
-					return nil
+					event := <-signalEvents
+					draining = r.handleSignal(event, len(localWorkers)) || draining
+					continue
 				}
 			}
 		} else if draining && len(localWorkers) == 0 {
@@ -2098,11 +2140,22 @@ func persistedWorkerCount(current *state.State) int {
 	return count
 }
 
-func unfinishedRunCount(current *state.State) int {
+func activeRunCount(current *state.State) int {
 	count := 0
 	for _, lease := range current.Leases {
 		run := findRun(current.Runs, lease.RunID)
-		if scheduler.RequiresLease(run.Status) {
+		if scheduler.IsActive(run.Status) {
+			count++
+		}
+	}
+	return count
+}
+
+func interventionRequiredCount(current *state.State) int {
+	count := 0
+	for _, lease := range current.Leases {
+		run := findRun(current.Runs, lease.RunID)
+		if scheduler.RequiresIntervention(run.Status) {
 			count++
 		}
 	}

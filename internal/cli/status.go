@@ -32,16 +32,13 @@ func statusSectionFor(run scheduler.Run, leased bool) statusSection {
 	if !leased {
 		return statusHistory
 	}
-	switch run.Status {
-	case scheduler.StatusClaimed, scheduler.StatusWorktreeReady, scheduler.StatusRunning,
-		scheduler.StatusWaitingForMerge, scheduler.StatusSuspended:
+	if scheduler.IsActive(run.Status) {
 		return statusActive
-	default:
-		return statusAttention
 	}
+	return statusAttention
 }
 
-func printPlainStatus(output io.Writer, current state.State, source followStateSource, now time.Time) error {
+func observeStatusSections(current state.State, source followStateSource, now time.Time) map[statusSection][]statusRun {
 	leasedRuns := make(map[string]struct{}, len(current.Leases))
 	for _, lease := range current.Leases {
 		leasedRuns[lease.RunID] = struct{}{}
@@ -61,13 +58,26 @@ func printPlainStatus(output io.Writer, current state.State, source followStateS
 		sections[section] = append(sections[section], statusRun{run: run, observation: observation})
 	}
 
+	return sections
+}
+
+func printPlainStatus(output io.Writer, current state.State, source followStateSource, now time.Time) error {
+	sections := observeStatusSections(current, source, now)
 	printer := statusPrinter{output: output}
-	printer.printf("Repository: %s\n", valueOr(plainStatusValue(current.Repo), "not initialized"))
-	printer.printf("Runs: %d\n", len(current.Runs))
-	printer.printf("Active Leases: %d\n", len(current.Leases))
+	printer.header(current)
 	printer.section("Active", sections[statusActive])
 	printer.section("Attention Required", sections[statusAttention])
 	printer.section("History", sections[statusHistory])
+	return printer.err
+}
+
+func printRunFinalSummary(output io.Writer, current state.State, source followStateSource, now time.Time) error {
+	sections := observeStatusSections(current, source, now)
+	printer := statusPrinter{output: output}
+	printer.printf("\nFinal aggregate summary\n")
+	printer.header(current)
+	printer.section("Active", sections[statusActive])
+	printer.section("Attention Required", sections[statusAttention])
 	return printer.err
 }
 
@@ -81,6 +91,12 @@ func (p *statusPrinter) printf(format string, values ...any) {
 		return
 	}
 	_, p.err = fmt.Fprintf(p.output, format, values...)
+}
+
+func (p *statusPrinter) header(current state.State) {
+	p.printf("Repository: %s\n", valueOr(plainStatusValue(current.Repo), "not initialized"))
+	p.printf("Runs: %d\n", len(current.Runs))
+	p.printf("Active Leases: %d\n", len(current.Leases))
 }
 
 func (p *statusPrinter) section(name string, runs []statusRun) {

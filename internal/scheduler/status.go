@@ -11,6 +11,24 @@ func RequiresLease(status Status) bool {
 	}
 }
 
+// IsActive reports whether a leased Run can still advance autonomously or be
+// reconciled by the Runner. Every other status with a retained Lease requires
+// intervention.
+func IsActive(status Status) bool {
+	switch status {
+	case StatusClaimed, StatusWorktreeReady, StatusRunning, StatusWaitingForMerge, StatusSuspended:
+		return true
+	default:
+		return false
+	}
+}
+
+// RequiresIntervention reports whether a retained Lease represents work that
+// the Runner cannot advance autonomously.
+func RequiresIntervention(status Status) bool {
+	return !IsActive(status)
+}
+
 // IsTerminal reports whether a Run status stops producing autonomous work.
 func IsTerminal(status Status) bool {
 	switch status {
