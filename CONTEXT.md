@@ -24,6 +24,14 @@ _Avoid_: Claim, lock
 One isolated attempt to take an eligible candidate through the AFK workflow and verify its GitHub outcome.
 _Avoid_: Task, execution
 
+**Historical Run**:
+A Run without a Lease that remains available for inspection but no longer reserves its issue.
+_Avoid_: Archived Run, deleted Run
+
+**Outcome Acknowledgment**:
+A durable indication that an operator has seen a Historical Run's unexpected non-Completion outcome, allowing default status to omit it without deleting history.
+_Avoid_: Dismissal, clearance, deletion
+
 **Intervention-required Run**:
 An incomplete Run that retains its Lease because Backlog cannot safely continue or release ownership without human judgment.
 _Avoid_: Past failed Run, historical failure
