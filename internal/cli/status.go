@@ -5,6 +5,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -216,11 +217,7 @@ func (p *statusPrinter) run(observed statusRun) {
 	if title := plainStatusValue(run.IssueTitle); title != "" {
 		identity += "  " + title
 	}
-	displayedState := string(run.Status)
-	if run.Status == scheduler.StatusRunning && run.SuspendingAt != nil && observed.observation.process.supervision == "SUPERVISED" {
-		displayedState = "suspending"
-	}
-	p.printf("  %s  %s\n", identity, displayedState)
+	p.printf("  %s  %s\n", identity, displayedRunState(run, observed.observation.process))
 	if issueURL := plainStatusValue(run.IssueURL); issueURL != "" {
 		p.printf("    Issue: %s\n", issueURL)
 	}
@@ -307,13 +304,108 @@ func (p *statusPrinter) printReason(run scheduler.Run) {
 	p.printf("    Diagnostic: %s\n", valueOr(strings.TrimSpace(plainStatusValue(run.Error)), "n/a"))
 }
 
+func displayedRunState(run scheduler.Run, process followObservation) string {
+	if run.Status == scheduler.StatusRunning && run.SuspendingAt != nil && process.supervision == "SUPERVISED" {
+		return "suspending"
+	}
+	return string(run.Status)
+}
+
+type terminalTextState uint8
+
+const (
+	terminalText terminalTextState = iota
+	terminalEscape
+	terminalCSI
+	terminalControlString
+	terminalControlStringEscape
+)
+
+type terminalControlWriter struct {
+	output io.Writer
+
+	mu    sync.Mutex
+	state terminalTextState
+}
+
+func (w *terminalControlWriter) Write(content []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	filtered := filterTerminalControls(content, &w.state, true)
+	if len(filtered) == 0 {
+		return len(content), nil
+	}
+	written, err := w.output.Write(filtered)
+	if err == nil && written != len(filtered) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		return 0, err
+	}
+	return len(content), nil
+}
+
 func plainStatusValue(value string) string {
+	state := terminalText
+	filtered := filterTerminalControls([]byte(value), &state, false)
 	return strings.Map(func(character rune) rune {
 		if unicode.IsControl(character) {
 			return -1
 		}
 		return character
-	}, value)
+	}, string(filtered))
+}
+
+func filterTerminalControls(content []byte, state *terminalTextState, preserveWhitespace bool) []byte {
+	filtered := make([]byte, 0, len(content))
+	for _, character := range content {
+		switch *state {
+		case terminalText:
+			switch {
+			case character == 0x1b:
+				*state = terminalEscape
+			case character == 0x9b:
+				*state = terminalCSI
+			case character < 0x20 || character == 0x7f:
+				if preserveWhitespace && (character == '\n' || character == '\t') {
+					filtered = append(filtered, character)
+				}
+			default:
+				filtered = append(filtered, character)
+			}
+		case terminalEscape:
+			switch character {
+			case '[':
+				*state = terminalCSI
+			case ']', 'P', 'X', '^', '_':
+				*state = terminalControlString
+			case 0x1b:
+			default:
+				*state = terminalText
+				if character >= 0x20 && character != 0x7f {
+					filtered = append(filtered, character)
+				}
+			}
+		case terminalCSI:
+			if character >= 0x40 && character <= 0x7e {
+				*state = terminalText
+			}
+		case terminalControlString:
+			switch character {
+			case 0x07:
+				*state = terminalText
+			case 0x1b:
+				*state = terminalControlStringEscape
+			}
+		case terminalControlStringEscape:
+			if character == '\\' {
+				*state = terminalText
+			} else if character != 0x1b {
+				*state = terminalControlString
+			}
+		}
+	}
+	return filtered
 }
 
 func (p *statusPrinter) printTime(label string, value *time.Time) {

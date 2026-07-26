@@ -23,6 +23,7 @@ import (
 	"github.com/robinjoseph08/backlog/internal/state"
 	"github.com/robinjoseph08/backlog/internal/worker"
 	"github.com/robinjoseph08/backlog/internal/worktree"
+	"golang.org/x/term"
 )
 
 func Main(ctx context.Context, args []string, stdout, stderr io.Writer) int {
@@ -32,6 +33,16 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 // MainWithSignals runs the CLI while preserving each delivered interrupt for
 // the runner lifecycle instead of reducing all interrupts to one cancellation.
 func MainWithSignals(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan os.Signal) int {
+	return MainWithSignalsAndTerminal(ctx, args, stdout, stderr, signals, outputIsTerminal)
+}
+
+// MainWithSignalsAndTerminal supplies terminal capability through a
+// deterministic seam. Production callers use MainWithSignals; CLI tests can
+// select dashboard or plain output without allocating a real terminal.
+func MainWithSignalsAndTerminal(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan os.Signal, isTerminal func(io.Writer) bool) int {
+	if isTerminal == nil {
+		isTerminal = outputIsTerminal
+	}
 	if len(args) == 0 {
 		printUsage(stderr)
 		return 2
@@ -39,7 +50,7 @@ func MainWithSignals(ctx context.Context, args []string, stdout, stderr io.Write
 	var err error
 	switch args[0] {
 	case "run":
-		err = runCommand(ctx, args[1:], stdout, stderr, signals)
+		err = runCommand(ctx, args[1:], stdout, stderr, signals, isTerminal(stdout))
 	case "status":
 		commandCtx, stop := cancelContextOnSignal(ctx, signals)
 		defer stop()
@@ -94,7 +105,12 @@ const (
 	setupSignalTermSuspension      int32 = 143
 )
 
-func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan os.Signal) (resultErr error) {
+func outputIsTerminal(output io.Writer) bool {
+	file, ok := output.(interface{ Fd() uintptr })
+	return ok && term.IsTerminal(int(file.Fd()))
+}
+
+func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan os.Signal, terminalOutput bool) (resultErr error) {
 	setupCtx := ctx
 	runnerSignals := signals
 	var cancelSetup context.CancelFunc
@@ -171,6 +187,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 	poll := flags.Duration("poll", 30*time.Second, "GitHub and process reconciliation interval")
 	maxWorkerAge := flags.Duration("max-worker-age", 7*24*time.Hour, "maximum age before a recovered PID requires human verification")
 	watch := flags.Bool("watch", false, "keep waiting after the current runnable backlog is exhausted")
+	plain := flags.Bool("plain", false, "disable the live terminal dashboard")
 	approve := flags.Bool("approve", true, "trust project-local Pi resources in worker worktrees")
 	ghExecutable := flags.String("gh", "gh", "gh executable")
 	gitExecutable := flags.String("git", "git", "git executable")
@@ -229,27 +246,48 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 	}
 	store := state.FileStore{Path: filepath.Join(resolvedStateDir, "state.json")}
 	summarySource := repositoryFollowSource{followStateSource: store, commonDirectory: commonDirectory}
+	supervision, err := establishRunnerSupervision(commonDirectory)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = supervision.Release() }()
+
+	var runnerStore runner.Store = store
+	runnerOutput := io.Writer(&terminalControlWriter{output: stdout})
+	finalSummary := func(current state.State) error {
+		return printRunFinalSummary(stdout, current, summarySource, time.Now())
+	}
+	if terminalOutput && !*plain {
+		initial, _, err := store.Preview()
+		if err != nil {
+			return err
+		}
+		if initial.Repo == "" {
+			initial.Repo = repository.Slug
+			initial.DefaultBranch = repository.DefaultBranch
+			initial.MaxConcurrentIssues = *maxWorkers
+		}
+		dashboard := newLiveDashboard(stdout, summarySource, initial, time.Now)
+		runnerStore = dashboardStore{FileStore: store, dashboard: dashboard}
+		runnerOutput = dashboard
+		finalSummary = dashboard.finalSummary
+		dashboard.start()
+		defer dashboard.close()
+	}
 	backlogRunner := &runner.Runner{
 		Config: runner.Config{
 			Repo: repository.Slug, DefaultBranch: repository.DefaultBranch,
 			MaxConcurrentIssues: *maxWorkers, PollInterval: *poll, MaxWorkerAge: *maxWorkerAge, Watch: *watch,
 			SessionsDir: filepath.Join(resolvedStateDir, "sessions"),
 		},
-		GitHub:    github,
-		Store:     store,
-		Worktrees: worktrees,
-		Workers:   workerAdapter{supervisor: supervisor},
-		Output:    stdout,
-		Signals:   runnerSignals,
-		FinalSummary: func(current state.State) error {
-			return printRunFinalSummary(stdout, current, summarySource, time.Now())
-		},
+		GitHub:       github,
+		Store:        runnerStore,
+		Worktrees:    worktrees,
+		Workers:      workerAdapter{supervisor: supervisor},
+		Output:       runnerOutput,
+		Signals:      runnerSignals,
+		FinalSummary: finalSummary,
 	}
-	supervision, err := establishRunnerSupervision(commonDirectory)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = supervision.Release() }()
 	if signals != nil {
 		setupMu.Lock()
 		setupActive = false
