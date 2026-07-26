@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -26,6 +27,15 @@ func (s *dashboardTestSource) Preview() (state.State, bool, error) {
 }
 
 func (s *dashboardTestSource) RunnerSupervised() (bool, error) { return true, nil }
+
+func lastDashboardFrame(output string) string {
+	const redraw = "\x1b[H\x1b[2J"
+	index := strings.LastIndex(output, redraw)
+	if index < 0 {
+		return output
+	}
+	return output[index+len(redraw):]
+}
 
 func TestRunOutputSelectionUsesTerminalCapabilityAndPlainOverride(t *testing.T) {
 	for _, test := range []struct {
@@ -65,6 +75,11 @@ esac
 			}
 			if !strings.Contains(stdout.String(), test.wantOutput) {
 				t.Fatalf("stdout missing %q: %q", test.wantOutput, stdout.String())
+			}
+			if test.wantANSI {
+				if strings.Count(stdout.String(), "\x1b[?25l") != 1 || strings.Count(stdout.String(), "\x1b[?25h") != 1 || !strings.HasSuffix(stdout.String(), "\x1b[?25h\n") {
+					t.Fatalf("dashboard did not hide and restore the cursor exactly once: %q", stdout.String())
+				}
 			}
 		})
 	}
@@ -152,9 +167,10 @@ esac
 	if exit != 1 {
 		t.Fatalf("exit = %d, want unresolved-intervention exit 1; stderr = %q", exit, stderr.String())
 	}
+	finalFrame := lastDashboardFrame(stdout.String())
 	for _, want := range []string{"Final aggregate summary", "Attention Required (1)", "#33  Operator decision", "review retained Worker"} {
-		if !strings.Contains(stdout.String(), want) {
-			t.Fatalf("terminal final summary missing %q: %q", want, stdout.String())
+		if !strings.Contains(finalFrame, want) {
+			t.Fatalf("terminal final frame missing %q: %q", want, finalFrame)
 		}
 	}
 }
@@ -268,9 +284,10 @@ esac
 	if exit != 0 {
 		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
 	}
-	for _, want := range []string{"Recently Finished (1)", "#44  Merge while watching", "State: merged"} {
-		if !strings.Contains(stdout.String(), want) {
-			t.Fatalf("terminal dashboard missing %q: %q", want, stdout.String())
+	finalFrame := lastDashboardFrame(stdout.String())
+	for _, want := range []string{"Final aggregate summary", "Recently Finished (1)", "#44  Merge while watching", "State: merged"} {
+		if !strings.Contains(finalFrame, want) {
+			t.Fatalf("terminal final frame missing %q: %q", want, finalFrame)
 		}
 	}
 }
@@ -291,6 +308,13 @@ func TestDashboardRedrawsForActivityWithoutCreatingActivity(t *testing.T) {
 		Operation: "edit", OperationChanged: true, TurnDelta: 1, ResponseCompleted: true, TokenDelta: 1200, TokensKnown: true,
 	}
 	if err := json.NewEncoder(projection).Encode(entry); err != nil {
+		t.Fatal(err)
+	}
+	turns, tools, tokens := 2, 3, int64(500)
+	if err := json.NewEncoder(projection).Encode(activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: now.Add(-time.Second), Kind: "subagent", Description: "Subagent testing",
+		Subagent: &activity.SubagentSnapshot{ID: "review", Description: "Review dashboard", Status: "running", Activity: "testing", Turns: &turns, ToolUses: &tools, ApproxTokens: &tokens, Active: true},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := projection.Close(); err != nil {
@@ -319,14 +343,19 @@ func TestDashboardRedrawsForActivityWithoutCreatingActivity(t *testing.T) {
 	dashboard.redraw()
 	for _, want := range []string{
 		"Repository: acme/widgets", "Worker capacity: 1 used | 1 available | 2 total", "#41  Live observation",
-		"State: running | Elapsed: 1m0s", "alive (PID", "Activity age: 2s | Deepest operation: edit",
-		"Turns: Worker 1 | Subagent n/a | Observed tokens: 1200",
+		"Issue: https://github.com/acme/widgets/issues/41", "State: running | Elapsed: 1m0s", "alive (PID",
+		"Activity age: 1s | Deepest operation: Subagent \"Review dashboard\": testing",
+		"Turns: Worker 1 | Subagent ~2 | Observed tokens: ~1700",
 	} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("dashboard missing %q:\n%s", want, output.String())
 		}
 	}
+	cachedSource := dashboard.observations[run.RunID].source
 	dashboard.redraw()
+	if cachedSource == nil || dashboard.observations[run.RunID].source != cachedSource {
+		t.Fatal("dashboard reopened Activity from the beginning during an elapsed-only redraw")
+	}
 	after, err := os.Stat(projectionPath)
 	if err != nil {
 		t.Fatal(err)
@@ -354,11 +383,78 @@ func TestDashboardRedrawsForActivityWithoutCreatingActivity(t *testing.T) {
 		t.Fatal("meaningful Activity append did not request a dashboard refresh")
 	}
 	dashboard.redraw()
-	if !strings.Contains(output.String(), "Activity age: 1s | Deepest operation: bash") {
-		t.Fatalf("Activity redraw did not show latest operation:\n%s", output.String())
+	if !strings.Contains(output.String(), "Activity age: 1s | Deepest operation: Subagent \"Review dashboard\": testing") {
+		t.Fatalf("Activity redraw did not retain the deepest active operation:\n%s", output.String())
+	}
+	suspendingAt := now
+	current.Runs[0].SuspendingAt = &suspendingAt
+	source.current = current
+	dashboard.update(current)
+	dashboard.redraw()
+	if !strings.Contains(lastDashboardFrame(output.String()), "State: suspending") {
+		t.Fatalf("dashboard did not use the shared Suspending state:\n%s", output.String())
 	}
 	if dashboardElapsedInterval > time.Second {
 		t.Fatalf("elapsed refresh interval = %s, want at most 1s", dashboardElapsedInterval)
+	}
+}
+
+func TestDashboardElapsedTimerRedrawsWithoutStateActivity(t *testing.T) {
+	started := time.Now().Add(-time.Minute).Truncate(time.Second)
+	var clock atomic.Int64
+	clock.Store(started.Add(time.Minute).UnixNano())
+	now := func() time.Time { return time.Unix(0, clock.Load()) }
+	run := scheduler.Run{Issue: 51, RunID: "run-51", Status: scheduler.StatusRunning, StartedAt: started}
+	current := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1,
+		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+	}
+	source := &dashboardTestSource{current: current}
+	var output synchronizedBuffer
+	dashboard := newLiveDashboard(&output, source, current, now)
+	dashboard.start()
+	defer dashboard.close()
+	clock.Store(started.Add(62 * time.Second).UnixNano())
+	deadline := time.Now().Add(2 * dashboardElapsedInterval)
+	for !strings.Contains(lastDashboardFrame(output.String()), "Elapsed: 1m2s") {
+		if time.Now().After(deadline) {
+			t.Fatalf("elapsed timer did not update the dashboard without state or Activity:\n%s", output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestDashboardCapacityMatchesSchedulerSemantics(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		run  scheduler.Run
+		want int
+	}{
+		{name: "running", run: scheduler.Run{RunID: "run", Status: scheduler.StatusRunning}, want: 1},
+		{name: "suspended", run: scheduler.Run{RunID: "run", Status: scheduler.StatusSuspended}, want: 1},
+		{name: "waiting for merge", run: scheduler.Run{RunID: "run", Status: scheduler.StatusWaitingForMerge}},
+		{name: "needs human without Worker", run: scheduler.Run{RunID: "run", Status: scheduler.StatusNeedsHuman}},
+		{name: "needs human with retained Worker", run: scheduler.Run{RunID: "run", Status: scheduler.StatusNeedsHuman, PID: 42}, want: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			current := state.State{Runs: []scheduler.Run{test.run}, Leases: []scheduler.Lease{{LeaseID: test.run.RunID, Issue: 1, RunID: test.run.RunID}}}
+			if got := dashboardUsedCapacity(current); got != test.want {
+				t.Fatalf("used capacity = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestPlainRunOutputRemovesSplitTerminalControls(t *testing.T) {
+	var output bytes.Buffer
+	writer := &terminalControlWriter{output: &output}
+	for _, content := range []string{"discovery ", "\x1b[3", "1mfailed\x1b[0m\n", "next\a line\n"} {
+		if _, err := writer.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, want := output.String(), "discovery failed\nnext line\n"; got != want {
+		t.Fatalf("sanitized plain output = %q, want %q", got, want)
 	}
 }
 

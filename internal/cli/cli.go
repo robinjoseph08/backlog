@@ -249,7 +249,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 	defer func() { _ = supervision.Release() }()
 
 	var runnerStore runner.Store = store
-	runnerOutput := stdout
+	runnerOutput := io.Writer(&terminalControlWriter{output: stdout})
 	finalSummary := func(current state.State) error {
 		return printRunFinalSummary(stdout, current, summarySource, time.Now())
 	}
@@ -258,9 +258,11 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 		if err != nil {
 			return err
 		}
-		initial.Repo = repository.Slug
-		initial.DefaultBranch = repository.DefaultBranch
-		initial.MaxConcurrentIssues = *maxWorkers
+		if initial.Repo == "" {
+			initial.Repo = repository.Slug
+			initial.DefaultBranch = repository.DefaultBranch
+			initial.MaxConcurrentIssues = *maxWorkers
+		}
 		dashboard := newLiveDashboard(stdout, summarySource, initial, time.Now)
 		runnerStore = dashboardStore{FileStore: store, dashboard: dashboard}
 		runnerOutput = dashboard

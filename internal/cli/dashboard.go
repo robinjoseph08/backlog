@@ -47,6 +47,7 @@ type liveDashboard struct {
 	messages         []string
 	stage            dashboardStage
 	lastActivity     map[string]fileSignature
+	observations     map[string]dashboardActivityObservation
 	pendingOutput    bytes.Buffer
 	err              error
 
@@ -62,6 +63,12 @@ type fileSignature struct {
 	modTime time.Time
 }
 
+type dashboardActivityObservation struct {
+	logPath string
+	metrics followMetrics
+	source  *normalizedActivitySource
+}
+
 func newLiveDashboard(output io.Writer, source followStateSource, initial state.State, now func() time.Time) *liveDashboard {
 	if now == nil {
 		now = time.Now
@@ -74,7 +81,7 @@ func newLiveDashboard(output io.Writer, source followStateSource, initial state.
 	return &liveDashboard{
 		output: output, source: source, now: now, current: initial,
 		baselineStatuses: baseline, stage: dashboardRunning,
-		lastActivity: activitySignatures(initial), updates: make(chan struct{}, 1),
+		lastActivity: activitySignatures(initial), observations: make(map[string]dashboardActivityObservation), updates: make(chan struct{}, 1),
 		stop: make(chan struct{}), done: make(chan struct{}),
 	}
 }
@@ -274,7 +281,7 @@ func (d *liveDashboard) redraw() {
 }
 
 func (d *liveDashboard) render(current state.State, messages []string, stage dashboardStage, now time.Time) string {
-	sections := observeStatusSections(current, d.source, now)
+	sections := d.observeSections(current, now)
 	active := sections[statusActive]
 	attention := sections[statusAttention]
 	recent := d.recentlyFinished(current, sections, now)
@@ -295,6 +302,39 @@ func (d *liveDashboard) render(current state.State, messages []string, stage das
 	}
 	fmt.Fprintf(&output, "\n%s\n", dashboardFooter(stage))
 	return output.String()
+}
+
+func (d *liveDashboard) observeSections(current state.State, now time.Time) map[statusSection][]statusRun {
+	leasedRuns := make(map[string]struct{}, len(current.Leases))
+	for _, lease := range current.Leases {
+		leasedRuns[lease.RunID] = struct{}{}
+	}
+	sections := map[statusSection][]statusRun{
+		statusActive:    {},
+		statusAttention: {},
+		statusHistory:   {},
+	}
+	for _, run := range current.Runs {
+		_, leased := leasedRuns[run.RunID]
+		section := statusSectionFor(run, leased)
+		if section == statusHistory {
+			continue
+		}
+		observation := runObservation{run: run, process: observeFollowRun(d.source, run), observed: now}
+		if run.Status == scheduler.StatusRunning {
+			cached, exists := d.observations[run.RunID]
+			if !exists || cached.logPath != run.LogPath {
+				observed, source := observeRunOnce(d.source, run, io.Discard, d.now)
+				cached = dashboardActivityObservation{logPath: run.LogPath, metrics: observed.metrics, source: source}
+			} else if cached.source != nil {
+				consumeActivity(&cached.metrics, cached.source)
+			}
+			d.observations[run.RunID] = cached
+			observation.metrics = cached.metrics
+		}
+		sections[section] = append(sections[section], statusRun{run: run, observation: observation})
+	}
+	return sections
 }
 
 func (d *liveDashboard) recentlyFinished(current state.State, sections map[statusSection][]statusRun, now time.Time) []statusRun {
@@ -342,7 +382,7 @@ func renderDashboardSection(output *strings.Builder, name string, runs []statusR
 			fmt.Fprintf(output, "    Issue: %s\n", plainStatusValue(run.IssueURL))
 		}
 		fmt.Fprintf(output, "    State: %s | Elapsed: %s | Worker liveness: %s\n",
-			run.Status, progress.elapsed, plainStatusValue(observed.observation.process.workerLiveness))
+			displayedRunState(run, observed.observation.process), progress.elapsed, plainStatusValue(observed.observation.process.workerLiveness))
 		fmt.Fprintf(output, "    Activity age: %s | Deepest operation: %s\n",
 			progress.activityAge, plainStatusValue(progress.deepestOperation))
 		fmt.Fprintf(output, "    Turns: Worker %s | Subagent %s | Observed tokens: %s\n",
@@ -412,7 +452,7 @@ func (d *liveDashboard) close() {
 	d.stopLoop()
 	d.mu.Lock()
 	finished := d.stage == dashboardFinished
-	if !finished {
+	if !finished && d.stage < dashboardDrainComplete {
 		d.stage = dashboardStopped
 	}
 	d.mu.Unlock()
