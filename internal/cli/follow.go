@@ -353,6 +353,7 @@ type followMetrics struct {
 	latest              time.Time
 	operation           string
 	turns               int
+	turnsUnavailable    bool
 	tokens              int64
 	tokensKnown         bool
 	usageMissing        bool
@@ -386,7 +387,11 @@ func (m *followMetrics) apply(entry activity.Entry) {
 	if entry.OperationChanged {
 		m.operation = entry.Operation
 	}
-	m.turns += entry.TurnDelta
+	if entry.TurnDelta < 0 || entry.TurnDelta > 1 {
+		m.turnsUnavailable = true
+	} else if !m.turnsUnavailable {
+		m.turns += entry.TurnDelta
+	}
 	if entry.ResponseCompleted {
 		if !entry.TokensKnown || entry.TokenDelta < 0 || entry.TokenDelta > math.MaxInt64-m.tokens {
 			m.usageMissing = true
@@ -596,11 +601,12 @@ func consumeActivity(metrics *followMetrics, source *normalizedActivitySource) [
 	return entries[min(replayed, len(entries)):]
 }
 
-func observeRunOnce(source followStateSource, run scheduler.Run, diagnostics io.Writer, observed time.Time) (runObservation, *normalizedActivitySource) {
+func observeRunOnce(source followStateSource, run scheduler.Run, diagnostics io.Writer, now func() time.Time) (runObservation, *normalizedActivitySource) {
 	if diagnostics == nil {
 		diagnostics = io.Discard
 	}
-	activitySource, err := openNormalizedActivitySource(run, diagnostics, func() time.Time { return observed })
+	observed := now()
+	activitySource, err := openNormalizedActivitySource(run, diagnostics, now)
 	if err != nil {
 		fmt.Fprintln(diagnostics, "Run observation diagnostic:", err)
 	}
@@ -670,7 +676,7 @@ func followNormalized(
 	if err != nil {
 		return err
 	}
-	initial, activitySource := observeRunOnce(source, selected, diagnostics, now())
+	initial, activitySource := observeRunOnce(source, selected, diagnostics, now)
 	metrics := initial.metrics
 	lastObservation := initial.process
 	nextObservation := initial.observed.Add(followObservationInterval)
@@ -819,8 +825,12 @@ func printFollowSummary(output io.Writer, run scheduler.Run, metrics followMetri
 		issue += "  " + run.IssueURL
 	}
 	progress := summarizeRunProgress(run, metrics, now)
-	if _, err := fmt.Fprintf(output, "Run: %s\nIssue: %s\nState: %s\nRunner supervision: %s\nWorker liveness: %s\nElapsed: %s\nActivity age: %s\nCurrent Worker operation: %s\nCompleted Worker turns: %d\nCompleted Worker tokens: %s\nSubagents: %d (%d active)\nDeepest current operation: %s\nApproximate Subagent turns: %s\nApproximate Subagent tool uses: %s\nApproximate Subagent tokens: %s\nObserved tokens: %s\n",
-		run.RunID, issue, run.Status, observation.supervision, observation.workerLiveness, progress.elapsed, progress.activityAge, progress.workerOperation, metrics.turns, progress.workerTokens, len(metrics.subagents), progress.activeSubagents,
+	workerTurns := fmt.Sprintf("%d", metrics.turns)
+	if metrics.turnsUnavailable {
+		workerTurns = "n/a"
+	}
+	if _, err := fmt.Fprintf(output, "Run: %s\nIssue: %s\nState: %s\nRunner supervision: %s\nWorker liveness: %s\nElapsed: %s\nActivity age: %s\nCurrent Worker operation: %s\nCompleted Worker turns: %s\nCompleted Worker tokens: %s\nSubagents: %d (%d active)\nDeepest current operation: %s\nApproximate Subagent turns: %s\nApproximate Subagent tool uses: %s\nApproximate Subagent tokens: %s\nObserved tokens: %s\n",
+		run.RunID, issue, run.Status, observation.supervision, observation.workerLiveness, progress.elapsed, progress.activityAge, progress.workerOperation, workerTurns, progress.workerTokens, len(metrics.subagents), progress.activeSubagents,
 		progress.deepestOperation, progress.subagentTurns, progress.subagentToolUses, progress.subagentTokens, progress.observedTokens); err != nil {
 		return err
 	}

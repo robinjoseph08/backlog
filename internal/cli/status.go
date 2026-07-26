@@ -53,7 +53,10 @@ func printPlainStatus(output io.Writer, current state.State, source followStateS
 	}
 	for _, run := range current.Runs {
 		_, leased := leasedRuns[run.RunID]
-		observation, _ := observeRunOnce(source, run, io.Discard, now)
+		observation := runObservation{run: run, process: observeFollowRun(source, run), observed: now}
+		if run.Status == scheduler.StatusRunning {
+			observation, _ = observeRunOnce(source, run, io.Discard, func() time.Time { return now })
+		}
 		section := statusSectionFor(run, leased)
 		sections[section] = append(sections[section], statusRun{run: run, observation: observation})
 	}
@@ -112,7 +115,7 @@ func (p *statusPrinter) run(observed statusRun) {
 		p.printf("    Progress: Lease retained; preparing the Run; Worker not started\n")
 		p.printBranch(run)
 	case scheduler.StatusWorktreeReady:
-		p.printf("    Progress: worktree ready; Worker not started\n")
+		p.printf("    Progress: worktree ready; Worker has not been released to begin AFK work\n")
 		p.printBranch(run)
 	case scheduler.StatusRunning:
 		p.printRunning(observed.observation)
@@ -121,14 +124,14 @@ func (p *statusPrinter) run(observed statusRun) {
 		p.printf("    Progress: waiting for merge reconciliation; Worker not active\n")
 		p.printf("    Pull request: %s\n", valueOr(plainStatusValue(run.PullRequest), "n/a"))
 	case scheduler.StatusSuspended:
-		resume := "availability n/a (continuation telemetry unavailable)"
+		resume := "continuation telemetry unavailable; Runner will recheck Resume eligibility"
 		if run.Continuation != nil && !run.Continuation.VerifiedAt.IsZero() {
-			resume = "available to a replacement Worker"
+			resume = "continuation recorded; Runner will recheck Resume eligibility"
 		}
 		if run.ResumePending {
-			resume = "pending"
+			resume = "replacement Worker launch pending; Worker liveness uncertain"
 		}
-		p.printf("    Progress: suspended; Worker stopped; Resume %s\n", resume)
+		p.printf("    Progress: suspended; %s\n", resume)
 		p.printTime("Suspended", run.SuspendedAt)
 	case scheduler.StatusResetting:
 		p.printf("    Intervention: Reset is incomplete; rerun backlog reset; Worker not active\n")
@@ -158,7 +161,7 @@ func (p *statusPrinter) run(observed statusRun) {
 func (p *statusPrinter) printRunning(observed runObservation) {
 	progress := summarizeRunProgress(observed.run, observed.metrics, observed.observed)
 	workerTurns := "n/a"
-	if len(observed.metrics.entries) > 0 {
+	if len(observed.metrics.entries) > 0 && !observed.metrics.turnsUnavailable {
 		workerTurns = fmt.Sprintf("%d", observed.metrics.turns)
 	}
 	p.printf("    Worker liveness: %s\n", plainStatusValue(observed.process.workerLiveness))
