@@ -222,6 +222,65 @@ func TestStatusConciseProjectionAndFullHistoryAreCompleteOrderedAndExplicit(t *t
 	}
 }
 
+func TestStatusKeepsOperationalSectionsUnboundedAndOrdersEverySectionNewestFirst(t *testing.T) {
+	base := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	runs := []scheduler.Run{
+		{Issue: 100, RunID: "active-a", Status: scheduler.StatusClaimed, WorkerMode: scheduler.WorkerModePrint, UpdatedAt: base.Add(40 * time.Hour)},
+		{Issue: 101, RunID: "active-z", Status: scheduler.StatusClaimed, WorkerMode: scheduler.WorkerModePrint, UpdatedAt: base.Add(40 * time.Hour)},
+		{Issue: 102, RunID: "history-a", Status: scheduler.StatusReset, WorkerMode: scheduler.WorkerModePrint, UpdatedAt: base.Add(50 * time.Hour)},
+		{Issue: 103, RunID: "history-z", Status: scheduler.StatusReset, WorkerMode: scheduler.WorkerModePrint, UpdatedAt: base.Add(50 * time.Hour)},
+	}
+	leases := []scheduler.Lease{
+		{LeaseID: "active-a", Issue: 100, RunID: "active-a"},
+		{LeaseID: "active-z", Issue: 101, RunID: "active-z"},
+	}
+	for index := 0; index < 12; index++ {
+		updatedAt := base.Add(time.Duration(index) * time.Hour)
+		attentionID := fmt.Sprintf("attention-%02d", index)
+		outcomeID := fmt.Sprintf("outcome-%02d", index)
+		runs = append(runs,
+			scheduler.Run{Issue: 200 + index, RunID: attentionID, Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, UpdatedAt: updatedAt},
+			scheduler.Run{Issue: 300 + index, RunID: outcomeID, Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, UpdatedAt: updatedAt},
+		)
+		leases = append(leases, scheduler.Lease{LeaseID: attentionID, Issue: 200 + index, RunID: attentionID})
+	}
+	current := state.State{Version: state.CurrentVersion, Runs: runs, Leases: leases}
+
+	var concise bytes.Buffer
+	if err := printPlainStatusProjection(&concise, current, &sequenceFollowSource{}, base.Add(60*time.Hour), false); err != nil {
+		t.Fatal(err)
+	}
+	active := statusSectionOutput(t, concise.String(), "Active", "Attention Required")
+	attention := statusSectionOutput(t, concise.String(), "Attention Required", "Outcomes to Acknowledge")
+	outcomes := statusSectionOutput(t, concise.String(), "Outcomes to Acknowledge", "Recent Completions")
+	if strings.Count(attention, "Run: attention-") != 12 || strings.Count(outcomes, "Run: outcome-") != 12 {
+		t.Fatalf("operational sections were bounded:\n%s", concise.String())
+	}
+	for _, ordering := range []struct {
+		section string
+		newer   string
+		older   string
+	}{
+		{section: active, newer: "Run: active-z", older: "Run: active-a"},
+		{section: attention, newer: "Run: attention-11", older: "Run: attention-10"},
+		{section: outcomes, newer: "Run: outcome-11", older: "Run: outcome-10"},
+	} {
+		if !strings.Contains(ordering.section, ordering.newer) || !strings.Contains(ordering.section, ordering.older) ||
+			strings.Index(ordering.section, ordering.newer) > strings.Index(ordering.section, ordering.older) {
+			t.Fatalf("section was not newest first: newer=%q older=%q\n%s", ordering.newer, ordering.older, ordering.section)
+		}
+	}
+
+	var full bytes.Buffer
+	if err := printPlainStatusProjection(&full, current, &sequenceFollowSource{}, base.Add(60*time.Hour), true); err != nil {
+		t.Fatal(err)
+	}
+	history := statusSectionOutput(t, full.String(), "History", "")
+	if strings.Count(history, "Run: outcome-") != 12 || strings.Index(history, "Run: history-z") > strings.Index(history, "Run: history-a") {
+		t.Fatalf("full History was incomplete or not deterministically newest first:\n%s", history)
+	}
+}
+
 func TestStatusMovesRunFromActiveToAttentionToHistoryWithLeaseLifecycle(t *testing.T) {
 	repository := initializeFollowRepository(t)
 	stateDir := t.TempDir()

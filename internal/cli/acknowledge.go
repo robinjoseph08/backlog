@@ -34,6 +34,9 @@ func acknowledgeCommand(ctx context.Context, args []string, stdout, stderr io.Wr
 	gitExecutable := flags.String("git", "git", "git executable used to identify the repository root")
 	all := flags.Bool("all", false, "acknowledge every currently eligible Historical Run outcome")
 	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
 		if arg == "-h" || arg == "--help" {
 			return flags.Parse([]string{arg})
 		}
@@ -97,8 +100,17 @@ func acknowledgeCommand(ctx context.Context, args []string, stdout, stderr io.Wr
 func splitAcknowledgeArguments(args []string) ([]string, []string) {
 	selectors := make([]string, 0, len(args))
 	flagArgs := make([]string, 0, len(args))
+	afterDelimiter := false
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
+		if afterDelimiter {
+			selectors = append(selectors, arg)
+			continue
+		}
+		if arg == "--" {
+			afterDelimiter = true
+			continue
+		}
 		name := strings.TrimLeft(strings.SplitN(arg, "=", 2)[0], "-")
 		if strings.HasPrefix(arg, "-") {
 			flagArgs = append(flagArgs, arg)

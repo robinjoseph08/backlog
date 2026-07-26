@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -155,6 +156,7 @@ func TestAcknowledgeAcceptsFlagsBeforeAndBetweenSelectors(t *testing.T) {
 	if err := store.Save(state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{
 		{Issue: 1, RunID: "first", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint},
 		{Issue: 2, RunID: "second", Status: scheduler.StatusNeedsHuman, WorkerMode: scheduler.WorkerModePrint},
+		{Issue: 3, RunID: "--help", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint},
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -164,6 +166,43 @@ func TestAcknowledgeAcceptsFlagsBeforeAndBetweenSelectors(t *testing.T) {
 	}, &stdout, &stderr)
 	if exit != 0 || !strings.Contains(stdout.String(), "first (issue #1)") || !strings.Contains(stdout.String(), "second (issue #2)") {
 		t.Fatalf("interspersed flags exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	exit = Main(context.Background(), []string{
+		"acknowledge", "--repo-dir", repository, "--state-dir", stateDir, "--", "--help",
+	}, &stdout, &stderr)
+	if exit != 0 || stderr.String() != "" || !strings.Contains(stdout.String(), "--help (issue #3)") ||
+		findAcknowledgmentRun(t, loadAcknowledgeState(t, store.Path), "--help").AcknowledgedAt == nil {
+		t.Fatalf("flag-like exact selector exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
+	}
+}
+
+func TestAcknowledgeAllSucceedsWithoutEligibleOutcomesOrStateMutation(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
+	if err := store.Save(state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{
+		{Issue: 1, RunID: "merged", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint},
+		{Issue: 2, RunID: "reset", Status: scheduler.StatusReset, WorkerMode: scheduler.WorkerModePrint},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, exit := runAcknowledgeMain(repository, stateDir, io.Discard, "--all")
+	if exit != 0 || stderr != "" || !strings.Contains(stdout, "No eligible Historical Run outcomes") {
+		t.Fatalf("empty acknowledge --all exit=%d stdout=%q stderr=%q", exit, stdout, stderr)
+	}
+	after, err := os.ReadFile(store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("empty acknowledge --all changed state")
 	}
 }
 
@@ -279,25 +318,50 @@ func TestAcknowledgeOutputFailureReturnsFailureAfterDurableUpdate(t *testing.T) 
 	}
 }
 
-func TestFollowModesSelectExplicitlyAcknowledgedHistoricalRun(t *testing.T) {
+func TestAcknowledgePreservesMetadataAndFollowModesForHistoricalRun(t *testing.T) {
 	repository := initializeFollowRepository(t)
 	stateDir := t.TempDir()
 	logPath := filepath.Join(stateDir, "acknowledged.jsonl")
+	stderrPath := filepath.Join(stateDir, "acknowledged.stderr.log")
 	if err := os.WriteFile(logPath, []byte("raw record\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	acknowledgedAt := time.Date(2026, 7, 2, 3, 4, 5, 0, time.UTC)
-	if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{
-		Version: state.CurrentVersion,
-		Runs: []scheduler.Run{{
-			Issue: 5, RunID: "acknowledged-follow", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint,
-			LogPath: logPath, AcknowledgedAt: &acknowledgedAt,
-		}},
-	}); err != nil {
+	if err := os.WriteFile(stderrPath, []byte("diagnostic record\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	startedAt := time.Date(2026, 7, 2, 3, 4, 5, 0, time.UTC)
+	original := scheduler.Run{
+		Issue: 5, IssueTitle: "Preserve evidence", IssueURL: "https://example.test/issues/5", RunID: "acknowledged-follow",
+		Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, Branch: "agent/issue-5", Worktree: "/worktrees/issue-5",
+		SessionName: "afk #5", LogPath: logPath, StderrPath: stderrPath, PullRequest: "https://example.test/pull/5",
+		Error: "preserved diagnostic", StartedAt: startedAt, WorkerStartedAt: startedAt.Add(time.Minute), UpdatedAt: startedAt.Add(2 * time.Minute),
+	}
+	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
+	if err := store.Save(state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{original}}); err != nil {
+		t.Fatal(err)
+	}
+	acknowledgeOutput, acknowledgeErrors, exit := runAcknowledgeMain(repository, stateDir, io.Discard, original.RunID)
+	if exit != 0 || acknowledgeErrors != "" || !strings.Contains(acknowledgeOutput, original.RunID) {
+		t.Fatalf("acknowledge exit=%d stdout=%q stderr=%q", exit, acknowledgeOutput, acknowledgeErrors)
+	}
+	persisted := findAcknowledgmentRun(t, loadAcknowledgeState(t, store.Path), original.RunID)
+	if persisted.AcknowledgedAt == nil {
+		t.Fatal("acknowledgment timestamp was not persisted")
+	}
+	expected := original
+	expected.AcknowledgedAt = persisted.AcknowledgedAt
+	if !reflect.DeepEqual(persisted, expected) {
+		t.Fatalf("acknowledgment changed Run metadata:\n got %#v\nwant %#v", persisted, expected)
+	}
+	for path, want := range map[string]string{logPath: "raw record\n", stderrPath: "diagnostic record\n"} {
+		contents, err := os.ReadFile(path)
+		if err != nil || string(contents) != want {
+			t.Fatalf("retained artifact %q = %q, %v", path, contents, err)
+		}
+	}
+
 	var stdout, stderr bytes.Buffer
-	exit := Main(context.Background(), []string{"follow", "acknowledged-follow", "--repo-dir", repository, "--state-dir", stateDir}, &stdout, &stderr)
+	exit = Main(context.Background(), []string{"follow", "acknowledged-follow", "--repo-dir", repository, "--state-dir", stateDir}, &stdout, &stderr)
 	if exit != 0 || !strings.Contains(stdout.String(), "Run: acknowledged-follow") || !strings.Contains(stdout.String(), "State: failed") {
 		t.Fatalf("Follow acknowledged Run exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
 	}

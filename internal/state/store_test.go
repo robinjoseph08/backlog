@@ -172,7 +172,7 @@ func TestFileStoreMigratesV1WithoutLosingRunArtifacts(t *testing.T) {
 	}
 }
 
-func TestFileStoreMigrationRetainsEveryNonMergedV1Lease(t *testing.T) {
+func TestFileStoreMigrationRetainsOnlyUnfinishedV1Leases(t *testing.T) {
 	t.Parallel()
 
 	statuses := []scheduler.Status{
@@ -182,6 +182,7 @@ func TestFileStoreMigrationRetainsEveryNonMergedV1Lease(t *testing.T) {
 		scheduler.StatusWaitingForMerge,
 		scheduler.StatusFailed,
 		scheduler.StatusNeedsHuman,
+		scheduler.StatusReset,
 		scheduler.StatusMerged,
 	}
 	legacy := legacyState{Version: legacyVersion}
@@ -209,13 +210,17 @@ func TestFileStoreMigrationRetainsEveryNonMergedV1Lease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Runs) != len(statuses) || len(got.Leases) != len(statuses)-1 {
-		t.Fatalf("migrated Runs/Leases = %d/%d, want %d/%d", len(got.Runs), len(got.Leases), len(statuses), len(statuses)-1)
+	if len(got.Runs) != len(statuses) || len(got.Leases) != len(statuses)-2 {
+		t.Fatalf("migrated Runs/Leases = %d/%d, want %d/%d", len(got.Runs), len(got.Leases), len(statuses), len(statuses)-2)
 	}
 	for _, lease := range got.Leases {
-		if lease.RunID == string(scheduler.StatusMerged) {
-			t.Fatal("verified merged V1 Run retained an active Lease")
+		if lease.RunID == string(scheduler.StatusMerged) || lease.RunID == string(scheduler.StatusReset) {
+			t.Fatalf("handled V1 Run %q retained an active Lease", lease.RunID)
 		}
+	}
+	reset := got.Runs[len(got.Runs)-2]
+	if reset.Status != scheduler.StatusReset || reset.AcknowledgedAt != nil {
+		t.Fatalf("migrated Reset = %#v, want handled Historical Run", reset)
 	}
 }
 

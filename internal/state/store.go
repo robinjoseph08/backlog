@@ -148,7 +148,7 @@ func migrateV1(legacy legacyState) (State, error) {
 		run := &value.Runs[index]
 		run.WorkerMode = scheduler.WorkerModePrint
 		run.AcknowledgedAt = nil
-		if run.Status != scheduler.StatusMerged {
+		if run.Status != scheduler.StatusMerged && run.Status != scheduler.StatusReset {
 			value.Leases = append(value.Leases, scheduler.Lease{
 				LeaseID: run.RunID,
 				Issue:   run.Issue,
