@@ -486,15 +486,8 @@ func (p *Process) CloseWithForceContext(ctx context.Context, authorizeKill func(
 		return p.forceStop(authorizeKill, ctx.Err())
 	case <-grace.C:
 		gracefulErr = errors.New("Pi RPC process did not exit after input closed")
-		terminationResult := make(chan error, 1)
-		go func() { terminationResult <- p.terminate() }()
-		select {
-		case err := <-terminationResult:
-			if err != nil && !errors.Is(err, os.ErrProcessDone) {
-				gracefulErr = errors.Join(gracefulErr, fmt.Errorf("terminate Pi RPC process group: %w", err))
-			}
-		case <-ctx.Done():
-			return p.forceStop(authorizeKill, ctx.Err())
+		if err := p.terminate(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			gracefulErr = errors.Join(gracefulErr, fmt.Errorf("terminate Pi RPC process group: %w", err))
 		}
 		select {
 		case <-p.exitDone:
@@ -562,8 +555,18 @@ func (p *Process) forceStop(authorizeKill func() error, triggerErr error) Result
 	}
 	forceStopped := killErr == nil
 
+	// Reaping waits for an already-started graceful termination helper so it
+	// cannot signal a reused process group. Give that helper and reaping their
+	// own bounded stages instead of racing both against one grace period.
 	select {
 	case <-p.exitDone:
+	case <-p.terminationStarted:
+		<-p.terminationDone
+		select {
+		case <-p.exitDone:
+		case <-time.After(p.processGroupGrace):
+			return unauthorized(errors.New("Worker process did not exit after force stop"))
+		}
 	case <-time.After(p.processGroupGrace):
 		return unauthorized(errors.New("Worker process did not exit after force stop"))
 	}

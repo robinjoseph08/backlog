@@ -790,8 +790,8 @@ func TestCloseWithForceContextHonorsCancellationAfterGraceExpires(t *testing.T) 
 	root := t.TempDir()
 	pi := fakePi(t, `
 IFS= read -r command
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 trap '' TERM
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 while :; do sleep 1; done
 `)
 	process, err := (Supervisor{
@@ -807,10 +807,25 @@ while :; do sleep 1; done
 		t.Fatalf("wait = %#v", result)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
-	defer cancel()
+	ctx, cancel := context.WithCancel(context.Background())
+	resultReady := make(chan Result, 1)
 	started := time.Now()
-	result := process.CloseWithForceContext(ctx, func() error { return nil })
+	go func() {
+		resultReady <- process.CloseWithForceContext(ctx, func() error { return nil })
+	}()
+	select {
+	case <-process.terminationStarted:
+		cancel()
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("graceful process-group termination did not start")
+	}
+	var result Result
+	select {
+	case result = <-resultReady:
+	case <-time.After(time.Second):
+		t.Fatal("force close did not return after cancellation")
+	}
 	if !result.GroupExited || !result.ForceStopped {
 		t.Fatalf("force close after grace = %#v", result)
 	}
