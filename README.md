@@ -46,6 +46,7 @@ Useful options:
 --poll 30s          GitHub and process reconciliation interval
 --max-worker-age 168h  Bound trust in recovered PID identity
 --watch             Keep waiting for future eligible issues
+--plain             Disable the live terminal dashboard
 --repo-dir PATH     Target Git repository, default current directory
 --state-dir PATH    Override the external state directory
 --approve=false     Do not trust project-local Pi resources
@@ -53,7 +54,9 @@ Useful options:
 
 The concurrency limit counts top-level issues. Each AFK worker may itself launch implementation and review subagents.
 
-After a complete Candidate snapshot succeeds, the foreground runner exits when no leased Run remains capable of autonomous progress and no eligible Candidate starts a Worker. Before this natural one-shot exit, it prints a final aggregate summary with Active and Attention Required sections. The exit is unsuccessful when any Intervention-required Run retains its Lease, including unresolved Runs loaded at startup or produced during the invocation. Historical failed Runs without Leases do not affect the result. Blocked Candidates do not keep the runner alive unless `--watch` is set, and Attention Required alone never ends watch mode.
+When standard output is a terminal, `backlog run` automatically shows a live dashboard with Worker capacity, Active Runs, Attention Required, Recently Finished Runs from the invocation, lifecycle messages, and the current shutdown stage. Active rows use the same normalized Activity observation model as `status` and `follow`. Use `--plain` to disable redraws. Redirected output and plain mode keep append-only lifecycle messages and never emit ANSI terminal controls.
+
+After a complete Candidate snapshot succeeds, the foreground runner exits when no leased Run remains capable of autonomous progress and no eligible Candidate starts a Worker. Before this natural one-shot exit, it leaves a final static aggregate summary with Active and Attention Required sections. The exit is unsuccessful when any Intervention-required Run retains its Lease, including unresolved Runs loaded at startup or produced during the invocation. Historical failed Runs without Leases do not affect the result. Blocked Candidates do not keep the runner alive unless `--watch` is set, and Attention Required alone never ends watch mode.
 
 Candidate discovery fails closed for admission. If a discovery pass fails, the runner creates no Leases from that pass, reports the underlying GitHub error, continues supervising existing Workers, and retries after `--poll` in every runner state. This includes initial startup and idle non-watch invocations. A later successful snapshot restores normal admission or one-shot exit behavior.
 

@@ -132,10 +132,13 @@ while IFS= read -r ignored; do :; done
 	if _, err := os.Stat(persisted.Runs[0].Worktree); !os.IsNotExist(err) {
 		t.Fatalf("successful worktree still exists, stat error = %v", err)
 	}
-	for _, want := range []string{"verified merged completion for issue #42", "Final aggregate summary", "Active (0)", "Attention Required (0)"} {
+	for _, want := range []string{"claimed issue #42", "started issue #42", "verified merged completion for issue #42", "Final aggregate summary", "Active (0)", "Attention Required (0)"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("stdout missing %q: %q", want, stdout.String())
 		}
+	}
+	if strings.Contains(stdout.String(), "\x1b[") {
+		t.Fatalf("redirected lifecycle output contains ANSI terminal controls: %q", stdout.String())
 	}
 }
 
