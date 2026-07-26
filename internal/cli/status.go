@@ -137,6 +137,12 @@ func (p *statusPrinter) run(observed statusRun) {
 		p.printf("    Completion: verified merged; Worker not active\n")
 		p.printf("    Pull request: %s\n", valueOr(plainStatusValue(run.PullRequest), "n/a"))
 		p.printTime("Completed", run.CompletedAt)
+		if run.CleanupPending {
+			p.printf("    Completion cleanup: pending; the next runner startup will retry\n")
+		}
+		if run.Error != "" {
+			p.printReason(run)
+		}
 	case scheduler.StatusFailed:
 		p.printf("    Outcome: failed; Worker not active\n")
 		p.printReason(run)

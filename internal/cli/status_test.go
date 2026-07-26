@@ -50,7 +50,8 @@ func TestStatusPresentsOperationalSectionsWithSharedRunObservation(t *testing.T)
 		{Issue: 7, RunID: "human-retained", Status: scheduler.StatusNeedsHuman, WorkerMode: scheduler.WorkerModePrint, Error: "verify GitHub outcome"},
 		{Issue: 8, RunID: "resetting-retained", Status: scheduler.StatusResetting, WorkerMode: scheduler.WorkerModePrint, Error: "remote branch remains"},
 		{Issue: 9, IssueTitle: "Old failure", RunID: "failed-history", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, Error: "historical diagnostic"},
-		{Issue: 10, RunID: "merged-history", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint, PullRequest: "https://example.test/pull/10"},
+		{Issue: 10, RunID: "merged-history", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint, PullRequest: "https://example.test/pull/10",
+			CleanupPending: true, Error: "completion verified; worktree cleanup remains pending"},
 		{Issue: 11, RunID: "reset-history", Status: scheduler.StatusReset, WorkerMode: scheduler.WorkerModePrint},
 	}
 	leased := make([]scheduler.Lease, 0, 8)
@@ -84,10 +85,14 @@ func TestStatusPresentsOperationalSectionsWithSharedRunObservation(t *testing.T)
 		}
 	}
 	if strings.Contains(attention, "failed-history") || strings.Contains(attention, "historical diagnostic") {
-		t.Fatalf("released historical failure appeared as attention:\n%s", attention)
+		t.Fatalf("released failed Run appeared as attention:\n%s", attention)
 	}
 	history := statusSectionOutput(t, output, "History", "")
-	for _, want := range []string{"#9  Old failure  failed", "Run: failed-history", "historical diagnostic", "#10  merged", "Completion: verified merged", "#11  reset", "Reset completed; Lease released"} {
+	for _, want := range []string{
+		"#9  Old failure  failed", "Run: failed-history", "historical diagnostic", "#10  merged", "Completion: verified merged",
+		"Completion cleanup: pending; the next runner startup will retry", "completion verified; worktree cleanup remains pending",
+		"#11  reset", "Reset completed; Lease released",
+	} {
 		if !strings.Contains(history, want) {
 			t.Fatalf("History section missing %q:\n%s", want, history)
 		}
