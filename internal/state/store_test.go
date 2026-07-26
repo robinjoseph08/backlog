@@ -219,6 +219,117 @@ func TestFileStoreMigrationRetainsEveryNonMergedV1Lease(t *testing.T) {
 	}
 }
 
+func TestFileStoreMigratesV2ToV3WithoutAcknowledgingOutcomesOrLosingMetadata(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.json")
+	completedAt := time.Date(2026, 7, 3, 3, 4, 5, 0, time.UTC)
+	fixture := State{Version: previousVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 2,
+		Runs: []scheduler.Run{
+			{Issue: 1, IssueTitle: "Historical failure", IssueURL: "https://example.test/issues/1", RunID: "failed", Status: scheduler.StatusFailed,
+				WorkerMode: scheduler.WorkerModePrint, Branch: "agent/failed", Worktree: "/worktrees/failed", LogPath: "/logs/failed.jsonl",
+				Error: "diagnostic", StartedAt: completedAt.Add(-time.Hour), UpdatedAt: completedAt},
+			{Issue: 2, RunID: "human", Status: scheduler.StatusNeedsHuman, WorkerMode: scheduler.WorkerModePrint, Error: "human diagnostic", UpdatedAt: completedAt},
+			{Issue: 3, RunID: "reset", Status: scheduler.StatusReset, WorkerMode: scheduler.WorkerModePrint, Error: "reset diagnostic", UpdatedAt: completedAt},
+			{Issue: 4, RunID: "merged", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint, PullRequest: "https://example.test/pull/4", CompletedAt: &completedAt},
+		},
+	}
+	encoded, err := json.Marshal(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	preview, migrationRequired, err := (FileStore{Path: path}).Preview()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !migrationRequired || preview.Version != CurrentVersion {
+		t.Fatalf("preview version/migration = %d/%t", preview.Version, migrationRequired)
+	}
+	for _, run := range preview.Runs {
+		if run.AcknowledgedAt != nil {
+			t.Fatalf("V2 Run %q was implicitly acknowledged", run.RunID)
+		}
+	}
+	beforeLoad, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(beforeLoad), `"version":2`) {
+		t.Fatalf("Preview persisted V2 migration: %s", beforeLoad)
+	}
+
+	got, err := (FileStore{Path: path}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Version != CurrentVersion || got.Repo != fixture.Repo || got.DefaultBranch != fixture.DefaultBranch || got.MaxConcurrentIssues != fixture.MaxConcurrentIssues ||
+		!reflect.DeepEqual(got.Runs, fixture.Runs) || len(got.Leases) != 0 {
+		t.Fatalf("V2 migration lost state: got=%#v want=%#v", got, fixture)
+	}
+	persisted, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(persisted), `"version": 3`) {
+		t.Fatalf("V3 migration was not persisted: %s", persisted)
+	}
+}
+
+func TestFileStoreRoundTripsAndValidatesOutcomeAcknowledgmentMetadata(t *testing.T) {
+	t.Parallel()
+
+	acknowledgedAt := time.Date(2026, 7, 4, 5, 6, 7, 0, time.UTC)
+	store := FileStore{Path: filepath.Join(t.TempDir(), "state.json")}
+	value := State{Version: CurrentVersion, Runs: []scheduler.Run{{
+		Issue: 1, RunID: "acknowledged", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, AcknowledgedAt: &acknowledgedAt,
+	}}}
+	if err := store.Save(value); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Runs[0].AcknowledgedAt == nil || !got.Runs[0].AcknowledgedAt.Equal(acknowledgedAt) {
+		t.Fatalf("acknowledgment round trip = %#v", got.Runs[0].AcknowledgedAt)
+	}
+
+	zero := time.Time{}
+	for _, test := range []struct {
+		name  string
+		run   scheduler.Run
+		lease []scheduler.Lease
+		want  string
+	}{
+		{name: "zero timestamp", run: scheduler.Run{Issue: 2, RunID: "zero", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, AcknowledgedAt: &zero}, want: "invalid Outcome Acknowledgment time"},
+		{name: "Completion", run: scheduler.Run{Issue: 2, RunID: "merged", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint, AcknowledgedAt: &acknowledgedAt}, want: "ineligible Run"},
+		{name: "leased failure", run: scheduler.Run{Issue: 2, RunID: "leased", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, AcknowledgedAt: &acknowledgedAt}, lease: []scheduler.Lease{{LeaseID: "leased", Issue: 2, RunID: "leased"}}, want: "ineligible Run"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := store.Save(State{Version: CurrentVersion, Runs: []scheduler.Run{test.run}, Leases: test.lease})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validation error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestFileStoreRejectsUnsupportedNewerStateVersion(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte(`{"version":4,"runs":[],"leases":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (FileStore{Path: path}).Load(); err == nil || !strings.Contains(err.Error(), "unsupported state version 4") {
+		t.Fatalf("newer state error = %v", err)
+	}
+}
+
 func TestFileStoreAllowsRunHistoryWithOneActiveLeasePerIssue(t *testing.T) {
 	t.Parallel()
 

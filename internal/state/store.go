@@ -16,9 +16,10 @@ import (
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
 
-const CurrentVersion = 2
+const CurrentVersion = 3
 
 const legacyVersion = 1
+const previousVersion = 2
 const sha256HexLength = 64
 
 type State struct {
@@ -94,6 +95,24 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 			return State{}, false, err
 		}
 		return value, false, nil
+	case previousVersion:
+		value, err := decodeCurrentState(encoded)
+		if err != nil {
+			return State{}, false, fmt.Errorf("decode version 2 state: %w", err)
+		}
+		value.Version = CurrentVersion
+		for index := range value.Runs {
+			value.Runs[index].AcknowledgedAt = nil
+		}
+		if err := validate(value, true); err != nil {
+			return State{}, false, fmt.Errorf("migrate version 2 state: %w", err)
+		}
+		if persistMigration {
+			if err := s.Save(value); err != nil {
+				return State{}, false, fmt.Errorf("persist version 3 state migration: %w", err)
+			}
+		}
+		return value, true, nil
 	case legacyVersion:
 		var legacy legacyState
 		if err := json.Unmarshal(encoded, &legacy); err != nil {
@@ -105,7 +124,7 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 		}
 		if persistMigration {
 			if err := s.Save(value); err != nil {
-				return State{}, false, fmt.Errorf("persist version 2 state migration: %w", err)
+				return State{}, false, fmt.Errorf("persist version 3 state migration: %w", err)
 			}
 		}
 		return value, true, nil
@@ -128,6 +147,7 @@ func migrateV1(legacy legacyState) (State, error) {
 	for index := range value.Runs {
 		run := &value.Runs[index]
 		run.WorkerMode = scheduler.WorkerModePrint
+		run.AcknowledgedAt = nil
 		if run.Status != scheduler.StatusMerged {
 			value.Leases = append(value.Leases, scheduler.Lease{
 				LeaseID: run.RunID,
@@ -376,9 +396,16 @@ func validate(value State, recoverUnsafeContinuation bool) error {
 		}
 	}
 	for _, run := range value.Runs {
-		if scheduler.RequiresLease(run.Status) {
-			if _, exists := leasedRuns[run.RunID]; !exists {
-				return fmt.Errorf("active Run %q for issue #%d has no Lease", run.RunID, run.Issue)
+		_, leased := leasedRuns[run.RunID]
+		if scheduler.RequiresLease(run.Status) && !leased {
+			return fmt.Errorf("active Run %q for issue #%d has no Lease", run.RunID, run.Issue)
+		}
+		if run.AcknowledgedAt != nil {
+			if run.AcknowledgedAt.IsZero() {
+				return fmt.Errorf("state contains Run %q with an invalid Outcome Acknowledgment time", run.RunID)
+			}
+			if leased || run.Status != scheduler.StatusFailed && run.Status != scheduler.StatusNeedsHuman {
+				return fmt.Errorf("state contains ineligible Run %q with an Outcome Acknowledgment", run.RunID)
 			}
 		}
 	}

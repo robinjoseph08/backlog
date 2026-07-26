@@ -502,7 +502,7 @@ func TestCommandHelpExitsSuccessfully(t *testing.T) {
 	if exit := Main(context.Background(), []string{"help"}, &stdout, &stderr); exit != 0 {
 		t.Fatalf("top-level help exit = %d, stderr = %q", exit, stderr.String())
 	}
-	for _, text := range []string{"backlog run lifecycle", "First SIGINT", "first SIGTERM", "resumes verified Suspended Runs", "Reset retires verified artifacts", "deprecated alias for reset", "natural one-shot exhaustion with Intervention-required Runs", "first-SIGINT Drain exits 0", "second-SIGINT suspension exits 130", "SIGTERM suspension exits 143", "legacy print-mode Runs cannot Resume", "newer unsupported version"} {
+	for _, text := range []string{"backlog run lifecycle", "First SIGINT", "first SIGTERM", "resumes verified Suspended Runs", "Reset retires verified artifacts", "presentation-only review", "deprecated alias for reset", "natural one-shot exhaustion with Intervention-required Runs", "first-SIGINT Drain exits 0", "second-SIGINT suspension exits 130", "SIGTERM suspension exits 143", "legacy print-mode Runs cannot Resume", "newer unsupported version"} {
 		if !strings.Contains(stdout.String(), text) {
 			t.Fatalf("top-level help omitted %q: %q", text, stdout.String())
 		}
@@ -524,6 +524,16 @@ func TestCommandHelpExitsSuccessfully(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "Usage: backlog follow <run-id|positive-issue-number> [--raw] [flags]") || strings.Contains(stderr.String(), "requires a Run ID") {
 		t.Fatalf("follow help = %q", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if exit := Main(context.Background(), []string{"acknowledge", "--help"}, &stdout, &stderr); exit != 0 {
+		t.Fatalf("acknowledge help exit = %d, stderr = %q", exit, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "Usage: backlog acknowledge <run-id|positive-issue-number>...") ||
+		!strings.Contains(stderr.String(), "--all") || strings.Contains(stderr.String(), "--yes") || strings.Contains(stderr.String(), "--dry-run") {
+		t.Fatalf("acknowledge help = %q", stderr.String())
 	}
 
 	stdout.Reset()

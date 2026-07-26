@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -16,8 +17,12 @@ type statusSection int
 const (
 	statusActive statusSection = iota
 	statusAttention
+	statusOutcomes
+	statusCompletions
 	statusHistory
 )
+
+const recentCompletionLimit = 10
 
 type statusRun struct {
 	run         scheduler.Run
@@ -44,9 +49,7 @@ func observeStatusSections(current state.State, source followStateSource, now ti
 		leasedRuns[lease.RunID] = struct{}{}
 	}
 	sections := map[statusSection][]statusRun{
-		statusActive:    {},
-		statusAttention: {},
-		statusHistory:   {},
+		statusActive: {}, statusAttention: {}, statusOutcomes: {}, statusCompletions: {}, statusHistory: {},
 	}
 	for _, run := range current.Runs {
 		_, leased := leasedRuns[run.RunID]
@@ -57,17 +60,58 @@ func observeStatusSections(current state.State, source followStateSource, now ti
 		section := statusSectionFor(run, leased)
 		sections[section] = append(sections[section], statusRun{run: run, observation: observation})
 	}
-
 	return sections
 }
 
 func printPlainStatus(output io.Writer, current state.State, source followStateSource, now time.Time) error {
-	sections := observeStatusSections(current, source, now)
+	return printPlainStatusProjection(output, current, source, now, false)
+}
+
+func printPlainStatusProjection(output io.Writer, current state.State, source followStateSource, now time.Time, showAll bool) error {
+	fullSections := observeStatusSections(current, source, now)
+	sections := map[statusSection][]statusRun{
+		statusActive: fullSections[statusActive], statusAttention: fullSections[statusAttention],
+		statusOutcomes: {}, statusCompletions: {}, statusHistory: {},
+	}
+	recentCompletions := selectRecentCompletions(current.Runs)
+	acknowledgedHidden := 0
+	for _, observed := range fullSections[statusHistory] {
+		run := observed.run
+		if run.AcknowledgedAt != nil {
+			acknowledgedHidden++
+		}
+		if showAll {
+			sections[statusHistory] = append(sections[statusHistory], observed)
+			continue
+		}
+		switch {
+		case (run.Status == scheduler.StatusFailed || run.Status == scheduler.StatusNeedsHuman) && run.AcknowledgedAt == nil:
+			sections[statusOutcomes] = append(sections[statusOutcomes], observed)
+		case run.Status == scheduler.StatusMerged && (run.CleanupPending || recentCompletions[run.RunID]):
+			sections[statusCompletions] = append(sections[statusCompletions], observed)
+		}
+	}
+	for section := range sections {
+		sortStatusRuns(sections[section])
+	}
+
+	displayed := 0
+	for _, runs := range sections {
+		displayed += len(runs)
+	}
 	printer := statusPrinter{output: output}
-	printer.header(current)
+	printer.printf("Repository: %s\n", valueOr(plainStatusValue(current.Repo), "not initialized"))
+	printer.printf("Runs: %d total | %d displayed\n", len(current.Runs), displayed)
+	printer.printf("Acknowledged outcomes hidden by default: %d\n", acknowledgedHidden)
+	printer.printf("Active Leases: %d\n", len(current.Leases))
 	printer.section("Active", sections[statusActive])
 	printer.section("Attention Required", sections[statusAttention])
-	printer.section("History", sections[statusHistory])
+	if showAll {
+		printer.section("History", sections[statusHistory])
+	} else {
+		printer.section("Outcomes to Acknowledge", sections[statusOutcomes])
+		printer.section("Recent Completions", sections[statusCompletions])
+	}
 	return printer.err
 }
 
@@ -79,6 +123,62 @@ func printRunFinalSummary(output io.Writer, current state.State, source followSt
 	printer.section("Active", sections[statusActive])
 	printer.section("Attention Required", sections[statusAttention])
 	return printer.err
+}
+
+func selectRecentCompletions(runs []scheduler.Run) map[string]bool {
+	completions := make([]scheduler.Run, 0)
+	for _, run := range runs {
+		if run.Status == scheduler.StatusMerged {
+			completions = append(completions, run)
+		}
+	}
+	sort.SliceStable(completions, func(i, j int) bool {
+		left, right := completionTime(completions[i]), completionTime(completions[j])
+		if left.Equal(right) {
+			return completions[i].RunID > completions[j].RunID
+		}
+		return left.After(right)
+	})
+	selected := make(map[string]bool, min(recentCompletionLimit, len(completions)))
+	for _, run := range completions[:min(recentCompletionLimit, len(completions))] {
+		selected[run.RunID] = true
+	}
+	return selected
+}
+
+func completionTime(run scheduler.Run) time.Time {
+	if run.CompletedAt != nil && !run.CompletedAt.IsZero() {
+		return *run.CompletedAt
+	}
+	if !run.UpdatedAt.IsZero() {
+		return run.UpdatedAt
+	}
+	return run.StartedAt
+}
+
+func sortStatusRuns(runs []statusRun) {
+	sort.SliceStable(runs, func(i, j int) bool {
+		left, right := lifecycleTime(runs[i].run), lifecycleTime(runs[j].run)
+		if left.Equal(right) {
+			return runs[i].run.RunID > runs[j].run.RunID
+		}
+		return left.After(right)
+	})
+}
+
+func lifecycleTime(run scheduler.Run) time.Time {
+	latest := run.StartedAt
+	for _, candidate := range []time.Time{run.WorkerStartedAt, run.UpdatedAt} {
+		if candidate.After(latest) {
+			latest = candidate
+		}
+	}
+	for _, candidate := range []*time.Time{run.SuspendingAt, run.SuspendedAt, run.CompletedAt, run.AcknowledgedAt} {
+		if candidate != nil && candidate.After(latest) {
+			latest = *candidate
+		}
+	}
+	return latest
 }
 
 type statusPrinter struct {
@@ -125,6 +225,9 @@ func (p *statusPrinter) run(observed statusRun) {
 		p.printf("    Issue: %s\n", issueURL)
 	}
 	p.printf("    Run: %s | State: %s\n", plainStatusValue(run.RunID), run.Status)
+	if run.AcknowledgedAt != nil {
+		p.printTime("Acknowledged", run.AcknowledgedAt)
+	}
 
 	switch run.Status {
 	case scheduler.StatusClaimed:
