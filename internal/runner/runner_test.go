@@ -1448,6 +1448,9 @@ func TestRunnerDrainReportsSecondOrderCompletionRecoveryFailures(t *testing.T) {
 			done := make(chan error, 1)
 			go func() { done <- runner.Run(context.Background()) }()
 			workers.waitForStarts(t, 34, 35)
+			waitForPersistedRun(t, store, 35, func(run scheduler.Run) bool {
+				return run.Status == scheduler.StatusRunning && run.PID != 0 && run.ProcessIdentity != ""
+			})
 			signals <- os.Interrupt
 			output.waitFor(t, "Drain: admission stopped; 2 Workers remaining")
 			test.configure(store)
