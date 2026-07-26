@@ -25,11 +25,11 @@ One isolated attempt to take an eligible candidate through the AFK workflow and 
 _Avoid_: Task, execution
 
 **Historical Run**:
-A Run without a Lease that is retained for inspection but no longer owned by Backlog.
+A Run without a Lease that remains available for inspection but no longer reserves its issue.
 _Avoid_: Archived Run, deleted Run
 
 **Outcome Acknowledgment**:
-A durable indication that an operator has seen a Historical Run that did not reach Completion, allowing default status to omit it without deleting history.
+A durable indication that an operator has seen a Historical Run's unexpected non-Completion outcome, allowing default status to omit it without deleting history.
 _Avoid_: Dismissal, clearance, deletion
 
 **Intervention-required Run**:
