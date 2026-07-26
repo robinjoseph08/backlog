@@ -1218,6 +1218,8 @@ func TestProcessSuspendStopsWaitingForMissingSettlementWhenContextCanceled(t *te
 	worktree := filepath.Join(root, "worktree")
 	sessionDir := filepath.Join(root, "sessions")
 	started := filepath.Join(root, "started")
+	abortReceived := filepath.Join(root, "abort-received")
+	releaseAbort := filepath.Join(root, "release-abort")
 	if err := os.MkdirAll(worktree, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1226,6 +1228,8 @@ IFS= read -r prompt
 touch `+shellQuote(started)+`
 printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
 IFS= read -r abort
+touch `+shellQuote(abortReceived)+`
+while [ ! -f `+shellQuote(releaseAbort)+` ]; do sleep 0.001; done
 printf '%s\n' '{"id":"backlog-suspend-abort","type":"response","command":"abort","success":true}' '{"type":"turn_end"}' '{"type":"agent_end"}'
 while IFS= read -r ignored; do :; done
 `)
@@ -1238,6 +1242,10 @@ while IFS= read -r ignored; do :; done
 	if err := process.Release(); err != nil {
 		t.Fatal(err)
 	}
+	defer func() {
+		_ = process.Abort()
+		_ = process.Close()
+	}()
 	waitForPath(t, started)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1247,13 +1255,17 @@ while IFS= read -r ignored; do :; done
 		_, err := process.Suspend(ctx, ContinuationRequest{SessionID: "backlog-run-52", SessionDir: sessionDir, Worktree: worktree})
 		suspendErr <- err
 	}()
+	waitForPath(t, abortReceived)
+	abortResponse := rpcResponseResult(t, process.events, "backlog-suspend-abort")
+	if err := os.WriteFile(releaseAbort, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	waitForRPCState(t, process.events, rpcBetweenAgentRuns)
+	waitForRPCResponseConsumption(t, abortResponse)
 	cancel()
 	if err := <-suspendErr; err == nil || !strings.Contains(err.Error(), "wait for agent_settled: context canceled") {
 		t.Fatalf("suspend error = %v, want canceled settlement wait", err)
 	}
-	_ = process.Abort()
-	_ = process.Close()
 }
 
 func TestVerifySessionBoundaryRejectsPathIdentityAndEntryMismatches(t *testing.T) {
@@ -1664,6 +1676,17 @@ func waitForPath(t *testing.T, path string) {
 	t.Fatalf("path %s was not created", path)
 }
 
+func rpcResponseResult(t *testing.T, events *rpcWriter, id string) <-chan rpcResponse {
+	t.Helper()
+	events.mu.Lock()
+	defer events.mu.Unlock()
+	waiter, ok := events.responses[id]
+	if !ok {
+		t.Fatalf("Pi RPC response waiter %q was not registered", id)
+	}
+	return waiter.result
+}
+
 func waitForRPCState(t *testing.T, events *rpcWriter, want rpcAgentState) {
 	t.Helper()
 	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
@@ -1676,6 +1699,17 @@ func waitForRPCState(t *testing.T, events *rpcWriter, want rpcAgentState) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("Pi RPC state did not become %d", want)
+}
+
+func waitForRPCResponseConsumption(t *testing.T, response <-chan rpcResponse) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		if len(response) == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("Pi RPC response was not consumed")
 }
 
 func TestProcessExplicitlyRejectsProjectTrustWhenApprovalIsDisabled(t *testing.T) {
