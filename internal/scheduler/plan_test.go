@@ -101,6 +101,22 @@ func TestPlanWaitingForMergeLeaseDoesNotConsumeWorkerCapacity(t *testing.T) {
 	}
 }
 
+func TestPlanIgnoresOutcomeAcknowledgmentMetadata(t *testing.T) {
+	t.Parallel()
+
+	acknowledgedAt := time.Now()
+	snapshot := Snapshot{
+		Candidates: []Candidate{{Number: 10, CreatedAt: time.Now()}},
+		Runs:       []Run{{Issue: 10, RunID: "failed", Status: StatusFailed, AcknowledgedAt: &acknowledgedAt}},
+	}
+	withAcknowledgment := Plan(snapshot, 1)
+	snapshot.Runs[0].AcknowledgedAt = nil
+	withoutAcknowledgment := Plan(snapshot, 1)
+	if len(withAcknowledgment.Starts) != 1 || len(withoutAcknowledgment.Starts) != 1 || withAcknowledgment.Starts[0].Number != withoutAcknowledgment.Starts[0].Number {
+		t.Fatalf("plans with/without acknowledgment = %#v/%#v", withAcknowledgment, withoutAcknowledgment)
+	}
+}
+
 func TestPlanAllowsNewRunWhenOnlyHistoricalRunsRemain(t *testing.T) {
 	t.Parallel()
 

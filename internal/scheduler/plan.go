@@ -81,6 +81,7 @@ type Run struct {
 	SuspendedAt     *time.Time            `json:"suspendedAt,omitempty"`
 	UpdatedAt       time.Time             `json:"updatedAt"`
 	CompletedAt     *time.Time            `json:"completedAt,omitempty"`
+	AcknowledgedAt  *time.Time            `json:"acknowledgedAt,omitempty"`
 }
 
 type Lease struct {

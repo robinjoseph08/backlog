@@ -100,22 +100,37 @@ Normal completion cleanup removes worktrees and local branches only for verified
 
 State and logs live outside the target repository. By default they are stored under the operating system's user cache directory in a path derived from the absolute repository path. Use `--state-dir` when a stable explicit location is preferable.
 
-State is written with same-directory temporary files, file sync, atomic rename, and directory sync. A repository-level advisory lock in the Git common directory prevents two local runner instances from scheduling the same backlog, even if they request different state paths. The first runner start, or a status command that migrates version 1 state, binds the repository to one state directory; later conflicting `--state-dir` values are rejected.
+State is written with same-directory temporary files, file sync, atomic rename, and directory sync. A repository-level advisory lock in the Git common directory prevents two local runner instances from scheduling the same backlog, even if they request different state paths. The first runner start or mutating lifecycle command, or a status command that migrates older state, binds the repository to one state directory; later conflicting `--state-dir` values are rejected.
 
-State keeps historical Runs separate from active Leases. New Runs snapshot the Candidate issue title and URL when their Lease is created, then persist their RPC session identity and dedicated session storage before launch. Worker log paths become durable as soon as the gated Worker starts. Existing Runs without issue snapshots or startup log paths remain valid and are not backfilled through GitHub. Upgrading version 1 state preserves Run metadata and artifacts, removes the obsolete paused setting, and records legacy print-mode Runs as non-resumable. During migration, incomplete and intervention-required Runs retain their Leases, while verified merged Runs remain as history without active ownership. Legacy print-mode Runs cannot Resume because they have no verified RPC continuation boundary. Backlog refuses state from newer unsupported versions rather than attempting a downgrade.
+State keeps Historical Runs separate from active Leases. New Runs snapshot the Candidate issue title and URL when their Lease is created, then persist their RPC session identity and dedicated session storage before launch. Worker log paths become durable as soon as the gated Worker starts. Existing Runs without issue snapshots or startup log paths remain valid and are not backfilled through GitHub. Version 1 and version 2 state migrate atomically to schema version 3 under repository coordination. Migration preserves Run metadata, Leases, and artifacts. Historical `failed` and `needs-human` outcomes remain unacknowledged, while completed Reset outcomes are already treated as handled. Version 1 migration also removes the obsolete paused setting and records legacy print-mode Runs as non-resumable. Incomplete and intervention-required Runs retain their Leases, while verified merged Runs remain as history without active ownership. Legacy print-mode Runs cannot Resume because they have no verified RPC continuation boundary. Backlog refuses state from newer unsupported versions rather than attempting a downgrade.
 
 On restart, the runner reconciles persisted Leases with process liveness and GitHub pull request and issue state before Candidate admission. Safe Suspended Runs fill Worker capacity before new Candidates. Resume rechecks Completion, the open issue and managed workflow labels, the exact branch and worktree, the Pi session identity, durable leaf, entry count and file hash, and proof that the old Worker stopped. A replacement Worker keeps the Run, Lease, branch, worktree, and Pi session identities while receiving a new PID and process-start identity. Its prompt requires Pi to reassess repository and GitHub state before continuing AFK.
 
 A continuation marker persisted before a crash can recover a dead Worker into Resume. Missing, changed, malformed, or uncertain continuation state on a Suspended Run becomes `needs-human` with its Lease retained. Legacy print-mode Runs never Resume automatically. The runner compares each recovered PID with its persisted operating-system process start identity, so PID reuse becomes `needs-human` instead of being mistaken for the Worker. A live matching Worker is never launched twice. A recovered live RPC Worker becomes `needs-human` because a replacement runner cannot restore its prompt and event pipes. Its process identity remains durable and consumes Worker capacity. Recovered Workers older than `--max-worker-age` also become `needs-human`.
 
-Inspect state. Plain status partitions every Run into Active, Attention Required, or History according to its retained Lease and lifecycle state. Active running Runs use Follow's observation model to report verified Worker liveness, Activity age, the current deepest Worker or Subagent operation, separate turn counts, and observed tokens. Missing legacy telemetry is shown as `n/a`. Waiting, suspended, and historical outcomes report their relevant reconciliation, Resume, Completion, and diagnostic context without treating them as live Workers.
+Inspect state. Default plain status is a concise operational projection with Active, Attention Required, Outcomes to Acknowledge, and Recent Completions sections. Active and Attention Required are classified from retained Leases. Every unacknowledged Historical Run in `failed` or `needs-human` remains visible under Outcomes to Acknowledge without an age or count limit. Recent Completions contains the ten newest merged Runs plus any older merged Run whose Completion cleanup is still pending. Completed Reset outcomes and explicitly acknowledged outcomes are omitted from the default projection.
 
-Plain status includes each snapshotted issue title and URL when available, falls back to its issue number for older history, and reports `suspending` only while a verified local Runner is supervising bounded suspension. `status --json` remains the complete lifecycle state, including additive issue metadata and lifecycle timestamps such as `suspendingAt` and `suspendedAt`; it does not include normalized observation counters. Reading version 1 state performs the version 2 migration under the repository lock before printing status:
+Active running Runs use Follow's observation model to report verified Worker liveness, Activity age, the current deepest Worker or Subagent operation, separate turn counts, and observed tokens. Missing legacy telemetry is shown as `n/a`. Plain status includes each snapshotted issue title and URL when available, falls back to its issue number for older history, and reports `suspending` only while a verified local Runner is supervising bounded suspension. Sections are newest first with deterministic Run ID tie-breaking. The summary distinguishes total and displayed Runs and reports how many acknowledged outcomes the default projection hides.
+
+Use `--all` for every persisted Run exactly once. Explicitly acknowledged outcomes show their acknowledgment timestamp. JSON status is also complete and unfiltered, includes additive `acknowledgedAt` metadata, and does not include normalized observation counters. Status remains read-only except when an older schema must be migrated under repository coordination:
 
 ```sh
 backlog status
+backlog status --all
 backlog status --json
 ```
+
+Acknowledge one or more reviewed Historical Run outcomes without deleting history:
+
+```sh
+backlog acknowledge <run-id>
+backlog acknowledge <positive-issue-number>...
+backlog acknowledge --all
+```
+
+An exact Run ID takes precedence, including a numeric Run ID. Otherwise, a positive issue number selects every Historical Run for that issue in `failed` or `needs-human` without a Lease. Multiple selectors are validated before one atomic state update, so an unknown or ineligible exact Run refuses the whole operation. `--all` applies to one locked snapshot and cannot be combined with selectors. Repeated acknowledgment is successful and preserves the original timestamp. Acknowledgment is non-interactive and does not use `--yes` or `--dry-run`.
+
+Outcome Acknowledgment means only that an operator has seen an unexpected non-Completion outcome. It does not claim Completion or external resolution. It does not release a Lease, change Candidate eligibility or GitHub state, retire a branch, worktree, session, or log, or remove diagnostics. Reset abandons incomplete owned work and retires active artifacts. Completion is a GitHub-verified merged outcome. Full status and Follow retain access to acknowledged Runs.
 
 Follow one Run through normalized Worker and Subagent Activity without acquiring scheduling ownership or communicating with its Runner or Worker:
 
@@ -177,7 +192,7 @@ Non-signal context cancellation retains the immediate failure shutdown behavior.
 
 ## Exit statuses
 
-- `0`: command succeeded, natural one-shot exhaustion found no unresolved intervention, a first-signal Drain completed, a dry-run completed, or interactive Reset was declined
+- `0`: command succeeded, an acknowledgment was completed or already satisfied, natural one-shot exhaustion found no unresolved intervention, a first-signal Drain completed, a dry-run completed, or interactive Reset was declined
 - `1`: natural one-shot exhaustion left an Intervention-required Run with its Lease, an ownership or safety check refused the command, or an operational command failed
 - `2`: the top-level command was missing or unknown
 - `130`: `backlog run` suspension was initiated by a second `SIGINT`

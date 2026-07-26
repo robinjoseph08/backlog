@@ -48,6 +48,10 @@ func MainWithSignals(ctx context.Context, args []string, stdout, stderr io.Write
 		commandCtx, stop := cancelContextOnSignal(ctx, signals)
 		defer stop()
 		err = followCommand(commandCtx, args[1:], stdout, stderr)
+	case "acknowledge":
+		commandCtx, stop := cancelContextOnSignal(ctx, signals)
+		defer stop()
+		err = acknowledgeCommand(commandCtx, args[1:], stdout, stderr)
 	case "reset":
 		commandCtx, stop := cancelContextOnSignal(ctx, signals)
 		defer stop()
@@ -302,6 +306,7 @@ func statusCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 	stateDir := flags.String("state-dir", "", "runner state directory")
 	gitExecutable := flags.String("git", "git", "git executable used to identify the repository root")
 	asJSON := flags.Bool("json", false, "print the complete state as JSON")
+	showAll := flags.Bool("all", false, "print every persisted Run")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -337,7 +342,7 @@ func statusCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return encoder.Encode(current)
 	}
 	source := repositoryFollowSource{followStateSource: store, commonDirectory: commonDirectory}
-	return printPlainStatus(stdout, current, source, time.Now())
+	return printPlainStatusProjection(stdout, current, source, time.Now(), *showAll)
 }
 
 func resolveStateFromFlags(ctx context.Context, repoDir, stateDir, gitExecutable string) (string, string, error) {
@@ -584,8 +589,10 @@ func valueOr(value, fallback string) string {
 func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "Usage:")
 	fmt.Fprintln(writer, "  backlog run [flags]")
-	fmt.Fprintln(writer, "  backlog status [flags]")
+	fmt.Fprintln(writer, "  backlog status [--all] [--json] [flags]")
 	fmt.Fprintln(writer, "  backlog follow <run-id|positive-issue-number> [--raw] [flags]")
+	fmt.Fprintln(writer, "  backlog acknowledge <run-id|positive-issue-number>... [flags]")
+	fmt.Fprintln(writer, "  backlog acknowledge --all [flags]")
 	fmt.Fprintln(writer, "  backlog reset <issue-number> [--dry-run | --yes] [flags]")
 	fmt.Fprintln(writer, "  backlog retry <issue-number> [--dry-run | --yes] [flags]  (deprecated alias for reset)")
 	fmt.Fprintln(writer, "")
@@ -596,6 +603,7 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "  Restarting run resumes verified Suspended Runs before admitting new Candidates.")
 	fmt.Fprintln(writer, "  Reset retires verified artifacts, archives active Pi sessions, preserves logs and Run history,")
 	fmt.Fprintln(writer, "  restores Candidate labels, and releases the Lease only after all postconditions pass.")
+	fmt.Fprintln(writer, "  Acknowledge records presentation-only review of eligible Historical Run outcomes.")
 	fmt.Fprintln(writer, "")
 	fmt.Fprintln(writer, "Exit statuses:")
 	fmt.Fprintln(writer, "  0 success; 1 natural one-shot exhaustion with Intervention-required Runs, command refusal, or operational failure; 2 missing or unknown command.")
@@ -603,6 +611,6 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "  SIGTERM suspension exits 143, including later force escalation.")
 	fmt.Fprintln(writer, "")
 	fmt.Fprintln(writer, "Upgrade limits:")
-	fmt.Fprintln(writer, "  Version 1 state migrates to version 2, but legacy print-mode Runs cannot Resume.")
+	fmt.Fprintln(writer, "  Version 1 and version 2 state migrate to version 3; legacy print-mode Runs cannot Resume.")
 	fmt.Fprintln(writer, "  State written by a newer unsupported version is refused.")
 }

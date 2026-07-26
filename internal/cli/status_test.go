@@ -84,7 +84,7 @@ func TestStatusPresentsOperationalSectionsWithSharedRunObservation(t *testing.T)
 	if strings.Contains(active, "Activity age: n/a") {
 		t.Fatalf("running Run lost available Activity age:\n%s", active)
 	}
-	attention := statusSectionOutput(t, output, "Attention Required", "History")
+	attention := statusSectionOutput(t, output, "Attention Required", "Outcomes to Acknowledge")
 	for _, want := range []string{"#6  failed", "inspect protocol failure", "#7  needs-human", "human judgment required", "#8  resetting", "rerun backlog reset"} {
 		if !strings.Contains(attention, want) {
 			t.Fatalf("Attention Required section missing %q:\n%s", want, attention)
@@ -93,16 +93,24 @@ func TestStatusPresentsOperationalSectionsWithSharedRunObservation(t *testing.T)
 	if strings.Contains(attention, "failed-history") || strings.Contains(attention, "historical diagnostic") {
 		t.Fatalf("released failed Run appeared as attention:\n%s", attention)
 	}
-	history := statusSectionOutput(t, output, "History", "")
-	for _, want := range []string{
-		"#9  Old failure  failed", "Run: failed-history", "historical diagnostic", "#10  merged", "Completion: verified merged",
-		"Pull request: https://example.test/pull/10", "Completed: " + completedAt.Format(time.RFC3339),
-		"Completion cleanup: pending; the next runner startup will retry", "completion verified; worktree cleanup remains pending",
-		"#11  reset", "Reset completed; Lease released", "preserved Reset diagnostic",
-	} {
-		if !strings.Contains(history, want) {
-			t.Fatalf("History section missing %q:\n%s", want, history)
+	outcomes := statusSectionOutput(t, output, "Outcomes to Acknowledge", "Recent Completions")
+	for _, want := range []string{"#9  Old failure  failed", "Run: failed-history", "historical diagnostic"} {
+		if !strings.Contains(outcomes, want) {
+			t.Fatalf("Outcomes section missing %q:\n%s", want, outcomes)
 		}
+	}
+	completions := statusSectionOutput(t, output, "Recent Completions", "")
+	for _, want := range []string{
+		"#10  merged", "Completion: verified merged", "Pull request: https://example.test/pull/10",
+		"Completed: " + completedAt.Format(time.RFC3339), "Completion cleanup: pending; the next runner startup will retry",
+		"completion verified; worktree cleanup remains pending",
+	} {
+		if !strings.Contains(completions, want) {
+			t.Fatalf("Recent Completions section missing %q:\n%s", want, completions)
+		}
+	}
+	if strings.Contains(output, "Run: reset-history | State:") {
+		t.Fatalf("completed Reset appeared in concise status:\n%s", output)
 	}
 	for _, control := range []string{"\x1b", "\r", "\t"} {
 		if strings.Contains(output, control) {
@@ -111,9 +119,165 @@ func TestStatusPresentsOperationalSectionsWithSharedRunObservation(t *testing.T)
 	}
 	for _, run := range runs {
 		id := plainStatusValue(run.RunID)
-		if count := strings.Count(output, "Run: "+id+" | State:"); count != 1 {
-			t.Fatalf("Run %q appeared %d times, want exactly once:\n%s", id, count, output)
+		want := 1
+		if run.Status == scheduler.StatusReset {
+			want = 0
 		}
+		if count := strings.Count(output, "Run: "+id+" | State:"); count != want {
+			t.Fatalf("Run %q appeared %d times, want %d:\n%s", id, count, want, output)
+		}
+	}
+}
+
+func TestStatusConciseProjectionAndFullHistoryAreCompleteOrderedAndExplicit(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	base := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	acknowledgedAt := base.Add(48 * time.Hour)
+	runs := []scheduler.Run{
+		{Issue: 1, RunID: "active", Status: scheduler.StatusClaimed, WorkerMode: scheduler.WorkerModePrint, UpdatedAt: base.Add(time.Hour)},
+		{Issue: 2, RunID: "attention", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, UpdatedAt: base.Add(2 * time.Hour)},
+		{Issue: 3, RunID: "outcome-a", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, UpdatedAt: base.Add(3 * time.Hour)},
+		{Issue: 4, RunID: "outcome-z", Status: scheduler.StatusNeedsHuman, WorkerMode: scheduler.WorkerModePrint, UpdatedAt: base.Add(3 * time.Hour)},
+		{Issue: 5, RunID: "acknowledged", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, UpdatedAt: base.Add(4 * time.Hour), AcknowledgedAt: &acknowledgedAt},
+		{Issue: 6, RunID: "reset", Status: scheduler.StatusReset, WorkerMode: scheduler.WorkerModePrint, UpdatedAt: base.Add(5 * time.Hour)},
+	}
+	for index := 0; index < 12; index++ {
+		completedAt := base.Add(time.Duration(10+index) * time.Hour)
+		runs = append(runs, scheduler.Run{
+			Issue: 100 + index, RunID: fmt.Sprintf("completion-%02d", index), Status: scheduler.StatusMerged,
+			WorkerMode: scheduler.WorkerModePrint, UpdatedAt: completedAt, CompletedAt: &completedAt, CleanupPending: index == 0,
+		})
+	}
+	current := state.State{Version: state.CurrentVersion, Runs: runs, Leases: []scheduler.Lease{
+		{LeaseID: "active", Issue: 1, RunID: "active"}, {LeaseID: "attention", Issue: 2, RunID: "attention"},
+	}}
+	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
+	if err := store.Save(current); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output := runStatusCommand(t, repository, stateDir)
+	for _, want := range []string{"Runs: 18 total | 15 displayed", "Acknowledged outcomes hidden by default: 1", "Outcomes to Acknowledge (2)", "Recent Completions (11)"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("concise status missing %q:\n%s", want, output)
+		}
+	}
+	for _, hidden := range []string{"Run: acknowledged | State:", "Run: reset | State:", "Run: completion-01 | State:"} {
+		if strings.Contains(output, hidden) {
+			t.Fatalf("concise status included hidden Run %q:\n%s", hidden, output)
+		}
+	}
+	for _, visible := range []string{"Run: outcome-a | State:", "Run: outcome-z | State:", "Run: completion-00 | State:", "Run: completion-02 | State:", "Run: completion-11 | State:"} {
+		if !strings.Contains(output, visible) {
+			t.Fatalf("concise status omitted %q:\n%s", visible, output)
+		}
+	}
+	outcomes := statusSectionOutput(t, output, "Outcomes to Acknowledge", "Recent Completions")
+	if strings.Index(outcomes, "Run: outcome-z") > strings.Index(outcomes, "Run: outcome-a") {
+		t.Fatalf("deterministic Run-ID tie breaker was not newest first:\n%s", outcomes)
+	}
+	completions := statusSectionOutput(t, output, "Recent Completions", "")
+	if strings.Index(completions, "Run: completion-11") > strings.Index(completions, "Run: completion-10") {
+		t.Fatalf("recent Completions were not newest first:\n%s", completions)
+	}
+	after, err := os.ReadFile(store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("default status changed state")
+	}
+
+	var stdout, stderr bytes.Buffer
+	if exit := Main(context.Background(), []string{"status", "--all", "--repo-dir", repository, "--state-dir", stateDir}, &stdout, &stderr); exit != 0 {
+		t.Fatalf("status --all exit=%d stderr=%q", exit, stderr.String())
+	}
+	all := stdout.String()
+	if !strings.Contains(all, "Runs: 18 total | 18 displayed") || !strings.Contains(all, "History (16)") ||
+		!strings.Contains(all, "Run: acknowledged | State: failed\n    Acknowledged: "+acknowledgedAt.Format(time.RFC3339)) {
+		t.Fatalf("full status did not expose complete acknowledged history:\n%s", all)
+	}
+	for _, run := range runs {
+		if count := strings.Count(all, "Run: "+run.RunID+" | State:"); count != 1 {
+			t.Fatalf("full status Run %q count=%d, want 1:\n%s", run.RunID, count, all)
+		}
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if exit := Main(context.Background(), []string{"status", "--json", "--repo-dir", repository, "--state-dir", stateDir}, &stdout, &stderr); exit != 0 {
+		t.Fatalf("status --json exit=%d stderr=%q", exit, stderr.String())
+	}
+	var jsonState state.State
+	if err := json.Unmarshal(stdout.Bytes(), &jsonState); err != nil {
+		t.Fatal(err)
+	}
+	if len(jsonState.Runs) != len(runs) || findAcknowledgmentRun(t, jsonState, "acknowledged").AcknowledgedAt == nil {
+		t.Fatalf("JSON status was filtered or omitted acknowledgment metadata: %#v", jsonState)
+	}
+}
+
+func TestStatusKeepsOperationalSectionsUnboundedAndOrdersEverySectionNewestFirst(t *testing.T) {
+	base := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	runs := []scheduler.Run{
+		{Issue: 100, RunID: "active-a", Status: scheduler.StatusClaimed, WorkerMode: scheduler.WorkerModePrint, UpdatedAt: base.Add(40 * time.Hour)},
+		{Issue: 101, RunID: "active-z", Status: scheduler.StatusClaimed, WorkerMode: scheduler.WorkerModePrint, UpdatedAt: base.Add(40 * time.Hour)},
+		{Issue: 102, RunID: "history-a", Status: scheduler.StatusReset, WorkerMode: scheduler.WorkerModePrint, UpdatedAt: base.Add(50 * time.Hour)},
+		{Issue: 103, RunID: "history-z", Status: scheduler.StatusReset, WorkerMode: scheduler.WorkerModePrint, UpdatedAt: base.Add(50 * time.Hour)},
+	}
+	leases := []scheduler.Lease{
+		{LeaseID: "active-a", Issue: 100, RunID: "active-a"},
+		{LeaseID: "active-z", Issue: 101, RunID: "active-z"},
+	}
+	for index := 0; index < 12; index++ {
+		updatedAt := base.Add(time.Duration(index) * time.Hour)
+		attentionID := fmt.Sprintf("attention-%02d", index)
+		outcomeID := fmt.Sprintf("outcome-%02d", index)
+		runs = append(runs,
+			scheduler.Run{Issue: 200 + index, RunID: attentionID, Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, UpdatedAt: updatedAt},
+			scheduler.Run{Issue: 300 + index, RunID: outcomeID, Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, UpdatedAt: updatedAt},
+		)
+		leases = append(leases, scheduler.Lease{LeaseID: attentionID, Issue: 200 + index, RunID: attentionID})
+	}
+	current := state.State{Version: state.CurrentVersion, Runs: runs, Leases: leases}
+
+	var concise bytes.Buffer
+	if err := printPlainStatusProjection(&concise, current, &sequenceFollowSource{}, base.Add(60*time.Hour), false); err != nil {
+		t.Fatal(err)
+	}
+	active := statusSectionOutput(t, concise.String(), "Active", "Attention Required")
+	attention := statusSectionOutput(t, concise.String(), "Attention Required", "Outcomes to Acknowledge")
+	outcomes := statusSectionOutput(t, concise.String(), "Outcomes to Acknowledge", "Recent Completions")
+	if strings.Count(attention, "Run: attention-") != 12 || strings.Count(outcomes, "Run: outcome-") != 12 {
+		t.Fatalf("operational sections were bounded:\n%s", concise.String())
+	}
+	for _, ordering := range []struct {
+		section string
+		newer   string
+		older   string
+	}{
+		{section: active, newer: "Run: active-z", older: "Run: active-a"},
+		{section: attention, newer: "Run: attention-11", older: "Run: attention-10"},
+		{section: outcomes, newer: "Run: outcome-11", older: "Run: outcome-10"},
+	} {
+		if !strings.Contains(ordering.section, ordering.newer) || !strings.Contains(ordering.section, ordering.older) ||
+			strings.Index(ordering.section, ordering.newer) > strings.Index(ordering.section, ordering.older) {
+			t.Fatalf("section was not newest first: newer=%q older=%q\n%s", ordering.newer, ordering.older, ordering.section)
+		}
+	}
+
+	var full bytes.Buffer
+	if err := printPlainStatusProjection(&full, current, &sequenceFollowSource{}, base.Add(60*time.Hour), true); err != nil {
+		t.Fatal(err)
+	}
+	history := statusSectionOutput(t, full.String(), "History", "")
+	if strings.Count(history, "Run: outcome-") != 12 || strings.Index(history, "Run: history-z") > strings.Index(history, "Run: history-a") {
+		t.Fatalf("full History was incomplete or not deterministically newest first:\n%s", history)
 	}
 }
 
@@ -146,7 +310,7 @@ func TestStatusMovesRunFromActiveToAttentionToHistoryWithLeaseLifecycle(t *testi
 		t.Fatal(err)
 	}
 	history := runStatusCommand(t, repository, stateDir)
-	assertStatusRunSection(t, history, "moving", "History")
+	assertStatusRunSection(t, history, "moving", "Outcomes to Acknowledge")
 }
 
 func TestStatusLoadsLegacyRunWithUnavailableTelemetry(t *testing.T) {
@@ -386,8 +550,9 @@ func assertStatusRunSection(t *testing.T, output, runID, expectedSection string)
 		next string
 	}{
 		{name: "Active", next: "Attention Required"},
-		{name: "Attention Required", next: "History"},
-		{name: "History"},
+		{name: "Attention Required", next: "Outcomes to Acknowledge"},
+		{name: "Outcomes to Acknowledge", next: "Recent Completions"},
+		{name: "Recent Completions"},
 	}
 	for _, section := range sections {
 		contains := strings.Contains(statusSectionOutput(t, output, section.name, section.next), "Run: "+runID+" | State:")
