@@ -373,6 +373,18 @@ func TestDashboardFinalSummaryReturnsOutputFailure(t *testing.T) {
 	dashboard.close()
 }
 
+func TestDashboardCloseShowsThatRunnerStopped(t *testing.T) {
+	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+	source := &dashboardTestSource{current: current}
+	var output bytes.Buffer
+	dashboard := newLiveDashboard(&output, source, current, time.Now)
+	dashboard.start()
+	dashboard.close()
+	if !strings.Contains(output.String(), "Stopped: the runner is exiting; interrupts have no further effect.") {
+		t.Fatalf("closed dashboard retained an active footer:\n%s", output.String())
+	}
+}
+
 func TestDashboardKeepsTerminalRunsAndShutdownMessagesVisible(t *testing.T) {
 	now := time.Date(2026, 7, 26, 17, 0, 0, 0, time.UTC)
 	initial := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
@@ -406,5 +418,12 @@ func TestDashboardKeepsTerminalRunsAndShutdownMessagesVisible(t *testing.T) {
 	dashboard.redraw()
 	if !strings.Contains(output.String(), "Suspending: continuation boundaries are being established; next Ctrl-C force stops") {
 		t.Fatalf("suspension footer did not describe next interrupt:\n%s", output.String())
+	}
+	if _, err := dashboard.Write([]byte("Force stop: additional signal accepted; requesting force stop for 1 Worker\nSuspension: 1 Worker remaining\n")); err != nil {
+		t.Fatal(err)
+	}
+	dashboard.redraw()
+	if !strings.Contains(output.String(), "Force stopping: Worker identities are revalidated before signaling; next Ctrl-C repeats") {
+		t.Fatalf("suspension progress regressed the force-stop footer:\n%s", output.String())
 	}
 }

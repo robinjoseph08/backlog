@@ -28,6 +28,7 @@ const (
 	dashboardForceStopping
 	dashboardDrainComplete
 	dashboardSuspensionComplete
+	dashboardStopped
 	dashboardFinished
 )
 
@@ -184,17 +185,21 @@ func (d *liveDashboard) recordMessageLocked(message string) {
 			}
 		}
 	}
+	var next dashboardStage
 	switch {
 	case strings.HasPrefix(message, "Drain complete"):
-		d.stage = dashboardDrainComplete
+		next = dashboardDrainComplete
 	case strings.HasPrefix(message, "Suspension complete"), strings.HasPrefix(message, "Suspension incomplete"):
-		d.stage = dashboardSuspensionComplete
+		next = dashboardSuspensionComplete
 	case strings.HasPrefix(message, "Force stop"):
-		d.stage = dashboardForceStopping
+		next = dashboardForceStopping
 	case strings.HasPrefix(message, "Suspension:"), strings.HasPrefix(message, "Drain: additional"):
-		d.stage = dashboardSuspending
+		next = dashboardSuspending
 	case strings.HasPrefix(message, "Drain:"):
-		d.stage = dashboardDraining
+		next = dashboardDraining
+	}
+	if next > d.stage {
+		d.stage = next
 	}
 }
 
@@ -375,6 +380,8 @@ func dashboardFooter(stage dashboardStage) string {
 		return "Drain complete: no Owned Workers remain; no further interrupt is needed."
 	case dashboardSuspensionComplete:
 		return "Suspension finished: no further interrupt has an effect before exit."
+	case dashboardStopped:
+		return "Stopped: the runner is exiting; interrupts have no further effect."
 	case dashboardFinished:
 		return "Complete: the runner has exited; interrupts have no further effect."
 	default:
@@ -405,6 +412,9 @@ func (d *liveDashboard) close() {
 	d.stopLoop()
 	d.mu.Lock()
 	finished := d.stage == dashboardFinished
+	if !finished {
+		d.stage = dashboardStopped
+	}
 	d.mu.Unlock()
 	// A state or lifecycle update can be queued when Run returns. Publish the
 	// latest complete shutdown frame before restoring the cursor. Natural exit
