@@ -1101,9 +1101,7 @@ while IFS= read -r ignored; do :; done
 				t.Fatal(err)
 			}
 			waitForPath(t, started)
-			ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
-			_, suspendErr := process.Suspend(ctx, ContinuationRequest{SessionID: "backlog-run-51", SessionDir: sessionDir, Worktree: worktree})
-			cancel()
+			_, suspendErr := process.Suspend(context.Background(), ContinuationRequest{SessionID: "backlog-run-51", SessionDir: sessionDir, Worktree: worktree})
 			if suspendErr == nil || !strings.Contains(suspendErr.Error(), test.want) {
 				t.Fatalf("suspend error = %v, want %q", suspendErr, test.want)
 			}
@@ -1155,9 +1153,6 @@ func TestProcessSuspendRejectsIncompleteIdleStateAndWrongSession(t *testing.T) {
 		}, entriesData: func(entry string) string {
 			return `{"entries":[` + entry + `],"LeafID":"user"}`
 		}, settleEvent: `{"type":"agent_settled"}`, want: "non-canonical key"},
-		{name: "missing settlement", stateData: func(path string) string {
-			return `{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(path) + `,"sessionId":"backlog-run-52"}`
-		}, want: "deadline exceeded"},
 		{name: "open tool activity", stateData: func(path string) string {
 			return `{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(path) + `,"sessionId":"backlog-run-52"}`
 		}, settleEvent: `{"type":"tool_execution_start","toolCallId":"open"}` + "\n" + `{"type":"agent_settled"}`, want: "tool_execution_start"},
@@ -1208,9 +1203,7 @@ while IFS= read -r ignored; do :; done
 				t.Fatal(err)
 			}
 			waitForPath(t, started)
-			ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
-			_, suspendErr := process.Suspend(ctx, ContinuationRequest{SessionID: "backlog-run-52", SessionDir: sessionDir, Worktree: worktree})
-			cancel()
+			_, suspendErr := process.Suspend(context.Background(), ContinuationRequest{SessionID: "backlog-run-52", SessionDir: sessionDir, Worktree: worktree})
 			if suspendErr == nil || !strings.Contains(suspendErr.Error(), test.want) {
 				t.Fatalf("suspend error = %v, want %q", suspendErr, test.want)
 			}
@@ -1218,6 +1211,49 @@ while IFS= read -r ignored; do :; done
 			_ = process.Close()
 		})
 	}
+}
+
+func TestProcessSuspendStopsWaitingForMissingSettlementWhenContextCanceled(t *testing.T) {
+	root := t.TempDir()
+	worktree := filepath.Join(root, "worktree")
+	sessionDir := filepath.Join(root, "sessions")
+	started := filepath.Join(root, "started")
+	if err := os.MkdirAll(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pi := fakePi(t, `
+IFS= read -r prompt
+touch `+shellQuote(started)+`
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
+IFS= read -r abort
+printf '%s\n' '{"id":"backlog-suspend-abort","type":"response","command":"abort","success":true}' '{"type":"turn_end"}' '{"type":"agent_end"}'
+while IFS= read -r ignored; do :; done
+`)
+	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(
+		context.Background(), request(52, "run-52", worktree, sessionDir),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatal(err)
+	}
+	waitForPath(t, started)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	suspendErr := make(chan error, 1)
+	go func() {
+		_, err := process.Suspend(ctx, ContinuationRequest{SessionID: "backlog-run-52", SessionDir: sessionDir, Worktree: worktree})
+		suspendErr <- err
+	}()
+	waitForRPCState(t, process.events, rpcBetweenAgentRuns)
+	cancel()
+	if err := <-suspendErr; err == nil || !strings.Contains(err.Error(), "wait for agent_settled: context canceled") {
+		t.Fatalf("suspend error = %v, want canceled settlement wait", err)
+	}
+	_ = process.Abort()
+	_ = process.Close()
 }
 
 func TestVerifySessionBoundaryRejectsPathIdentityAndEntryMismatches(t *testing.T) {
@@ -1626,6 +1662,20 @@ func waitForPath(t *testing.T, path string) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("path %s was not created", path)
+}
+
+func waitForRPCState(t *testing.T, events *rpcWriter, want rpcAgentState) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		events.mu.Lock()
+		state := events.state
+		events.mu.Unlock()
+		if state == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("Pi RPC state did not become %d", want)
 }
 
 func TestProcessExplicitlyRejectsProjectTrustWhenApprovalIsDisabled(t *testing.T) {
