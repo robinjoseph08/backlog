@@ -328,6 +328,12 @@ func (r *Runner) Run(ctx context.Context) error {
 					continue
 				}
 				candidateDiscoveryFailures++
+				if candidateRetryTimer == nil {
+					candidateRetryTimer = time.NewTimer(r.Config.PollInterval)
+				} else {
+					candidateRetryTimer.Reset(r.Config.PollInterval)
+				}
+				candidateRetry = candidateRetryTimer.C
 				occurredAt := r.Now().UTC()
 				operation := CandidateDiscoverySnapshot
 				var issue *int
@@ -349,12 +355,6 @@ func (r *Runner) Run(ctx context.Context) error {
 					OccurredAt: occurredAt, RetryAt: occurredAt.Add(r.Config.PollInterval),
 					ConsecutiveFailures: candidateDiscoveryFailures,
 				})
-				if candidateRetryTimer == nil {
-					candidateRetryTimer = time.NewTimer(r.Config.PollInterval)
-				} else {
-					candidateRetryTimer.Reset(r.Config.PollInterval)
-				}
-				candidateRetry = candidateRetryTimer.C
 			} else {
 				if candidateDiscoveryFailures > 0 {
 					r.emit(CandidateDiscoveryRecovered{OccurredAt: r.Now().UTC(), Failures: candidateDiscoveryFailures})

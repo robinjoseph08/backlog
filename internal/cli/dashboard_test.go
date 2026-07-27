@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -152,13 +153,29 @@ func TestDashboardReceivesShutdownStageWithoutParsingFormattedMessages(t *testin
 	if !strings.Contains(lastDashboardFrame(output.String()), "Running: Ctrl-C starts Drain") {
 		t.Fatalf("formatted message changed shutdown stage:\n%s", output.String())
 	}
+	shutdownMessage := "Suspension: establishing continuation boundaries for 2 Workers"
 	dashboard.operationalEvent(runner.ShutdownEvent{
 		Stage: runner.ShutdownStageSuspending, Action: "establishing continuation boundaries", RemainingWorkers: 2,
-		NextInterrupt: runner.NextInterruptForceStops,
+		NextInterrupt: runner.NextInterruptForceStops, Message: shutdownMessage,
 	})
+	if _, err := fmt.Fprintln(dashboard, shutdownMessage); err != nil {
+		t.Fatal(err)
+	}
+	for index := range 12 {
+		if _, err := fmt.Fprintf(dashboard, "ordinary lifecycle message %d\n", index); err != nil {
+			t.Fatal(err)
+		}
+	}
 	dashboard.redraw()
-	if !strings.Contains(lastDashboardFrame(output.String()), "Suspending: continuation boundaries are being established") {
+	frame := lastDashboardFrame(output.String())
+	if !strings.Contains(frame, "Suspending: continuation boundaries are being established") {
 		t.Fatalf("structured event did not change shutdown stage:\n%s", output.String())
+	}
+	if !strings.Contains(frame, shutdownMessage) {
+		t.Fatalf("typed shutdown message was evicted before ordinary history:\n%s", output.String())
+	}
+	if strings.Contains(frame, "Force stop: this is diagnostic text") {
+		t.Fatalf("formatted prefix received shutdown retention without a typed event:\n%s", output.String())
 	}
 }
 

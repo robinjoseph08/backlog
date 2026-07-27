@@ -43,20 +43,26 @@ type liveDashboard struct {
 	source followStateSource
 	now    func() time.Time
 
-	mu               sync.Mutex
-	current          state.State
-	baselineStatuses map[string]scheduler.Status
-	messages         []string
-	stage            dashboardStage
-	lastActivity     map[string]fileSignature
-	observations     map[string]dashboardActivityObservation
-	pendingOutput    bytes.Buffer
-	err              error
+	mu                      sync.Mutex
+	current                 state.State
+	baselineStatuses        map[string]scheduler.Status
+	messages                []dashboardMessage
+	pendingShutdownMessages map[string]int
+	stage                   dashboardStage
+	lastActivity            map[string]fileSignature
+	observations            map[string]dashboardActivityObservation
+	pendingOutput           bytes.Buffer
+	err                     error
 
 	updates chan struct{}
 	stop    chan struct{}
 	done    chan struct{}
 	once    sync.Once
+}
+
+type dashboardMessage struct {
+	text     string
+	shutdown bool
 }
 
 type fileSignature struct {
@@ -82,7 +88,7 @@ func newLiveDashboard(output io.Writer, source followStateSource, initial state.
 	}
 	return &liveDashboard{
 		output: output, source: source, now: now, current: initial,
-		baselineStatuses: baseline, stage: dashboardRunning,
+		baselineStatuses: baseline, pendingShutdownMessages: make(map[string]int), stage: dashboardRunning,
 		lastActivity: activitySignatures(initial), observations: make(map[string]dashboardActivityObservation), updates: make(chan struct{}, 1),
 		stop: make(chan struct{}), done: make(chan struct{}),
 	}
@@ -181,14 +187,38 @@ func (d *liveDashboard) Write(content []byte) (int, error) {
 }
 
 func (d *liveDashboard) recordMessageLocked(message string) {
-	message = plainStatusValue(strings.TrimSpace(message))
+	message = normalizedDashboardMessage(message)
 	if message == "" {
 		return
 	}
-	d.messages = append(d.messages, message)
-	if len(d.messages) > 12 {
-		d.messages = d.messages[len(d.messages)-12:]
+	shutdown := d.pendingShutdownMessages[message] > 0
+	if shutdown {
+		d.pendingShutdownMessages[message]--
+		if d.pendingShutdownMessages[message] == 0 {
+			delete(d.pendingShutdownMessages, message)
+		}
 	}
+	d.messages = append(d.messages, dashboardMessage{text: message, shutdown: shutdown})
+	if len(d.messages) > 12 {
+		for index, retained := range d.messages {
+			if !retained.shutdown {
+				d.messages = append(d.messages[:index], d.messages[index+1:]...)
+				break
+			}
+		}
+	}
+}
+
+func normalizedDashboardMessage(message string) string {
+	return plainStatusValue(strings.TrimSpace(message))
+}
+
+func dashboardMessageTexts(messages []dashboardMessage) []string {
+	texts := make([]string, len(messages))
+	for index, message := range messages {
+		texts[index] = message.text
+	}
+	return texts
 }
 
 // operationalEvent receives lifecycle state directly from the Runner. Message
@@ -217,6 +247,9 @@ func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
 		return
 	}
 	d.mu.Lock()
+	if message := normalizedDashboardMessage(shutdown.Message); message != "" {
+		d.pendingShutdownMessages[message]++
+	}
 	if next > d.stage {
 		d.stage = next
 	}
@@ -277,7 +310,7 @@ func (d *liveDashboard) redraw() {
 		return
 	}
 	current := d.current
-	messages := append([]string(nil), d.messages...)
+	messages := dashboardMessageTexts(d.messages)
 	stage := d.stage
 	d.mu.Unlock()
 
@@ -449,7 +482,7 @@ func (d *liveDashboard) finalSummary(current state.State) error {
 	d.stopLoop()
 	d.mu.Lock()
 	d.stage = dashboardFinished
-	messages := append([]string(nil), d.messages...)
+	messages := dashboardMessageTexts(d.messages)
 	d.mu.Unlock()
 	body := "Final aggregate summary\n" + d.render(current, messages, dashboardFinished, d.now())
 	_, err := fmt.Fprintf(d.output, "\x1b[H\x1b[2J%s", body)

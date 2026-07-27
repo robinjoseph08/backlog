@@ -92,6 +92,39 @@ func TestRunnerReportsCandidateDiscoveryFailureAndAdmissionRecovery(t *testing.T
 	}
 }
 
+func TestRunnerStartsCandidateRetryBeforeDeliveringFailureEvent(t *testing.T) {
+	pollInterval := 250 * time.Millisecond
+	github := &fakeGitHub{
+		candidateResults: []candidateResult{{err: errors.New("temporary failure")}, {}},
+		candidateChanged: make(chan struct{}, 2),
+	}
+	runner := testRunner(github, newFakeWorkers(), &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+	runner.Config.PollInterval = pollInterval
+	eventStarted := make(chan struct{})
+	releaseEvent := make(chan struct{})
+	runner.OnOperationalEvent = func(event OperationalEvent) {
+		if _, ok := event.(CandidateDiscoveryFailed); !ok {
+			return
+		}
+		close(eventStarted)
+		<-releaseEvent
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	<-eventStarted
+	time.Sleep(pollInterval + 50*time.Millisecond)
+	releasedAt := time.Now()
+	close(releaseEvent)
+	github.waitForCandidateCalls(t, 2)
+	if elapsed := github.candidateCallSnapshot()[1].Sub(releasedAt); elapsed >= pollInterval/2 {
+		t.Fatalf("retry began %s after event delivery completed, want timer elapsed during delivery", elapsed)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+}
+
 func TestRunnerReportsStructuredDrainStages(t *testing.T) {
 	t.Parallel()
 
