@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -123,9 +122,10 @@ func (e *PresentationFailure) Unwrap() []error {
 const presentationEventLimit = 32
 
 type presentationEventQueue struct {
-	mu     sync.Mutex
-	events []runner.OperationalEvent
-	wake   chan struct{}
+	mu       sync.Mutex
+	events   []runner.OperationalEvent
+	inFlight int
+	wake     chan struct{}
 }
 
 func newPresentationEventQueue() *presentationEventQueue {
@@ -217,7 +217,22 @@ func (q *presentationEventQueue) pop() runner.OperationalEvent {
 	if len(q.events) == 0 {
 		q.events = nil
 	}
+	q.inFlight++
 	return event
+}
+
+func (q *presentationEventQueue) complete() {
+	q.mu.Lock()
+	if q.inFlight > 0 {
+		q.inFlight--
+	}
+	q.mu.Unlock()
+}
+
+func (q *presentationEventQueue) idle() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.events) == 0 && q.inFlight == 0
 }
 
 func (q *presentationEventQueue) next(ctx context.Context) (runner.OperationalEvent, error) {
@@ -475,22 +490,4 @@ func openURL(ctx context.Context, url string) error {
 		return err
 	}
 	return command.Process.Release()
-}
-
-func plainRunRequested(args []string) bool {
-	for _, argument := range args {
-		if argument == "--plain" || argument == "-plain" {
-			return true
-		}
-		for _, prefix := range []string{"--plain=", "-plain="} {
-			if !strings.HasPrefix(argument, prefix) {
-				continue
-			}
-			plain, err := strconv.ParseBool(strings.TrimPrefix(argument, prefix))
-			if err != nil || plain {
-				return true
-			}
-		}
-	}
-	return false
 }

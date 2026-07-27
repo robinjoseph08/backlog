@@ -32,11 +32,14 @@ func (s *dashboardTestSource) RunnerSupervised() (bool, error) { return true, ni
 
 func lastDashboardFrame(output string) string {
 	const redraw = "\x1b[H\x1b[2J"
-	index := strings.LastIndex(output, redraw)
-	if index < 0 {
-		return output
+	if index := strings.LastIndex(output, redraw); index >= 0 {
+		return output[index+len(redraw):]
 	}
-	return output[index+len(redraw):]
+	const title = "Backlog Run Dashboard"
+	if index := strings.LastIndex(output, title); index >= 0 {
+		return output[index:]
+	}
+	return output
 }
 
 func TestRunOutputSelectionUsesTerminalCapabilityAndPlainOverride(t *testing.T) {
@@ -79,11 +82,62 @@ esac
 				t.Fatalf("stdout missing %q: %q", test.wantOutput, stdout.String())
 			}
 			if test.wantANSI {
-				if strings.Count(stdout.String(), "\x1b[?25l") != 1 || strings.Count(stdout.String(), "\x1b[?25h") != 1 || !strings.HasSuffix(stdout.String(), "\x1b[?25h\n") {
-					t.Fatalf("dashboard did not hide and restore the cursor exactly once: %q", stdout.String())
+				output := stdout.String()
+				restore := strings.Index(output, "\x1b[?1049l")
+				summary := strings.Index(output, "Final aggregate summary")
+				if strings.Count(output, "\x1b[?1049h") != 1 || strings.Count(output, "\x1b[?1049l") != 1 || strings.Count(output, "\x1b[?25l") != 1 || strings.Count(output, "\x1b[?25h") != 1 || restore < 0 || summary < restore {
+					t.Fatalf("Bubble Tea did not restore the screen and cursor before the summary: %q", output)
 				}
 			}
 		})
+	}
+}
+
+func TestAutomaticBubbleDashboardRawCtrlCCompletesDrainThroughTerminalInput(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	discovered := filepath.Join(t.TempDir(), "discovered")
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef") printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url") touch `+quote(discovered)+`; printf '%s\n' '[]' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	input, writeInput := io.Pipe()
+	defer input.Close()
+	defer writeInput.Close()
+	var stdout synchronizedBuffer
+	var stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- MainWithTerminal(context.Background(), []string{
+			"run", "--watch", "--repo-dir", repository, "--state-dir", t.TempDir(), "--poll", "5ms", "--gh", gh,
+		}, TerminalDependencies{
+			Input: input, Output: &stdout, ErrorOutput: &stderr,
+			IsTerminal:   func() bool { return true },
+			Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
+			ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+		})
+	}()
+	waitForFile(t, discovered)
+	waitForBuffer(t, &stdout, "Backlog Run Dashboard")
+	if _, err := writeInput.Write([]byte{0x03}); err != nil {
+		t.Fatalf("write raw Ctrl-C: %v", err)
+	}
+	select {
+	case exit := <-done:
+		if exit != 0 {
+			t.Fatalf("raw Ctrl-C exit = %d, stderr = %q", exit, stderr.String())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("automatic Bubble Tea input did not complete Drain")
+	}
+	output := stdout.String()
+	for _, want := range []string{"Drain complete", "\x1b[?1049h", "\x1b[?1049l"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("raw Ctrl-C dashboard output missing %q: %q", want, output)
+		}
 	}
 }
 
@@ -96,11 +150,11 @@ func TestTerminalDashboardPreservesDrainAndSuspensionMessages(t *testing.T) {
 	}{
 		{
 			name: "Drain", signal: os.Interrupt, wantExit: 0,
-			wantOutput: []string{"Drain: admission stopped; 0 Workers remaining", "Drain complete: 0 Workers remaining; exiting successfully", "Drain complete: no Owned Workers remain"},
+			wantOutput: []string{"Drain complete", "no effect"},
 		},
 		{
 			name: "suspension", signal: syscall.SIGTERM, wantExit: 143,
-			wantOutput: []string{"Suspension: SIGTERM accepted; 0 Workers share one 1m0s deadline", "Suspension complete: 0 Workers remaining", "Suspension finished: no further interrupt has an effect before exit"},
+			wantOutput: []string{"Suspension complete", "no effect"},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -304,7 +358,7 @@ esac
 	}
 }
 
-func TestTerminalDashboardRedrawsForLiveWorkerActivity(t *testing.T) {
+func TestTerminalBubbleDashboardHandlesWorkerActivityChanges(t *testing.T) {
 	repository := initializeFollowRepository(t)
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "state")
@@ -353,16 +407,8 @@ while IFS= read -r ignored; do :; done
 		}, &stdout, &stderr, nil, func(io.Writer) bool { return true })
 	}()
 	waitForFile(t, activityEmitted)
-	for deadline := time.Now().Add(3 * time.Second); ; {
-		observed := stdout.String()
-		if strings.Contains(observed, "Deepest operation: bash") && strings.Contains(observed, "Observed tokens: 1200") {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("dashboard did not redraw for live Activity: %q", observed)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitForBuffer(t, &stdout, "Deepest operation: bash")
+	waitForBuffer(t, &stdout, "Observed tokens: 1200")
 	if err := os.WriteFile(releaseWorker, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -374,8 +420,8 @@ while IFS= read -r ignored; do :; done
 	case <-time.After(3 * time.Second):
 		t.Fatal("runner did not exit after live Activity test Worker settled")
 	}
-	if strings.Count(stdout.String(), "\x1b[H\x1b[2J") < 2 {
-		t.Fatalf("dashboard did not redraw: %q", stdout.String())
+	if !strings.Contains(stdout.String(), "\x1b[?1049h") || !strings.Contains(stdout.String(), "\x1b[?1049l") {
+		t.Fatalf("Bubble Tea did not enter and leave the alternate screen: %q", stdout.String())
 	}
 }
 
@@ -423,8 +469,8 @@ esac
 	}
 	finalFrame := lastDashboardFrame(stdout.String())
 	for _, want := range []string{
-		"Final aggregate summary", "Recently Finished (1)", "#44  Merge while watching", "State: merged",
-		"(quiet)", "Turns: Worker 1 | Subagent n/a",
+		"Final aggregate summary", "Repository: acme/widgets", "Runs: 1", "Active Leases: 0",
+		"Active (0)", "Attention Required (0)",
 	} {
 		if !strings.Contains(finalFrame, want) {
 			t.Fatalf("terminal final frame missing %q: %q", want, finalFrame)
@@ -503,8 +549,8 @@ func TestDashboardRedrawsForActivityWithoutCreatingActivity(t *testing.T) {
 	if before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
 		t.Fatalf("dashboard redraw changed Activity sidecar: before=%v after=%v", before, after)
 	}
-	if strings.Count(output.String(), "\x1b[H\x1b[2J") != 2 {
-		t.Fatalf("redraw control sequence count = %d, want 2", strings.Count(output.String(), "\x1b[H\x1b[2J"))
+	if strings.Count(output.String(), "Backlog Run Dashboard") != 2 {
+		t.Fatalf("aggregate render count = %d, want 2", strings.Count(output.String(), "Backlog Run Dashboard"))
 	}
 	projection, err = os.OpenFile(projectionPath, os.O_WRONLY|os.O_APPEND, 0)
 	if err != nil {
@@ -619,6 +665,27 @@ func TestDashboardElapsedTimerRedrawsWithoutStateActivity(t *testing.T) {
 	}
 }
 
+func TestDashboardStagePresentationCoversEveryStage(t *testing.T) {
+	seen := make(map[string]dashboardStage)
+	for stage := dashboardRunning; stage < dashboardStageCount; stage++ {
+		presentation := dashboardStagePresentationFor(stage)
+		if presentation.summary == "" || presentation.stage == "" || presentation.nextInterrupt == "" {
+			t.Fatalf("stage %d has incomplete presentation: %#v", stage, presentation)
+		}
+		if previous, exists := seen[presentation.stage]; exists {
+			t.Fatalf("stages %d and %d share presentation %q; the stage switch may be incomplete", previous, stage, presentation.stage)
+		}
+		seen[presentation.stage] = stage
+		if got := dashboardFooter(stage); got != presentation.summary {
+			t.Fatalf("stage %d summary = %q, want %q", stage, got, presentation.summary)
+		}
+		wantParts := fmt.Sprintf("Runner stage: %s\nNext Ctrl-C: %s", presentation.stage, presentation.nextInterrupt)
+		if got := dashboardFooterParts(stage); got != wantParts {
+			t.Fatalf("stage %d footer parts = %q, want %q", stage, got, wantParts)
+		}
+	}
+}
+
 func TestDashboardCapacityMatchesSchedulerSemantics(t *testing.T) {
 	for _, test := range []struct {
 		name string
@@ -643,13 +710,45 @@ func TestDashboardCapacityMatchesSchedulerSemantics(t *testing.T) {
 func TestPlainRunOutputRemovesSplitTerminalControls(t *testing.T) {
 	var output bytes.Buffer
 	writer := &terminalControlWriter{output: &output}
-	for _, content := range []string{"discovery ", "\x1b[3", "1mfailed\x1b[0m\n", "next\a line\n"} {
+	for _, content := range []string{
+		"discovery ", "\x1b[3", "1mfailed\x1b[0m\n", "next\a line\n",
+		"\x1b]8;;https://example.test\aissue link\x1b]8;;\a\n",
+		"\x1b[?1049h\x1b[?25l\x1b[?1000hcontrols removed\x1b[?1000l\x1b[?25h\x1b[?1049l\n",
+	} {
 		if _, err := writer.Write([]byte(content)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if got, want := output.String(), "discovery failed\nnext line\n"; got != want {
+	if got, want := output.String(), "discovery failed\nnext line\nissue link\ncontrols removed\n"; got != want {
 		t.Fatalf("sanitized plain output = %q, want %q", got, want)
+	}
+}
+
+type dashboardWriterContractProbe struct {
+	bytes.Buffer
+	writeCalls       int
+	writeStringCalls int
+}
+
+func (b *dashboardWriterContractProbe) Write(content []byte) (int, error) {
+	b.writeCalls++
+	return b.Buffer.Write(content)
+}
+
+func (b *dashboardWriterContractProbe) WriteString(content string) (int, error) {
+	b.writeStringCalls++
+	return b.Buffer.WriteString(content)
+}
+
+func TestDashboardRenderingUsesSynchronizedWriterContract(t *testing.T) {
+	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+	source := &dashboardTestSource{current: current}
+	var output dashboardWriterContractProbe
+	dashboard := newLiveDashboard(&output, source, current, time.Now)
+
+	dashboard.redraw()
+	if output.writeCalls != 1 || output.writeStringCalls != 0 {
+		t.Fatalf("dashboard writes = %d Write and %d WriteString calls, want 1 synchronized Write call", output.writeCalls, output.writeStringCalls)
 	}
 }
 

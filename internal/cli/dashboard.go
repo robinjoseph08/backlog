@@ -34,12 +34,12 @@ const (
 	dashboardSuspensionComplete
 	dashboardStopped
 	dashboardFinished
+	dashboardStageCount
 )
 
-// liveDashboard presents the same aggregate observation model as status while
-// keeping all terminal control sequences inside the explicitly selected TTY
-// path. It only reads lifecycle state and Activity evidence; redraws never
-// write Worker Activity.
+// liveDashboard holds the aggregate observation model shared by the Bubble Tea
+// dashboard and focused projection tests. It only reads lifecycle state and
+// Activity evidence; rendering never writes Worker Activity.
 type liveDashboard struct {
 	output io.Writer
 	source followStateSource
@@ -100,7 +100,6 @@ func newLiveDashboard(output io.Writer, source followStateSource, initial state.
 }
 
 func (d *liveDashboard) start() {
-	_, _ = io.WriteString(d.output, "\x1b[?25l")
 	d.redraw()
 	go d.loop()
 }
@@ -189,6 +188,12 @@ func (d *liveDashboard) Write(content []byte) (int, error) {
 	d.mu.Unlock()
 	d.requestRedraw()
 	return len(content), nil
+}
+
+func (d *liveDashboard) recordMessage(message string) {
+	d.mu.Lock()
+	d.recordMessageLocked(message)
+	d.mu.Unlock()
 }
 
 func (d *liveDashboard) recordMessageLocked(message string) {
@@ -396,7 +401,7 @@ func (d *liveDashboard) redraw() {
 	d.mu.Unlock()
 
 	body := d.render(current, messages, stage, d.now())
-	_, err := fmt.Fprintf(d.output, "\x1b[H\x1b[2J%s", body)
+	_, err := d.output.Write([]byte(body))
 	if err != nil {
 		d.mu.Lock()
 		d.err = err
@@ -405,27 +410,44 @@ func (d *liveDashboard) redraw() {
 }
 
 func (d *liveDashboard) render(current state.State, messages []string, stage dashboardStage, now time.Time) string {
+	header, body, _ := d.renderPartsFor(current, messages, stage, now)
+	return header + "\n" + body + "\n\n" + dashboardFooter(stage) + "\n"
+}
+
+func (d *liveDashboard) renderParts(now time.Time) (string, string, string) {
+	d.mu.Lock()
+	current := cloneDashboardState(d.current)
+	messages := dashboardMessageTexts(d.messages)
+	stage := d.stage
+	d.mu.Unlock()
+	return d.renderPartsFor(current, messages, stage, now)
+}
+
+func (d *liveDashboard) renderPartsFor(current state.State, messages []string, stage dashboardStage, now time.Time) (string, string, string) {
 	sections := d.observeSections(current, now)
 	active := sections[statusActive]
 	attention := sections[statusAttention]
 	recent := d.recentlyFinished(current, sections, now)
-	used := dashboardUsedCapacity(current)
-	available := max(0, current.MaxConcurrentIssues-used)
+	capacity := "Worker capacity: pending configuration"
+	if current.MaxConcurrentIssues > 0 {
+		used := dashboardUsedCapacity(current)
+		available := max(0, current.MaxConcurrentIssues-used)
+		capacity = fmt.Sprintf("Worker capacity: %d used | %d available | %d total", used, available, current.MaxConcurrentIssues)
+	}
 
-	var output strings.Builder
-	fmt.Fprintf(&output, "Backlog Run Dashboard\nRepository: %s\nWorker capacity: %d used | %d available | %d total\n",
-		valueOr(plainStatusValue(current.Repo), "not initialized"), used, available, current.MaxConcurrentIssues)
-	renderDashboardSection(&output, "Active Runs", active, now)
-	renderDashboardSection(&output, "Attention Required", attention, now)
-	renderDashboardSection(&output, "Recently Finished", recent, now)
+	header := fmt.Sprintf("Backlog Run Dashboard\nRepository: %s\n%s",
+		valueOr(plainStatusValue(current.Repo), "not initialized"), capacity)
+	var body strings.Builder
+	renderDashboardSection(&body, "Active Runs", active, now)
+	renderDashboardSection(&body, "Attention Required", attention, now)
+	renderDashboardSection(&body, "Recently Finished", recent, now)
 	if len(messages) > 0 {
-		output.WriteString("\nOperational messages\n")
+		body.WriteString("\nOperational messages\n")
 		for _, message := range messages {
-			fmt.Fprintf(&output, "  %s\n", message)
+			fmt.Fprintf(&body, "  %s\n", message)
 		}
 	}
-	fmt.Fprintf(&output, "\n%s\n", dashboardFooter(stage))
-	return output.String()
+	return header, strings.TrimPrefix(body.String(), "\n"), dashboardFooterParts(stage)
 }
 
 func (d *liveDashboard) observeSections(current state.State, now time.Time) map[statusSection][]statusRun {
@@ -535,27 +557,78 @@ func dashboardUsedCapacity(current state.State) int {
 	return used
 }
 
-func dashboardFooter(stage dashboardStage) string {
+type dashboardStagePresentation struct {
+	summary       string
+	stage         string
+	nextInterrupt string
+}
+
+func dashboardStagePresentationFor(stage dashboardStage) dashboardStagePresentation {
 	switch stage {
 	case dashboardDraining:
-		return "Draining: admission is stopped; next Ctrl-C suspends unfinished Runs within the shared deadline."
+		return dashboardStagePresentation{
+			summary:       "Draining: admission is stopped; next Ctrl-C suspends unfinished Runs within the shared deadline.",
+			stage:         "Draining",
+			nextInterrupt: "suspend unfinished Runs within the shared deadline",
+		}
 	case dashboardSuspending:
-		return "Suspending: continuation boundaries are being established; next Ctrl-C force stops remaining verified Worker groups."
+		return dashboardStagePresentation{
+			summary:       "Suspending: continuation boundaries are being established; next Ctrl-C force stops remaining verified Worker groups.",
+			stage:         "Suspending",
+			nextInterrupt: "force stop remaining verified Worker groups",
+		}
 	case dashboardForceStopping:
-		return "Force stopping: Worker identities are revalidated before signaling; next Ctrl-C repeats the force-stop request."
+		return dashboardStagePresentation{
+			summary:       "Force stopping: Worker identities are revalidated before signaling; next Ctrl-C repeats the force-stop request.",
+			stage:         "Force stopping",
+			nextInterrupt: "repeat the force-stop request after identity checks",
+		}
 	case dashboardDrainComplete:
-		return "Drain complete: no Owned Workers remain; no further interrupt is needed."
+		return dashboardStagePresentation{
+			summary:       "Drain complete: no Owned Workers remain; no further interrupt is needed.",
+			stage:         "Drain complete",
+			nextInterrupt: "no effect",
+		}
 	case dashboardDrainIncomplete:
-		return "Drain incomplete: Worker liveness remains unverified; no further interrupt has an effect before exit."
+		return dashboardStagePresentation{
+			summary:       "Drain incomplete: Worker liveness remains unverified; no further interrupt has an effect before exit.",
+			stage:         "Drain incomplete; Worker liveness is unverified",
+			nextInterrupt: "no effect",
+		}
 	case dashboardSuspensionComplete:
-		return "Suspension finished: no further interrupt has an effect before exit."
+		return dashboardStagePresentation{
+			summary:       "Suspension finished: no further interrupt has an effect before exit.",
+			stage:         "Suspension finished",
+			nextInterrupt: "no effect",
+		}
 	case dashboardStopped:
-		return "Stopped: the runner is exiting; interrupts have no further effect."
+		return dashboardStagePresentation{
+			summary:       "Stopped: the runner is exiting; interrupts have no further effect.",
+			stage:         "Stopped; the Runner is exiting",
+			nextInterrupt: "no effect",
+		}
 	case dashboardFinished:
-		return "Complete: the runner has exited; interrupts have no further effect."
+		return dashboardStagePresentation{
+			summary:       "Complete: the runner has exited; interrupts have no further effect.",
+			stage:         "Complete; the Runner has exited",
+			nextInterrupt: "no effect",
+		}
 	default:
-		return "Running: Ctrl-C starts Drain, stopping admission while Owned Workers finish."
+		return dashboardStagePresentation{
+			summary:       "Running: Ctrl-C starts Drain, stopping admission while Owned Workers finish.",
+			stage:         "Running",
+			nextInterrupt: "start Drain and stop Admission",
+		}
 	}
+}
+
+func dashboardFooter(stage dashboardStage) string {
+	return dashboardStagePresentationFor(stage).summary
+}
+
+func dashboardFooterParts(stage dashboardStage) string {
+	presentation := dashboardStagePresentationFor(stage)
+	return fmt.Sprintf("Runner stage: %s\nNext Ctrl-C: %s", presentation.stage, presentation.nextInterrupt)
 }
 
 func (d *liveDashboard) finalSummary(current state.State) error {
@@ -566,7 +639,7 @@ func (d *liveDashboard) finalSummary(current state.State) error {
 	messages := dashboardMessageTexts(d.messages)
 	d.mu.Unlock()
 	body := "Final aggregate summary\n" + d.render(current, messages, dashboardFinished, d.now())
-	_, err := fmt.Fprintf(d.output, "\x1b[H\x1b[2J%s", body)
+	_, err := d.output.Write([]byte(body))
 	return err
 }
 
@@ -591,18 +664,4 @@ func (d *liveDashboard) close() {
 	if !finished {
 		d.redraw()
 	}
-	_, _ = io.WriteString(d.output, "\x1b[?25h\n")
-}
-
-type dashboardStore struct {
-	state.FileStore
-	dashboard *liveDashboard
-}
-
-func (s dashboardStore) Save(current state.State) error {
-	if err := s.FileStore.Save(current); err != nil {
-		return err
-	}
-	s.dashboard.update(current)
-	return nil
 }

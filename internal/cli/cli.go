@@ -37,14 +37,18 @@ func MainWithSignals(ctx context.Context, args []string, stdout, stderr io.Write
 }
 
 // MainWithSignalsAndTerminal preserves the previous focused terminal
-// capability seam. New complete-invocation tests should use MainWithTerminal.
+// capability seam with inert input. New complete-invocation tests that need
+// terminal input should use MainWithTerminal.
 func MainWithSignalsAndTerminal(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan os.Signal, isTerminal func(io.Writer) bool) int {
 	if isTerminal == nil {
 		isTerminal = outputIsTerminal
 	}
 	return MainWithTerminal(ctx, args, TerminalDependencies{
-		Output: stdout, ErrorOutput: stderr, Signals: signals,
+		Input: strings.NewReader(""), Output: stdout, ErrorOutput: stderr, Signals: signals,
 		IsTerminal: func() bool { return isTerminal(stdout) },
+		Dimensions: func() (TerminalDimensions, error) {
+			return TerminalDimensions{Width: 80, Height: 24}, nil
+		},
 	})
 }
 
@@ -61,15 +65,34 @@ func MainWithTerminal(ctx context.Context, args []string, dependencies TerminalD
 	var err error
 	switch args[0] {
 	case "run":
+		options, parseErr := parseRunOptions(args[1:], stderr)
+		if parseErr != nil {
+			err = parseErr
+			break
+		}
 		terminalOutput := terminal.IsTerminal()
 		presentation := terminal.Presentation
-		if !terminalOutput || plainRunRequested(args[1:]) {
+		var dashboard *bubbleDashboardSession
+		if !terminalOutput || options.plain {
 			presentation = nil
+		} else if presentation == nil {
+			dashboard = newBubbleDashboardSession(terminal.Now)
+			presentation = dashboard.presentation
 		}
 		host := runnerHost{terminal: terminal}
 		err = host.run(ctx, func(signals <-chan lifecycleSignal, onOperationalEvent func(runner.OperationalEvent)) error {
-			return runCommand(ctx, args[1:], stdout, stderr, signals, onOperationalEvent, terminalOutput && presentation == nil, terminal.Now)
+			if dashboard != nil {
+				if startupErr := dashboard.waitForStartup(ctx); startupErr != nil {
+					return startupErr
+				}
+			}
+			return runCommand(ctx, options, stdout, signals, onOperationalEvent, dashboard, terminal.Now)
 		}, presentation)
+		if dashboard != nil {
+			if summaryErr := dashboard.printFinalSummary(stdout); summaryErr != nil {
+				err = errors.Join(err, summaryErr)
+			}
+		}
 	case "status":
 		commandCtx, stop := cancelContextOnSignal(ctx, terminal.Signals)
 		defer stop()
@@ -134,7 +157,45 @@ func outputIsTerminal(output io.Writer) bool {
 	return ok && term.IsTerminal(int(file.Fd()))
 }
 
-func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan lifecycleSignal, onOperationalEvent func(runner.OperationalEvent), dashboardOutput bool, now func() time.Time) (resultErr error) {
+type runOptions struct {
+	repoDir       string
+	stateDir      string
+	maxWorkers    int
+	poll          time.Duration
+	maxWorkerAge  time.Duration
+	watch         bool
+	plain         bool
+	approve       bool
+	ghExecutable  string
+	gitExecutable string
+	piExecutable  string
+}
+
+func parseRunOptions(args []string, stderr io.Writer) (runOptions, error) {
+	var options runOptions
+	flags := flag.NewFlagSet("run", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	flags.StringVar(&options.repoDir, "repo-dir", ".", "Git repository to drain")
+	flags.StringVar(&options.stateDir, "state-dir", "", "runner state directory outside the repository")
+	flags.IntVar(&options.maxWorkers, "max-workers", 3, "maximum concurrent issue workers")
+	flags.DurationVar(&options.poll, "poll", 30*time.Second, "GitHub and process reconciliation interval")
+	flags.DurationVar(&options.maxWorkerAge, "max-worker-age", 7*24*time.Hour, "maximum age before a recovered PID requires human verification")
+	flags.BoolVar(&options.watch, "watch", false, "keep waiting after the current runnable backlog is exhausted")
+	flags.BoolVar(&options.plain, "plain", false, "disable the full-screen terminal dashboard")
+	flags.BoolVar(&options.approve, "approve", true, "trust project-local Pi resources in worker worktrees")
+	flags.StringVar(&options.ghExecutable, "gh", "gh", "gh executable")
+	flags.StringVar(&options.gitExecutable, "git", "git", "git executable")
+	flags.StringVar(&options.piExecutable, "pi", "pi", "pi executable")
+	if err := flags.Parse(args); err != nil {
+		return runOptions{}, err
+	}
+	if flags.NArg() != 0 {
+		return runOptions{}, fmt.Errorf("run takes no positional arguments")
+	}
+	return options, nil
+}
+
+func runCommand(ctx context.Context, options runOptions, stdout io.Writer, signals <-chan lifecycleSignal, onOperationalEvent func(runner.OperationalEvent), dashboard *bubbleDashboardSession, now func() time.Time) (resultErr error) {
 	setupCtx := ctx
 	var runnerSignals <-chan os.Signal
 	var cancelSetup context.CancelFunc
@@ -218,38 +279,19 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 		}()
 	}
 
-	flags := flag.NewFlagSet("run", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	repoDir := flags.String("repo-dir", ".", "Git repository to drain")
-	stateDir := flags.String("state-dir", "", "runner state directory outside the repository")
-	maxWorkers := flags.Int("max-workers", 3, "maximum concurrent issue workers")
-	poll := flags.Duration("poll", 30*time.Second, "GitHub and process reconciliation interval")
-	maxWorkerAge := flags.Duration("max-worker-age", 7*24*time.Hour, "maximum age before a recovered PID requires human verification")
-	watch := flags.Bool("watch", false, "keep waiting after the current runnable backlog is exhausted")
-	plain := flags.Bool("plain", false, "disable the live terminal dashboard")
-	approve := flags.Bool("approve", true, "trust project-local Pi resources in worker worktrees")
-	ghExecutable := flags.String("gh", "gh", "gh executable")
-	gitExecutable := flags.String("git", "git", "git executable")
-	piExecutable := flags.String("pi", "pi", "pi executable")
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("run takes no positional arguments")
-	}
-	absoluteRepo, err := filepath.Abs(*repoDir)
+	absoluteRepo, err := filepath.Abs(options.repoDir)
 	if err != nil {
 		return fmt.Errorf("resolve repository directory: %w", err)
 	}
-	repositoryRoot, err := gitRepositoryRoot(setupCtx, *gitExecutable, absoluteRepo)
+	repositoryRoot, err := gitRepositoryRoot(setupCtx, options.gitExecutable, absoluteRepo)
 	if err != nil {
 		return err
 	}
-	commonDirectory, err := gitCommonDirectory(setupCtx, *gitExecutable, repositoryRoot)
+	commonDirectory, err := gitCommonDirectory(setupCtx, options.gitExecutable, repositoryRoot)
 	if err != nil {
 		return err
 	}
-	resolvedStateDir, err := repositoryStateDirectory(commonDirectory, repositoryRoot, *stateDir)
+	resolvedStateDir, err := repositoryStateDirectory(commonDirectory, repositoryRoot, options.stateDir)
 	if err != nil {
 		return err
 	}
@@ -267,21 +309,21 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 		defer func() { _ = herdrReporter.Release() }()
 	}
 
-	github := &ghadapter.Client{Executable: *ghExecutable, Dir: repositoryRoot}
+	github := &ghadapter.Client{Executable: options.ghExecutable, Dir: repositoryRoot}
 	repository, err := github.Repository(setupCtx)
 	if err != nil {
 		return err
 	}
 	worktrees := &worktree.Manager{
-		GitExecutable: *gitExecutable,
+		GitExecutable: options.gitExecutable,
 		RepositoryDir: repositoryRoot,
 		WorktreesDir:  filepath.Join(resolvedStateDir, "worktrees"),
 		DefaultBranch: repository.DefaultBranch,
 	}
 	supervisor := &worker.Supervisor{
-		Executable: *piExecutable,
+		Executable: options.piExecutable,
 		LogsDir:    filepath.Join(resolvedStateDir, "logs"),
-		Approve:    *approve,
+		Approve:    options.approve,
 	}
 	store := state.FileStore{Path: filepath.Join(resolvedStateDir, "state.json")}
 	summarySource := repositoryFollowSource{followStateSource: store, commonDirectory: commonDirectory}
@@ -296,7 +338,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 	finalSummary := func(current state.State) error {
 		return printRunFinalSummary(stdout, current, summarySource, now())
 	}
-	if dashboardOutput && !*plain {
+	if dashboard != nil && !options.plain {
 		initial, _, err := store.Preview()
 		if err != nil {
 			return err
@@ -304,20 +346,17 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 		if initial.Repo == "" {
 			initial.Repo = repository.Slug
 			initial.DefaultBranch = repository.DefaultBranch
-			initial.MaxConcurrentIssues = *maxWorkers
+			initial.MaxConcurrentIssues = options.maxWorkers
 		}
-		dashboard := newLiveDashboard(stdout, summarySource, initial, now)
-		runnerStore = dashboardStore{FileStore: store, dashboard: dashboard}
+		dashboard.configure(initial, summarySource)
+		runnerStore = bubbleDashboardStore{FileStore: store, session: dashboard}
 		runnerOutput = dashboard
-		onOperationalEvent = dashboard.operationalEvent
-		finalSummary = dashboard.finalSummary
-		dashboard.start()
-		defer dashboard.close()
+		finalSummary = dashboard.captureFinalSummary
 	}
 	backlogRunner := &runner.Runner{
 		Config: runner.Config{
 			Repo: repository.Slug, DefaultBranch: repository.DefaultBranch,
-			MaxConcurrentIssues: *maxWorkers, PollInterval: *poll, MaxWorkerAge: *maxWorkerAge, Watch: *watch,
+			MaxConcurrentIssues: options.maxWorkers, PollInterval: options.poll, MaxWorkerAge: options.maxWorkerAge, Watch: options.watch,
 			SessionsDir: filepath.Join(resolvedStateDir, "sessions"),
 		},
 		GitHub:             github,
@@ -343,6 +382,11 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 	}
 	runErr := backlogRunner.Run(ctx)
 	backlogRunner.WaitForOperationalEventDelivery()
+	if dashboard != nil {
+		if flushErr := dashboard.flush(ctx); flushErr != nil {
+			return errors.Join(runErr, flushErr)
+		}
+	}
 	return runErr
 }
 

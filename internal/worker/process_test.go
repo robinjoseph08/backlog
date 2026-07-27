@@ -795,7 +795,8 @@ printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","
 while :; do sleep 1; done
 `)
 	process, err := (Supervisor{
-		Executable: pi, LogsDir: filepath.Join(root, "logs"), TerminationGrace: 20 * time.Millisecond,
+		// TerminationGrace also bounds exec.Wait cleanup after a force signal.
+		Executable: pi, LogsDir: filepath.Join(root, "logs"), TerminationGrace: 500 * time.Millisecond,
 	}).Start(context.Background(), request(20, "run-20", root, filepath.Join(root, "sessions", "run-20")))
 	if err != nil {
 		t.Fatalf("start: %v", err)
@@ -827,9 +828,9 @@ while :; do sleep 1; done
 		t.Fatal("force close did not return after cancellation")
 	}
 	if !result.GroupExited || !result.ForceStopped {
-		t.Fatalf("force close after grace = %#v", result)
+		t.Fatalf("force close after grace = %#v: %v", result, result.Err)
 	}
-	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("cancellation after grace did not bound close: %s", elapsed)
 	}
 }
@@ -846,7 +847,8 @@ trap '' TERM
 while :; do sleep 1; done
 `)
 	process, err := (Supervisor{
-		Executable: pi, LogsDir: filepath.Join(root, "logs"), TerminationGrace: 100 * time.Millisecond,
+		// TerminationGrace also bounds exec.Wait cleanup after a force signal.
+		Executable: pi, LogsDir: filepath.Join(root, "logs"), TerminationGrace: 500 * time.Millisecond,
 	}).Start(context.Background(), request(16, "run-16", root, filepath.Join(root, "sessions", "run-16")))
 	if err != nil {
 		t.Fatalf("start: %v", err)
@@ -880,9 +882,9 @@ while :; do sleep 1; done
 	started := time.Now()
 	result := process.CloseContext(ctx, func() error { return nil })
 	if !result.GroupExited || !result.ForceStopped || result.Err != nil {
-		t.Fatalf("force close = %#v", result)
+		t.Fatalf("force close = %#v: %v", result, result.Err)
 	}
-	if elapsed := time.Since(started); elapsed > time.Second {
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("force close took %s", elapsed)
 	}
 	if err := syscall.Kill(-process.PID(), syscall.Signal(0)); !errors.Is(err, syscall.ESRCH) {

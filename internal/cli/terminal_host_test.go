@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -705,28 +704,30 @@ while IFS= read -r ignored; do :; done
 `
 }
 
-func TestMainWithTerminalDoesNotStartPresentationForPlainOrRedirectedRun(t *testing.T) {
+func TestMainWithTerminalParsesRunHelpBeforeStartingPresentation(t *testing.T) {
 	for _, test := range []struct {
 		name      string
 		terminal  bool
 		arguments []string
 	}{
+		{name: "interactive help", terminal: true, arguments: []string{"run", "--help"}},
 		{name: "plain override", terminal: true, arguments: []string{"run", "--plain", "--help"}},
 		{name: "plain boolean override", terminal: true, arguments: []string{"run", "--plain=1", "--help"}},
 		{name: "redirected output", arguments: []string{"run", "--help"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			called := false
+			var stdout, stderr bytes.Buffer
 			exit := MainWithTerminal(context.Background(), test.arguments, TerminalDependencies{
-				Output: io.Discard, ErrorOutput: io.Discard,
+				Output: &stdout, ErrorOutput: &stderr,
 				IsTerminal: func() bool { return test.terminal },
 				Presentation: func(context.Context, PresentationControl) error {
 					called = true
 					return nil
 				},
 			})
-			if exit != 0 || called {
-				t.Fatalf("exit = %d, presentation called = %t", exit, called)
+			if exit != 0 || called || !strings.Contains(stderr.String(), "max-workers") {
+				t.Fatalf("exit = %d, presentation called = %t, help = %q", exit, called, stderr.String())
 			}
 		})
 	}
