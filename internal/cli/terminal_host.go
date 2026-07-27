@@ -223,15 +223,9 @@ func (h runnerHost) run(ctx context.Context, run func(<-chan lifecycleSignal) er
 
 	select {
 	case runnerErr := <-runnerDone:
-		stopPresentation()
-		presentationErr := <-presentationDone
-		if presentationErr != nil && !errors.Is(presentationErr, context.Canceled) {
-			return &PresentationFailure{Err: presentationErr, RunnerErr: runnerErr}
-		}
-		return runnerErr
+		return finishPresentationAfterRunner(presentationCtx, runnerErr, stopPresentation, presentationDone)
 	case presentationErr := <-presentationDone:
-		presentationCtxErr := presentationCtx.Err()
-		if presentationCtxErr != nil && (presentationErr == nil || errors.Is(presentationErr, presentationCtxErr)) {
+		if presentationReturnMatchesContext(presentationCtx, presentationErr) {
 			return <-runnerDone
 		}
 		if presentationErr == nil {
@@ -252,6 +246,25 @@ func (h runnerHost) run(ctx context.Context, run func(<-chan lifecycleSignal) er
 		stopPresentation()
 		return &PresentationFailure{Err: presentationErr, RunnerErr: runnerErr}
 	}
+}
+
+func finishPresentationAfterRunner(
+	presentationCtx context.Context,
+	runnerErr error,
+	stopPresentation context.CancelFunc,
+	presentationDone <-chan error,
+) error {
+	stopPresentation()
+	presentationErr := <-presentationDone
+	if presentationErr != nil && !presentationReturnMatchesContext(presentationCtx, presentationErr) {
+		return &PresentationFailure{Err: presentationErr, RunnerErr: runnerErr}
+	}
+	return runnerErr
+}
+
+func presentationReturnMatchesContext(ctx context.Context, err error) bool {
+	ctxErr := ctx.Err()
+	return ctxErr != nil && (err == nil || errors.Is(err, ctxErr))
 }
 
 func normalizeTerminalDependencies(dependencies TerminalDependencies) TerminalDependencies {

@@ -194,6 +194,20 @@ func TestRunnerHostAcceptsCleanPresentationReturnAfterParentCancellation(t *test
 	}
 }
 
+func TestRunnerFirstCompletionAcceptsMatchingPresentationDeadline(t *testing.T) {
+	parentCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	presentationCtx, stopPresentation := context.WithCancel(parentCtx)
+	presentationDone := make(chan error, 1)
+	presentationDone <- errors.Join(errors.New("terminal restore stopped"), context.DeadlineExceeded)
+	runnerErr := errors.New("Runner stopped after deadline")
+
+	err := finishPresentationAfterRunner(presentationCtx, runnerErr, stopPresentation, presentationDone)
+	if err != runnerErr {
+		t.Fatalf("host error = %v, want Runner completion after matching presentation deadline", err)
+	}
+}
+
 func TestRunnerHostReportsRunnerFirstCompletionAsPresentationFailure(t *testing.T) {
 	presentationStarted := make(chan struct{})
 	runnerErr := errors.New("Runner completed unsuccessfully")
