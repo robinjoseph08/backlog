@@ -27,22 +27,33 @@ import (
 )
 
 func Main(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	return MainWithSignals(ctx, args, stdout, stderr, nil)
+	return MainWithTerminal(ctx, args, TerminalDependencies{Output: stdout, ErrorOutput: stderr})
 }
 
 // MainWithSignals runs the CLI while preserving each delivered interrupt for
-// the runner lifecycle instead of reducing all interrupts to one cancellation.
+// the Runner lifecycle instead of reducing all interrupts to one cancellation.
 func MainWithSignals(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan os.Signal) int {
-	return MainWithSignalsAndTerminal(ctx, args, stdout, stderr, signals, outputIsTerminal)
+	return MainWithTerminal(ctx, args, TerminalDependencies{Output: stdout, ErrorOutput: stderr, Signals: signals})
 }
 
-// MainWithSignalsAndTerminal supplies terminal capability through a
-// deterministic seam. Production callers use MainWithSignals; CLI tests can
-// select dashboard or plain output without allocating a real terminal.
+// MainWithSignalsAndTerminal preserves the previous focused terminal
+// capability seam. New complete-invocation tests should use MainWithTerminal.
 func MainWithSignalsAndTerminal(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan os.Signal, isTerminal func(io.Writer) bool) int {
 	if isTerminal == nil {
 		isTerminal = outputIsTerminal
 	}
+	return MainWithTerminal(ctx, args, TerminalDependencies{
+		Output: stdout, ErrorOutput: stderr, Signals: signals,
+		IsTerminal: func() bool { return isTerminal(stdout) },
+	})
+}
+
+// MainWithTerminal runs the CLI through one deterministic terminal dependency
+// seam, including the ordered signal ingress used by a full-screen
+// presentation and the Runner.
+func MainWithTerminal(ctx context.Context, args []string, dependencies TerminalDependencies) int {
+	terminal := normalizeTerminalDependencies(dependencies)
+	stdout, stderr := terminal.Output, terminal.ErrorOutput
 	if len(args) == 0 {
 		printUsage(stderr)
 		return 2
@@ -50,25 +61,33 @@ func MainWithSignalsAndTerminal(ctx context.Context, args []string, stdout, stde
 	var err error
 	switch args[0] {
 	case "run":
-		err = runCommand(ctx, args[1:], stdout, stderr, signals, isTerminal(stdout))
+		terminalOutput := terminal.IsTerminal()
+		presentation := terminal.Presentation
+		if !terminalOutput || plainRunRequested(args[1:]) {
+			presentation = nil
+		}
+		host := runnerHost{terminal: terminal}
+		err = host.run(ctx, func(signals <-chan os.Signal) error {
+			return runCommand(ctx, args[1:], stdout, stderr, signals, terminalOutput, terminal.Now)
+		}, presentation)
 	case "status":
-		commandCtx, stop := cancelContextOnSignal(ctx, signals)
+		commandCtx, stop := cancelContextOnSignal(ctx, terminal.Signals)
 		defer stop()
 		err = statusCommand(commandCtx, args[1:], stdout, stderr)
 	case "follow":
-		commandCtx, stop := cancelContextOnSignal(ctx, signals)
+		commandCtx, stop := cancelContextOnSignal(ctx, terminal.Signals)
 		defer stop()
 		err = followCommand(commandCtx, args[1:], stdout, stderr)
 	case "acknowledge":
-		commandCtx, stop := cancelContextOnSignal(ctx, signals)
+		commandCtx, stop := cancelContextOnSignal(ctx, terminal.Signals)
 		defer stop()
 		err = acknowledgeCommand(commandCtx, args[1:], stdout, stderr)
 	case "reset":
-		commandCtx, stop := cancelContextOnSignal(ctx, signals)
+		commandCtx, stop := cancelContextOnSignal(ctx, terminal.Signals)
 		defer stop()
 		err = resetCommand(commandCtx, args[1:], stdout, stderr)
 	case "retry":
-		commandCtx, stop := cancelContextOnSignal(ctx, signals)
+		commandCtx, stop := cancelContextOnSignal(ctx, terminal.Signals)
 		defer stop()
 		fmt.Fprintln(stderr, "Warning: backlog retry is deprecated; use backlog reset.")
 		err = resetCommand(commandCtx, args[1:], stdout, stderr)
@@ -84,6 +103,11 @@ func MainWithSignalsAndTerminal(ctx context.Context, args []string, stdout, stde
 		return 0
 	}
 	if err != nil {
+		var presentationFailure *PresentationFailure
+		if errors.As(err, &presentationFailure) {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
 		var signalExit *runner.SignalExit
 		if errors.As(err, &signalExit) {
 			return signalExit.Code
@@ -110,7 +134,7 @@ func outputIsTerminal(output io.Writer) bool {
 	return ok && term.IsTerminal(int(file.Fd()))
 }
 
-func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan os.Signal, terminalOutput bool) (resultErr error) {
+func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan os.Signal, terminalOutput bool, now func() time.Time) (resultErr error) {
 	setupCtx := ctx
 	runnerSignals := signals
 	var cancelSetup context.CancelFunc
@@ -118,6 +142,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 	var setupMu sync.Mutex
 	setupActive := signals != nil
 	setupSignalExit := setupSignalNone
+	setupForceStop := false
 	runnerEntered := false
 	if signals != nil {
 		setupCtx, cancelSetup = context.WithCancel(ctx)
@@ -145,6 +170,8 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 							setupSignalExit = setupSignalDrainAccepted
 						case setupSignalExit == setupSignalDrainAccepted:
 							setupSignalExit = setupSignalInterruptSuspension
+						default:
+							setupForceStop = true
 						}
 						cancelSetup()
 					}
@@ -159,10 +186,14 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 			cancelSetup()
 			setupMu.Lock()
 			setupExit := setupSignalExit
+			forceStop := setupForceStop
 			entered := runnerEntered
 			setupMu.Unlock()
 			if entered {
 				return
+			}
+			if forceStop {
+				fmt.Fprintln(stdout, "Force stop: additional signal accepted during setup; 0 Workers remaining")
 			}
 			switch setupExit {
 			case setupSignalDrainAccepted:
@@ -255,7 +286,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 	var runnerStore runner.Store = store
 	runnerOutput := io.Writer(&terminalControlWriter{output: stdout})
 	finalSummary := func(current state.State) error {
-		return printRunFinalSummary(stdout, current, summarySource, time.Now())
+		return printRunFinalSummary(stdout, current, summarySource, now())
 	}
 	if terminalOutput && !*plain {
 		initial, _, err := store.Preview()
@@ -267,7 +298,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 			initial.DefaultBranch = repository.DefaultBranch
 			initial.MaxConcurrentIssues = *maxWorkers
 		}
-		dashboard := newLiveDashboard(stdout, summarySource, initial, time.Now)
+		dashboard := newLiveDashboard(stdout, summarySource, initial, now)
 		runnerStore = dashboardStore{FileStore: store, dashboard: dashboard}
 		runnerOutput = dashboard
 		finalSummary = dashboard.finalSummary
