@@ -68,7 +68,7 @@ func MainWithTerminal(ctx context.Context, args []string, dependencies TerminalD
 		}
 		host := runnerHost{terminal: terminal}
 		err = host.run(ctx, func(signals <-chan lifecycleSignal) error {
-			return runCommand(ctx, args[1:], stdout, stderr, signals, terminalOutput, terminal.Now)
+			return runCommand(ctx, args[1:], stdout, stderr, signals, terminalOutput && presentation == nil, terminal.Now)
 		}, presentation)
 	case "status":
 		commandCtx, stop := cancelContextOnSignal(ctx, terminal.Signals)
@@ -134,7 +134,7 @@ func outputIsTerminal(output io.Writer) bool {
 	return ok && term.IsTerminal(int(file.Fd()))
 }
 
-func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan lifecycleSignal, terminalOutput bool, now func() time.Time) (resultErr error) {
+func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan lifecycleSignal, dashboardOutput bool, now func() time.Time) (resultErr error) {
 	setupCtx := ctx
 	var runnerSignals <-chan os.Signal
 	var cancelSetup context.CancelFunc
@@ -296,7 +296,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 	finalSummary := func(current state.State) error {
 		return printRunFinalSummary(stdout, current, summarySource, now())
 	}
-	if terminalOutput && !*plain {
+	if dashboardOutput && !*plain {
 		initial, _, err := store.Preview()
 		if err != nil {
 			return err
