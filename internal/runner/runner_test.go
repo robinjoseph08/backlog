@@ -1311,6 +1311,8 @@ func TestRunnerDrainFailsClosedWhenSettledWorkerExitIsUnverified(t *testing.T) {
 	runner := testRunner(github, workers, store, 1)
 	runner.Signals = signals
 	runner.Output = output
+	recorder := &operationalEventRecorder{}
+	runner.OnOperationalEvent = recorder.record
 
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
@@ -1324,6 +1326,19 @@ func TestRunnerDrainFailsClosedWhenSettledWorkerExitIsUnverified(t *testing.T) {
 		t.Fatalf("Drain error = %v, want unverified settled Worker exit", err)
 	}
 	output.waitFor(t, "Drain incomplete: 0 supervised Workers remaining; 1 Worker retained with unverified liveness")
+	events := recorder.waitFor(t, func(events []OperationalEvent) bool {
+		_, ok := findShutdownEvent(events, ShutdownStageDrainIncomplete, "retaining Workers with unverified liveness")
+		return ok
+	})
+	var incomplete *ShutdownEvent
+	for _, event := range events {
+		if shutdown, ok := event.(ShutdownEvent); ok && shutdown.Stage == ShutdownStageDrainIncomplete {
+			incomplete = &shutdown
+		}
+	}
+	if incomplete == nil || incomplete.Action != "retaining Workers with unverified liveness" || incomplete.RemainingWorkers != 0 || incomplete.NextInterrupt != NextInterruptNone {
+		t.Fatalf("Drain incomplete event = %#v, want 0 remaining supervised Owned Workers and no next interrupt", incomplete)
+	}
 	got := store.LoadValue()
 	run := findRun(got.Runs, fmt.Sprintf("run-%d", issue))
 	if run.Status != scheduler.StatusNeedsHuman || run.PID != 1000+issue || run.ProcessIdentity == "" || len(got.Leases) != 1 {

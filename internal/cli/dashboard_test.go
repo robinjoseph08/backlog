@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/robinjoseph08/backlog/internal/activity"
+	"github.com/robinjoseph08/backlog/internal/runner"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 )
@@ -134,6 +136,133 @@ esac
 				if !strings.Contains(stdout.String(), want) {
 					t.Fatalf("dashboard shutdown output missing %q: %q", want, stdout.String())
 				}
+			}
+		})
+	}
+}
+
+func TestDashboardReceivesShutdownStageWithoutParsingFormattedMessages(t *testing.T) {
+	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+	source := &dashboardTestSource{current: current}
+	var output bytes.Buffer
+	dashboard := newLiveDashboard(&output, source, current, time.Now)
+	if _, err := dashboard.Write([]byte("Force stop: this is diagnostic text, not a lifecycle event\n")); err != nil {
+		t.Fatal(err)
+	}
+	dashboard.redraw()
+	if !strings.Contains(lastDashboardFrame(output.String()), "Running: Ctrl-C starts Drain") {
+		t.Fatalf("formatted message changed shutdown stage:\n%s", output.String())
+	}
+	shutdownMessage := "Suspension: establishing continuation boundaries for 2 Workers"
+	if _, err := fmt.Fprintln(dashboard, shutdownMessage); err != nil {
+		t.Fatal(err)
+	}
+	// Runner event delivery is asynchronous, so enough newer plain output may
+	// evict the compatible rendering before its typed classification arrives.
+	for index := range 12 {
+		if _, err := fmt.Fprintf(dashboard, "ordinary lifecycle message %d\n", index); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dashboard.operationalEvent(runner.ShutdownEvent{
+		Stage: runner.ShutdownStageSuspending, Action: "establishing continuation boundaries", RemainingWorkers: 2,
+		NextInterrupt: runner.NextInterruptForceStops, Message: shutdownMessage,
+	})
+	dashboard.redraw()
+	frame := lastDashboardFrame(output.String())
+	if !strings.Contains(frame, "Suspending: continuation boundaries are being established") {
+		t.Fatalf("structured event did not change shutdown stage:\n%s", output.String())
+	}
+	if !strings.Contains(frame, shutdownMessage) {
+		t.Fatalf("typed shutdown message was evicted before ordinary history:\n%s", output.String())
+	}
+	if !strings.Contains(frame, "Operational messages") || strings.Contains(frame, "Lifecycle messages") {
+		t.Fatalf("dashboard used an inaccurate operational message heading:\n%s", output.String())
+	}
+	if strings.Contains(frame, "Force stop: this is diagnostic text") {
+		t.Fatalf("formatted prefix received shutdown retention without a typed event:\n%s", output.String())
+	}
+}
+
+func TestDashboardBoundsOccurrenceTrackingAndSuppressesTypedFirstOutput(t *testing.T) {
+	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+	source := &dashboardTestSource{current: current}
+	var output bytes.Buffer
+	dashboard := newLiveDashboard(&output, source, current, time.Now)
+
+	typedFirst := "Drain: typed event arrived before compatible output"
+	dashboard.operationalEvent(runner.ShutdownEvent{Stage: runner.ShutdownStageDraining, Message: typedFirst})
+	for index := range dashboardOccurrenceLimit * 4 {
+		if _, err := fmt.Fprintf(dashboard, "operational message %d\n", index); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(dashboard.messageOccurrences) > dashboardOccurrenceLimit || len(dashboard.shutdownOccurrences) > dashboardOccurrenceLimit || len(dashboard.occurrenceOrder) > dashboardOccurrenceLimit {
+		t.Fatalf("occurrence tracking grew beyond %d entries before delayed output: messages=%d shutdown=%d order=%d", dashboardOccurrenceLimit, len(dashboard.messageOccurrences), len(dashboard.shutdownOccurrences), len(dashboard.occurrenceOrder))
+	}
+	if len(dashboard.messages) != dashboardMessageLimit {
+		t.Fatalf("visible message history = %d entries, want %d", len(dashboard.messages), dashboardMessageLimit)
+	}
+	if dashboard.shutdownOccurrences[typedFirst] != 1 {
+		t.Fatalf("typed-first occurrence was pruned while its shutdown history remained visible: %#v", dashboard.shutdownOccurrences)
+	}
+
+	if _, err := fmt.Fprintln(dashboard, typedFirst); err != nil {
+		t.Fatal(err)
+	}
+	matches := 0
+	for _, message := range dashboard.messages {
+		if message.text == typedFirst {
+			matches++
+			if !message.shutdown {
+				t.Fatalf("typed-first message was not retained as shutdown history: %#v", message)
+			}
+		}
+	}
+	if matches != 1 {
+		t.Fatalf("typed-first message occurrences after delayed plain output = %d, want 1", matches)
+	}
+	if len(dashboard.messageOccurrences) > dashboardOccurrenceLimit || len(dashboard.shutdownOccurrences) > dashboardOccurrenceLimit || len(dashboard.occurrenceOrder) > dashboardOccurrenceLimit {
+		t.Fatalf("occurrence tracking grew beyond %d entries after delayed output: messages=%d shutdown=%d order=%d", dashboardOccurrenceLimit, len(dashboard.messageOccurrences), len(dashboard.shutdownOccurrences), len(dashboard.occurrenceOrder))
+	}
+	if _, exists := dashboard.messageOccurrences[typedFirst]; exists {
+		t.Fatal("resolved plain occurrence remained tracked")
+	}
+	if _, exists := dashboard.shutdownOccurrences[typedFirst]; exists {
+		t.Fatal("resolved shutdown occurrence remained tracked")
+	}
+
+	for index := range dashboardOccurrenceLimit * 2 {
+		dashboard.operationalEvent(runner.ShutdownEvent{
+			Stage: runner.ShutdownStageDraining, Message: fmt.Sprintf("typed shutdown message %d", index),
+		})
+	}
+	if len(dashboard.messages) > dashboardMessageLimit || len(dashboard.messageOccurrences) > dashboardOccurrenceLimit || len(dashboard.shutdownOccurrences) > dashboardOccurrenceLimit || len(dashboard.occurrenceOrder) > dashboardOccurrenceLimit {
+		t.Fatalf("typed shutdown tracking exceeded its bounds: visible=%d messages=%d shutdown=%d order=%d", len(dashboard.messages), len(dashboard.messageOccurrences), len(dashboard.shutdownOccurrences), len(dashboard.occurrenceOrder))
+	}
+}
+
+func TestDashboardClosePreservesIncompleteShutdownStages(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		stage runner.ShutdownStage
+		want  string
+	}{
+		{name: "Drain incomplete", stage: runner.ShutdownStageDrainIncomplete, want: "Drain incomplete: Worker liveness remains unverified"},
+		{name: "Suspension incomplete", stage: runner.ShutdownStageSuspensionIncomplete, want: "Suspension finished: no further interrupt has an effect before exit"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+			source := &dashboardTestSource{current: current}
+			var output bytes.Buffer
+			dashboard := newLiveDashboard(&output, source, current, time.Now)
+			dashboard.start()
+			dashboard.operationalEvent(runner.ShutdownEvent{Stage: test.stage, NextInterrupt: runner.NextInterruptNone})
+			dashboard.close()
+
+			frame := lastDashboardFrame(output.String())
+			if !strings.Contains(frame, test.want) || strings.Contains(frame, "Stopped: the runner is exiting") {
+				t.Fatalf("close replaced %s stage:\n%s", test.name, output.String())
 			}
 		})
 	}
@@ -576,6 +705,10 @@ func TestDashboardKeepsTerminalRunsAndShutdownMessagesVisible(t *testing.T) {
 	current.Runs, current.Leases = []scheduler.Run{terminal}, nil
 	source.current = current
 	dashboard.update(current)
+	dashboard.operationalEvent(runner.ShutdownEvent{
+		Stage: runner.ShutdownStageDraining, Action: "admission stopped", RemainingWorkers: 1,
+		NextInterrupt: runner.NextInterruptSuspends,
+	})
 	if _, err := dashboard.Write([]byte("Drain: admission stopped; 1 Worker remaining; next SIGINT will be recorded as a suspension request\n")); err != nil {
 		t.Fatal(err)
 	}
@@ -589,6 +722,10 @@ func TestDashboardKeepsTerminalRunsAndShutdownMessagesVisible(t *testing.T) {
 			t.Fatalf("dashboard missing %q:\n%s", want, output.String())
 		}
 	}
+	dashboard.operationalEvent(runner.ShutdownEvent{
+		Stage: runner.ShutdownStageSuspending, Action: "suspension requested", RemainingWorkers: 1,
+		NextInterrupt: runner.NextInterruptForceStops,
+	})
 	if _, err := dashboard.Write([]byte("Drain: additional interrupt recorded as a suspension request; 1 Worker remaining\n")); err != nil {
 		t.Fatal(err)
 	}
@@ -596,6 +733,10 @@ func TestDashboardKeepsTerminalRunsAndShutdownMessagesVisible(t *testing.T) {
 	if !strings.Contains(output.String(), "Suspending: continuation boundaries are being established; next Ctrl-C force stops") {
 		t.Fatalf("suspension footer did not describe next interrupt:\n%s", output.String())
 	}
+	dashboard.operationalEvent(runner.ShutdownEvent{
+		Stage: runner.ShutdownStageForceStopping, Action: "requesting force stop", RemainingWorkers: 1,
+		NextInterrupt: runner.NextInterruptRepeatsForceStop,
+	})
 	if _, err := dashboard.Write([]byte("Force stop: additional signal accepted; requesting force stop for 1 Worker\nSuspension: 1 Worker remaining\n")); err != nil {
 		t.Fatal(err)
 	}

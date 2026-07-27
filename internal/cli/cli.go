@@ -67,8 +67,8 @@ func MainWithTerminal(ctx context.Context, args []string, dependencies TerminalD
 			presentation = nil
 		}
 		host := runnerHost{terminal: terminal}
-		err = host.run(ctx, func(signals <-chan lifecycleSignal) error {
-			return runCommand(ctx, args[1:], stdout, stderr, signals, terminalOutput && presentation == nil, terminal.Now)
+		err = host.run(ctx, func(signals <-chan lifecycleSignal, onOperationalEvent func(runner.OperationalEvent)) error {
+			return runCommand(ctx, args[1:], stdout, stderr, signals, onOperationalEvent, terminalOutput && presentation == nil, terminal.Now)
 		}, presentation)
 	case "status":
 		commandCtx, stop := cancelContextOnSignal(ctx, terminal.Signals)
@@ -134,7 +134,7 @@ func outputIsTerminal(output io.Writer) bool {
 	return ok && term.IsTerminal(int(file.Fd()))
 }
 
-func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan lifecycleSignal, dashboardOutput bool, now func() time.Time) (resultErr error) {
+func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan lifecycleSignal, onOperationalEvent func(runner.OperationalEvent), dashboardOutput bool, now func() time.Time) (resultErr error) {
 	setupCtx := ctx
 	var runnerSignals <-chan os.Signal
 	var cancelSetup context.CancelFunc
@@ -309,6 +309,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 		dashboard := newLiveDashboard(stdout, summarySource, initial, now)
 		runnerStore = dashboardStore{FileStore: store, dashboard: dashboard}
 		runnerOutput = dashboard
+		onOperationalEvent = dashboard.operationalEvent
 		finalSummary = dashboard.finalSummary
 		dashboard.start()
 		defer dashboard.close()
@@ -319,13 +320,14 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 			MaxConcurrentIssues: *maxWorkers, PollInterval: *poll, MaxWorkerAge: *maxWorkerAge, Watch: *watch,
 			SessionsDir: filepath.Join(resolvedStateDir, "sessions"),
 		},
-		GitHub:       github,
-		Store:        runnerStore,
-		Worktrees:    worktrees,
-		Workers:      workerAdapter{supervisor: supervisor},
-		Output:       runnerOutput,
-		Signals:      runnerSignals,
-		FinalSummary: finalSummary,
+		GitHub:             github,
+		Store:              runnerStore,
+		Worktrees:          worktrees,
+		Workers:            workerAdapter{supervisor: supervisor},
+		Output:             runnerOutput,
+		Signals:            runnerSignals,
+		OnOperationalEvent: onOperationalEvent,
+		FinalSummary:       finalSummary,
 	}
 	if signals != nil {
 		setupMu.Lock()
@@ -339,7 +341,9 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 			return setupCtx.Err()
 		}
 	}
-	return backlogRunner.Run(ctx)
+	runErr := backlogRunner.Run(ctx)
+	backlogRunner.WaitForOperationalEventDelivery()
+	return runErr
 }
 
 func cancelContextOnSignal(ctx context.Context, signals <-chan os.Signal) (context.Context, func()) {

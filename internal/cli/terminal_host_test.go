@@ -42,7 +42,7 @@ func TestRunnerHostOrdersExternalAndPresentationSignalsThroughOneIngress(t *test
 		<-ctx.Done()
 		return ctx.Err()
 	}
-	err := host.run(context.Background(), func(signals <-chan lifecycleSignal) error {
+	err := host.run(context.Background(), func(signals <-chan lifecycleSignal, _ func(runner.OperationalEvent)) error {
 		observed := make([]os.Signal, 0, 4)
 		for len(observed) < 4 {
 			event := <-signals
@@ -66,6 +66,83 @@ func TestRunnerHostOrdersExternalAndPresentationSignalsThroughOneIngress(t *test
 	want := []os.Signal{os.Interrupt, os.Interrupt, syscall.SIGTERM, os.Interrupt}
 	if observed := <-got; !reflect.DeepEqual(observed, want) {
 		t.Fatalf("ordered signals = %v, want %v", observed, want)
+	}
+}
+
+func TestPresentationEventQueueBoundsIgnoredConsumer(t *testing.T) {
+	queue := newPresentationEventQueue()
+	published := make(chan struct{})
+	go func() {
+		for failure := 1; failure <= presentationEventLimit*100; failure++ {
+			queue.publish(runner.CandidateDiscoveryFailed{ConsecutiveFailures: failure})
+		}
+		close(published)
+	}()
+	select {
+	case <-published:
+	case <-time.After(time.Second):
+		t.Fatal("publishing blocked on an ignored presentation event consumer")
+	}
+
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	if len(queue.events) != presentationEventLimit {
+		t.Fatalf("ignored-consumer queue length = %d, want hard limit %d", len(queue.events), presentationEventLimit)
+	}
+	latest, ok := queue.events[len(queue.events)-1].(runner.CandidateDiscoveryFailed)
+	if !ok || latest.ConsecutiveFailures != presentationEventLimit*100 {
+		t.Fatalf("latest retained Admission event = %#v", queue.events[len(queue.events)-1])
+	}
+}
+
+func TestPresentationEventQueuePreservesOrderedShutdownAndTerminalDeliveryForSlowConsumer(t *testing.T) {
+	queue := newPresentationEventQueue()
+	for failure := 1; failure <= presentationEventLimit*4; failure++ {
+		queue.publish(runner.CandidateDiscoveryFailed{ConsecutiveFailures: failure})
+	}
+	for _, stage := range []runner.ShutdownStage{
+		runner.ShutdownStageDraining,
+		runner.ShutdownStageSuspending,
+		runner.ShutdownStageForceStopping,
+		runner.ShutdownStageSuspensionIncomplete,
+	} {
+		queue.publish(runner.ShutdownEvent{Stage: stage})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var events []runner.OperationalEvent
+	for {
+		event, err := queue.next(ctx)
+		if err != nil {
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("drain bounded event queue: %v", err)
+			}
+			break
+		}
+		events = append(events, event)
+	}
+	if len(events) != presentationEventLimit {
+		t.Fatalf("slow-consumer delivery count = %d, want bounded %d", len(events), presentationEventLimit)
+	}
+	previousFailure := 0
+	for _, event := range events[:len(events)-4] {
+		failure, ok := event.(runner.CandidateDiscoveryFailed)
+		if !ok || failure.ConsecutiveFailures <= previousFailure {
+			t.Fatalf("retained Admission delivery is not ordered: %#v", events)
+		}
+		previousFailure = failure.ConsecutiveFailures
+	}
+	for index, stage := range []runner.ShutdownStage{
+		runner.ShutdownStageDraining,
+		runner.ShutdownStageSuspending,
+		runner.ShutdownStageForceStopping,
+		runner.ShutdownStageSuspensionIncomplete,
+	} {
+		shutdown, ok := events[len(events)-4+index].(runner.ShutdownEvent)
+		if !ok || shutdown.Stage != stage {
+			t.Fatalf("shutdown delivery %d = %#v, want stage %s", index, events[len(events)-4+index], stage)
+		}
 	}
 }
 
@@ -122,7 +199,7 @@ func TestRunnerHostPresentationFailureRequestsSuspensionAndWaitsForRunner(t *tes
 			done := make(chan error, 1)
 			host := runnerHost{terminal: TerminalDependencies{}}
 			go func() {
-				done <- host.run(context.Background(), func(signals <-chan lifecycleSignal) error {
+				done <- host.run(context.Background(), func(signals <-chan lifecycleSignal, _ func(runner.OperationalEvent)) error {
 					event := <-signals
 					if event.signal != syscall.SIGTERM {
 						t.Errorf("presentation failure signal = %v, want SIGTERM", event.signal)
@@ -164,7 +241,7 @@ func TestRunnerHostAcceptsCleanPresentationReturnAfterParentCancellation(t *test
 	host := runnerHost{terminal: TerminalDependencies{}}
 	done := make(chan error, 1)
 	go func() {
-		done <- host.run(ctx, func(signals <-chan lifecycleSignal) error {
+		done <- host.run(ctx, func(signals <-chan lifecycleSignal, _ func(runner.OperationalEvent)) error {
 			close(runnerStarted)
 			<-ctx.Done()
 			select {
@@ -212,7 +289,7 @@ func TestRunnerHostReportsRunnerFirstCompletionAsPresentationFailure(t *testing.
 	presentationStarted := make(chan struct{})
 	runnerErr := errors.New("Runner completed unsuccessfully")
 	host := runnerHost{terminal: TerminalDependencies{}}
-	err := host.run(context.Background(), func(<-chan lifecycleSignal) error {
+	err := host.run(context.Background(), func(<-chan lifecycleSignal, func(runner.OperationalEvent)) error {
 		<-presentationStarted
 		return runnerErr
 	}, func(ctx context.Context, _ PresentationControl) error {
@@ -313,6 +390,82 @@ exec sleep 30
 				t.Fatalf("stderr = %q", stderr.String())
 			}
 		})
+	}
+}
+
+func TestMainWithTerminalRoutesTypedOperationalEventsToSelectedPresentation(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	root := t.TempDir()
+	failedOnce := filepath.Join(root, "candidate-failed")
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef") printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
+    if ! test -f `+quote(failedOnce)+`; then touch `+quote(failedOnce)+`; echo "GitHub temporarily unavailable" >&2; exit 1; fi
+    printf '%s\n' '[]' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	var stdout, stderr bytes.Buffer
+	var events []runner.OperationalEvent
+	dependencies := TerminalDependencies{
+		Output: &stdout, ErrorOutput: &stderr, IsTerminal: func() bool { return true },
+	}
+	dependencies.Presentation = func(ctx context.Context, control PresentationControl) error {
+		interrupted := false
+		for {
+			event, err := control.NextOperationalEvent(ctx)
+			if err != nil {
+				return err
+			}
+			events = append(events, event)
+			if _, recovered := event.(runner.CandidateDiscoveryRecovered); recovered && !interrupted {
+				interrupted = true
+				if err := control.Interrupt(ctx); err != nil {
+					return err
+				}
+			}
+			if shutdown, ok := event.(runner.ShutdownEvent); ok && shutdown.Stage == runner.ShutdownStageDrainComplete {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+		}
+	}
+
+	exit := MainWithTerminal(context.Background(), []string{
+		"run", "--watch", "--repo-dir", repository, "--state-dir", filepath.Join(root, "state"), "--poll", "5ms", "--gh", gh,
+	}, dependencies)
+	if exit != 0 {
+		t.Fatalf("exit = %d, stdout = %q, stderr = %q", exit, stdout.String(), stderr.String())
+	}
+	if len(events) != 4 {
+		t.Fatalf("presentation events = %#v, want failure, recovery, Drain, and Drain completion", events)
+	}
+	if _, ok := events[0].(runner.CandidateDiscoveryFailed); !ok {
+		t.Fatalf("first presentation event = %T, want CandidateDiscoveryFailed", events[0])
+	}
+	if _, ok := events[1].(runner.CandidateDiscoveryRecovered); !ok {
+		t.Fatalf("second presentation event = %T, want CandidateDiscoveryRecovered", events[1])
+	}
+	for index, stage := range []runner.ShutdownStage{runner.ShutdownStageDraining, runner.ShutdownStageDrainComplete} {
+		shutdown, ok := events[index+2].(runner.ShutdownEvent)
+		if !ok || shutdown.Stage != stage {
+			t.Fatalf("presentation event %d = %#v, want shutdown stage %s", index+2, events[index+2], stage)
+		}
+	}
+	for _, message := range []string{
+		"candidate discovery failed; admission paused",
+		"candidate discovery recovered; admission resumed after 1 failure",
+		"Drain: admission stopped; 0 Workers remaining",
+		"Drain complete: 0 Workers remaining; exiting successfully",
+	} {
+		if !strings.Contains(stdout.String(), message) {
+			t.Fatalf("compatible plain output omitted %q: %q", message, stdout.String())
+		}
+	}
+	if strings.Contains(stdout.String(), "Backlog Run Dashboard") || strings.Contains(stdout.String(), "\x1b[") || stderr.Len() != 0 {
+		t.Fatalf("selected presentation output compatibility changed: stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
 }
 

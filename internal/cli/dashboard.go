@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/robinjoseph08/backlog/internal/activity"
+	"github.com/robinjoseph08/backlog/internal/runner"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 )
@@ -17,6 +18,8 @@ import (
 const (
 	dashboardActivityInterval = 100 * time.Millisecond
 	dashboardElapsedInterval  = time.Second
+	dashboardMessageLimit     = 12
+	dashboardOccurrenceLimit  = dashboardMessageLimit * 2
 )
 
 type dashboardStage int
@@ -27,6 +30,7 @@ const (
 	dashboardSuspending
 	dashboardForceStopping
 	dashboardDrainComplete
+	dashboardDrainIncomplete
 	dashboardSuspensionComplete
 	dashboardStopped
 	dashboardFinished
@@ -41,20 +45,29 @@ type liveDashboard struct {
 	source followStateSource
 	now    func() time.Time
 
-	mu               sync.Mutex
-	current          state.State
-	baselineStatuses map[string]scheduler.Status
-	messages         []string
-	stage            dashboardStage
-	lastActivity     map[string]fileSignature
-	observations     map[string]dashboardActivityObservation
-	pendingOutput    bytes.Buffer
-	err              error
+	mu                  sync.Mutex
+	current             state.State
+	baselineStatuses    map[string]scheduler.Status
+	messages            []dashboardMessage
+	messageOccurrences  map[string]int
+	shutdownOccurrences map[string]int
+	occurrenceOrder     []string
+	stage               dashboardStage
+	lastActivity        map[string]fileSignature
+	observations        map[string]dashboardActivityObservation
+	pendingOutput       bytes.Buffer
+	err                 error
 
 	updates chan struct{}
 	stop    chan struct{}
 	done    chan struct{}
 	once    sync.Once
+}
+
+type dashboardMessage struct {
+	text         string
+	shutdown     bool
+	plainMatched bool
 }
 
 type fileSignature struct {
@@ -80,7 +93,7 @@ func newLiveDashboard(output io.Writer, source followStateSource, initial state.
 	}
 	return &liveDashboard{
 		output: output, source: source, now: now, current: initial,
-		baselineStatuses: baseline, stage: dashboardRunning,
+		baselineStatuses: baseline, messageOccurrences: make(map[string]int), shutdownOccurrences: make(map[string]int), stage: dashboardRunning,
 		lastActivity: activitySignatures(initial), observations: make(map[string]dashboardActivityObservation), updates: make(chan struct{}, 1),
 		stop: make(chan struct{}), done: make(chan struct{}),
 	}
@@ -179,39 +192,150 @@ func (d *liveDashboard) Write(content []byte) (int, error) {
 }
 
 func (d *liveDashboard) recordMessageLocked(message string) {
-	message = plainStatusValue(strings.TrimSpace(message))
+	message = normalizedDashboardMessage(message)
 	if message == "" {
 		return
 	}
-	d.messages = append(d.messages, message)
-	if len(d.messages) > 12 {
-		for index, retained := range d.messages {
-			if !isShutdownMessage(retained) {
-				d.messages = append(d.messages[:index], d.messages[index+1:]...)
+	d.trackOccurrenceLocked(message, false)
+	if d.messageOccurrences[message] <= d.shutdownOccurrences[message] {
+		// A typed event arrived first and already inserted this compatible
+		// rendering into history.
+		for index := range d.messages {
+			tracked := &d.messages[index]
+			if tracked.text == message && tracked.shutdown && !tracked.plainMatched {
+				tracked.plainMatched = true
 				break
 			}
 		}
+		d.reconcileOccurrencesLocked(message)
+		return
+	}
+	d.appendMessageLocked(dashboardMessage{text: message})
+}
+
+func (d *liveDashboard) trackOccurrenceLocked(message string, shutdown bool) {
+	if d.messageOccurrences[message] == 0 && d.shutdownOccurrences[message] == 0 {
+		d.occurrenceOrder = append(d.occurrenceOrder, message)
+	}
+	if shutdown {
+		d.shutdownOccurrences[message]++
+	} else {
+		d.messageOccurrences[message]++
+	}
+	for len(d.occurrenceOrder) > dashboardOccurrenceLimit {
+		pruneIndex := 0
+		for index, tracked := range d.occurrenceOrder {
+			if !d.hasVisibleUnmatchedShutdownLocked(tracked) {
+				pruneIndex = index
+				break
+			}
+		}
+		pruned := d.occurrenceOrder[pruneIndex]
+		d.occurrenceOrder = append(d.occurrenceOrder[:pruneIndex], d.occurrenceOrder[pruneIndex+1:]...)
+		delete(d.messageOccurrences, pruned)
+		delete(d.shutdownOccurrences, pruned)
+	}
+}
+
+func (d *liveDashboard) hasVisibleUnmatchedShutdownLocked(message string) bool {
+	for _, tracked := range d.messages {
+		if tracked.text == message && tracked.shutdown && !tracked.plainMatched {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *liveDashboard) reconcileOccurrencesLocked(message string) {
+	if d.messageOccurrences[message] != d.shutdownOccurrences[message] {
+		return
+	}
+	delete(d.messageOccurrences, message)
+	delete(d.shutdownOccurrences, message)
+	for index, tracked := range d.occurrenceOrder {
+		if tracked == message {
+			d.occurrenceOrder = append(d.occurrenceOrder[:index], d.occurrenceOrder[index+1:]...)
+			return
+		}
+	}
+}
+
+func (d *liveDashboard) appendMessageLocked(message dashboardMessage) {
+	d.messages = append(d.messages, message)
+	if len(d.messages) <= dashboardMessageLimit {
+		return
+	}
+	for index, retained := range d.messages {
+		if !retained.shutdown {
+			d.messages = append(d.messages[:index], d.messages[index+1:]...)
+			return
+		}
+	}
+	d.messages = d.messages[1:]
+}
+
+func normalizedDashboardMessage(message string) string {
+	return plainStatusValue(strings.TrimSpace(message))
+}
+
+func dashboardMessageTexts(messages []dashboardMessage) []string {
+	texts := make([]string, len(messages))
+	for index, message := range messages {
+		texts[index] = message.text
+	}
+	return texts
+}
+
+// operationalEvent receives lifecycle state directly from the Runner. Message
+// formatting remains independent, so presentation never infers shutdown stage
+// from append-only prose.
+func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
+	shutdown, ok := event.(runner.ShutdownEvent)
+	if !ok {
+		return
 	}
 	var next dashboardStage
-	switch {
-	case strings.HasPrefix(message, "Drain complete"):
-		next = dashboardDrainComplete
-	case strings.HasPrefix(message, "Suspension complete"), strings.HasPrefix(message, "Suspension incomplete"):
-		next = dashboardSuspensionComplete
-	case strings.HasPrefix(message, "Force stop"):
-		next = dashboardForceStopping
-	case strings.HasPrefix(message, "Suspension:"), strings.HasPrefix(message, "Drain: additional"):
-		next = dashboardSuspending
-	case strings.HasPrefix(message, "Drain:"):
+	switch shutdown.Stage {
+	case runner.ShutdownStageDraining:
 		next = dashboardDraining
+	case runner.ShutdownStageSuspending:
+		next = dashboardSuspending
+	case runner.ShutdownStageForceStopping:
+		next = dashboardForceStopping
+	case runner.ShutdownStageDrainComplete:
+		next = dashboardDrainComplete
+	case runner.ShutdownStageDrainIncomplete:
+		next = dashboardDrainIncomplete
+	case runner.ShutdownStageSuspensionComplete, runner.ShutdownStageSuspensionIncomplete:
+		next = dashboardSuspensionComplete
+	default:
+		return
+	}
+	d.mu.Lock()
+	if message := normalizedDashboardMessage(shutdown.Message); message != "" {
+		d.trackOccurrenceLocked(message, true)
+		matched := false
+		for index := len(d.messages) - 1; index >= 0; index-- {
+			if d.messages[index].text == message && !d.messages[index].shutdown {
+				d.messages[index].shutdown = true
+				d.messages[index].plainMatched = true
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			// Event delivery may lag far enough behind output for the matching
+			// ordinary line to be evicted. Restore it as typed history. This also
+			// represents the line when the event arrives before plain output.
+			d.appendMessageLocked(dashboardMessage{text: message, shutdown: true})
+		}
+		d.reconcileOccurrencesLocked(message)
 	}
 	if next > d.stage {
 		d.stage = next
 	}
-}
-
-func isShutdownMessage(message string) bool {
-	return strings.HasPrefix(message, "Drain") || strings.HasPrefix(message, "Suspension") || strings.HasPrefix(message, "Force stop")
+	d.mu.Unlock()
+	d.requestRedraw()
 }
 
 func (d *liveDashboard) activityChanged() bool {
@@ -267,7 +391,7 @@ func (d *liveDashboard) redraw() {
 		return
 	}
 	current := d.current
-	messages := append([]string(nil), d.messages...)
+	messages := dashboardMessageTexts(d.messages)
 	stage := d.stage
 	d.mu.Unlock()
 
@@ -295,7 +419,7 @@ func (d *liveDashboard) render(current state.State, messages []string, stage das
 	renderDashboardSection(&output, "Attention Required", attention, now)
 	renderDashboardSection(&output, "Recently Finished", recent, now)
 	if len(messages) > 0 {
-		output.WriteString("\nLifecycle messages\n")
+		output.WriteString("\nOperational messages\n")
 		for _, message := range messages {
 			fmt.Fprintf(&output, "  %s\n", message)
 		}
@@ -421,6 +545,8 @@ func dashboardFooter(stage dashboardStage) string {
 		return "Force stopping: Worker identities are revalidated before signaling; next Ctrl-C repeats the force-stop request."
 	case dashboardDrainComplete:
 		return "Drain complete: no Owned Workers remain; no further interrupt is needed."
+	case dashboardDrainIncomplete:
+		return "Drain incomplete: Worker liveness remains unverified; no further interrupt has an effect before exit."
 	case dashboardSuspensionComplete:
 		return "Suspension finished: no further interrupt has an effect before exit."
 	case dashboardStopped:
@@ -437,7 +563,7 @@ func (d *liveDashboard) finalSummary(current state.State) error {
 	d.stopLoop()
 	d.mu.Lock()
 	d.stage = dashboardFinished
-	messages := append([]string(nil), d.messages...)
+	messages := dashboardMessageTexts(d.messages)
 	d.mu.Unlock()
 	body := "Final aggregate summary\n" + d.render(current, messages, dashboardFinished, d.now())
 	_, err := fmt.Fprintf(d.output, "\x1b[H\x1b[2J%s", body)

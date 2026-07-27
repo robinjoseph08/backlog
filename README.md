@@ -58,7 +58,7 @@ When standard output is a terminal, `backlog run` automatically shows a live das
 
 After a complete Candidate snapshot succeeds, the foreground runner exits when no leased Run remains capable of autonomous progress and no eligible Candidate starts a Worker. Before this natural one-shot exit, it leaves a final static aggregate summary with Active and Attention Required sections. The exit is unsuccessful when any Intervention-required Run retains its Lease, including unresolved Runs loaded at startup or produced during the invocation. Historical failed Runs without Leases do not affect the result. Blocked Candidates do not keep the runner alive unless `--watch` is set, and Attention Required alone never ends watch mode.
 
-Candidate discovery fails closed for admission. If a discovery pass fails, the runner creates no Leases from that pass, reports the underlying GitHub error, continues supervising existing Workers, and retries after `--poll` in every runner state. This includes initial startup and idle non-watch invocations. A later successful snapshot restores normal admission or one-shot exit behavior.
+Candidate discovery fails closed for admission. If a discovery pass fails, the runner creates no Leases from that pass, reports the underlying GitHub error, continues supervising existing Workers, and retries after `--poll` while Admission remains active. This includes initial startup and idle non-watch invocations. A later successful snapshot restores normal admission or one-shot exit behavior.
 
 ## Herdr integration
 
