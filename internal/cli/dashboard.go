@@ -428,11 +428,15 @@ func (d *liveDashboard) renderPartsFor(current state.State, messages []string, s
 	active := sections[statusActive]
 	attention := sections[statusAttention]
 	recent := d.recentlyFinished(current, sections, now)
-	used := dashboardUsedCapacity(current)
-	available := max(0, current.MaxConcurrentIssues-used)
+	capacity := "Worker capacity: pending configuration"
+	if current.MaxConcurrentIssues > 0 {
+		used := dashboardUsedCapacity(current)
+		available := max(0, current.MaxConcurrentIssues-used)
+		capacity = fmt.Sprintf("Worker capacity: %d used | %d available | %d total", used, available, current.MaxConcurrentIssues)
+	}
 
-	header := fmt.Sprintf("Backlog Run Dashboard\nRepository: %s\nWorker capacity: %d used | %d available | %d total",
-		valueOr(plainStatusValue(current.Repo), "not initialized"), used, available, current.MaxConcurrentIssues)
+	header := fmt.Sprintf("Backlog Run Dashboard\nRepository: %s\n%s",
+		valueOr(plainStatusValue(current.Repo), "not initialized"), capacity)
 	var body strings.Builder
 	renderDashboardSection(&body, "Active Runs", active, now)
 	renderDashboardSection(&body, "Attention Required", attention, now)

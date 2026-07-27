@@ -66,6 +66,50 @@ func assertBubbleDashboardFits(t *testing.T, model bubbleDashboardModel, width, 
 	}
 }
 
+func TestBubbleDashboardInitialFrameShowsCapacityPendingUntilConfigured(t *testing.T) {
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: time.Now}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 12})
+	initial := ansi.Strip(model.View().Content)
+	if !strings.Contains(initial, "Worker capacity: pending configuration") || strings.Contains(initial, "Worker capacity: 0 used | 0 available | 0 total") {
+		t.Fatalf("initial capacity was not pending configuration:\n%s", initial)
+	}
+
+	configured := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 3}
+	updated, _ := model.Update(dashboardConfiguredMsg{initial: configured, source: &dashboardTestSource{current: configured}})
+	configuredView := ansi.Strip(updated.(bubbleDashboardModel).View().Content)
+	if !strings.Contains(configuredView, "Worker capacity: 0 used | 3 available | 3 total") || strings.Contains(configuredView, "pending configuration") {
+		t.Fatalf("configured capacity was not rendered:\n%s", configuredView)
+	}
+}
+
+func TestBubbleDashboardElapsedTickAdvancesAndReschedulesWithoutExternalUpdates(t *testing.T) {
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	clock := now
+	run := scheduler.Run{Issue: 66, RunID: "run-66", Status: scheduler.StatusRunning, StartedAt: now.Add(-5 * time.Second)}
+	current := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1,
+		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+	}
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return clock }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 16})
+	model.dashboard.source = &dashboardTestSource{current: current}
+	model.dashboard.update(current)
+	if initial := ansi.Strip(model.View().Content); !strings.Contains(initial, "Elapsed: 5s") {
+		t.Fatalf("initial Bubble Tea elapsed value missing:\n%s", initial)
+	}
+
+	clock = now.Add(time.Second)
+	updated, command := model.Update(dashboardElapsedMsg(clock))
+	model = updated.(bubbleDashboardModel)
+	if advanced := ansi.Strip(model.View().Content); !strings.Contains(advanced, "Elapsed: 6s") {
+		t.Fatalf("elapsed tick did not advance the Bubble Tea value:\n%s", advanced)
+	}
+	if command == nil {
+		t.Fatal("elapsed tick did not schedule its successor")
+	}
+	if _, ok := command().(dashboardElapsedMsg); !ok {
+		t.Fatal("elapsed tick successor did not emit dashboardElapsedMsg")
+	}
+}
+
 func TestBubbleDashboardViewportSupportsKeyboardScrolling(t *testing.T) {
 	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: time.Now}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 60, Height: 9})
 	for range 30 {

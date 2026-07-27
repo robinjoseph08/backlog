@@ -529,6 +529,9 @@ func wrapDashboardChrome(groups [][]string, width int) []string {
 
 func compactDashboardCapacity(line string) string {
 	line = strings.TrimPrefix(line, "Worker capacity: ")
+	if line == "pending configuration" {
+		return "W:pending"
+	}
 	line = strings.Replace(line, " used | ", "u/", 1)
 	line = strings.Replace(line, " available | ", "a/", 1)
 	line = strings.TrimSuffix(line, " total") + "t"

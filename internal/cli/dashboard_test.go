@@ -93,6 +93,54 @@ esac
 	}
 }
 
+func TestAutomaticBubbleDashboardRawCtrlCCompletesDrainThroughTerminalInput(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	discovered := filepath.Join(t.TempDir(), "discovered")
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef") printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url") touch `+quote(discovered)+`; printf '%s\n' '[]' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	input, writeInput := io.Pipe()
+	defer input.Close()
+	defer writeInput.Close()
+	var stdout synchronizedBuffer
+	var stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- MainWithTerminal(context.Background(), []string{
+			"run", "--watch", "--repo-dir", repository, "--state-dir", t.TempDir(), "--poll", "5ms", "--gh", gh,
+		}, TerminalDependencies{
+			Input: input, Output: &stdout, ErrorOutput: &stderr,
+			IsTerminal:   func() bool { return true },
+			Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
+			ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+		})
+	}()
+	waitForFile(t, discovered)
+	waitForBuffer(t, &stdout, "Backlog Run Dashboard")
+	if _, err := writeInput.Write([]byte{0x03}); err != nil {
+		t.Fatalf("write raw Ctrl-C: %v", err)
+	}
+	select {
+	case exit := <-done:
+		if exit != 0 {
+			t.Fatalf("raw Ctrl-C exit = %d, stderr = %q", exit, stderr.String())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("automatic Bubble Tea input did not complete Drain")
+	}
+	output := stdout.String()
+	for _, want := range []string{"Drain complete", "\x1b[?1049h", "\x1b[?1049l"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("raw Ctrl-C dashboard output missing %q: %q", want, output)
+		}
+	}
+}
+
 func TestTerminalDashboardPreservesDrainAndSuspensionMessages(t *testing.T) {
 	for _, test := range []struct {
 		name       string
