@@ -84,7 +84,7 @@ esac`)
 		t.Fatalf("error = %v, want malformed GitHub output failure", err)
 	}
 	var discovery *CandidateDiscoveryError
-	if !errors.As(err, &discovery) || discovery.Operation != "list candidates" || discovery.Issue != 0 {
+	if !errors.As(err, &discovery) || discovery.Operation != CandidateDiscoveryList || discovery.Issue != 0 {
 		t.Fatalf("Candidate discovery context = %#v", discovery)
 	}
 }
@@ -135,7 +135,7 @@ esac`)
 				t.Fatalf("error = %v, want %q", err, test.want)
 			}
 			var discovery *CandidateDiscoveryError
-			if !errors.As(err, &discovery) || discovery.Operation != "inspect candidate" || discovery.Issue != 1 {
+			if !errors.As(err, &discovery) || discovery.Operation != CandidateDiscoveryInspect || discovery.Issue != 1 {
 				t.Fatalf("Candidate discovery context = %#v", discovery)
 			}
 		})

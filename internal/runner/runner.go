@@ -333,10 +333,15 @@ func (r *Runner) Run(ctx context.Context) error {
 				var issue *int
 				var discoveryErr *ghadapter.CandidateDiscoveryError
 				if errors.As(err, &discoveryErr) {
-					operation = CandidateDiscoveryOperation(discoveryErr.Operation)
-					if discoveryErr.Issue > 0 {
-						identity := discoveryErr.Issue
-						issue = &identity
+					switch discoveryErr.Operation {
+					case ghadapter.CandidateDiscoveryList:
+						operation = CandidateDiscoveryList
+					case ghadapter.CandidateDiscoveryInspect:
+						operation = CandidateDiscoveryInspect
+						if discoveryErr.Issue > 0 {
+							identity := discoveryErr.Issue
+							issue = &identity
+						}
 					}
 				}
 				r.emit(CandidateDiscoveryFailed{
@@ -413,7 +418,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		} else if draining && len(localWorkers) == 0 {
 			if drainOperationalErr != nil {
 				if unverified := persistedWorkerCount(&current); unverified > 0 {
-					r.shutdownEvent(ShutdownStageDrainIncomplete, "retaining Workers with unverified liveness", 0, NextInterruptNone, "Drain incomplete: 0 supervised Workers remaining; %s retained with unverified liveness", workerSummary(unverified))
+					r.shutdownEvent(ShutdownStageDrainIncomplete, "retaining Workers with unverified liveness", unverified, NextInterruptNone, "Drain incomplete: 0 supervised Workers remaining; %s retained with unverified liveness", workerSummary(unverified))
 				} else {
 					r.shutdownEvent(ShutdownStageDrainComplete, "exiting after an operational failure", 0, NextInterruptNone, "Drain complete: 0 Workers remaining; exiting after an operational failure")
 				}

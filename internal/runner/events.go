@@ -15,7 +15,11 @@ type OperationalEvent interface {
 // that failed without requiring presentation code to classify error prose.
 type CandidateDiscoveryOperation string
 
-const CandidateDiscoverySnapshot CandidateDiscoveryOperation = "list and inspect Candidates"
+const (
+	CandidateDiscoverySnapshot CandidateDiscoveryOperation = "list and inspect Candidates"
+	CandidateDiscoveryList     CandidateDiscoveryOperation = "list candidates"
+	CandidateDiscoveryInspect  CandidateDiscoveryOperation = "inspect candidate"
+)
 
 // CandidateDiscoveryFailed reports that Admission cannot use an incomplete
 // Candidate snapshot. Issue is nil when the failed operation was not scoped to

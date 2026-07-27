@@ -58,10 +58,18 @@ type Client struct {
 	Dir        string
 }
 
+// CandidateDiscoveryOperation identifies a Candidate discovery operation.
+type CandidateDiscoveryOperation string
+
+const (
+	CandidateDiscoveryList    CandidateDiscoveryOperation = "list candidates"
+	CandidateDiscoveryInspect CandidateDiscoveryOperation = "inspect candidate"
+)
+
 // CandidateDiscoveryError identifies the failed operation and optional issue
 // while preserving the underlying GitHub error.
 type CandidateDiscoveryError struct {
-	Operation string
+	Operation CandidateDiscoveryOperation
 	Issue     int
 	Err       error
 }
@@ -102,14 +110,14 @@ func (c Client) Candidates(ctx context.Context, repo string) ([]scheduler.Candid
 		"issue", "list", "--repo", repo, "--state", "open", "--label", "ready-for-agent",
 		"--limit", "1000", "--json", "number,title,createdAt,url",
 	); err != nil {
-		return nil, &CandidateDiscoveryError{Operation: "list candidates", Err: err}
+		return nil, &CandidateDiscoveryError{Operation: CandidateDiscoveryList, Err: err}
 	}
 
 	candidates := make([]scheduler.Candidate, 0, len(listed))
 	for _, item := range listed {
 		candidate, err := c.candidate(ctx, repo, item.Number)
 		if err != nil {
-			return nil, &CandidateDiscoveryError{Operation: "inspect candidate", Issue: item.Number, Err: err}
+			return nil, &CandidateDiscoveryError{Operation: CandidateDiscoveryInspect, Issue: item.Number, Err: err}
 		}
 		candidates = append(candidates, candidate)
 	}
