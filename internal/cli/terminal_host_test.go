@@ -155,6 +155,45 @@ func TestRunnerHostPresentationFailureRequestsSuspensionAndWaitsForRunner(t *tes
 	}
 }
 
+func TestRunnerHostAcceptsCleanPresentationReturnAfterParentCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	runnerStarted := make(chan struct{})
+	presentationCanceled := make(chan struct{})
+	receivedSignal := make(chan os.Signal, 1)
+	runnerErr := errors.New("Runner stopped after parent cancellation")
+	host := runnerHost{terminal: TerminalDependencies{}}
+	done := make(chan error, 1)
+	go func() {
+		done <- host.run(ctx, func(signals <-chan lifecycleSignal) error {
+			close(runnerStarted)
+			<-ctx.Done()
+			select {
+			case event := <-signals:
+				receivedSignal <- event.signal
+				event.accept()
+			case <-time.After(250 * time.Millisecond):
+			}
+			return runnerErr
+		}, func(presentationCtx context.Context, _ PresentationControl) error {
+			<-presentationCtx.Done()
+			close(presentationCanceled)
+			return nil
+		})
+	}()
+
+	<-runnerStarted
+	cancel()
+	<-presentationCanceled
+	if err := <-done; err != runnerErr {
+		t.Fatalf("host error = %v, want Runner completion after clean canceled presentation return", err)
+	}
+	select {
+	case signal := <-receivedSignal:
+		t.Fatalf("clean canceled presentation return submitted signal %v", signal)
+	default:
+	}
+}
+
 func TestRunnerHostReportsRunnerFirstCompletionAsPresentationFailure(t *testing.T) {
 	presentationStarted := make(chan struct{})
 	runnerErr := errors.New("Runner completed unsuccessfully")

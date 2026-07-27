@@ -54,7 +54,8 @@ type TerminalDependencies struct {
 }
 
 // Presentation is a full-screen command presentation hosted beside the
-// Runner. Returning while the Runner is active is a presentation failure.
+// Runner. Returning before its context ends while the Runner is active is a
+// presentation failure.
 type Presentation func(context.Context, PresentationControl) error
 
 // PresentationTerminal contains the terminal services available to a hosted
@@ -229,7 +230,8 @@ func (h runnerHost) run(ctx context.Context, run func(<-chan lifecycleSignal) er
 		}
 		return runnerErr
 	case presentationErr := <-presentationDone:
-		if ctx.Err() != nil && errors.Is(presentationErr, ctx.Err()) {
+		presentationCtxErr := presentationCtx.Err()
+		if presentationCtxErr != nil && (presentationErr == nil || errors.Is(presentationErr, presentationCtxErr)) {
 			return <-runnerDone
 		}
 		if presentationErr == nil {
