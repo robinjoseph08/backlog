@@ -327,13 +327,6 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 		runnerStore = bubbleDashboardStore{FileStore: store, session: dashboard}
 		runnerOutput = dashboard
 		finalSummary = dashboard.captureFinalSummary
-		publishToHost := onOperationalEvent
-		onOperationalEvent = func(event runner.OperationalEvent) {
-			if publishToHost != nil {
-				publishToHost(event)
-			}
-			dashboard.publish(dashboardOperationalMsg{event: event})
-		}
 	}
 	backlogRunner := &runner.Runner{
 		Config: runner.Config{

@@ -20,7 +20,7 @@ import (
 	"github.com/robinjoseph08/backlog/internal/state"
 )
 
-const dashboardUpdateLimit = 64
+const dashboardOutputUpdateLimit = 64
 
 type dashboardConfiguredMsg struct {
 	initial state.State
@@ -39,7 +39,8 @@ type dashboardFlushRenderedMsg struct{ acknowledged chan struct{} }
 
 // bubbleDashboardSession is the asynchronous boundary between Runner writes
 // and Bubble Tea's single Update loop. State updates are coalesced while plain
-// operational lines remain bounded independently of Runner progress.
+// operational lines remain bounded independently of required configuration,
+// state, and flush updates.
 type bubbleDashboardSession struct {
 	mu      sync.Mutex
 	updates []tea.Msg
@@ -174,18 +175,9 @@ func (s *bubbleDashboardSession) printFinalSummary(output io.Writer) error {
 func (s *bubbleDashboardSession) publish(msg tea.Msg) {
 	s.mu.Lock()
 	switch msg.(type) {
-	case dashboardStateMsg:
+	case dashboardStateMsg, dashboardConfiguredMsg:
 		for index := len(s.updates) - 1; index >= 0; index-- {
-			if _, ok := s.updates[index].(dashboardStateMsg); ok {
-				s.updates[index] = msg
-				s.mu.Unlock()
-				s.wakeUpdate()
-				return
-			}
-		}
-	case dashboardConfiguredMsg:
-		for index := len(s.updates) - 1; index >= 0; index-- {
-			if _, ok := s.updates[index].(dashboardConfiguredMsg); ok {
+			if sameDashboardUpdateKind(s.updates[index], msg) {
 				s.updates[index] = msg
 				s.mu.Unlock()
 				s.wakeUpdate()
@@ -194,12 +186,47 @@ func (s *bubbleDashboardSession) publish(msg tea.Msg) {
 		}
 	}
 	s.updates = append(s.updates, msg)
-	if len(s.updates) > dashboardUpdateLimit {
-		s.updates[0] = nil
-		s.updates = s.updates[1:]
+	if _, optional := msg.(dashboardOutputMsg); optional {
+		for dashboardOutputUpdateCount(s.updates) > dashboardOutputUpdateLimit {
+			for index, update := range s.updates {
+				if _, ok := update.(dashboardOutputMsg); ok {
+					s.removeUpdate(index)
+					break
+				}
+			}
+		}
 	}
 	s.mu.Unlock()
 	s.wakeUpdate()
+}
+
+func sameDashboardUpdateKind(left, right tea.Msg) bool {
+	switch left.(type) {
+	case dashboardStateMsg:
+		_, ok := right.(dashboardStateMsg)
+		return ok
+	case dashboardConfiguredMsg:
+		_, ok := right.(dashboardConfiguredMsg)
+		return ok
+	default:
+		return false
+	}
+}
+
+func dashboardOutputUpdateCount(updates []tea.Msg) int {
+	count := 0
+	for _, update := range updates {
+		if _, ok := update.(dashboardOutputMsg); ok {
+			count++
+		}
+	}
+	return count
+}
+
+func (s *bubbleDashboardSession) removeUpdate(index int) {
+	copy(s.updates[index:], s.updates[index+1:])
+	s.updates[len(s.updates)-1] = nil
+	s.updates = s.updates[:len(s.updates)-1]
 }
 
 func (s *bubbleDashboardSession) wakeUpdate() {
@@ -268,20 +295,23 @@ type bubbleDashboardModel struct {
 	height    int
 
 	interruptsWaiting int
+	pendingFlushes    []dashboardFlushMsg
 	startup           *atomic.Bool
 }
 
 func newBubbleDashboardModel(ctx context.Context, control PresentationControl, session *bubbleDashboardSession, dimensions TerminalDimensions) bubbleDashboardModel {
 	empty := state.State{Version: state.CurrentVersion}
-	view := viewport.New(viewport.WithWidth(dimensions.Width), viewport.WithHeight(max(0, dimensions.Height-5)))
+	view := viewport.New(viewport.WithWidth(dimensions.Width))
 	view.SoftWrap = true
 	view.FillHeight = true
-	return bubbleDashboardModel{
+	model := bubbleDashboardModel{
 		ctx: ctx, control: control, session: session,
 		dashboard: newLiveDashboard(io.Discard, nil, empty, control.Terminal.Now),
 		viewport:  view, width: dimensions.Width, height: dimensions.Height,
 		startup: &atomic.Bool{},
 	}
+	model.resizeViewport()
+	return model
 }
 
 func (m bubbleDashboardModel) started() bool {
@@ -291,7 +321,7 @@ func (m bubbleDashboardModel) started() bool {
 func (m bubbleDashboardModel) Init() tea.Cmd {
 	m.startup.Store(true)
 	m.session.signalStartup(nil)
-	return tea.Batch(m.waitForSessionUpdate(), dashboardElapsedTick(), dashboardActivityTick())
+	return tea.Batch(m.waitForSessionUpdate(), m.waitForOperationalEvent(), dashboardElapsedTick(), dashboardActivityTick())
 }
 
 func (m bubbleDashboardModel) waitForSessionUpdate() tea.Cmd {
@@ -301,6 +331,16 @@ func (m bubbleDashboardModel) waitForSessionUpdate() tea.Cmd {
 			return dashboardQueueStoppedMsg{err: err}
 		}
 		return msg
+	}
+}
+
+func (m bubbleDashboardModel) waitForOperationalEvent() tea.Cmd {
+	return func() tea.Msg {
+		event, err := m.control.NextOperationalEvent(m.ctx)
+		if err != nil {
+			return dashboardQueueStoppedMsg{err: err}
+		}
+		return dashboardOperationalMsg{event: event}
 	}
 }
 
@@ -317,8 +357,6 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = max(1, msg.Width), max(1, msg.Height)
-		m.viewport.SetWidth(m.width)
-		m.viewport.SetHeight(max(0, m.height-5))
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" {
 			m.interruptsWaiting++
@@ -352,16 +390,19 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		commands = append(commands, m.waitForSessionUpdate())
 	case dashboardOperationalMsg:
 		m.dashboard.operationalEvent(msg.event)
-		commands = append(commands, m.waitForSessionUpdate())
+		if m.control.operationalEvents != nil {
+			m.control.operationalEvents.complete()
+		}
+		commands = append(commands, m.waitForOperationalEvent())
+		commands = append(commands, m.renderPendingFlushes()...)
 	case dashboardElapsedMsg:
 		commands = append(commands, dashboardElapsedTick())
 	case dashboardActivityMsg:
 		_ = m.dashboard.activityChanged()
 		commands = append(commands, dashboardActivityTick())
 	case dashboardFlushMsg:
-		commands = append(commands, tea.Tick(time.Second/30, func(time.Time) tea.Msg {
-			return dashboardFlushRenderedMsg(msg)
-		}))
+		m.pendingFlushes = append(m.pendingFlushes, msg)
+		commands = append(commands, m.renderPendingFlushes()...)
 		commands = append(commands, m.waitForSessionUpdate())
 	case dashboardFlushRenderedMsg:
 		close(msg.acknowledged)
@@ -371,6 +412,7 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.dashboard.recordMessage(msg.err.Error())
 	}
+	m.resizeViewport()
 	_, body, _ := m.dashboard.renderParts(m.dashboard.now())
 	m.viewport.SetContent(body)
 	updated, command := m.viewport.Update(msg)
@@ -385,31 +427,112 @@ func (m bubbleDashboardModel) interrupt() tea.Cmd {
 	return func() tea.Msg { return dashboardInterruptResultMsg{err: m.control.Interrupt(m.ctx)} }
 }
 
+func (m *bubbleDashboardModel) renderPendingFlushes() []tea.Cmd {
+	if m.control.operationalEvents != nil && !m.control.operationalEvents.idle() {
+		return nil
+	}
+	commands := make([]tea.Cmd, 0, len(m.pendingFlushes))
+	for _, pending := range m.pendingFlushes {
+		message := pending
+		commands = append(commands, tea.Tick(time.Second/30, func(time.Time) tea.Msg {
+			return dashboardFlushRenderedMsg(message)
+		}))
+	}
+	m.pendingFlushes = nil
+	return commands
+}
+
+func (m *bubbleDashboardModel) resizeViewport() {
+	header, _, footer := m.dashboard.renderParts(m.dashboard.now())
+	headerLines := strings.SplitN(header, "\n", 3)
+	chrome := dashboardChromeLines(headerLines[1:], strings.Split(footer, "\n"), m.width, m.height)
+	chromeHeight := len(chrome.top) + len(chrome.bottom)
+	titleHeight := 0
+	if chromeHeight < m.height {
+		titleHeight = 1
+	}
+	m.viewport.SetWidth(m.width)
+	m.viewport.SetHeight(max(0, m.height-chromeHeight-titleHeight))
+}
+
 func (m bubbleDashboardModel) View() tea.View {
 	header, body, footer := m.dashboard.renderParts(m.dashboard.now())
-	m.viewport.SetContent(body)
-	lines := []string{
-		lipgloss.NewStyle().Bold(true).Render("Backlog Run Dashboard"),
-		strings.TrimPrefix(strings.SplitN(header, "\n", 3)[1], ""),
-		strings.SplitN(header, "\n", 3)[2],
+	headerLines := strings.SplitN(header, "\n", 3)
+	chrome := dashboardChromeLines(headerLines[1:], strings.Split(footer, "\n"), m.width, m.height)
+	chromeHeight := len(chrome.top) + len(chrome.bottom)
+
+	lines := make([]string, 0, m.height)
+	titleHeight := 0
+	if chromeHeight < m.height {
+		lines = append(lines, lipgloss.NewStyle().Bold(true).Render(headerLines[0]))
+		titleHeight = 1
 	}
-	if m.height >= 5 {
-		lines = append(lines, strings.Split(m.viewport.View(), "\n")...)
+	lines = append(lines, chrome.top...)
+	bodyHeight := max(0, m.height-chromeHeight-titleHeight)
+	if bodyHeight > 0 {
+		view := m.viewport
+		view.SetWidth(m.width)
+		view.SetHeight(bodyHeight)
+		view.SetContent(body)
+		lines = append(lines, strings.Split(view.View(), "\n")...)
 	}
-	lines = append(lines, strings.Split(footer, "\n")...)
-	if len(lines) > m.height {
-		essential := []string{lines[1], lines[2], lines[len(lines)-2], lines[len(lines)-1]}
-		if m.height < len(essential) {
-			essential = essential[len(essential)-m.height:]
-		}
-		lines = essential
-	}
+	lines = append(lines, chrome.bottom...)
 	for index := range lines {
 		lines[index] = fitDashboardLine(lines[index], m.width)
 	}
 	view := tea.NewView(strings.Join(lines, "\n"))
 	view.AltScreen = true
 	return view
+}
+
+type dashboardChrome struct {
+	top    []string
+	bottom []string
+}
+
+func dashboardChromeLines(header, footer []string, width, height int) dashboardChrome {
+	if width <= 0 || height <= 0 {
+		return dashboardChrome{}
+	}
+	candidates := []dashboardChrome{
+		{top: wrapDashboardChrome([][]string{{header[0]}, {header[1]}}, width), bottom: wrapDashboardChrome([][]string{{footer[0]}, {footer[1]}}, width)},
+		{top: wrapDashboardChrome([][]string{{header[0], header[1]}}, width), bottom: wrapDashboardChrome([][]string{{footer[0], footer[1]}}, width)},
+		{top: wrapDashboardChrome([][]string{{header[0], header[1], footer[0], footer[1]}}, width)},
+	}
+	for _, candidate := range candidates {
+		if len(candidate.top)+len(candidate.bottom) <= height {
+			return candidate
+		}
+	}
+
+	compact := []string{
+		strings.Replace(header[0], "Repository: ", "R:", 1),
+		compactDashboardCapacity(header[1]),
+		strings.Replace(footer[0], "Runner stage: ", "S:", 1),
+		strings.Replace(footer[1], "Next Ctrl-C: ", "^C:", 1),
+	}
+	lines := wrapDashboardChrome([][]string{compact}, width)
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	return dashboardChrome{top: lines}
+}
+
+func wrapDashboardChrome(groups [][]string, width int) []string {
+	var lines []string
+	for _, group := range groups {
+		wrapped := ansi.Wordwrap(strings.Join(group, " | "), width, "|")
+		lines = append(lines, strings.Split(wrapped, "\n")...)
+	}
+	return lines
+}
+
+func compactDashboardCapacity(line string) string {
+	line = strings.TrimPrefix(line, "Worker capacity: ")
+	line = strings.Replace(line, " used | ", "u/", 1)
+	line = strings.Replace(line, " available | ", "a/", 1)
+	line = strings.TrimSuffix(line, " total") + "t"
+	return "W:" + line
 }
 
 func fitDashboardLine(line string, width int) string {

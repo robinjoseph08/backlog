@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -36,7 +37,7 @@ func TestBubbleDashboardModelResizesViewportAroundFixedLifecycleChrome(t *testin
 	assertBubbleDashboardFits(t, model, 48, 10, 5)
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 36, Height: 8})
 	model = updated.(bubbleDashboardModel)
-	assertBubbleDashboardFits(t, model, 36, 8, 3)
+	assertBubbleDashboardFits(t, model, 36, 8, 1)
 }
 
 func assertBubbleDashboardFits(t *testing.T, model bubbleDashboardModel, width, height, viewportHeight int) {
@@ -144,16 +145,28 @@ func TestBubbleDashboardSessionSafelyDeliversStateOutputAndOperationalEvents(t *
 	if _, err := io.WriteString(session, "candidate discovery failed\n"); err != nil {
 		t.Fatal(err)
 	}
-	session.publish(dashboardOperationalMsg{event: runner.ShutdownEvent{Stage: runner.ShutdownStageDraining, Message: "Drain accepted"}})
-
-	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: time.Now}}, session, TerminalDimensions{Width: 80, Height: 20})
-	for range 4 {
+	events := newPresentationEventQueue()
+	events.publish(runner.ShutdownEvent{Stage: runner.ShutdownStageDraining, Message: "Drain accepted"})
+	control := PresentationControl{Terminal: PresentationTerminal{Now: time.Now}, operationalEvents: events}
+	model := newBubbleDashboardModel(context.Background(), control, session, TerminalDimensions{Width: 80, Height: 20})
+	for range 3 {
 		msg, err := session.next(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
 		updated, _ := model.Update(msg)
 		model = updated.(bubbleDashboardModel)
+	}
+	operational := model.waitForOperationalEvent()()
+	updated, _ := model.Update(dashboardFlushMsg{acknowledged: make(chan struct{})})
+	model = updated.(bubbleDashboardModel)
+	if len(model.pendingFlushes) != 1 {
+		t.Fatal("final render flush did not wait for the in-flight operational event")
+	}
+	updated, _ = model.Update(operational)
+	model = updated.(bubbleDashboardModel)
+	if len(model.pendingFlushes) != 0 || !events.idle() {
+		t.Fatal("final render flush did not resume after the operational event was applied")
 	}
 	view := ansi.Strip(model.View().Content)
 	for _, want := range []string{"Repository: acme/widgets", "Runner stage: Draining", "Next Ctrl-C: suspend"} {
@@ -163,6 +176,74 @@ func TestBubbleDashboardSessionSafelyDeliversStateOutputAndOperationalEvents(t *
 	}
 	if body := model.viewport.GetContent(); !strings.Contains(body, "candidate discovery failed") || !strings.Contains(body, "Drain accepted") {
 		t.Fatalf("scrollable body did not receive output and typed event: %q", body)
+	}
+}
+
+func TestBubbleDashboardQueueBoundsOnlyOptionalOutput(t *testing.T) {
+	session := newBubbleDashboardSession(time.Now)
+	initial := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+	latest := initial
+	latest.MaxConcurrentIssues = 3
+	acknowledged := make(chan struct{})
+	session.configure(initial, &dashboardTestSource{current: initial})
+	session.stateSaved(initial)
+	session.publish(dashboardFlushMsg{acknowledged: acknowledged})
+	for index := range dashboardOutputUpdateLimit + 6 {
+		session.publish(dashboardOutputMsg("output " + fmt.Sprint(index)))
+	}
+	session.stateSaved(latest)
+
+	var configured dashboardConfiguredMsg
+	var saved dashboardStateMsg
+	var flush dashboardFlushMsg
+	var outputs []string
+	session.mu.Lock()
+	updates := append([]tea.Msg(nil), session.updates...)
+	session.mu.Unlock()
+	for _, update := range updates {
+		switch update := update.(type) {
+		case dashboardConfiguredMsg:
+			configured = update
+		case dashboardStateMsg:
+			saved = update
+		case dashboardFlushMsg:
+			flush = update
+		case dashboardOutputMsg:
+			outputs = append(outputs, string(update))
+		}
+	}
+	if configured.initial.Repo != initial.Repo || state.State(saved).MaxConcurrentIssues != latest.MaxConcurrentIssues || flush.acknowledged != acknowledged {
+		t.Fatalf("required dashboard updates were lost: configured=%#v saved=%#v flush=%#v", configured, saved, flush)
+	}
+	if len(outputs) != dashboardOutputUpdateLimit || outputs[0] != "output 6" {
+		t.Fatalf("bounded output = %d messages starting at %q", len(outputs), outputs[0])
+	}
+}
+
+func TestBubbleDashboardConstrainedChromeKeepsRequiredLifecycleInformation(t *testing.T) {
+	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 3}
+	for _, dimensions := range []TerminalDimensions{
+		{Width: 18, Height: 12},
+		{Width: 120, Height: 2},
+		{Width: 200, Height: 1},
+	} {
+		model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: time.Now}}, newBubbleDashboardSession(time.Now), dimensions)
+		model.dashboard.update(current)
+		plain := ansi.Strip(model.View().Content)
+		for _, want := range []string{"acme/widgets", "Worker capacity:", "Runner stage:", "Next Ctrl-C:"} {
+			if !strings.Contains(plain, want) {
+				t.Fatalf("%dx%d dashboard omitted %q:\n%s", dimensions.Width, dimensions.Height, want, plain)
+			}
+		}
+		lines := strings.Split(plain, "\n")
+		if len(lines) > dimensions.Height {
+			t.Fatalf("%dx%d dashboard used %d lines:\n%s", dimensions.Width, dimensions.Height, len(lines), plain)
+		}
+		for _, line := range lines {
+			if lipgloss.Width(line) > dimensions.Width {
+				t.Fatalf("%dx%d dashboard overflowed with %q", dimensions.Width, dimensions.Height, line)
+			}
+		}
 	}
 }
 

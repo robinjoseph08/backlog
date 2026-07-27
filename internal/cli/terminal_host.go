@@ -123,9 +123,10 @@ func (e *PresentationFailure) Unwrap() []error {
 const presentationEventLimit = 32
 
 type presentationEventQueue struct {
-	mu     sync.Mutex
-	events []runner.OperationalEvent
-	wake   chan struct{}
+	mu       sync.Mutex
+	events   []runner.OperationalEvent
+	inFlight int
+	wake     chan struct{}
 }
 
 func newPresentationEventQueue() *presentationEventQueue {
@@ -217,7 +218,22 @@ func (q *presentationEventQueue) pop() runner.OperationalEvent {
 	if len(q.events) == 0 {
 		q.events = nil
 	}
+	q.inFlight++
 	return event
+}
+
+func (q *presentationEventQueue) complete() {
+	q.mu.Lock()
+	if q.inFlight > 0 {
+		q.inFlight--
+	}
+	q.mu.Unlock()
+}
+
+func (q *presentationEventQueue) idle() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.events) == 0 && q.inFlight == 0
 }
 
 func (q *presentationEventQueue) next(ctx context.Context) (runner.OperationalEvent, error) {
