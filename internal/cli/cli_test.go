@@ -373,8 +373,13 @@ func TestStatusRejectsInvalidAndUnsupportedStateWithoutMutation(t *testing.T) {
 		diagnostic string
 	}{
 		{
-			name:       "invalid legacy state",
-			fixture:    `{"version":2,"runs":[{"issue":1,"runId":"invalid","status":"unknown","workerMode":"print"}],"leases":[]}`,
+			name:       "invalid version 1 state",
+			fixture:    `{"version":1,"runs":[{"issue":1,"runId":"invalid-v1","status":"unknown"}]}`,
+			diagnostic: `state contains unknown status "unknown"`,
+		},
+		{
+			name:       "invalid version 2 state",
+			fixture:    `{"version":2,"runs":[{"issue":1,"runId":"invalid-v2","status":"unknown","workerMode":"print"}],"leases":[]}`,
 			diagnostic: `state contains unknown status "unknown"`,
 		},
 		{

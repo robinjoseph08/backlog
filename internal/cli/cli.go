@@ -635,6 +635,7 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "  SIGTERM suspension exits 143, including later force escalation.")
 	fmt.Fprintln(writer, "")
 	fmt.Fprintln(writer, "Upgrade limits:")
-	fmt.Fprintln(writer, "  Version 1 and version 2 state migrate to version 3; legacy print-mode Runs cannot Resume.")
+	fmt.Fprintln(writer, "  Runner startup and successful lifecycle mutations migrate version 1 and version 2 state to version 3.")
+	fmt.Fprintln(writer, "  Passive inspection previews supported legacy state; legacy print-mode Runs cannot Resume.")
 	fmt.Fprintln(writer, "  State written by a newer unsupported version is refused.")
 }
