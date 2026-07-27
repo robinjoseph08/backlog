@@ -154,7 +154,7 @@ func TestTerminalDashboardPreservesDrainAndSuspensionMessages(t *testing.T) {
 		},
 		{
 			name: "suspension", signal: syscall.SIGTERM, wantExit: 143,
-			wantOutput: []string{"Suspension finished", "no effect"},
+			wantOutput: []string{"Suspension complete", "no effect"},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {

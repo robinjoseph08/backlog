@@ -223,6 +223,23 @@ func TestBubbleDashboardSessionSafelyDeliversStateOutputAndOperationalEvents(t *
 	}
 }
 
+func TestBubbleDashboardRendersCompleteSuspensionFooterAfterSuspending(t *testing.T) {
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: time.Now}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 24})
+	for _, test := range []struct {
+		stage runner.ShutdownStage
+		want  string
+	}{
+		{stage: runner.ShutdownStageSuspending, want: "Runner stage: Suspending"},
+		{stage: runner.ShutdownStageSuspensionComplete, want: "Runner stage: Suspension finished"},
+	} {
+		updated, _ := model.Update(dashboardOperationalMsg{event: runner.ShutdownEvent{Stage: test.stage}})
+		model = updated.(bubbleDashboardModel)
+		if view := ansi.Strip(model.View().Content); !strings.Contains(view, test.want) {
+			t.Fatalf("shutdown stage %q missing from Bubble Tea view:\n%s", test.want, view)
+		}
+	}
+}
+
 func TestBubbleDashboardQueueBoundsOnlyOptionalOutput(t *testing.T) {
 	session := newBubbleDashboardSession(time.Now)
 	initial := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
