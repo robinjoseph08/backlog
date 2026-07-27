@@ -342,7 +342,9 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 			return setupCtx.Err()
 		}
 	}
-	return backlogRunner.Run(ctx)
+	runErr := backlogRunner.Run(ctx)
+	backlogRunner.WaitForOperationalEventDelivery()
+	return runErr
 }
 
 func cancelContextOnSignal(ctx context.Context, signals <-chan os.Signal) (context.Context, func()) {

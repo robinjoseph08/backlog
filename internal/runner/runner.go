@@ -108,6 +108,7 @@ type Runner struct {
 	operationalEventMu       sync.Mutex
 	operationalEventWake     chan struct{}
 	operationalEventStop     chan struct{}
+	operationalEventDone     chan struct{}
 	operationalEventStopping bool
 	operationalEvents        []OperationalEvent
 }
@@ -2125,6 +2126,7 @@ func (r *Runner) enqueueOperationalEvent(event OperationalEvent) {
 	r.operationalEventOnce.Do(func() {
 		r.operationalEventWake = make(chan struct{}, 1)
 		r.operationalEventStop = make(chan struct{})
+		r.operationalEventDone = make(chan struct{})
 		go r.deliverOperationalEvents(r.OnOperationalEvent)
 	})
 	r.operationalEventMu.Lock()
@@ -2137,6 +2139,7 @@ func (r *Runner) enqueueOperationalEvent(event OperationalEvent) {
 }
 
 func (r *Runner) deliverOperationalEvents(deliver func(OperationalEvent)) {
+	defer close(r.operationalEventDone)
 	for {
 		select {
 		case <-r.operationalEventWake:
@@ -2168,6 +2171,19 @@ func (r *Runner) stopOperationalEventDelivery() {
 	}
 	r.operationalEventStopping = true
 	close(r.operationalEventStop)
+}
+
+// WaitForOperationalEventDelivery waits for callbacks queued by Run to finish.
+// Run itself never waits, so callback latency remains isolated from Runner
+// control paths. Presentation adapters can call this after Run returns before
+// tearing down callback-owned state.
+func (r *Runner) WaitForOperationalEventDelivery() {
+	r.operationalEventMu.Lock()
+	done := r.operationalEventDone
+	r.operationalEventMu.Unlock()
+	if done != nil {
+		<-done
+	}
 }
 
 func invokeOperationalEvent(deliver func(OperationalEvent), event OperationalEvent) {

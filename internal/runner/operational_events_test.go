@@ -138,7 +138,7 @@ func TestRunnerReportsCandidateDiscoveryFailuresAndResetsCountAfterRecovery(t *t
 	}
 }
 
-func TestRunnerCandidateRetryAndOutputDoNotWaitForOperationalEventDelivery(t *testing.T) {
+func TestRunnerControlAndOutputDoNotWaitForOperationalEventDelivery(t *testing.T) {
 	pollInterval := 50 * time.Millisecond
 	github := &fakeGitHub{
 		candidateResults: []candidateResult{{err: errors.New("temporary failure")}, {}},
@@ -183,11 +183,26 @@ func TestRunnerCandidateRetryAndOutputDoNotWaitForOperationalEventDelivery(t *te
 		t.Fatal("operational callbacks ran concurrently while failure delivery was blocked")
 	default:
 	}
+	deliveryDone := make(chan struct{})
+	go func() {
+		runner.WaitForOperationalEventDelivery()
+		close(deliveryDone)
+	}()
+	select {
+	case <-deliveryDone:
+		t.Fatal("delivery boundary returned while queued callbacks were blocked")
+	case <-time.After(20 * time.Millisecond):
+	}
 	releaseOnce.Do(func() { close(releaseEvent) })
 	select {
 	case <-recoveryStarted:
 	case <-time.After(time.Second):
 		t.Fatal("ordered recovery event was not delivered after the callback resumed")
+	}
+	select {
+	case <-deliveryDone:
+	case <-time.After(time.Second):
+		t.Fatal("delivery boundary did not finish after queued callbacks were delivered")
 	}
 }
 
