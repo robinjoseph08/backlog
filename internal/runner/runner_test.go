@@ -1326,14 +1326,18 @@ func TestRunnerDrainFailsClosedWhenSettledWorkerExitIsUnverified(t *testing.T) {
 		t.Fatalf("Drain error = %v, want unverified settled Worker exit", err)
 	}
 	output.waitFor(t, "Drain incomplete: 0 supervised Workers remaining; 1 Worker retained with unverified liveness")
+	events := recorder.waitFor(t, func(events []OperationalEvent) bool {
+		_, ok := findShutdownEvent(events, ShutdownStageDrainIncomplete, "retaining Workers with unverified liveness")
+		return ok
+	})
 	var incomplete *ShutdownEvent
-	for _, event := range recorder.snapshot() {
+	for _, event := range events {
 		if shutdown, ok := event.(ShutdownEvent); ok && shutdown.Stage == ShutdownStageDrainIncomplete {
 			incomplete = &shutdown
 		}
 	}
-	if incomplete == nil || incomplete.RemainingWorkers != 1 {
-		t.Fatalf("Drain incomplete event = %#v, want 1 remaining Worker", incomplete)
+	if incomplete == nil || incomplete.Action != "retaining Workers with unverified liveness" || incomplete.RemainingWorkers != 1 || incomplete.NextInterrupt != NextInterruptNone {
+		t.Fatalf("Drain incomplete event = %#v, want 1 remaining Worker and no next interrupt", incomplete)
 	}
 	got := store.LoadValue()
 	run := findRun(got.Runs, fmt.Sprintf("run-%d", issue))

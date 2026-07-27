@@ -80,7 +80,8 @@ type Runner struct {
 	Signals   <-chan os.Signal
 
 	// OnOperationalEvent receives typed Admission and shutdown lifecycle events.
-	// The Runner also writes each event through its compatible plain formatter.
+	// Delivery is asynchronous, ordered, and isolated from callback panics so
+	// presentation cannot block Runner control paths or compatible plain output.
 	OnOperationalEvent func(OperationalEvent)
 
 	// FinalSummary presents the aggregate state immediately before natural
@@ -102,6 +103,13 @@ type Runner struct {
 	suspensionDeadline   time.Time
 	suspensionCancel     context.CancelFunc
 	suspensionEventReady chan struct{}
+
+	operationalEventOnce     sync.Once
+	operationalEventMu       sync.Mutex
+	operationalEventWake     chan struct{}
+	operationalEventStop     chan struct{}
+	operationalEventStopping bool
+	operationalEvents        []OperationalEvent
 }
 
 type workerCompletion struct {
@@ -198,6 +206,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := r.validate(); err != nil {
 		return err
 	}
+	defer r.stopOperationalEventDelivery()
 	workerCtx, cancelWorkers := context.WithCancel(context.Background())
 	operationCtx, cancelOperations := context.WithCancel(ctx)
 	defer cancelOperations()
@@ -681,6 +690,7 @@ func (r *Runner) requestSuspension(exitCode int32, cancelOperations context.Canc
 		// A signal received while suspension is already active requests the
 		// same force-stop path used when its shared deadline expires.
 		r.forceStopRequested.Store(true)
+		r.forceStopping.Store(true)
 		if r.suspensionCancel != nil {
 			r.suspensionCancel()
 		}
@@ -1810,17 +1820,24 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 	workerCount := len(local)
 	var forceStopRemaining atomic.Int64
 	forceStopRemaining.Store(int64(workerCount))
-	go func() {
-		<-ctx.Done()
-		remainingWorkers := int(forceStopRemaining.Load())
-		remaining := workerSummary(remainingWorkers)
-		switch {
-		case r.forceStopRequested.Load():
-			r.shutdownEvent(ShutdownStageForceStopping, "requesting force stop", remainingWorkers, NextInterruptRepeatsForceStop, "Force stop: additional signal accepted; requesting force stop for %s; each identity will be revalidated before signaling; next SIGINT will repeat the force-stop request", remaining)
-		case errors.Is(ctx.Err(), context.DeadlineExceeded):
-			r.shutdownEvent(ShutdownStageForceStopping, "requesting force stop after suspension deadline", remainingWorkers, NextInterruptRepeatsForceStop, "Force stop: suspension deadline expired; requesting force stop for %s; each identity will be revalidated before signaling; next SIGINT will repeat the force-stop request", remaining)
+	var reportForceStopOnce sync.Once
+	reportForceStop := func() {
+		if ctx.Err() == nil {
+			return
 		}
-	}()
+		reportForceStopOnce.Do(func() {
+			r.forceStopping.Store(true)
+			remainingWorkers := int(forceStopRemaining.Load())
+			remaining := workerSummary(remainingWorkers)
+			if r.forceStopRequested.Load() {
+				r.shutdownEvent(ShutdownStageForceStopping, "requesting force stop", remainingWorkers, NextInterruptRepeatsForceStop, "Force stop: additional signal accepted; requesting force stop for %s; each identity will be revalidated before signaling; next SIGINT will repeat the force-stop request", remaining)
+				return
+			}
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				r.shutdownEvent(ShutdownStageForceStopping, "requesting force stop after suspension deadline", remainingWorkers, NextInterruptRepeatsForceStop, "Force stop: suspension deadline expired; requesting force stop for %s; each identity will be revalidated before signaling; next SIGINT will repeat the force-stop request", remaining)
+			}
+		})
+	}
 	boundaries := make(chan suspensionBoundaryResult, workerCount)
 	runIDs := make(map[int]string, workerCount)
 	for issue, process := range local {
@@ -1862,6 +1879,7 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 	}
 	for completed := 0; completed < workerCount; completed++ {
 		result := <-boundaries
+		reportForceStop()
 		process := local[result.issue]
 		run := findActiveRun(current, result.issue)
 		if result.err != nil {
@@ -1907,6 +1925,7 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 	verifiedOutcomes := make(map[int]ghadapter.CompletionOutcome, reconciliationCount)
 	for completed := 0; completed < reconciliationCount; completed++ {
 		result := <-githubResults
+		reportForceStop()
 		if result.err != nil {
 			clean = false
 			failureReasons[result.issue] = fmt.Sprintf("reconcile GitHub before suspension: %v", result.err)
@@ -1922,6 +1941,7 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 	}
 	for completed := 0; completed < workerCount; completed++ {
 		closed := <-closeResults
+		reportForceStop()
 		if closed.result.GroupExited {
 			delete(local, closed.issue)
 		}
@@ -2094,11 +2114,65 @@ func (r *Runner) shutdownOwned(
 
 func (r *Runner) emit(event OperationalEvent) {
 	if r.OnOperationalEvent != nil {
-		r.OnOperationalEvent(event)
+		r.enqueueOperationalEvent(event)
 	}
 	if message := FormatOperationalEvent(event); message != "" {
 		r.logf("%s", message)
 	}
+}
+
+func (r *Runner) enqueueOperationalEvent(event OperationalEvent) {
+	r.operationalEventOnce.Do(func() {
+		r.operationalEventWake = make(chan struct{}, 1)
+		r.operationalEventStop = make(chan struct{})
+		go r.deliverOperationalEvents(r.OnOperationalEvent)
+	})
+	r.operationalEventMu.Lock()
+	r.operationalEvents = append(r.operationalEvents, event)
+	r.operationalEventMu.Unlock()
+	select {
+	case r.operationalEventWake <- struct{}{}:
+	default:
+	}
+}
+
+func (r *Runner) deliverOperationalEvents(deliver func(OperationalEvent)) {
+	for {
+		select {
+		case <-r.operationalEventWake:
+		case <-r.operationalEventStop:
+		}
+		for {
+			r.operationalEventMu.Lock()
+			if len(r.operationalEvents) == 0 {
+				stopping := r.operationalEventStopping
+				r.operationalEventMu.Unlock()
+				if stopping {
+					return
+				}
+				break
+			}
+			event := r.operationalEvents[0]
+			r.operationalEvents = r.operationalEvents[1:]
+			r.operationalEventMu.Unlock()
+			invokeOperationalEvent(deliver, event)
+		}
+	}
+}
+
+func (r *Runner) stopOperationalEventDelivery() {
+	r.operationalEventMu.Lock()
+	defer r.operationalEventMu.Unlock()
+	if r.operationalEventStop == nil || r.operationalEventStopping {
+		return
+	}
+	r.operationalEventStopping = true
+	close(r.operationalEventStop)
+}
+
+func invokeOperationalEvent(deliver func(OperationalEvent), event OperationalEvent) {
+	defer func() { _ = recover() }()
+	deliver(event)
 }
 
 func (r *Runner) shutdownEvent(stage ShutdownStage, action string, workers int, next NextInterruptBehavior, format string, args ...any) {

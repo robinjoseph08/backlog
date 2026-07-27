@@ -154,13 +154,15 @@ func TestDashboardReceivesShutdownStageWithoutParsingFormattedMessages(t *testin
 		t.Fatalf("formatted message changed shutdown stage:\n%s", output.String())
 	}
 	shutdownMessage := "Suspension: establishing continuation boundaries for 2 Workers"
+	if _, err := fmt.Fprintln(dashboard, shutdownMessage); err != nil {
+		t.Fatal(err)
+	}
+	// Runner event delivery is asynchronous, so the typed event may arrive
+	// after its compatible plain rendering.
 	dashboard.operationalEvent(runner.ShutdownEvent{
 		Stage: runner.ShutdownStageSuspending, Action: "establishing continuation boundaries", RemainingWorkers: 2,
 		NextInterrupt: runner.NextInterruptForceStops, Message: shutdownMessage,
 	})
-	if _, err := fmt.Fprintln(dashboard, shutdownMessage); err != nil {
-		t.Fatal(err)
-	}
 	for index := range 12 {
 		if _, err := fmt.Fprintf(dashboard, "ordinary lifecycle message %d\n", index); err != nil {
 			t.Fatal(err)

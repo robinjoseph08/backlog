@@ -248,7 +248,17 @@ func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
 	}
 	d.mu.Lock()
 	if message := normalizedDashboardMessage(shutdown.Message); message != "" {
-		d.pendingShutdownMessages[message]++
+		matched := false
+		for index := len(d.messages) - 1; index >= 0; index-- {
+			if d.messages[index].text == message && !d.messages[index].shutdown {
+				d.messages[index].shutdown = true
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			d.pendingShutdownMessages[message]++
+		}
 	}
 	if next > d.stage {
 		d.stage = next

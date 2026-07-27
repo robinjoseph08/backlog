@@ -7,10 +7,12 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
+	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 )
 
@@ -29,6 +31,31 @@ func (r *operationalEventRecorder) snapshot() []OperationalEvent {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]OperationalEvent(nil), r.events...)
+}
+
+func (r *operationalEventRecorder) waitFor(t *testing.T, match func([]OperationalEvent) bool) []OperationalEvent {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		events := r.snapshot()
+		if match(events) {
+			return events
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("operational events = %#v, want matching event sequence", events)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func findShutdownEvent(events []OperationalEvent, stage ShutdownStage, action string) (ShutdownEvent, bool) {
+	for _, event := range events {
+		shutdown, ok := event.(ShutdownEvent)
+		if ok && shutdown.Stage == stage && shutdown.Action == action {
+			return shutdown, true
+		}
+	}
+	return ShutdownEvent{}, false
 }
 
 func TestRunnerReportsCandidateDiscoveryFailureAndAdmissionRecovery(t *testing.T) {
@@ -56,7 +83,7 @@ func TestRunnerReportsCandidateDiscoveryFailureAndAdmissionRecovery(t *testing.T
 	if err := runner.Run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	events := recorder.snapshot()
+	events := recorder.waitFor(t, func(events []OperationalEvent) bool { return len(events) >= 4 })
 	if len(events) != 4 {
 		t.Fatalf("operational events = %#v, want three discovery failures and recovery", events)
 	}
@@ -92,36 +119,81 @@ func TestRunnerReportsCandidateDiscoveryFailureAndAdmissionRecovery(t *testing.T
 	}
 }
 
-func TestRunnerStartsCandidateRetryBeforeDeliveringFailureEvent(t *testing.T) {
-	pollInterval := 250 * time.Millisecond
+func TestRunnerCandidateRetryAndOutputDoNotWaitForOperationalEventDelivery(t *testing.T) {
+	pollInterval := 50 * time.Millisecond
 	github := &fakeGitHub{
 		candidateResults: []candidateResult{{err: errors.New("temporary failure")}, {}},
 		candidateChanged: make(chan struct{}, 2),
 	}
 	runner := testRunner(github, newFakeWorkers(), &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
 	runner.Config.PollInterval = pollInterval
+	var output bytes.Buffer
+	runner.Output = &output
 	eventStarted := make(chan struct{})
 	releaseEvent := make(chan struct{})
+	recoveryStarted := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseEvent) })
 	runner.OnOperationalEvent = func(event OperationalEvent) {
-		if _, ok := event.(CandidateDiscoveryFailed); !ok {
-			return
+		switch event.(type) {
+		case CandidateDiscoveryFailed:
+			close(eventStarted)
+			<-releaseEvent
+		case CandidateDiscoveryRecovered:
+			close(recoveryStarted)
 		}
-		close(eventStarted)
-		<-releaseEvent
 	}
 
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	<-eventStarted
-	time.Sleep(pollInterval + 50*time.Millisecond)
-	releasedAt := time.Now()
-	close(releaseEvent)
 	github.waitForCandidateCalls(t, 2)
-	if elapsed := github.candidateCallSnapshot()[1].Sub(releasedAt); elapsed >= pollInterval/2 {
-		t.Fatalf("retry began %s after event delivery completed, want timer elapsed during delivery", elapsed)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Runner waited for blocked operational event delivery")
 	}
-	if err := <-done; err != nil {
+	if !strings.Contains(output.String(), "candidate discovery failed; admission paused") {
+		t.Fatalf("plain output waited for operational event delivery: %q", output.String())
+	}
+	select {
+	case <-recoveryStarted:
+		t.Fatal("operational callbacks ran concurrently while failure delivery was blocked")
+	default:
+	}
+	releaseOnce.Do(func() { close(releaseEvent) })
+	select {
+	case <-recoveryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("ordered recovery event was not delivered after the callback resumed")
+	}
+}
+
+func TestRunnerIsolatesOperationalEventCallbackPanics(t *testing.T) {
+	github := &fakeGitHub{
+		candidateResults: []candidateResult{{err: errors.New("temporary failure")}, {}},
+		candidateChanged: make(chan struct{}, 2),
+	}
+	runner := testRunner(github, newFakeWorkers(), &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+	runner.Config.PollInterval = time.Millisecond
+	callbackStarted := make(chan struct{}, 2)
+	runner.OnOperationalEvent = func(OperationalEvent) {
+		callbackStarted <- struct{}{}
+		panic("presentation failed")
+	}
+
+	if err := runner.Run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
+	}
+	for range 2 {
+		select {
+		case <-callbackStarted:
+		case <-time.After(time.Second):
+			t.Fatal("operational event delivery did not continue after a callback panic")
+		}
 	}
 }
 
@@ -154,5 +226,123 @@ func TestRunnerReportsStructuredDrainStages(t *testing.T) {
 	complete := <-events
 	if complete.Stage != ShutdownStageDrainComplete || complete.Action != "exiting successfully" || complete.RemainingWorkers != 0 || complete.NextInterrupt != NextInterruptNone {
 		t.Fatalf("Drain completion event = %#v", complete)
+	}
+}
+
+func TestRunnerReportsStructuredSuspensionStages(t *testing.T) {
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 40, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	signals := make(chan os.Signal, 2)
+	runner := testRunner(github, workers, &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+	runner.Signals = signals
+	recorder := &operationalEventRecorder{}
+	runner.OnOperationalEvent = recorder.record
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 40)
+	signals <- os.Interrupt
+	signals <- os.Interrupt
+	if err := <-done; !isSignalExit(err, 130) {
+		t.Fatalf("run: %v, want signal exit 130", err)
+	}
+	events := recorder.waitFor(t, func(events []OperationalEvent) bool {
+		_, ok := findShutdownEvent(events, ShutdownStageSuspensionComplete, "exiting after suspension")
+		return ok
+	})
+	suspending, ok := findShutdownEvent(events, ShutdownStageSuspending, "establishing continuation boundaries")
+	if !ok || suspending.RemainingWorkers != 1 || suspending.NextInterrupt != NextInterruptForceStops {
+		t.Fatalf("Suspending event = %#v, found=%t", suspending, ok)
+	}
+	complete, _ := findShutdownEvent(events, ShutdownStageSuspensionComplete, "exiting after suspension")
+	if complete.RemainingWorkers != 0 || complete.NextInterrupt != NextInterruptNone {
+		t.Fatalf("Suspension completion event = %#v", complete)
+	}
+}
+
+func TestRunnerReportsStructuredForceStopStages(t *testing.T) {
+	tests := []struct {
+		name       string
+		exitCode   int
+		timeout    time.Duration
+		trigger    func(chan os.Signal, <-chan int)
+		wantAction string
+	}{
+		{
+			name: "third SIGINT", exitCode: 130, timeout: 5 * time.Second,
+			trigger: func(signals chan os.Signal, closeStarted <-chan int) {
+				signals <- os.Interrupt
+				signals <- os.Interrupt
+				<-closeStarted
+				signals <- os.Interrupt
+			},
+			wantAction: "requesting force stop",
+		},
+		{
+			name: "suspension timeout", exitCode: 143, timeout: 20 * time.Millisecond,
+			trigger: func(signals chan os.Signal, _ <-chan int) {
+				signals <- syscall.SIGTERM
+			},
+			wantAction: "requesting force stop after suspension deadline",
+		},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			issue := 50 + index
+			github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: issue, CreatedAt: time.Now()}}}
+			workers := newFakeWorkers()
+			workers.authorizeClose = true
+			workers.waitForForce = true
+			signals := make(chan os.Signal, 3)
+			runner := testRunner(github, workers, &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+			runner.Config.SuspensionTimeout = test.timeout
+			runner.Signals = signals
+			recorder := &operationalEventRecorder{}
+			runner.OnOperationalEvent = recorder.record
+
+			done := make(chan error, 1)
+			go func() { done <- runner.Run(context.Background()) }()
+			workers.waitForStarts(t, issue)
+			test.trigger(signals, workers.closeContextStarted)
+			if err := <-done; !isSignalExit(err, test.exitCode) {
+				t.Fatalf("run: %v, want signal exit %d", err, test.exitCode)
+			}
+			events := recorder.waitFor(t, func(events []OperationalEvent) bool {
+				_, force := findShutdownEvent(events, ShutdownStageForceStopping, test.wantAction)
+				_, complete := findShutdownEvent(events, ShutdownStageSuspensionComplete, "exiting after suspension")
+				return force && complete
+			})
+			force, _ := findShutdownEvent(events, ShutdownStageForceStopping, test.wantAction)
+			if force.RemainingWorkers != 1 || force.NextInterrupt != NextInterruptRepeatsForceStop {
+				t.Fatalf("Force-stop event = %#v", force)
+			}
+			complete, _ := findShutdownEvent(events, ShutdownStageSuspensionComplete, "exiting after suspension")
+			if complete.RemainingWorkers != 0 || complete.NextInterrupt != NextInterruptNone {
+				t.Fatalf("post-force suspension completion event = %#v", complete)
+			}
+		})
+	}
+}
+
+func TestRunnerReportsStructuredIncompleteSuspension(t *testing.T) {
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+	var output bytes.Buffer
+	runner.Output = &output
+	runner.suspensionFailed.Store(true)
+	recorder := &operationalEventRecorder{}
+	runner.OnOperationalEvent = recorder.record
+	current := state.State{Version: state.CurrentVersion}
+
+	err := runner.suspendOwned(&current, map[int]WorkerProcess{}, 143)
+	if !isSignalExit(err, 143) {
+		t.Fatalf("run: %v, want signal exit 143", err)
+	}
+	events := recorder.waitFor(t, func(events []OperationalEvent) bool {
+		_, ok := findShutdownEvent(events, ShutdownStageSuspensionIncomplete, "exiting with incomplete suspension")
+		return ok
+	})
+	incomplete, _ := findShutdownEvent(events, ShutdownStageSuspensionIncomplete, "exiting with incomplete suspension")
+	if incomplete.RemainingWorkers != 0 || incomplete.NextInterrupt != NextInterruptNone {
+		t.Fatalf("Suspension incomplete event = %#v", incomplete)
 	}
 }
