@@ -293,6 +293,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 
 	var runnerStore runner.Store = store
 	runnerOutput := io.Writer(&terminalControlWriter{output: stdout})
+	var onOperationalEvent func(runner.OperationalEvent)
 	finalSummary := func(current state.State) error {
 		return printRunFinalSummary(stdout, current, summarySource, now())
 	}
@@ -309,6 +310,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 		dashboard := newLiveDashboard(stdout, summarySource, initial, now)
 		runnerStore = dashboardStore{FileStore: store, dashboard: dashboard}
 		runnerOutput = dashboard
+		onOperationalEvent = dashboard.operationalEvent
 		finalSummary = dashboard.finalSummary
 		dashboard.start()
 		defer dashboard.close()
@@ -319,13 +321,14 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 			MaxConcurrentIssues: *maxWorkers, PollInterval: *poll, MaxWorkerAge: *maxWorkerAge, Watch: *watch,
 			SessionsDir: filepath.Join(resolvedStateDir, "sessions"),
 		},
-		GitHub:       github,
-		Store:        runnerStore,
-		Worktrees:    worktrees,
-		Workers:      workerAdapter{supervisor: supervisor},
-		Output:       runnerOutput,
-		Signals:      runnerSignals,
-		FinalSummary: finalSummary,
+		GitHub:             github,
+		Store:              runnerStore,
+		Worktrees:          worktrees,
+		Workers:            workerAdapter{supervisor: supervisor},
+		Output:             runnerOutput,
+		Signals:            runnerSignals,
+		OnOperationalEvent: onOperationalEvent,
+		FinalSummary:       finalSummary,
 	}
 	if signals != nil {
 		setupMu.Lock()

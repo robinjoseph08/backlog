@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/robinjoseph08/backlog/internal/activity"
+	"github.com/robinjoseph08/backlog/internal/runner"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 )
@@ -27,6 +28,7 @@ const (
 	dashboardSuspending
 	dashboardForceStopping
 	dashboardDrainComplete
+	dashboardDrainIncomplete
 	dashboardSuspensionComplete
 	dashboardStopped
 	dashboardFinished
@@ -185,33 +187,41 @@ func (d *liveDashboard) recordMessageLocked(message string) {
 	}
 	d.messages = append(d.messages, message)
 	if len(d.messages) > 12 {
-		for index, retained := range d.messages {
-			if !isShutdownMessage(retained) {
-				d.messages = append(d.messages[:index], d.messages[index+1:]...)
-				break
-			}
-		}
-	}
-	var next dashboardStage
-	switch {
-	case strings.HasPrefix(message, "Drain complete"):
-		next = dashboardDrainComplete
-	case strings.HasPrefix(message, "Suspension complete"), strings.HasPrefix(message, "Suspension incomplete"):
-		next = dashboardSuspensionComplete
-	case strings.HasPrefix(message, "Force stop"):
-		next = dashboardForceStopping
-	case strings.HasPrefix(message, "Suspension:"), strings.HasPrefix(message, "Drain: additional"):
-		next = dashboardSuspending
-	case strings.HasPrefix(message, "Drain:"):
-		next = dashboardDraining
-	}
-	if next > d.stage {
-		d.stage = next
+		d.messages = d.messages[len(d.messages)-12:]
 	}
 }
 
-func isShutdownMessage(message string) bool {
-	return strings.HasPrefix(message, "Drain") || strings.HasPrefix(message, "Suspension") || strings.HasPrefix(message, "Force stop")
+// operationalEvent receives lifecycle state directly from the Runner. Message
+// formatting remains independent, so presentation never infers shutdown stage
+// from append-only prose.
+func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
+	shutdown, ok := event.(runner.ShutdownEvent)
+	if !ok {
+		return
+	}
+	var next dashboardStage
+	switch shutdown.Stage {
+	case runner.ShutdownStageDraining:
+		next = dashboardDraining
+	case runner.ShutdownStageSuspending:
+		next = dashboardSuspending
+	case runner.ShutdownStageForceStopping:
+		next = dashboardForceStopping
+	case runner.ShutdownStageDrainComplete:
+		next = dashboardDrainComplete
+	case runner.ShutdownStageDrainIncomplete:
+		next = dashboardDrainIncomplete
+	case runner.ShutdownStageSuspensionComplete, runner.ShutdownStageSuspensionIncomplete:
+		next = dashboardSuspensionComplete
+	default:
+		return
+	}
+	d.mu.Lock()
+	if next > d.stage {
+		d.stage = next
+	}
+	d.mu.Unlock()
+	d.requestRedraw()
 }
 
 func (d *liveDashboard) activityChanged() bool {
@@ -421,6 +431,8 @@ func dashboardFooter(stage dashboardStage) string {
 		return "Force stopping: Worker identities are revalidated before signaling; next Ctrl-C repeats the force-stop request."
 	case dashboardDrainComplete:
 		return "Drain complete: no Owned Workers remain; no further interrupt is needed."
+	case dashboardDrainIncomplete:
+		return "Drain incomplete: Worker liveness remains unverified; no further interrupt has an effect before exit."
 	case dashboardSuspensionComplete:
 		return "Suspension finished: no further interrupt has an effect before exit."
 	case dashboardStopped:

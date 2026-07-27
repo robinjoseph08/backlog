@@ -58,6 +58,23 @@ type Client struct {
 	Dir        string
 }
 
+// CandidateDiscoveryError identifies the failed operation and optional issue
+// while preserving the underlying GitHub error.
+type CandidateDiscoveryError struct {
+	Operation string
+	Issue     int
+	Err       error
+}
+
+func (e *CandidateDiscoveryError) Error() string {
+	if e.Issue > 0 {
+		return fmt.Sprintf("%s #%d: %v", e.Operation, e.Issue, e.Err)
+	}
+	return fmt.Sprintf("%s: %v", e.Operation, e.Err)
+}
+
+func (e *CandidateDiscoveryError) Unwrap() error { return e.Err }
+
 func (c Client) Repository(ctx context.Context) (Repository, error) {
 	var response struct {
 		NameWithOwner    string `json:"nameWithOwner"`
@@ -85,14 +102,14 @@ func (c Client) Candidates(ctx context.Context, repo string) ([]scheduler.Candid
 		"issue", "list", "--repo", repo, "--state", "open", "--label", "ready-for-agent",
 		"--limit", "1000", "--json", "number,title,createdAt,url",
 	); err != nil {
-		return nil, fmt.Errorf("list candidates: %w", err)
+		return nil, &CandidateDiscoveryError{Operation: "list candidates", Err: err}
 	}
 
 	candidates := make([]scheduler.Candidate, 0, len(listed))
 	for _, item := range listed {
 		candidate, err := c.candidate(ctx, repo, item.Number)
 		if err != nil {
-			return nil, fmt.Errorf("inspect candidate #%d: %w", item.Number, err)
+			return nil, &CandidateDiscoveryError{Operation: "inspect candidate", Issue: item.Number, Err: err}
 		}
 		candidates = append(candidates, candidate)
 	}

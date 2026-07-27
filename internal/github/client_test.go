@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -82,6 +83,10 @@ esac`)
 	if err == nil || !strings.Contains(err.Error(), "decode gh") {
 		t.Fatalf("error = %v, want malformed GitHub output failure", err)
 	}
+	var discovery *CandidateDiscoveryError
+	if !errors.As(err, &discovery) || discovery.Operation != "list candidates" || discovery.Issue != 0 {
+		t.Fatalf("Candidate discovery context = %#v", discovery)
+	}
 }
 
 func TestClientRejectsIncompleteCandidateSnapshots(t *testing.T) {
@@ -128,6 +133,10 @@ esac`)
 			_, err := (Client{Executable: gh}).Candidates(context.Background(), "acme/widgets")
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+			var discovery *CandidateDiscoveryError
+			if !errors.As(err, &discovery) || discovery.Operation != "inspect candidate" || discovery.Issue != 1 {
+				t.Fatalf("Candidate discovery context = %#v", discovery)
 			}
 		})
 	}

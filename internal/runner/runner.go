@@ -79,6 +79,10 @@ type Runner struct {
 	Output    io.Writer
 	Signals   <-chan os.Signal
 
+	// OnOperationalEvent receives typed Admission and shutdown lifecycle events.
+	// The Runner also writes each event through its compatible plain formatter.
+	OnOperationalEvent func(OperationalEvent)
+
 	// FinalSummary presents the aggregate state immediately before natural
 	// one-shot exhaustion. Signal shutdown and watch mode do not call it.
 	FinalSummary func(state.State) error
@@ -93,6 +97,7 @@ type Runner struct {
 	suspensionExit       atomic.Int32
 	suspensionFailed     atomic.Bool
 	forceStopRequested   atomic.Bool
+	forceStopping        atomic.Bool
 	suspensionMu         sync.Mutex
 	suspensionDeadline   time.Time
 	suspensionCancel     context.CancelFunc
@@ -244,6 +249,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	defer poll.Stop()
 	var candidateRetryTimer *time.Timer
 	var candidateRetry <-chan time.Time
+	candidateDiscoveryFailures := 0
 	defer func() {
 		if candidateRetryTimer != nil {
 			candidateRetryTimer.Stop()
@@ -321,7 +327,23 @@ func (r *Runner) Run(ctx context.Context) error {
 				if ctx.Err() != nil {
 					continue
 				}
-				r.logf("candidate discovery failed; admission paused; retry due in %s: %v", r.Config.PollInterval, err)
+				candidateDiscoveryFailures++
+				occurredAt := r.Now().UTC()
+				operation := CandidateDiscoverySnapshot
+				var issue *int
+				var discoveryErr *ghadapter.CandidateDiscoveryError
+				if errors.As(err, &discoveryErr) {
+					operation = CandidateDiscoveryOperation(discoveryErr.Operation)
+					if discoveryErr.Issue > 0 {
+						identity := discoveryErr.Issue
+						issue = &identity
+					}
+				}
+				r.emit(CandidateDiscoveryFailed{
+					Operation: operation, Issue: issue, Err: err,
+					OccurredAt: occurredAt, RetryAt: occurredAt.Add(r.Config.PollInterval),
+					ConsecutiveFailures: candidateDiscoveryFailures,
+				})
 				if candidateRetryTimer == nil {
 					candidateRetryTimer = time.NewTimer(r.Config.PollInterval)
 				} else {
@@ -329,6 +351,10 @@ func (r *Runner) Run(ctx context.Context) error {
 				}
 				candidateRetry = candidateRetryTimer.C
 			} else {
+				if candidateDiscoveryFailures > 0 {
+					r.emit(CandidateDiscoveryRecovered{OccurredAt: r.Now().UTC(), Failures: candidateDiscoveryFailures})
+					candidateDiscoveryFailures = 0
+				}
 				plan := scheduler.Plan(scheduler.Snapshot{Candidates: candidates, Runs: current.Runs, Leases: current.Leases}, r.Config.MaxConcurrentIssues)
 				startedWorker := false
 				for _, candidate := range plan.Starts {
@@ -387,13 +413,13 @@ func (r *Runner) Run(ctx context.Context) error {
 		} else if draining && len(localWorkers) == 0 {
 			if drainOperationalErr != nil {
 				if unverified := persistedWorkerCount(&current); unverified > 0 {
-					r.logf("Drain incomplete: 0 supervised Workers remaining; %s retained with unverified liveness", workerSummary(unverified))
+					r.shutdownEvent(ShutdownStageDrainIncomplete, "retaining Workers with unverified liveness", 0, NextInterruptNone, "Drain incomplete: 0 supervised Workers remaining; %s retained with unverified liveness", workerSummary(unverified))
 				} else {
-					r.logf("Drain complete: 0 Workers remaining; exiting after an operational failure")
+					r.shutdownEvent(ShutdownStageDrainComplete, "exiting after an operational failure", 0, NextInterruptNone, "Drain complete: 0 Workers remaining; exiting after an operational failure")
 				}
 				return drainOperationalErr
 			}
-			r.logf("Drain complete: 0 Workers remaining; exiting successfully")
+			r.shutdownEvent(ShutdownStageDrainComplete, "exiting successfully", 0, NextInterruptNone, "Drain complete: 0 Workers remaining; exiting successfully")
 			return nil
 		}
 
@@ -471,7 +497,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				if draining {
 					drainOperationalErr = errors.Join(drainOperationalErr, completionErr)
 					if len(localWorkers) > 0 {
-						r.logf("Drain: %s remaining; next SIGINT will be recorded as a suspension request", workerSummary(len(localWorkers)))
+						r.shutdownEvent(ShutdownStageDraining, "waiting for Owned Workers", len(localWorkers), NextInterruptSuspends, "Drain: %s remaining; next SIGINT will be recorded as a suspension request", workerSummary(len(localWorkers)))
 					}
 					continue
 				}
@@ -530,7 +556,7 @@ func (r *Runner) Run(ctx context.Context) error {
 						if draining {
 							drainOperationalErr = errors.Join(drainOperationalErr, markerErr, completedShutdownErr)
 							if len(localWorkers) > 0 {
-								r.logf("Drain: %s remaining; next SIGINT will be recorded as a suspension request", workerSummary(len(localWorkers)))
+								r.shutdownEvent(ShutdownStageDraining, "waiting for Owned Workers", len(localWorkers), NextInterruptSuspends, "Drain: %s remaining; next SIGINT will be recorded as a suspension request", workerSummary(len(localWorkers)))
 							}
 							continue
 						}
@@ -553,7 +579,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				delete(localWorkers, completion.issue)
 			}
 			if draining && len(localWorkers) > 0 {
-				r.logf("Drain: %s remaining; next SIGINT will be recorded as a suspension request", workerSummary(len(localWorkers)))
+				r.shutdownEvent(ShutdownStageDraining, "waiting for Owned Workers", len(localWorkers), NextInterruptSuspends, "Drain: %s remaining; next SIGINT will be recorded as a suspension request", workerSummary(len(localWorkers)))
 			}
 			if !closed.GroupExited && r.suspensionExit.Load() != 0 {
 				continue
@@ -561,14 +587,14 @@ func (r *Runner) Run(ctx context.Context) error {
 			if closed.ForceStopped && r.suspensionExit.Load() != 0 {
 				if err := r.finalizeForceStoppedSettledWorker(&current, runID, closed.Err); err != nil {
 					r.suspensionFailed.Store(true)
-					r.logf("Force stop: durable terminal outcome preserved, but post-stop cleanup failed: %v", err)
+					r.shutdownEvent(ShutdownStageForceStopping, "preserving terminal outcome after cleanup failure", len(localWorkers), NextInterruptRepeatsForceStop, "Force stop: durable terminal outcome preserved, but post-stop cleanup failed: %v", err)
 				}
 				continue
 			}
 			if err := r.finalizeSettledWithinLifecycle(ctx, &current, runID, closed.Err, completion.result.Settled); err != nil {
 				if r.suspensionExit.Load() != 0 {
 					r.suspensionFailed.Store(true)
-					r.logf("Suspension: merged cleanup stopped at the shared deadline: %v", err)
+					r.suspensionProgressEvent("stopping merged cleanup at the shared deadline", len(localWorkers), "Suspension: merged cleanup stopped at the shared deadline: %v", err)
 					continue
 				}
 				if draining {
@@ -681,14 +707,14 @@ func (r *Runner) handleSignal(event signalEvent, workers int) bool {
 		return true
 	}
 	if event.signal == syscall.SIGTERM {
-		r.logf("Suspension: SIGTERM accepted; %s share one %s deadline", workerSummary(workers), r.Config.SuspensionTimeout)
+		r.shutdownEvent(ShutdownStageSuspending, "suspension requested by SIGTERM", workers, NextInterruptForceStops, "Suspension: SIGTERM accepted; %s share one %s deadline", workerSummary(workers), r.Config.SuspensionTimeout)
 		return true
 	}
 	if event.firstDrain {
-		r.logf("Drain: admission stopped; %s remaining; next SIGINT will be recorded as a suspension request", workerSummary(workers))
+		r.shutdownEvent(ShutdownStageDraining, "admission stopped", workers, NextInterruptSuspends, "Drain: admission stopped; %s remaining; next SIGINT will be recorded as a suspension request", workerSummary(workers))
 		return true
 	}
-	r.logf("Drain: additional %s recorded as a suspension request; %s remaining", event.signal, workerSummary(workers))
+	r.shutdownEvent(ShutdownStageSuspending, "suspension requested by additional interrupt", workers, NextInterruptForceStops, "Drain: additional %s recorded as a suspension request; %s remaining", event.signal, workerSummary(workers))
 	return false
 }
 
@@ -1155,7 +1181,7 @@ func (r *Runner) closeSettledWhileObservingSignals(process WorkerProcess, runID 
 	}()
 	startDeadline()
 	if r.forceStopRequested.Load() {
-		r.logf("Force stop: requesting force stop for %s after settlement; identity will be revalidated before signaling", workerSummary(workers))
+		r.shutdownEvent(ShutdownStageForceStopping, "requesting force stop after settlement", workers, NextInterruptRepeatsForceStop, "Force stop: requesting force stop for %s after settlement; identity will be revalidated before signaling", workerSummary(workers))
 		cancelForce()
 	}
 
@@ -1167,12 +1193,12 @@ func (r *Runner) closeSettledWhileObservingSignals(process WorkerProcess, runID 
 			draining = r.handleSignal(event, workers) || draining
 			startDeadline()
 			if event.forceStop {
-				r.logf("Force stop: additional signal accepted; requesting force stop for %s after settlement; identity will be revalidated before signaling", workerSummary(workers))
+				r.shutdownEvent(ShutdownStageForceStopping, "requesting force stop after settlement", workers, NextInterruptRepeatsForceStop, "Force stop: additional signal accepted; requesting force stop for %s after settlement; identity will be revalidated before signaling", workerSummary(workers))
 				cancelForce()
 			}
 		case <-deadline:
 			deadline = nil
-			r.logf("Force stop: suspension deadline expired; requesting force stop for %s after settlement; identity will be revalidated before signaling", workerSummary(workers))
+			r.shutdownEvent(ShutdownStageForceStopping, "requesting force stop after suspension deadline", workers, NextInterruptRepeatsForceStop, "Force stop: suspension deadline expired; requesting force stop for %s after settlement; identity will be revalidated before signaling", workerSummary(workers))
 			cancelForce()
 		}
 	}
@@ -1751,15 +1777,15 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 	if len(local) == 0 {
 		if r.suspensionFailed.Load() {
 			cause := errors.New("suspension could not establish a continuation boundary for every admitted Run")
-			r.logf("Suspension incomplete: %v", cause)
+			r.shutdownEvent(ShutdownStageSuspensionIncomplete, "exiting with incomplete suspension", 0, NextInterruptNone, "Suspension incomplete: %v", cause)
 			return &SignalExit{Code: exitCode, Cause: cause}
 		}
-		r.logf("Suspension complete: 0 Workers remaining")
+		r.shutdownEvent(ShutdownStageSuspensionComplete, "exiting after suspension", 0, NextInterruptNone, "Suspension complete: 0 Workers remaining")
 		return &SignalExit{Code: exitCode}
 	}
 	ctx, cancel := r.suspensionContext()
 	defer cancel()
-	r.logf("Suspension: establishing continuation boundaries for %s; one %s deadline; next SIGINT will force stop remaining verified Worker groups", workerSummary(len(local)), r.Config.SuspensionTimeout)
+	r.shutdownEvent(ShutdownStageSuspending, "establishing continuation boundaries", len(local), NextInterruptForceStops, "Suspension: establishing continuation boundaries for %s; one %s deadline; next SIGINT will force stop remaining verified Worker groups", workerSummary(len(local)), r.Config.SuspensionTimeout)
 
 	suspendingAt := r.Now().UTC()
 	for issue := range local {
@@ -1781,12 +1807,13 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 	forceStopRemaining.Store(int64(workerCount))
 	go func() {
 		<-ctx.Done()
-		remaining := workerSummary(int(forceStopRemaining.Load()))
+		remainingWorkers := int(forceStopRemaining.Load())
+		remaining := workerSummary(remainingWorkers)
 		switch {
 		case r.forceStopRequested.Load():
-			r.logf("Force stop: additional signal accepted; requesting force stop for %s; each identity will be revalidated before signaling; next SIGINT will repeat the force-stop request", remaining)
+			r.shutdownEvent(ShutdownStageForceStopping, "requesting force stop", remainingWorkers, NextInterruptRepeatsForceStop, "Force stop: additional signal accepted; requesting force stop for %s; each identity will be revalidated before signaling; next SIGINT will repeat the force-stop request", remaining)
 		case errors.Is(ctx.Err(), context.DeadlineExceeded):
-			r.logf("Force stop: suspension deadline expired; requesting force stop for %s; each identity will be revalidated before signaling; next SIGINT will repeat the force-stop request", remaining)
+			r.shutdownEvent(ShutdownStageForceStopping, "requesting force stop after suspension deadline", remainingWorkers, NextInterruptRepeatsForceStop, "Force stop: suspension deadline expired; requesting force stop for %s; each identity will be revalidated before signaling; next SIGINT will repeat the force-stop request", remaining)
 		}
 	}()
 	boundaries := make(chan suspensionBoundaryResult, workerCount)
@@ -1901,7 +1928,7 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 		if err != nil {
 			clean = false
 			persistenceErrors = append(persistenceErrors, fmt.Errorf("reload issue #%d after Worker close: %w", closed.issue, err))
-			r.logf("Suspension: %s remaining", workerSummary(len(local)))
+			r.suspensionProgressEvent("waiting for suspension persistence", len(local), "Suspension: %s remaining", workerSummary(len(local)))
 			continue
 		}
 		*current = persisted
@@ -1909,7 +1936,7 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 		if run.RunID == "" {
 			clean = false
 			persistenceErrors = append(persistenceErrors, fmt.Errorf("reload issue #%d after Worker close: Run %q disappeared", closed.issue, runIDs[closed.issue]))
-			r.logf("Suspension: %s remaining", workerSummary(len(local)))
+			r.suspensionProgressEvent("waiting for suspension persistence", len(local), "Suspension: %s remaining", workerSummary(len(local)))
 			continue
 		}
 
@@ -1929,7 +1956,7 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 				clean = false
 				persistenceErrors = append(persistenceErrors, fmt.Errorf("persist terminal suspension outcome for issue #%d: %w", closed.issue, err))
 			}
-			r.logf("Suspension: %s remaining", workerSummary(len(local)))
+			r.suspensionProgressEvent("waiting for suspension completion", len(local), "Suspension: %s remaining", workerSummary(len(local)))
 			continue
 		}
 
@@ -2002,7 +2029,7 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 			clean = false
 			persistenceErrors = append(persistenceErrors, fmt.Errorf("persist suspended issue #%d: %w", closed.issue, err))
 		}
-		r.logf("Suspension: %s remaining", workerSummary(len(local)))
+		r.suspensionProgressEvent("waiting for suspension completion", len(local), "Suspension: %s remaining", workerSummary(len(local)))
 	}
 
 	var cause error
@@ -2014,9 +2041,9 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 		cause = errors.New("suspension stopped all Workers but one or more Runs require human verification")
 	}
 	if cause == nil {
-		r.logf("Suspension complete: 0 Workers remaining")
+		r.shutdownEvent(ShutdownStageSuspensionComplete, "exiting after suspension", 0, NextInterruptNone, "Suspension complete: 0 Workers remaining")
 	} else {
-		r.logf("Suspension incomplete: %v", cause)
+		r.shutdownEvent(ShutdownStageSuspensionIncomplete, "exiting with incomplete suspension", len(local), NextInterruptNone, "Suspension incomplete: %v", cause)
 	}
 	return &SignalExit{Code: exitCode, Cause: cause}
 }
@@ -2058,6 +2085,33 @@ func (r *Runner) shutdownOwned(
 		shutdownErrors = append(shutdownErrors, fmt.Errorf("persist interrupted runs: %w", err))
 	}
 	return errors.Join(shutdownErrors...)
+}
+
+func (r *Runner) emit(event OperationalEvent) {
+	if r.OnOperationalEvent != nil {
+		r.OnOperationalEvent(event)
+	}
+	if message := FormatOperationalEvent(event); message != "" {
+		r.logf("%s", message)
+	}
+}
+
+func (r *Runner) shutdownEvent(stage ShutdownStage, action string, workers int, next NextInterruptBehavior, format string, args ...any) {
+	if stage == ShutdownStageForceStopping {
+		r.forceStopping.Store(true)
+	}
+	r.emit(ShutdownEvent{
+		Stage: stage, Action: action, RemainingWorkers: workers, NextInterrupt: next,
+		Message: fmt.Sprintf(format, args...),
+	})
+}
+
+func (r *Runner) suspensionProgressEvent(action string, workers int, format string, args ...any) {
+	stage, next := ShutdownStageSuspending, NextInterruptForceStops
+	if r.forceStopping.Load() {
+		stage, next = ShutdownStageForceStopping, NextInterruptRepeatsForceStop
+	}
+	r.shutdownEvent(stage, action, workers, next, format, args...)
 }
 
 func (r *Runner) logf(format string, args ...any) {

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/robinjoseph08/backlog/internal/activity"
+	"github.com/robinjoseph08/backlog/internal/runner"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 )
@@ -136,6 +137,28 @@ esac
 				}
 			}
 		})
+	}
+}
+
+func TestDashboardReceivesShutdownStageWithoutParsingFormattedMessages(t *testing.T) {
+	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+	source := &dashboardTestSource{current: current}
+	var output bytes.Buffer
+	dashboard := newLiveDashboard(&output, source, current, time.Now)
+	if _, err := dashboard.Write([]byte("Force stop: this is diagnostic text, not a lifecycle event\n")); err != nil {
+		t.Fatal(err)
+	}
+	dashboard.redraw()
+	if !strings.Contains(lastDashboardFrame(output.String()), "Running: Ctrl-C starts Drain") {
+		t.Fatalf("formatted message changed shutdown stage:\n%s", output.String())
+	}
+	dashboard.operationalEvent(runner.ShutdownEvent{
+		Stage: runner.ShutdownStageSuspending, Action: "establishing continuation boundaries", RemainingWorkers: 2,
+		NextInterrupt: runner.NextInterruptForceStops,
+	})
+	dashboard.redraw()
+	if !strings.Contains(lastDashboardFrame(output.String()), "Suspending: continuation boundaries are being established") {
+		t.Fatalf("structured event did not change shutdown stage:\n%s", output.String())
 	}
 }
 
@@ -576,6 +599,10 @@ func TestDashboardKeepsTerminalRunsAndShutdownMessagesVisible(t *testing.T) {
 	current.Runs, current.Leases = []scheduler.Run{terminal}, nil
 	source.current = current
 	dashboard.update(current)
+	dashboard.operationalEvent(runner.ShutdownEvent{
+		Stage: runner.ShutdownStageDraining, Action: "admission stopped", RemainingWorkers: 1,
+		NextInterrupt: runner.NextInterruptSuspends,
+	})
 	if _, err := dashboard.Write([]byte("Drain: admission stopped; 1 Worker remaining; next SIGINT will be recorded as a suspension request\n")); err != nil {
 		t.Fatal(err)
 	}
@@ -589,6 +616,10 @@ func TestDashboardKeepsTerminalRunsAndShutdownMessagesVisible(t *testing.T) {
 			t.Fatalf("dashboard missing %q:\n%s", want, output.String())
 		}
 	}
+	dashboard.operationalEvent(runner.ShutdownEvent{
+		Stage: runner.ShutdownStageSuspending, Action: "suspension requested", RemainingWorkers: 1,
+		NextInterrupt: runner.NextInterruptForceStops,
+	})
 	if _, err := dashboard.Write([]byte("Drain: additional interrupt recorded as a suspension request; 1 Worker remaining\n")); err != nil {
 		t.Fatal(err)
 	}
@@ -596,6 +627,10 @@ func TestDashboardKeepsTerminalRunsAndShutdownMessagesVisible(t *testing.T) {
 	if !strings.Contains(output.String(), "Suspending: continuation boundaries are being established; next Ctrl-C force stops") {
 		t.Fatalf("suspension footer did not describe next interrupt:\n%s", output.String())
 	}
+	dashboard.operationalEvent(runner.ShutdownEvent{
+		Stage: runner.ShutdownStageForceStopping, Action: "requesting force stop", RemainingWorkers: 1,
+		NextInterrupt: runner.NextInterruptRepeatsForceStop,
+	})
 	if _, err := dashboard.Write([]byte("Force stop: additional signal accepted; requesting force stop for 1 Worker\nSuspension: 1 Worker remaining\n")); err != nil {
 		t.Fatal(err)
 	}
