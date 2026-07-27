@@ -67,7 +67,7 @@ func MainWithTerminal(ctx context.Context, args []string, dependencies TerminalD
 			presentation = nil
 		}
 		host := runnerHost{terminal: terminal}
-		err = host.run(ctx, func(signals <-chan os.Signal) error {
+		err = host.run(ctx, func(signals <-chan lifecycleSignal) error {
 			return runCommand(ctx, args[1:], stdout, stderr, signals, terminalOutput, terminal.Now)
 		}, presentation)
 	case "status":
@@ -134,11 +134,12 @@ func outputIsTerminal(output io.Writer) bool {
 	return ok && term.IsTerminal(int(file.Fd()))
 }
 
-func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan os.Signal, terminalOutput bool, now func() time.Time) (resultErr error) {
+func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan lifecycleSignal, terminalOutput bool, now func() time.Time) (resultErr error) {
 	setupCtx := ctx
-	runnerSignals := signals
+	var runnerSignals <-chan os.Signal
 	var cancelSetup context.CancelFunc
 	var relayDone chan struct{}
+	var relayStopped chan struct{}
 	var setupMu sync.Mutex
 	setupActive := signals != nil
 	setupSignalExit := setupSignalNone
@@ -149,22 +150,19 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 		forwarded := make(chan os.Signal, 16)
 		runnerSignals = forwarded
 		relayDone = make(chan struct{})
+		relayStopped = make(chan struct{})
 		go func() {
+			defer close(relayStopped)
 			for {
 				select {
-				case signal, ok := <-signals:
+				case event, ok := <-signals:
 					if !ok {
-						return
-					}
-					select {
-					case forwarded <- signal:
-					case <-relayDone:
 						return
 					}
 					setupMu.Lock()
 					if setupActive {
 						switch {
-						case signal == syscall.SIGTERM && setupSignalExit != setupSignalInterruptSuspension && setupSignalExit != setupSignalTermSuspension:
+						case event.signal == syscall.SIGTERM && setupSignalExit != setupSignalInterruptSuspension && setupSignalExit != setupSignalTermSuspension:
 							setupSignalExit = setupSignalTermSuspension
 						case setupSignalExit == setupSignalNone:
 							setupSignalExit = setupSignalDrainAccepted
@@ -174,8 +172,17 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 							setupForceStop = true
 						}
 						cancelSetup()
+						setupMu.Unlock()
+						event.accept()
+						continue
 					}
 					setupMu.Unlock()
+					select {
+					case forwarded <- event.signal:
+						event.accept()
+					case <-relayDone:
+						return
+					}
 				case <-relayDone:
 					return
 				}
@@ -184,6 +191,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 		defer func() {
 			close(relayDone)
 			cancelSetup()
+			<-relayStopped
 			setupMu.Lock()
 			setupExit := setupSignalExit
 			forceStop := setupForceStop

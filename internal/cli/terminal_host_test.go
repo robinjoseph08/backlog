@@ -39,10 +39,11 @@ func TestRunnerHostOrdersExternalAndPresentationSignalsThroughOneIngress(t *test
 		<-ctx.Done()
 		return ctx.Err()
 	}
-	err := host.run(context.Background(), func(signals <-chan os.Signal) error {
+	err := host.run(context.Background(), func(signals <-chan lifecycleSignal) error {
 		observed := make([]os.Signal, 0, 4)
 		for len(observed) < 4 {
-			observed = append(observed, <-signals)
+			event := <-signals
+			observed = append(observed, event.signal)
 			switch len(observed) {
 			case 1:
 				close(firstObserved)
@@ -51,6 +52,7 @@ func TestRunnerHostOrdersExternalAndPresentationSignalsThroughOneIngress(t *test
 			case 3:
 				close(thirdObserved)
 			}
+			event.accept()
 		}
 		got <- observed
 		return nil
@@ -61,6 +63,25 @@ func TestRunnerHostOrdersExternalAndPresentationSignalsThroughOneIngress(t *test
 	want := []os.Signal{os.Interrupt, os.Interrupt, syscall.SIGTERM, os.Interrupt}
 	if observed := <-got; !reflect.DeepEqual(observed, want) {
 		t.Fatalf("ordered signals = %v, want %v", observed, want)
+	}
+}
+
+func TestPresentationInterruptWaitsForLifecycleAcceptance(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ingress := newOrderedSignalIngress(ctx, nil)
+	returned := make(chan error, 1)
+	go func() { returned <- ingress.submit(context.Background(), os.Interrupt) }()
+
+	event := <-ingress.events
+	select {
+	case err := <-returned:
+		t.Fatalf("interrupt returned before lifecycle acceptance: %v", err)
+	default:
+	}
+	event.accept()
+	if err := <-returned; err != nil {
+		t.Fatalf("accepted interrupt: %v", err)
 	}
 }
 
@@ -98,10 +119,12 @@ func TestRunnerHostPresentationFailureRequestsSuspensionAndWaitsForRunner(t *tes
 			done := make(chan error, 1)
 			host := runnerHost{terminal: TerminalDependencies{}}
 			go func() {
-				done <- host.run(context.Background(), func(signals <-chan os.Signal) error {
-					if signal := <-signals; signal != syscall.SIGTERM {
-						t.Errorf("presentation failure signal = %v, want SIGTERM", signal)
+				done <- host.run(context.Background(), func(signals <-chan lifecycleSignal) error {
+					event := <-signals
+					if event.signal != syscall.SIGTERM {
+						t.Errorf("presentation failure signal = %v, want SIGTERM", event.signal)
 					}
+					event.accept()
 					close(handling)
 					<-finishHandling
 					return &runner.SignalExit{Code: 143}

@@ -104,9 +104,15 @@ func (e *PresentationFailure) Unwrap() []error {
 	return []error{e.Err, e.ShutdownErr}
 }
 
-type signalSubmission struct {
+type lifecycleSignal struct {
 	signal   os.Signal
 	accepted chan struct{}
+}
+
+func (s lifecycleSignal) accept() {
+	if s.accepted != nil {
+		close(s.accepted)
+	}
 }
 
 // orderedSignalIngress is the only path from external signals and
@@ -114,16 +120,16 @@ type signalSubmission struct {
 type orderedSignalIngress struct {
 	ctx         context.Context
 	external    <-chan os.Signal
-	submissions chan signalSubmission
-	events      chan os.Signal
+	submissions chan lifecycleSignal
+	events      chan lifecycleSignal
 }
 
 func newOrderedSignalIngress(ctx context.Context, external <-chan os.Signal) *orderedSignalIngress {
 	ingress := &orderedSignalIngress{
 		ctx:         ctx,
 		external:    external,
-		submissions: make(chan signalSubmission),
-		events:      make(chan os.Signal, 16),
+		submissions: make(chan lifecycleSignal),
+		events:      make(chan lifecycleSignal, 16),
 	}
 	go ingress.forward()
 	return ingress
@@ -137,21 +143,20 @@ func (i *orderedSignalIngress) forward() {
 				i.external = nil
 				continue
 			}
-			if !i.publish(signal) {
+			if !i.publish(lifecycleSignal{signal: signal}) {
 				return
 			}
 		case submission := <-i.submissions:
-			if !i.publish(submission.signal) {
+			if !i.publish(submission) {
 				return
 			}
-			close(submission.accepted)
 		case <-i.ctx.Done():
 			return
 		}
 	}
 }
 
-func (i *orderedSignalIngress) publish(signal os.Signal) bool {
+func (i *orderedSignalIngress) publish(signal lifecycleSignal) bool {
 	select {
 	case i.events <- signal:
 		return true
@@ -162,7 +167,7 @@ func (i *orderedSignalIngress) publish(signal os.Signal) bool {
 
 func (i *orderedSignalIngress) submit(ctx context.Context, signal os.Signal) error {
 	accepted := make(chan struct{})
-	request := signalSubmission{signal: signal, accepted: accepted}
+	request := lifecycleSignal{signal: signal, accepted: accepted}
 	select {
 	case i.submissions <- request:
 	case <-ctx.Done():
@@ -184,7 +189,7 @@ type runnerHost struct {
 	terminal TerminalDependencies
 }
 
-func (h runnerHost) run(ctx context.Context, run func(<-chan os.Signal) error, presentation Presentation) error {
+func (h runnerHost) run(ctx context.Context, run func(<-chan lifecycleSignal) error, presentation Presentation) error {
 	hostCtx, stopHost := context.WithCancel(context.Background())
 	defer stopHost()
 	ingress := newOrderedSignalIngress(hostCtx, h.terminal.Signals)
@@ -227,10 +232,18 @@ func (h runnerHost) run(ctx context.Context, run func(<-chan os.Signal) error, p
 		if presentationErr == nil {
 			presentationErr = errors.New("presentation stopped while Runner was active")
 		}
-		// The submission is acknowledged only after SIGTERM is in the same
-		// ordered stream used by external signals and Ctrl-C input.
-		_ = ingress.submit(context.Background(), syscall.SIGTERM)
-		runnerErr := <-runnerDone
+		// The submission is acknowledged only after the Runner side accepts
+		// SIGTERM from the same ordered stream used by external signals and
+		// Ctrl-C input. The Runner may finish concurrently, so do not make its
+		// completion depend on an acknowledgement it can no longer provide.
+		submissionDone := make(chan error, 1)
+		go func() { submissionDone <- ingress.submit(hostCtx, syscall.SIGTERM) }()
+		var runnerErr error
+		select {
+		case <-submissionDone:
+			runnerErr = <-runnerDone
+		case runnerErr = <-runnerDone:
+		}
 		stopPresentation()
 		return &PresentationFailure{Err: presentationErr, ShutdownErr: runnerErr}
 	}
