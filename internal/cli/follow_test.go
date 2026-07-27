@@ -1152,6 +1152,7 @@ func TestFollowCommandActivityAgeAdvancesOnlyForSemanticWorkerAndSubagentChanges
 			name: "meaningful Worker output advances age",
 			records: []timedWorkerRecord{
 				{observedAt, workerStart},
+				{observedAt, workerUpdate},
 				{observedAt.Add(4 * time.Second), strings.Replace(workerUpdate, "private Worker result", "changed private Worker result", 1)},
 			},
 			wantAge: "6s", wantEntry: "Tool bash output changed",
