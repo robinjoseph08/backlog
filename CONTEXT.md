@@ -36,6 +36,10 @@ _Avoid_: Archived Run, deleted Run
 A durable indication that an operator has seen a Historical Run's unexpected non-Completion outcome, allowing default status to omit it without deleting history.
 _Avoid_: Dismissal, clearance, deletion
 
+**External Resolution**:
+A GitHub-verified issue closure that makes an incomplete Run unnecessary without attributing issue completion to that Run.
+_Avoid_: Manual Completion, Outcome Acknowledgment, Reset
+
 **Intervention-required Run**:
 An incomplete Run that retains its Lease because Backlog cannot safely continue or release ownership without human judgment.
 _Avoid_: Past failed Run, historical failure
