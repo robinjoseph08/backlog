@@ -69,6 +69,83 @@ func TestRunnerHostOrdersExternalAndPresentationSignalsThroughOneIngress(t *test
 	}
 }
 
+func TestPresentationEventQueueBoundsIgnoredConsumer(t *testing.T) {
+	queue := newPresentationEventQueue()
+	published := make(chan struct{})
+	go func() {
+		for failure := 1; failure <= presentationEventLimit*100; failure++ {
+			queue.publish(runner.CandidateDiscoveryFailed{ConsecutiveFailures: failure})
+		}
+		close(published)
+	}()
+	select {
+	case <-published:
+	case <-time.After(time.Second):
+		t.Fatal("publishing blocked on an ignored presentation event consumer")
+	}
+
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	if len(queue.events) != presentationEventLimit {
+		t.Fatalf("ignored-consumer queue length = %d, want hard limit %d", len(queue.events), presentationEventLimit)
+	}
+	latest, ok := queue.events[len(queue.events)-1].(runner.CandidateDiscoveryFailed)
+	if !ok || latest.ConsecutiveFailures != presentationEventLimit*100 {
+		t.Fatalf("latest retained Admission event = %#v", queue.events[len(queue.events)-1])
+	}
+}
+
+func TestPresentationEventQueuePreservesOrderedShutdownAndTerminalDeliveryForSlowConsumer(t *testing.T) {
+	queue := newPresentationEventQueue()
+	for failure := 1; failure <= presentationEventLimit*4; failure++ {
+		queue.publish(runner.CandidateDiscoveryFailed{ConsecutiveFailures: failure})
+	}
+	for _, stage := range []runner.ShutdownStage{
+		runner.ShutdownStageDraining,
+		runner.ShutdownStageSuspending,
+		runner.ShutdownStageForceStopping,
+		runner.ShutdownStageSuspensionIncomplete,
+	} {
+		queue.publish(runner.ShutdownEvent{Stage: stage})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var events []runner.OperationalEvent
+	for {
+		event, err := queue.next(ctx)
+		if err != nil {
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("drain bounded event queue: %v", err)
+			}
+			break
+		}
+		events = append(events, event)
+	}
+	if len(events) != presentationEventLimit {
+		t.Fatalf("slow-consumer delivery count = %d, want bounded %d", len(events), presentationEventLimit)
+	}
+	previousFailure := 0
+	for _, event := range events[:len(events)-4] {
+		failure, ok := event.(runner.CandidateDiscoveryFailed)
+		if !ok || failure.ConsecutiveFailures <= previousFailure {
+			t.Fatalf("retained Admission delivery is not ordered: %#v", events)
+		}
+		previousFailure = failure.ConsecutiveFailures
+	}
+	for index, stage := range []runner.ShutdownStage{
+		runner.ShutdownStageDraining,
+		runner.ShutdownStageSuspending,
+		runner.ShutdownStageForceStopping,
+		runner.ShutdownStageSuspensionIncomplete,
+	} {
+		shutdown, ok := events[len(events)-4+index].(runner.ShutdownEvent)
+		if !ok || shutdown.Stage != stage {
+			t.Fatalf("shutdown delivery %d = %#v, want stage %s", index, events[len(events)-4+index], stage)
+		}
+	}
+}
+
 func TestPresentationInterruptWaitsForLifecycleAcceptance(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

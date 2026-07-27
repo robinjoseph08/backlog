@@ -120,6 +120,8 @@ func (e *PresentationFailure) Unwrap() []error {
 	return []error{e.Err, e.RunnerErr}
 }
 
+const presentationEventLimit = 32
+
 type presentationEventQueue struct {
 	mu     sync.Mutex
 	events []runner.OperationalEvent
@@ -133,6 +135,9 @@ func newPresentationEventQueue() *presentationEventQueue {
 func (q *presentationEventQueue) publish(event runner.OperationalEvent) {
 	q.mu.Lock()
 	q.events = append(q.events, event)
+	for len(q.events) > presentationEventLimit {
+		q.remove(presentationEventEvictionIndex(q.events))
+	}
 	q.mu.Unlock()
 	select {
 	case q.wake <- struct{}{}:
@@ -140,12 +145,86 @@ func (q *presentationEventQueue) publish(event runner.OperationalEvent) {
 	}
 }
 
+// presentationEventEvictionIndex prefers obsolete progress, then the oldest
+// nonterminal state. This retains a recent ordered lifecycle window and never
+// trades a terminal shutdown result for optional progress.
+func presentationEventEvictionIndex(events []runner.OperationalEvent) int {
+	for index, event := range events {
+		if presentationEventIsTerminal(event) {
+			continue
+		}
+		if presentationEventIsSuperseded(events, index) {
+			return index
+		}
+	}
+	for index, event := range events {
+		if !presentationEventIsTerminal(event) {
+			return index
+		}
+	}
+	return 0
+}
+
+func presentationEventIsSuperseded(events []runner.OperationalEvent, index int) bool {
+	switch event := events[index].(type) {
+	case runner.CandidateDiscoveryFailed:
+		for _, later := range events[index+1:] {
+			switch later.(type) {
+			case runner.CandidateDiscoveryFailed:
+				return true
+			case runner.CandidateDiscoveryRecovered:
+				return false
+			}
+		}
+	case runner.ShutdownEvent:
+		if presentationEventIsTerminal(event) {
+			return false
+		}
+		for _, later := range events[index+1:] {
+			shutdown, ok := later.(runner.ShutdownEvent)
+			if ok && shutdown.Stage == event.Stage {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func presentationEventIsTerminal(event runner.OperationalEvent) bool {
+	shutdown, ok := event.(runner.ShutdownEvent)
+	if !ok {
+		return false
+	}
+	switch shutdown.Stage {
+	case runner.ShutdownStageDrainComplete, runner.ShutdownStageDrainIncomplete,
+		runner.ShutdownStageSuspensionComplete, runner.ShutdownStageSuspensionIncomplete:
+		return true
+	default:
+		return false
+	}
+}
+
+func (q *presentationEventQueue) remove(index int) {
+	copy(q.events[index:], q.events[index+1:])
+	q.events[len(q.events)-1] = nil
+	q.events = q.events[:len(q.events)-1]
+}
+
+func (q *presentationEventQueue) pop() runner.OperationalEvent {
+	event := q.events[0]
+	q.events[0] = nil
+	q.events = q.events[1:]
+	if len(q.events) == 0 {
+		q.events = nil
+	}
+	return event
+}
+
 func (q *presentationEventQueue) next(ctx context.Context) (runner.OperationalEvent, error) {
 	for {
 		q.mu.Lock()
 		if len(q.events) > 0 {
-			event := q.events[0]
-			q.events = q.events[1:]
+			event := q.pop()
 			q.mu.Unlock()
 			return event, nil
 		}
@@ -153,12 +232,12 @@ func (q *presentationEventQueue) next(ctx context.Context) (runner.OperationalEv
 		select {
 		case <-q.wake:
 		case <-ctx.Done():
-			// Prefer an event published concurrently with cancellation so the
-			// presentation can observe the Runner's terminal lifecycle stage.
+			// Prefer queued events over cancellation so a slow presentation can
+			// still observe the Runner's ordered terminal lifecycle stage before
+			// host teardown completes.
 			q.mu.Lock()
 			if len(q.events) > 0 {
-				event := q.events[0]
-				q.events = q.events[1:]
+				event := q.pop()
 				q.mu.Unlock()
 				return event, nil
 			}
