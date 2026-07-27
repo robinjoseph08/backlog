@@ -34,6 +34,7 @@ const (
 	dashboardSuspensionComplete
 	dashboardStopped
 	dashboardFinished
+	dashboardStageCount
 )
 
 // liveDashboard holds the aggregate observation model shared by the Bubble Tea
@@ -552,50 +553,78 @@ func dashboardUsedCapacity(current state.State) int {
 	return used
 }
 
-func dashboardFooter(stage dashboardStage) string {
+type dashboardStagePresentation struct {
+	summary       string
+	stage         string
+	nextInterrupt string
+}
+
+func dashboardStagePresentationFor(stage dashboardStage) dashboardStagePresentation {
 	switch stage {
 	case dashboardDraining:
-		return "Draining: admission is stopped; next Ctrl-C suspends unfinished Runs within the shared deadline."
+		return dashboardStagePresentation{
+			summary:       "Draining: admission is stopped; next Ctrl-C suspends unfinished Runs within the shared deadline.",
+			stage:         "Draining",
+			nextInterrupt: "suspend unfinished Runs within the shared deadline",
+		}
 	case dashboardSuspending:
-		return "Suspending: continuation boundaries are being established; next Ctrl-C force stops remaining verified Worker groups."
+		return dashboardStagePresentation{
+			summary:       "Suspending: continuation boundaries are being established; next Ctrl-C force stops remaining verified Worker groups.",
+			stage:         "Suspending",
+			nextInterrupt: "force stop remaining verified Worker groups",
+		}
 	case dashboardForceStopping:
-		return "Force stopping: Worker identities are revalidated before signaling; next Ctrl-C repeats the force-stop request."
+		return dashboardStagePresentation{
+			summary:       "Force stopping: Worker identities are revalidated before signaling; next Ctrl-C repeats the force-stop request.",
+			stage:         "Force stopping",
+			nextInterrupt: "repeat the force-stop request after identity checks",
+		}
 	case dashboardDrainComplete:
-		return "Drain complete: no Owned Workers remain; no further interrupt is needed."
+		return dashboardStagePresentation{
+			summary:       "Drain complete: no Owned Workers remain; no further interrupt is needed.",
+			stage:         "Drain complete",
+			nextInterrupt: "no effect",
+		}
 	case dashboardDrainIncomplete:
-		return "Drain incomplete: Worker liveness remains unverified; no further interrupt has an effect before exit."
+		return dashboardStagePresentation{
+			summary:       "Drain incomplete: Worker liveness remains unverified; no further interrupt has an effect before exit.",
+			stage:         "Drain incomplete; Worker liveness is unverified",
+			nextInterrupt: "no effect",
+		}
 	case dashboardSuspensionComplete:
-		return "Suspension finished: no further interrupt has an effect before exit."
+		return dashboardStagePresentation{
+			summary:       "Suspension finished: no further interrupt has an effect before exit.",
+			stage:         "Suspension finished",
+			nextInterrupt: "no effect",
+		}
 	case dashboardStopped:
-		return "Stopped: the runner is exiting; interrupts have no further effect."
+		return dashboardStagePresentation{
+			summary:       "Stopped: the runner is exiting; interrupts have no further effect.",
+			stage:         "Stopped; the Runner is exiting",
+			nextInterrupt: "no effect",
+		}
 	case dashboardFinished:
-		return "Complete: the runner has exited; interrupts have no further effect."
+		return dashboardStagePresentation{
+			summary:       "Complete: the runner has exited; interrupts have no further effect.",
+			stage:         "Complete; the Runner has exited",
+			nextInterrupt: "no effect",
+		}
 	default:
-		return "Running: Ctrl-C starts Drain, stopping admission while Owned Workers finish."
+		return dashboardStagePresentation{
+			summary:       "Running: Ctrl-C starts Drain, stopping admission while Owned Workers finish.",
+			stage:         "Running",
+			nextInterrupt: "start Drain and stop Admission",
+		}
 	}
 }
 
+func dashboardFooter(stage dashboardStage) string {
+	return dashboardStagePresentationFor(stage).summary
+}
+
 func dashboardFooterParts(stage dashboardStage) string {
-	switch stage {
-	case dashboardDraining:
-		return "Runner stage: Draining\nNext Ctrl-C: suspend unfinished Runs within the shared deadline"
-	case dashboardSuspending:
-		return "Runner stage: Suspending\nNext Ctrl-C: force stop remaining verified Worker groups"
-	case dashboardForceStopping:
-		return "Runner stage: Force stopping\nNext Ctrl-C: repeat the force-stop request after identity checks"
-	case dashboardDrainComplete:
-		return "Runner stage: Drain complete\nNext Ctrl-C: no effect"
-	case dashboardDrainIncomplete:
-		return "Runner stage: Drain incomplete; Worker liveness is unverified\nNext Ctrl-C: no effect"
-	case dashboardSuspensionComplete:
-		return "Runner stage: Suspension finished\nNext Ctrl-C: no effect"
-	case dashboardStopped:
-		return "Runner stage: Stopped; the Runner is exiting\nNext Ctrl-C: no effect"
-	case dashboardFinished:
-		return "Runner stage: Complete; the Runner has exited\nNext Ctrl-C: no effect"
-	default:
-		return "Runner stage: Running\nNext Ctrl-C: start Drain and stop Admission"
-	}
+	presentation := dashboardStagePresentationFor(stage)
+	return fmt.Sprintf("Runner stage: %s\nNext Ctrl-C: %s", presentation.stage, presentation.nextInterrupt)
 }
 
 func (d *liveDashboard) finalSummary(current state.State) error {

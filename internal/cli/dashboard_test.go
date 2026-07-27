@@ -616,6 +616,27 @@ func TestDashboardElapsedTimerRedrawsWithoutStateActivity(t *testing.T) {
 	}
 }
 
+func TestDashboardStagePresentationCoversEveryStage(t *testing.T) {
+	seen := make(map[string]dashboardStage)
+	for stage := dashboardRunning; stage < dashboardStageCount; stage++ {
+		presentation := dashboardStagePresentationFor(stage)
+		if presentation.summary == "" || presentation.stage == "" || presentation.nextInterrupt == "" {
+			t.Fatalf("stage %d has incomplete presentation: %#v", stage, presentation)
+		}
+		if previous, exists := seen[presentation.stage]; exists {
+			t.Fatalf("stages %d and %d share presentation %q; the stage switch may be incomplete", previous, stage, presentation.stage)
+		}
+		seen[presentation.stage] = stage
+		if got := dashboardFooter(stage); got != presentation.summary {
+			t.Fatalf("stage %d summary = %q, want %q", stage, got, presentation.summary)
+		}
+		wantParts := fmt.Sprintf("Runner stage: %s\nNext Ctrl-C: %s", presentation.stage, presentation.nextInterrupt)
+		if got := dashboardFooterParts(stage); got != wantParts {
+			t.Fatalf("stage %d footer parts = %q, want %q", stage, got, wantParts)
+		}
+	}
+}
+
 func TestDashboardCapacityMatchesSchedulerSemantics(t *testing.T) {
 	for _, test := range []struct {
 		name string
