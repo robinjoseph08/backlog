@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -704,6 +705,8 @@ func TestCompiledExecutableFollowsNormalizedRunnerActivityConcurrentlyAndCtrlCIs
 	statePath := filepath.Join(stateDir, "state.json")
 	workerStarted := filepath.Join(root, "worker-started")
 	emitActivity := filepath.Join(root, "emit-activity")
+	emitSubagentChange := filepath.Join(root, "emit-subagent-change")
+	completeActivity := filepath.Join(root, "complete-activity")
 	finishWorker := filepath.Join(root, "finish-worker")
 	closedMarker := filepath.Join(root, "issue-closed")
 
@@ -750,7 +753,11 @@ printf '%s\n' \
   '{"type":"tool_execution_update","toolCallId":"tool-live","toolName":"bash","partialResult":{"output":"private tool result","durationMs":10,"spinnerFrame":1}}' \
   '{"type":"tool_execution_end","toolCallId":"tool-live","toolName":"bash","result":{"content":"private full tool result"},"isError":false}' \
   '{"type":"tool_execution_start","toolCallId":"subagent-live","toolName":"Agent","args":{"prompt":"private Subagent prompt"}}' \
-  '{"type":"tool_execution_update","toolCallId":"subagent-live","toolName":"Agent","partialResult":{"content":[{"type":"text","text":"private Subagent output"}],"details":{"description":"Review live Activity","status":"running","activity":"reviewing","turnCount":1,"toolUses":2,"tokens":"1.2k tokens","durationMs":20,"spinnerFrame":2}}}' \
+  '{"type":"tool_execution_update","toolCallId":"subagent-live","toolName":"Agent","partialResult":{"content":[{"type":"text","text":"private Subagent output"}],"details":{"description":"Review live Activity","status":"running","activity":"reviewing","turnCount":1,"toolUses":2,"tokens":"1.2k tokens","durationMs":20,"spinnerFrame":2}}}'
+while [ ! -f `+quote(emitSubagentChange)+` ]; do sleep 0.01; done
+printf '%s\n' '{"type":"tool_execution_update","toolCallId":"subagent-live","toolName":"Agent","partialResult":{"content":[{"type":"text","text":"changed private Subagent output"}],"details":{"description":"Review live Activity","status":"running","activity":"testing","turnCount":1,"toolUses":2,"tokens":"1.2k tokens","durationMs":30,"spinnerFrame":3}}}'
+while [ ! -f `+quote(completeActivity)+` ]; do sleep 0.01; done
+printf '%s\n' \
   '{"type":"tool_execution_end","toolCallId":"subagent-live","toolName":"Agent","result":{"content":[{"type":"text","text":"private full Subagent result"}],"details":{"description":"Review live Activity","status":"completed","activity":"reviewing","turnCount":1,"toolUses":2,"tokens":"1.2k tokens","durationMs":30}},"isError":false}' \
   '{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"private final reasoning"},{"type":"text","text":"Live normalized Activity observed"}],"usage":{"totalTokens":73}}}'
 while [ ! -f `+quote(finishWorker)+` ]; do sleep 0.01; done
@@ -799,42 +806,59 @@ while IFS= read -r ignored; do :; done
 		close(firstLines)
 	}()
 	var firstOutputLines []string
-	waitForFollowLine := func(want string) {
+	waitForFollowLine := func(lines <-chan string, outputLines *[]string, diagnostics *bytes.Buffer, want string) {
 		t.Helper()
 		timer := time.NewTimer(5 * time.Second)
 		defer timer.Stop()
 		for {
 			select {
-			case line, ok := <-firstLines:
+			case line, ok := <-lines:
 				if !ok {
-					t.Fatalf("normalized follower exited before %q, output = %q, stderr = %q", want, firstOutputLines, firstStderr.String())
+					t.Fatalf("normalized follower exited before %q, output = %q, stderr = %q", want, *outputLines, diagnostics.String())
 				}
-				firstOutputLines = append(firstOutputLines, line)
+				*outputLines = append(*outputLines, line)
 				if strings.Contains(line, want) {
 					return
 				}
 			case <-timer.C:
-				t.Fatalf("normalized follower did not emit %q, output = %q, stderr = %q", want, firstOutputLines, firstStderr.String())
+				t.Fatalf("normalized follower did not emit %q, output = %q, stderr = %q", want, *outputLines, diagnostics.String())
 			}
 		}
 	}
-	waitForFollowLine("Run Activity (latest 20)")
+	waitForFollowLine(firstLines, &firstOutputLines, &firstStderr, "Run Activity (latest 20)")
 
-	duplicate := exec.Command(runnerCommand.Path, runnerCommand.Args[1:]...)
-	if output, err := duplicate.CombinedOutput(); err == nil {
-		t.Fatalf("concurrent follower disrupted repository scheduling coordination; duplicate Runner started: %q", output)
+	duplicateContext, cancelDuplicate := context.WithTimeout(context.Background(), 2*time.Second)
+	duplicate := exec.CommandContext(duplicateContext, runnerCommand.Path, runnerCommand.Args[1:]...)
+	output, duplicateErr := duplicate.CombinedOutput()
+	cancelDuplicate()
+	var duplicateExit *exec.ExitError
+	if errors.Is(duplicateContext.Err(), context.DeadlineExceeded) {
+		t.Fatalf("duplicate Runner did not promptly honor repository scheduling coordination: %q", output)
+	}
+	if !errors.As(duplicateErr, &duplicateExit) || duplicateExit.ExitCode() != 1 || !strings.Contains(string(output), "runner already active") {
+		t.Fatalf("duplicate Runner coordination refusal = %v, output = %q", duplicateErr, output)
 	}
 	if err := os.WriteFile(emitActivity, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	waitForFollowLine("Worker started")
-	waitForFollowLine("Review live Activity")
-	waitForFollowLine("Assistant response completed: Live normalized Activity observed")
+	waitForFollowLine(firstLines, &firstOutputLines, &firstStderr, "Worker started")
+	waitForFollowLine(firstLines, &firstOutputLines, &firstStderr, "Review live Activity")
+	if err := os.WriteFile(emitSubagentChange, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitForFollowLine(firstLines, &firstOutputLines, &firstStderr, "activity: testing")
+	if err := os.WriteFile(completeActivity, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitForFollowLine(firstLines, &firstOutputLines, &firstStderr, "Assistant response completed: Live normalized Activity observed")
 	if err := firstFollower.Process.Signal(os.Interrupt); err != nil {
 		t.Fatalf("interrupt follower: %v", err)
 	}
 	if err := firstFollower.Wait(); err != nil {
 		t.Fatalf("interrupted follower: %v, stderr = %q", err, firstStderr.String())
+	}
+	if firstStderr.Len() != 0 {
+		t.Fatalf("live normalized follower diagnostics = %q", firstStderr.String())
 	}
 	for line := range firstLines {
 		firstOutputLines = append(firstOutputLines, line)
@@ -853,12 +877,25 @@ while IFS= read -r ignored; do :; done
 	}
 
 	secondFollower := exec.Command(binary, "follow", run.RunID, "--repo-dir", repository, "--state-dir", stateDir)
-	var secondOutput, secondDiagnostics bytes.Buffer
-	secondFollower.Stdout = &secondOutput
+	secondStdout, err := secondFollower.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secondDiagnostics bytes.Buffer
 	secondFollower.Stderr = &secondDiagnostics
 	if err := secondFollower.Start(); err != nil {
 		t.Fatal(err)
 	}
+	secondLines := make(chan string, 100)
+	go func() {
+		scanner := bufio.NewScanner(secondStdout)
+		for scanner.Scan() {
+			secondLines <- scanner.Text()
+		}
+		close(secondLines)
+	}()
+	var secondOutputLines []string
+	waitForFollowLine(secondLines, &secondOutputLines, &secondDiagnostics, "State: running")
 	if err := os.WriteFile(finishWorker, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -872,13 +909,17 @@ while IFS= read -r ignored; do :; done
 		t.Fatalf("follower Ctrl-C affected Runner lifecycle:\n%s", runnerOutput.String())
 	}
 	if err := secondFollower.Wait(); err != nil {
-		t.Fatalf("terminal follower: %v\n%s", err, secondOutput.String())
+		t.Fatalf("terminal follower: %v\n%s", err, strings.Join(secondOutputLines, "\n"))
 	}
+	for line := range secondLines {
+		secondOutputLines = append(secondOutputLines, line)
+	}
+	secondOutput := strings.Join(secondOutputLines, "\n")
 	final, err := (state.FileStore{Path: statePath}).Load()
 	if err != nil || len(final.Runs) != 1 || final.Runs[0].Status != scheduler.StatusMerged || len(final.Leases) != 0 {
 		t.Fatalf("final state = %#v, err = %v", final, err)
 	}
-	combinedFollowOutput := firstOutput + "\n" + secondOutput.String()
+	combinedFollowOutput := firstOutput + "\n" + secondOutput
 	for _, want := range []string{
 		"Run: " + run.RunID, "Worker started", "Worker turn started", "Model streaming",
 		"Tool bash started", "Tool bash output changed", "Tool bash completed",
@@ -891,7 +932,7 @@ while IFS= read -r ignored; do :; done
 	}
 	for _, private := range []string{
 		"private live reasoning", "private final reasoning", "private tool arguments", "private tool result",
-		"private full tool result", "private Subagent prompt", "private Subagent output", "private full Subagent result",
+		"private full tool result", "private Subagent prompt", "private Subagent output", "changed private Subagent output", "private full Subagent result",
 	} {
 		if strings.Contains(combinedFollowOutput, private) {
 			t.Fatalf("normalized Follow output exposed %q:\n%s", private, combinedFollowOutput)
