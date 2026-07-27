@@ -45,6 +45,9 @@ func MainWithSignalsAndTerminal(ctx context.Context, args []string, stdout, stde
 	return MainWithTerminal(ctx, args, TerminalDependencies{
 		Output: stdout, ErrorOutput: stderr, Signals: signals,
 		IsTerminal: func() bool { return isTerminal(stdout) },
+		Dimensions: func() (TerminalDimensions, error) {
+			return TerminalDimensions{Width: 80, Height: 24}, nil
+		},
 	})
 }
 
@@ -63,13 +66,27 @@ func MainWithTerminal(ctx context.Context, args []string, dependencies TerminalD
 	case "run":
 		terminalOutput := terminal.IsTerminal()
 		presentation := terminal.Presentation
+		var dashboard *bubbleDashboardSession
 		if !terminalOutput || plainRunRequested(args[1:]) {
 			presentation = nil
+		} else if presentation == nil {
+			dashboard = newBubbleDashboardSession(terminal.Now)
+			presentation = dashboard.presentation
 		}
 		host := runnerHost{terminal: terminal}
 		err = host.run(ctx, func(signals <-chan lifecycleSignal, onOperationalEvent func(runner.OperationalEvent)) error {
-			return runCommand(ctx, args[1:], stdout, stderr, signals, onOperationalEvent, terminalOutput && presentation == nil, terminal.Now)
+			if dashboard != nil {
+				if startupErr := dashboard.waitForStartup(ctx); startupErr != nil {
+					return startupErr
+				}
+			}
+			return runCommand(ctx, args[1:], stdout, stderr, signals, onOperationalEvent, dashboard, terminal.Now)
 		}, presentation)
+		if dashboard != nil {
+			if summaryErr := dashboard.printFinalSummary(stdout); summaryErr != nil {
+				err = errors.Join(err, summaryErr)
+			}
+		}
 	case "status":
 		commandCtx, stop := cancelContextOnSignal(ctx, terminal.Signals)
 		defer stop()
@@ -134,7 +151,7 @@ func outputIsTerminal(output io.Writer) bool {
 	return ok && term.IsTerminal(int(file.Fd()))
 }
 
-func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan lifecycleSignal, onOperationalEvent func(runner.OperationalEvent), dashboardOutput bool, now func() time.Time) (resultErr error) {
+func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan lifecycleSignal, onOperationalEvent func(runner.OperationalEvent), dashboard *bubbleDashboardSession, now func() time.Time) (resultErr error) {
 	setupCtx := ctx
 	var runnerSignals <-chan os.Signal
 	var cancelSetup context.CancelFunc
@@ -226,7 +243,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 	poll := flags.Duration("poll", 30*time.Second, "GitHub and process reconciliation interval")
 	maxWorkerAge := flags.Duration("max-worker-age", 7*24*time.Hour, "maximum age before a recovered PID requires human verification")
 	watch := flags.Bool("watch", false, "keep waiting after the current runnable backlog is exhausted")
-	plain := flags.Bool("plain", false, "disable the live terminal dashboard")
+	plain := flags.Bool("plain", false, "disable the full-screen terminal dashboard")
 	approve := flags.Bool("approve", true, "trust project-local Pi resources in worker worktrees")
 	ghExecutable := flags.String("gh", "gh", "gh executable")
 	gitExecutable := flags.String("git", "git", "git executable")
@@ -296,7 +313,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 	finalSummary := func(current state.State) error {
 		return printRunFinalSummary(stdout, current, summarySource, now())
 	}
-	if dashboardOutput && !*plain {
+	if dashboard != nil && !*plain {
 		initial, _, err := store.Preview()
 		if err != nil {
 			return err
@@ -306,13 +323,17 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 			initial.DefaultBranch = repository.DefaultBranch
 			initial.MaxConcurrentIssues = *maxWorkers
 		}
-		dashboard := newLiveDashboard(stdout, summarySource, initial, now)
-		runnerStore = dashboardStore{FileStore: store, dashboard: dashboard}
+		dashboard.configure(initial, summarySource)
+		runnerStore = bubbleDashboardStore{FileStore: store, session: dashboard}
 		runnerOutput = dashboard
-		onOperationalEvent = dashboard.operationalEvent
-		finalSummary = dashboard.finalSummary
-		dashboard.start()
-		defer dashboard.close()
+		finalSummary = dashboard.captureFinalSummary
+		publishToHost := onOperationalEvent
+		onOperationalEvent = func(event runner.OperationalEvent) {
+			if publishToHost != nil {
+				publishToHost(event)
+			}
+			dashboard.publish(dashboardOperationalMsg{event: event})
+		}
 	}
 	backlogRunner := &runner.Runner{
 		Config: runner.Config{
@@ -343,6 +364,11 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer, si
 	}
 	runErr := backlogRunner.Run(ctx)
 	backlogRunner.WaitForOperationalEventDelivery()
+	if dashboard != nil {
+		if flushErr := dashboard.flush(ctx); flushErr != nil {
+			return errors.Join(runErr, flushErr)
+		}
+	}
 	return runErr
 }
 
