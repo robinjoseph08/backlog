@@ -37,13 +37,14 @@ func MainWithSignals(ctx context.Context, args []string, stdout, stderr io.Write
 }
 
 // MainWithSignalsAndTerminal preserves the previous focused terminal
-// capability seam. New complete-invocation tests should use MainWithTerminal.
+// capability seam with inert input. New complete-invocation tests that need
+// terminal input should use MainWithTerminal.
 func MainWithSignalsAndTerminal(ctx context.Context, args []string, stdout, stderr io.Writer, signals <-chan os.Signal, isTerminal func(io.Writer) bool) int {
 	if isTerminal == nil {
 		isTerminal = outputIsTerminal
 	}
 	return MainWithTerminal(ctx, args, TerminalDependencies{
-		Output: stdout, ErrorOutput: stderr, Signals: signals,
+		Input: strings.NewReader(""), Output: stdout, ErrorOutput: stderr, Signals: signals,
 		IsTerminal: func() bool { return isTerminal(stdout) },
 		Dimensions: func() (TerminalDimensions, error) {
 			return TerminalDimensions{Width: 80, Height: 24}, nil
