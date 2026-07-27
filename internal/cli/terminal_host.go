@@ -83,25 +83,28 @@ func (c PresentationControl) Interrupt(ctx context.Context) error {
 	return c.ingress.submit(ctx, os.Interrupt)
 }
 
-// PresentationFailure reports a failed presentation after the hosted Runner
-// has completed its SIGTERM-equivalent bounded shutdown handling.
+// PresentationFailure reports a presentation error together with the hosted
+// Runner's completion result. When the presentation fails while the Runner is
+// active, the host requests SIGTERM-equivalent bounded shutdown and waits for
+// completion. If the Runner completes first, the host makes no shutdown
+// request and stops the presentation.
 type PresentationFailure struct {
-	Err         error
-	ShutdownErr error
+	Err       error
+	RunnerErr error
 }
 
 func (e *PresentationFailure) Error() string {
-	if e.ShutdownErr != nil {
-		return fmt.Sprintf("presentation failed: %v; Runner shutdown: %v", e.Err, e.ShutdownErr)
+	if e.RunnerErr != nil {
+		return fmt.Sprintf("presentation failed: %v; Runner completion: %v", e.Err, e.RunnerErr)
 	}
 	return fmt.Sprintf("presentation failed: %v", e.Err)
 }
 
 func (e *PresentationFailure) Unwrap() []error {
-	if e.ShutdownErr == nil {
+	if e.RunnerErr == nil {
 		return []error{e.Err}
 	}
-	return []error{e.Err, e.ShutdownErr}
+	return []error{e.Err, e.RunnerErr}
 }
 
 type lifecycleSignal struct {
@@ -222,7 +225,7 @@ func (h runnerHost) run(ctx context.Context, run func(<-chan lifecycleSignal) er
 		stopPresentation()
 		presentationErr := <-presentationDone
 		if presentationErr != nil && !errors.Is(presentationErr, context.Canceled) {
-			return &PresentationFailure{Err: presentationErr, ShutdownErr: runnerErr}
+			return &PresentationFailure{Err: presentationErr, RunnerErr: runnerErr}
 		}
 		return runnerErr
 	case presentationErr := <-presentationDone:
@@ -245,7 +248,7 @@ func (h runnerHost) run(ctx context.Context, run func(<-chan lifecycleSignal) er
 		case runnerErr = <-runnerDone:
 		}
 		stopPresentation()
-		return &PresentationFailure{Err: presentationErr, ShutdownErr: runnerErr}
+		return &PresentationFailure{Err: presentationErr, RunnerErr: runnerErr}
 	}
 }
 

@@ -155,6 +155,28 @@ func TestRunnerHostPresentationFailureRequestsSuspensionAndWaitsForRunner(t *tes
 	}
 }
 
+func TestRunnerHostReportsRunnerFirstCompletionAsPresentationFailure(t *testing.T) {
+	presentationStarted := make(chan struct{})
+	runnerErr := errors.New("Runner completed unsuccessfully")
+	host := runnerHost{terminal: TerminalDependencies{}}
+	err := host.run(context.Background(), func(<-chan lifecycleSignal) error {
+		<-presentationStarted
+		return runnerErr
+	}, func(ctx context.Context, _ PresentationControl) error {
+		close(presentationStarted)
+		<-ctx.Done()
+		return errors.New("terminal restore failed")
+	})
+
+	var failure *PresentationFailure
+	if !errors.As(err, &failure) || failure.RunnerErr != runnerErr {
+		t.Fatalf("host error = %v, want presentation failure with Runner completion", err)
+	}
+	if !strings.Contains(err.Error(), "Runner completion: Runner completed unsuccessfully") {
+		t.Fatalf("host error = %q, want accurate Runner completion label", err)
+	}
+}
+
 func TestMainWithTerminalSuppliesCompleteSeamAndRoutesPresentationCtrlC(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -195,6 +217,9 @@ exec sleep 30
 			dependencies.Presentation = func(ctx context.Context, control PresentationControl) error {
 				if control.Terminal.Input != input || control.Terminal.Output != &stdout || control.Terminal.ErrorOutput != &stderr {
 					return errors.New("presentation received different terminal streams")
+				}
+				if control.Terminal.IsTerminal == nil || !control.Terminal.IsTerminal() {
+					return errors.New("presentation received different terminal capability")
 				}
 				dimensions, err := control.Terminal.Dimensions()
 				if err != nil || dimensions != (TerminalDimensions{Width: 91, Height: 23}) {
