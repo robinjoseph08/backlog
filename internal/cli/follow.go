@@ -39,6 +39,10 @@ func (s repositoryFollowSource) RunnerSupervised() (bool, error) {
 }
 
 func followCommand(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	return followCommandWithClock(ctx, args, stdout, stderr, time.Now)
+}
+
+func followCommandWithClock(ctx context.Context, args []string, stdout, stderr io.Writer, now func() time.Time) error {
 	flags := flag.NewFlagSet("follow", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() {
@@ -85,10 +89,10 @@ func followCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 		if _, err := fmt.Fprintf(stderr, "Run: %s\nRunner supervision: %s\nWorker liveness: %s\n", runID, lastObservation.supervision, lastObservation.workerLiveness); err != nil {
 			return err
 		}
-		nextObservation := time.Now().Add(followObservationInterval)
+		nextObservation := now().Add(followObservationInterval)
 		lastStatus := selected.Status
 		return followRawObserved(ctx, source, runID, stdout, followPollInterval, func(run scheduler.Run) error {
-			observedAt := time.Now()
+			observedAt := now()
 			statusChanged := run.Status != lastStatus
 			observationDue := followObservationDue(run.Status, statusChanged, observedAt, nextObservation)
 			lastStatus = run.Status
@@ -111,7 +115,7 @@ func followCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 			return nil
 		})
 	}
-	return followNormalized(ctx, source, runID, stdout, stderr, followPollInterval, time.Now)
+	return followNormalized(ctx, source, runID, stdout, stderr, followPollInterval, now)
 }
 
 func splitFollowArguments(args []string) (string, []string, error) {

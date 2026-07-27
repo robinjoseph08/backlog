@@ -1133,6 +1133,99 @@ func TestFollowNormalizedReplaysSemanticWorkerActivityWithUsageAndPrivacy(t *tes
 	}
 }
 
+func TestFollowCommandActivityAgeAdvancesOnlyForSemanticWorkerAndSubagentChanges(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	observedAt := time.Date(2026, 7, 27, 1, 2, 3, 0, time.UTC)
+	now := observedAt.Add(10 * time.Second)
+	workerStart := `{"type":"tool_execution_start","toolCallId":"worker-tool","toolName":"bash","args":{"command":"private Worker arguments"}}`
+	workerUpdate := `{"type":"tool_execution_update","toolCallId":"worker-tool","toolName":"bash","partialResult":{"output":"private Worker result","durationMs":10,"spinnerFrame":1}}`
+	subagentStart := `{"type":"tool_execution_start","toolCallId":"subagent-tool","toolName":"Agent","args":{"prompt":"private Subagent prompt"}}`
+	subagentSnapshot := `{"type":"tool_execution_update","toolCallId":"subagent-tool","toolName":"Agent","partialResult":{"content":[{"type":"text","text":"private Subagent output"}],"details":{"description":"Check Activity age","status":"running","activity":"reviewing","turnCount":1,"toolUses":1,"tokens":"100 tokens","durationMs":10,"spinnerFrame":1}}}`
+
+	tests := []struct {
+		name      string
+		records   []timedWorkerRecord
+		wantAge   string
+		wantEntry string
+	}{
+		{
+			name: "meaningful Worker output advances age",
+			records: []timedWorkerRecord{
+				{observedAt, workerStart},
+				{observedAt, workerUpdate},
+				{observedAt.Add(4 * time.Second), strings.Replace(workerUpdate, "private Worker result", "changed private Worker result", 1)},
+			},
+			wantAge: "6s", wantEntry: "Tool bash output changed",
+		},
+		{
+			name: "repeated spinner and duration-only Worker updates retain age",
+			records: []timedWorkerRecord{
+				{observedAt, workerStart},
+				{observedAt, workerUpdate},
+				{observedAt.Add(4 * time.Second), workerUpdate},
+				{observedAt.Add(5 * time.Second), strings.Replace(workerUpdate, `"spinnerFrame":1`, `"spinnerFrame":2`, 1)},
+				{observedAt.Add(6 * time.Second), strings.Replace(workerUpdate, `"durationMs":10`, `"durationMs":20`, 1)},
+			},
+			wantAge: "10s", wantEntry: "Tool bash output changed",
+		},
+		{
+			name: "meaningful Subagent operation advances age",
+			records: []timedWorkerRecord{
+				{observedAt, subagentStart},
+				{observedAt, subagentSnapshot},
+				{observedAt.Add(4 * time.Second), strings.Replace(subagentSnapshot, `"activity":"reviewing"`, `"activity":"testing"`, 1)},
+			},
+			wantAge: "6s", wantEntry: "activity: testing",
+		},
+		{
+			name: "repeated spinner and duration-only Subagent snapshots retain age",
+			records: []timedWorkerRecord{
+				{observedAt, subagentStart},
+				{observedAt, subagentSnapshot},
+				{observedAt.Add(4 * time.Second), subagentSnapshot},
+				{observedAt.Add(5 * time.Second), strings.Replace(subagentSnapshot, `"spinnerFrame":1`, `"spinnerFrame":2`, 1)},
+				{observedAt.Add(6 * time.Second), strings.Replace(subagentSnapshot, `"durationMs":10`, `"durationMs":20`, 1)},
+			},
+			wantAge: "10s", wantEntry: "Check Activity age",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			logPath := filepath.Join(stateDir, "activity-age.jsonl")
+			writeProjectedActivityFixture(t, logPath, test.records)
+			run := scheduler.Run{
+				Issue: 56, IssueTitle: "Activity age boundary", RunID: "activity-age", Status: scheduler.StatusMerged,
+				WorkerMode: scheduler.WorkerModeRPC, LogPath: logPath, StartedAt: observedAt.Add(-time.Minute), UpdatedAt: now,
+				SessionID: "activity-age", SessionDir: filepath.Join(stateDir, "sessions", "activity-age"),
+			}
+			if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{
+				Version: state.CurrentVersion, Runs: []scheduler.Run{run},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var output, diagnostics bytes.Buffer
+			if err := followCommandWithClock(context.Background(), []string{
+				run.RunID, "--repo-dir", repository, "--state-dir", stateDir,
+			}, &output, &diagnostics, func() time.Time { return now }); err != nil {
+				t.Fatal(err)
+			}
+			got := output.String()
+			if !strings.Contains(got, "Activity age: "+test.wantAge) || !strings.Contains(got, test.wantEntry) {
+				t.Fatalf("CLI-visible Activity age/output missing %q/%q:\n%s", test.wantAge, test.wantEntry, got)
+			}
+			for _, private := range []string{"private Worker arguments", "private Worker result", "changed private Worker result", "private Subagent prompt", "private Subagent output"} {
+				if strings.Contains(got, private) {
+					t.Fatalf("normalized Activity age fixture exposed %q:\n%s", private, got)
+				}
+			}
+			if diagnostics.Len() != 0 {
+				t.Fatalf("Follow diagnostics = %q", diagnostics.String())
+			}
+		})
+	}
+}
+
 func TestFollowNormalizedShowsDistinctCoalescedSubagentActivityAndApproximateUsage(t *testing.T) {
 	directory := t.TempDir()
 	logPath := filepath.Join(directory, "subagents.jsonl")
@@ -1734,6 +1827,43 @@ func TestObserveRunOnceRetainsLiveClockForFollowUpdates(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "Subagent still working") {
 		t.Fatalf("Follow Activity source retained a frozen clock: %q", output.String())
+	}
+}
+
+type timedWorkerRecord struct {
+	observedAt time.Time
+	record     string
+}
+
+func writeProjectedActivityFixture(t *testing.T, logPath string, records []timedWorkerRecord) {
+	t.Helper()
+	var raw strings.Builder
+	projection, err := os.OpenFile(activity.PathForLog(logPath), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoder := json.NewEncoder(projection)
+	projector := activity.Projector{}
+	for _, record := range records {
+		raw.WriteString(record.record)
+		raw.WriteByte('\n')
+		entry, semantic, err := projector.Observe([]byte(record.record), record.observedAt)
+		if err != nil {
+			projection.Close()
+			t.Fatal(err)
+		}
+		if semantic {
+			if err := encoder.Encode(entry); err != nil {
+				projection.Close()
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := projection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte(raw.String()), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
