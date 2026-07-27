@@ -79,7 +79,9 @@ type PresentationControl struct {
 }
 
 // Interrupt submits a SIGINT-equivalent event to the Runner's ordered signal
-// ingress.
+// ingress and waits until Runner-side lifecycle handling accepts it. If ctx or
+// the host lifecycle ends before acceptance, Interrupt returns the completed
+// context's error.
 func (c PresentationControl) Interrupt(ctx context.Context) error {
 	return c.ingress.submit(ctx, os.Interrupt)
 }
