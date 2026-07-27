@@ -317,7 +317,8 @@ func TestStatusLoadsLegacyRunWithUnavailableTelemetry(t *testing.T) {
 	repository := initializeFollowRepository(t)
 	stateDir := t.TempDir()
 	legacy := `{"version":1,"repo":"acme/widgets","runs":[{"issue":12,"runId":"legacy-running","status":"running","pid":2147483646,"processIdentity":"2147483646:old","startedAt":"2026-07-01T00:00:00Z"}]}`
-	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), []byte(legacy), 0o600); err != nil {
+	statePath := filepath.Join(stateDir, "state.json")
+	if err := os.WriteFile(statePath, []byte(legacy), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	output := runStatusCommand(t, repository, stateDir)
@@ -327,9 +328,12 @@ func TestStatusLoadsLegacyRunWithUnavailableTelemetry(t *testing.T) {
 			t.Fatalf("legacy Active output missing %q:\n%s", want, active)
 		}
 	}
-	persisted, err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Load()
-	if err != nil || persisted.Version != state.CurrentVersion || len(persisted.Leases) != 1 {
-		t.Fatalf("legacy status migration = %#v, %v", persisted, err)
+	persisted, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(persisted, []byte(legacy)) {
+		t.Fatalf("status persisted legacy migration: %s", persisted)
 	}
 }
 

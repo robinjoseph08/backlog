@@ -356,23 +356,9 @@ func statusCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return err
 	}
 	store := state.FileStore{Path: filepath.Join(resolved, "state.json")}
-	current, migrationRequired, err := store.Preview()
+	current, _, err := store.Preview()
 	if err != nil {
 		return err
-	}
-	if migrationRequired {
-		lock, err := acquireRepositoryLock(commonDirectory)
-		if err != nil {
-			return fmt.Errorf("migrate state for status: %w", err)
-		}
-		defer func() { _ = lock.Release() }()
-		if err := bindStateDirectory(commonDirectory, resolved); err != nil {
-			return err
-		}
-		current, err = store.Load()
-		if err != nil {
-			return err
-		}
 	}
 	if *asJSON {
 		encoder := json.NewEncoder(stdout)
