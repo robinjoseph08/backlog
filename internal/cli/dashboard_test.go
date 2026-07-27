@@ -184,6 +184,49 @@ func TestDashboardReceivesShutdownStageWithoutParsingFormattedMessages(t *testin
 	}
 }
 
+func TestDashboardBoundsOccurrenceTrackingAndSuppressesTypedFirstOutput(t *testing.T) {
+	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+	source := &dashboardTestSource{current: current}
+	var output bytes.Buffer
+	dashboard := newLiveDashboard(&output, source, current, time.Now)
+
+	for index := range dashboardOccurrenceLimit * 4 {
+		if _, err := fmt.Fprintf(dashboard, "operational message %d\n", index); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(dashboard.messageOccurrences) > dashboardOccurrenceLimit || len(dashboard.shutdownOccurrences) > dashboardOccurrenceLimit || len(dashboard.occurrenceOrder) > dashboardOccurrenceLimit {
+		t.Fatalf("occurrence tracking grew beyond %d entries: messages=%d shutdown=%d order=%d", dashboardOccurrenceLimit, len(dashboard.messageOccurrences), len(dashboard.shutdownOccurrences), len(dashboard.occurrenceOrder))
+	}
+	if len(dashboard.messages) != dashboardMessageLimit {
+		t.Fatalf("visible message history = %d entries, want %d", len(dashboard.messages), dashboardMessageLimit)
+	}
+
+	typedFirst := "Drain: typed event arrived before compatible output"
+	dashboard.operationalEvent(runner.ShutdownEvent{Stage: runner.ShutdownStageDraining, Message: typedFirst})
+	if _, err := fmt.Fprintln(dashboard, typedFirst); err != nil {
+		t.Fatal(err)
+	}
+	matches := 0
+	for _, message := range dashboard.messages {
+		if message.text == typedFirst {
+			matches++
+			if !message.shutdown {
+				t.Fatalf("typed-first message was not retained as shutdown history: %#v", message)
+			}
+		}
+	}
+	if matches != 1 {
+		t.Fatalf("typed-first message occurrences = %d, want 1", matches)
+	}
+	if _, exists := dashboard.messageOccurrences[typedFirst]; exists {
+		t.Fatal("resolved plain occurrence remained tracked")
+	}
+	if _, exists := dashboard.shutdownOccurrences[typedFirst]; exists {
+		t.Fatal("resolved shutdown occurrence remained tracked")
+	}
+}
+
 func TestDashboardClosePreservesIncompleteShutdownStages(t *testing.T) {
 	for _, test := range []struct {
 		name  string

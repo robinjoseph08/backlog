@@ -18,6 +18,8 @@ import (
 const (
 	dashboardActivityInterval = 100 * time.Millisecond
 	dashboardElapsedInterval  = time.Second
+	dashboardMessageLimit     = 12
+	dashboardOccurrenceLimit  = dashboardMessageLimit * 2
 )
 
 type dashboardStage int
@@ -49,6 +51,7 @@ type liveDashboard struct {
 	messages            []dashboardMessage
 	messageOccurrences  map[string]int
 	shutdownOccurrences map[string]int
+	occurrenceOrder     []string
 	stage               dashboardStage
 	lastActivity        map[string]fileSignature
 	observations        map[string]dashboardActivityObservation
@@ -192,18 +195,50 @@ func (d *liveDashboard) recordMessageLocked(message string) {
 	if message == "" {
 		return
 	}
-	d.messageOccurrences[message]++
+	d.trackOccurrenceLocked(message, false)
 	if d.messageOccurrences[message] <= d.shutdownOccurrences[message] {
 		// A typed event arrived first and already inserted this compatible
 		// rendering into history.
+		d.reconcileOccurrencesLocked(message)
 		return
 	}
 	d.appendMessageLocked(dashboardMessage{text: message})
 }
 
+func (d *liveDashboard) trackOccurrenceLocked(message string, shutdown bool) {
+	if d.messageOccurrences[message] == 0 && d.shutdownOccurrences[message] == 0 {
+		d.occurrenceOrder = append(d.occurrenceOrder, message)
+	}
+	if shutdown {
+		d.shutdownOccurrences[message]++
+	} else {
+		d.messageOccurrences[message]++
+	}
+	for len(d.occurrenceOrder) > dashboardOccurrenceLimit {
+		oldest := d.occurrenceOrder[0]
+		d.occurrenceOrder = d.occurrenceOrder[1:]
+		delete(d.messageOccurrences, oldest)
+		delete(d.shutdownOccurrences, oldest)
+	}
+}
+
+func (d *liveDashboard) reconcileOccurrencesLocked(message string) {
+	if d.messageOccurrences[message] != d.shutdownOccurrences[message] {
+		return
+	}
+	delete(d.messageOccurrences, message)
+	delete(d.shutdownOccurrences, message)
+	for index, tracked := range d.occurrenceOrder {
+		if tracked == message {
+			d.occurrenceOrder = append(d.occurrenceOrder[:index], d.occurrenceOrder[index+1:]...)
+			return
+		}
+	}
+}
+
 func (d *liveDashboard) appendMessageLocked(message dashboardMessage) {
 	d.messages = append(d.messages, message)
-	if len(d.messages) > 12 {
+	if len(d.messages) > dashboardMessageLimit {
 		for index, retained := range d.messages {
 			if !retained.shutdown {
 				d.messages = append(d.messages[:index], d.messages[index+1:]...)
@@ -252,7 +287,7 @@ func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
 	}
 	d.mu.Lock()
 	if message := normalizedDashboardMessage(shutdown.Message); message != "" {
-		d.shutdownOccurrences[message]++
+		d.trackOccurrenceLocked(message, true)
 		matched := false
 		for index := len(d.messages) - 1; index >= 0; index-- {
 			if d.messages[index].text == message && !d.messages[index].shutdown {
@@ -267,6 +302,7 @@ func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
 			// represents the line when the event arrives before plain output.
 			d.appendMessageLocked(dashboardMessage{text: message, shutdown: true})
 		}
+		d.reconcileOccurrencesLocked(message)
 	}
 	if next > d.stage {
 		d.stage = next
