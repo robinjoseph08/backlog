@@ -348,7 +348,7 @@ func (d *liveDashboard) render(current state.State, messages []string, stage das
 	renderDashboardSection(&output, "Attention Required", attention, now)
 	renderDashboardSection(&output, "Recently Finished", recent, now)
 	if len(messages) > 0 {
-		output.WriteString("\nLifecycle messages\n")
+		output.WriteString("\nOperational messages\n")
 		for _, message := range messages {
 			fmt.Fprintf(&output, "  %s\n", message)
 		}

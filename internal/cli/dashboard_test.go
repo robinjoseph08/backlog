@@ -176,8 +176,37 @@ func TestDashboardReceivesShutdownStageWithoutParsingFormattedMessages(t *testin
 	if !strings.Contains(frame, shutdownMessage) {
 		t.Fatalf("typed shutdown message was evicted before ordinary history:\n%s", output.String())
 	}
+	if !strings.Contains(frame, "Operational messages") || strings.Contains(frame, "Lifecycle messages") {
+		t.Fatalf("dashboard used an inaccurate operational message heading:\n%s", output.String())
+	}
 	if strings.Contains(frame, "Force stop: this is diagnostic text") {
 		t.Fatalf("formatted prefix received shutdown retention without a typed event:\n%s", output.String())
+	}
+}
+
+func TestDashboardClosePreservesIncompleteShutdownStages(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		stage runner.ShutdownStage
+		want  string
+	}{
+		{name: "Drain incomplete", stage: runner.ShutdownStageDrainIncomplete, want: "Drain incomplete: Worker liveness remains unverified"},
+		{name: "Suspension incomplete", stage: runner.ShutdownStageSuspensionIncomplete, want: "Suspension finished: no further interrupt has an effect before exit"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+			source := &dashboardTestSource{current: current}
+			var output bytes.Buffer
+			dashboard := newLiveDashboard(&output, source, current, time.Now)
+			dashboard.start()
+			dashboard.operationalEvent(runner.ShutdownEvent{Stage: test.stage, NextInterrupt: runner.NextInterruptNone})
+			dashboard.close()
+
+			frame := lastDashboardFrame(output.String())
+			if !strings.Contains(frame, test.want) || strings.Contains(frame, "Stopped: the runner is exiting") {
+				t.Fatalf("close replaced %s stage:\n%s", test.name, output.String())
+			}
+		})
 	}
 }
 

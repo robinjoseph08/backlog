@@ -58,34 +58,43 @@ func findShutdownEvent(events []OperationalEvent, stage ShutdownStage, action st
 	return ShutdownEvent{}, false
 }
 
-func TestRunnerReportsCandidateDiscoveryFailureAndAdmissionRecovery(t *testing.T) {
+func TestRunnerReportsCandidateDiscoveryFailuresAndResetsCountAfterRecovery(t *testing.T) {
 	t.Parallel()
 
 	listErr := errors.New("i/o timeout")
 	inspectErr := errors.New("TLS handshake timeout")
 	unknownErr := errors.New("unexpected adapter operation")
+	laterErr := errors.New("connection reset")
 	github := &fakeGitHub{
 		candidateResults: []candidateResult{
 			{err: &ghadapter.CandidateDiscoveryError{Operation: ghadapter.CandidateDiscoveryList, Err: listErr}},
 			{err: &ghadapter.CandidateDiscoveryError{Operation: ghadapter.CandidateDiscoveryInspect, Issue: 17, Err: inspectErr}},
 			{err: &ghadapter.CandidateDiscoveryError{Operation: ghadapter.CandidateDiscoveryOperation("unexpected"), Issue: 99, Err: unknownErr}},
 			{},
+			{err: &ghadapter.CandidateDiscoveryError{Operation: ghadapter.CandidateDiscoveryList, Err: laterErr}},
+			{},
 		},
-		candidateChanged: make(chan struct{}, 4),
+		candidateChanged: make(chan struct{}, 6),
 	}
 	runner := testRunner(github, newFakeWorkers(), &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
 	runner.Config.PollInterval = 20 * time.Millisecond
+	runner.Config.Watch = true
 	var output bytes.Buffer
 	runner.Output = &output
 	recorder := &operationalEventRecorder{}
 	runner.OnOperationalEvent = recorder.record
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
 
-	if err := runner.Run(context.Background()); err != nil {
+	events := recorder.waitFor(t, func(events []OperationalEvent) bool { return len(events) >= 6 })
+	cancel()
+	if err := <-done; err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	events := recorder.waitFor(t, func(events []OperationalEvent) bool { return len(events) >= 4 })
-	if len(events) != 4 {
-		t.Fatalf("operational events = %#v, want three discovery failures and recovery", events)
+	if len(events) != 6 {
+		t.Fatalf("operational events = %#v, want two failure episodes and recoveries", events)
 	}
 	listing, ok := events[0].(CandidateDiscoveryFailed)
 	if !ok {
@@ -107,11 +116,21 @@ func TestRunnerReportsCandidateDiscoveryFailureAndAdmissionRecovery(t *testing.T
 	if !ok || recovery.Failures != 3 || !recovery.OccurredAt.Equal(occurredAt) {
 		t.Fatalf("recovery = %#v", events[3])
 	}
+	laterFailure, ok := events[4].(CandidateDiscoveryFailed)
+	if !ok || laterFailure.Operation != CandidateDiscoveryList || !errors.Is(laterFailure.Err, laterErr) || laterFailure.ConsecutiveFailures != 1 {
+		t.Fatalf("later Candidate discovery failure = %#v, want a reset consecutive count", events[4])
+	}
+	laterRecovery, ok := events[5].(CandidateDiscoveryRecovered)
+	if !ok || laterRecovery.Failures != 1 || !laterRecovery.OccurredAt.Equal(occurredAt) {
+		t.Fatalf("later recovery = %#v, want one failure", events[5])
+	}
 	for _, want := range []string{
 		"candidate discovery failed; admission paused; retry due in 20ms: list candidates: i/o timeout\n",
 		"candidate discovery failed; admission paused; retry due in 20ms: inspect candidate #17: TLS handshake timeout\n",
 		"candidate discovery failed; admission paused; retry due in 20ms: unexpected #99: unexpected adapter operation\n",
 		"candidate discovery recovered; admission resumed after 3 failures\n",
+		"candidate discovery failed; admission paused; retry due in 20ms: list candidates: connection reset\n",
+		"candidate discovery recovered; admission resumed after 1 failure\n",
 	} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("plain output omitted %q: %q", want, output.String())
