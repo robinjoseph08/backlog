@@ -225,6 +225,7 @@ func (p *statusPrinter) run(observed statusRun) {
 	if run.AcknowledgedAt != nil {
 		p.printTime("Acknowledged", run.AcknowledgedAt)
 	}
+	p.printf("    Elapsed: %s\n", summarizeRunProgress(run, observed.observation.metrics, observed.observation.observed).elapsed)
 
 	switch run.Status {
 	case scheduler.StatusClaimed:
@@ -276,14 +277,10 @@ func (p *statusPrinter) run(observed statusRun) {
 
 func (p *statusPrinter) printRunning(observed runObservation) {
 	progress := summarizeRunProgress(observed.run, observed.metrics, observed.observed)
-	workerTurns := "n/a"
-	if len(observed.metrics.entries) > 0 && !observed.metrics.turnsUnavailable {
-		workerTurns = fmt.Sprintf("%d", observed.metrics.turns)
-	}
 	p.printf("    Worker liveness: %s\n", plainStatusValue(observed.process.workerLiveness))
 	p.printf("    Activity age: %s\n", progress.activityAge)
 	p.printf("    Current deepest operation: %s\n", plainStatusValue(progress.deepestOperation))
-	p.printf("    Turns: Worker %s | Subagent %s\n", workerTurns, progress.subagentTurns)
+	p.printf("    Turns: Worker %s | Subagent %s\n", progress.workerTurns, progress.subagentTurns)
 	p.printf("    Observed tokens: %s\n", progress.observedTokens)
 }
 

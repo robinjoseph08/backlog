@@ -393,6 +393,55 @@ func TestStatusLoadsWhenRunningTelemetrySourceIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestStatusPresentsElapsedQuietAgeAndUnavailableTurnsFromSharedProgress(t *testing.T) {
+	stateDir := t.TempDir()
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	logPath := filepath.Join(stateDir, "quiet.jsonl")
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeActivityEntries(t, activity.PathForLog(logPath), activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: now.Add(-10 * time.Minute), Kind: "tool", Description: "Tool test started",
+	})
+	running := scheduler.Run{
+		Issue: 58, RunID: "quiet", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint,
+		LogPath: logPath, StartedAt: now.Add(-time.Hour),
+	}
+	withoutStart := scheduler.Run{Issue: 59, RunID: "not-started", Status: scheduler.StatusClaimed, WorkerMode: scheduler.WorkerModePrint}
+	current := state.State{
+		Version: state.CurrentVersion, Runs: []scheduler.Run{running, withoutStart},
+		Leases: []scheduler.Lease{
+			{LeaseID: running.RunID, Issue: running.Issue, RunID: running.RunID},
+			{LeaseID: withoutStart.RunID, Issue: withoutStart.Issue, RunID: withoutStart.RunID},
+		},
+	}
+	var output bytes.Buffer
+	if err := printPlainStatus(&output, current, &sequenceFollowSource{}, now); err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	quietStart := strings.Index(got, "Run: quiet | State: running")
+	if quietStart < 0 {
+		t.Fatalf("running status Run missing:\n%s", got)
+	}
+	quietEnd := strings.Index(got[quietStart:], "Run: not-started | State: claimed")
+	if quietEnd < 0 {
+		t.Fatalf("claimed status Run missing:\n%s", got)
+	}
+	quietOutput := got[quietStart : quietStart+quietEnd]
+	for _, want := range []string{"Elapsed: 1h0m0s", "Activity age: 10m0s (quiet)", "Turns: Worker n/a | Subagent n/a"} {
+		if !strings.Contains(quietOutput, want) {
+			t.Fatalf("quiet status output missing %q:\n%s", want, quietOutput)
+		}
+	}
+	if !strings.Contains(got, "Run: not-started | State: claimed\n    Elapsed: n/a") {
+		t.Fatalf("status did not show unavailable elapsed time:\n%s", got)
+	}
+	if strings.Contains(strings.ToLower(got), "stalled") {
+		t.Fatalf("quiet status presentation implied a stalled state:\n%s", got)
+	}
+}
+
 func TestStatusUsesExactSharedActivityAge(t *testing.T) {
 	stateDir := t.TempDir()
 	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)

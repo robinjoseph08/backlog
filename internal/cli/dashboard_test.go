@@ -399,6 +399,41 @@ func TestDashboardRedrawsForActivityWithoutCreatingActivity(t *testing.T) {
 	}
 }
 
+func TestDashboardPresentsQuietAgeAndUnavailableTurnsFromSharedProgress(t *testing.T) {
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	logPath := filepath.Join(t.TempDir(), "quiet.jsonl")
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeActivityEntries(t, activity.PathForLog(logPath), activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: now.Add(-10 * time.Minute), Kind: "tool", Description: "Tool test started",
+	})
+	run := scheduler.Run{
+		Issue: 58, RunID: "quiet-dashboard", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint,
+		LogPath: logPath, StartedAt: now.Add(-time.Hour),
+	}
+	current := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1,
+		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+	}
+	source := &dashboardTestSource{current: current}
+	var output bytes.Buffer
+	dashboard := newLiveDashboard(&output, source, current, func() time.Time { return now })
+	dashboard.redraw()
+	got := lastDashboardFrame(output.String())
+	for _, want := range []string{
+		"State: running | Elapsed: 1h0m0s", "Activity age: 10m0s (quiet)",
+		"Turns: Worker n/a | Subagent n/a | Observed tokens: n/a",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("quiet dashboard output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(strings.ToLower(got), "stalled") {
+		t.Fatalf("quiet dashboard presentation implied a stalled state:\n%s", got)
+	}
+}
+
 func TestDashboardElapsedTimerRedrawsWithoutStateActivity(t *testing.T) {
 	started := time.Now().Add(-time.Minute).Truncate(time.Second)
 	var clock atomic.Int64

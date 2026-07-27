@@ -373,10 +373,6 @@ func renderDashboardSection(output *strings.Builder, name string, runs []statusR
 			identity += "  " + title
 		}
 		progress := summarizeRunProgress(run, observed.observation.metrics, now)
-		workerTurns := "n/a"
-		if len(observed.observation.metrics.entries) > 0 && !observed.observation.metrics.turnsUnavailable {
-			workerTurns = fmt.Sprintf("%d", observed.observation.metrics.turns)
-		}
 		fmt.Fprintf(output, "  %s\n", identity)
 		if run.IssueURL != "" {
 			fmt.Fprintf(output, "    Issue: %s\n", plainStatusValue(run.IssueURL))
@@ -386,7 +382,7 @@ func renderDashboardSection(output *strings.Builder, name string, runs []statusR
 		fmt.Fprintf(output, "    Activity age: %s | Deepest operation: %s\n",
 			progress.activityAge, plainStatusValue(progress.deepestOperation))
 		fmt.Fprintf(output, "    Turns: Worker %s | Subagent %s | Observed tokens: %s\n",
-			workerTurns, progress.subagentTurns, progress.observedTokens)
+			progress.workerTurns, progress.subagentTurns, progress.observedTokens)
 		if run.Error != "" {
 			fmt.Fprintf(output, "    Diagnostic: %s\n", plainStatusValue(strings.TrimSpace(run.Error)))
 		}

@@ -1058,6 +1058,46 @@ func TestSplitFollowArgumentsAcceptsRunIDBeforeOrAfterFlags(t *testing.T) {
 	}
 }
 
+func TestFollowNormalizedPresentsUnavailableTurnsQuietAgeAndFeedDurations(t *testing.T) {
+	directory := t.TempDir()
+	logPath := filepath.Join(directory, "presentation.jsonl")
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	duration := int64(2500)
+	writeActivityEntries(t, activity.PathForLog(logPath),
+		activity.Entry{
+			Version: activity.CurrentVersion, ObservedAt: now.Add(-10 * time.Minute), Kind: "subagent",
+			Description: "Subagent duration available", Subagent: &activity.SubagentSnapshot{ID: "available", DurationMillis: &duration},
+		},
+		activity.Entry{
+			Version: activity.CurrentVersion, ObservedAt: now.Add(-10 * time.Minute), Kind: "subagent",
+			Description: "Subagent duration unavailable", Subagent: &activity.SubagentSnapshot{ID: "unavailable"},
+		},
+	)
+	run := scheduler.Run{
+		Issue: 58, RunID: "shared-presentation", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModeRPC,
+		LogPath: logPath, StartedAt: now.Add(-time.Hour), UpdatedAt: now,
+	}
+	var output bytes.Buffer
+	if err := followNormalized(context.Background(), &sequenceFollowSource{runs: []scheduler.Run{run}}, run.RunID, &output, io.Discard, time.Millisecond, func() time.Time { return now }); err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	for _, want := range []string{
+		"State: merged", "Completed Worker turns: n/a", "Activity age: 10m0s (quiet)",
+		"Subagent duration available | duration: 2.5s", "Subagent duration unavailable | duration: n/a",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("shared Follow presentation missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(strings.ToLower(got), "stalled") {
+		t.Fatalf("quiet Follow presentation implied a stalled state:\n%s", got)
+	}
+}
+
 func TestFollowNormalizedReplaysSemanticWorkerActivityWithUsageAndPrivacy(t *testing.T) {
 	directory := t.TempDir()
 	logPath := filepath.Join(directory, "worker.jsonl")
@@ -1444,6 +1484,22 @@ func TestFollowNormalizedLimitsInitialProjectionToLatestTwentyAndReportsAge(t *t
 	}
 	if strings.Contains(strings.ToLower(got), "stalled") {
 		t.Fatalf("quiet Activity age was labeled stalled:\n%s", got)
+	}
+}
+
+func TestDisplayActivityAgeUsesFixedQuietThreshold(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		age  time.Duration
+		want string
+	}{
+		{age: quietActivityThreshold - time.Second, want: "4m59s"},
+		{age: quietActivityThreshold, want: "5m0s (quiet)"},
+	} {
+		if got := displayActivityAge(test.age); got != test.want {
+			t.Fatalf("Activity age %s = %q, want %q", test.age, got, test.want)
+		}
 	}
 }
 
