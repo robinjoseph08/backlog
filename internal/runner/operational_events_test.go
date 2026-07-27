@@ -138,6 +138,53 @@ func TestRunnerReportsCandidateDiscoveryFailuresAndResetsCountAfterRecovery(t *t
 	}
 }
 
+func TestRunnerDoesNotReportAdmissionRecoveryAfterDrainIsAccepted(t *testing.T) {
+	calls := 0
+	retryStarted := make(chan struct{})
+	github := &fakeGitHub{candidatesFunc: func(ctx context.Context) ([]scheduler.Candidate, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New("temporary failure")
+		}
+		close(retryStarted)
+		<-ctx.Done()
+		// Simulate an adapter that completed successfully despite concurrent
+		// cancellation after the signal observer accepted Drain.
+		return nil, nil
+	}}
+	signals := make(chan os.Signal, 1)
+	runner := testRunner(github, newFakeWorkers(), &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+	runner.Config.PollInterval = time.Millisecond
+	runner.Config.Watch = true
+	runner.Signals = signals
+	var output bytes.Buffer
+	runner.Output = &output
+	recorder := &operationalEventRecorder{}
+	runner.OnOperationalEvent = recorder.record
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	<-retryStarted
+	signals <- os.Interrupt
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	runner.WaitForOperationalEventDelivery()
+
+	events := recorder.snapshot()
+	if _, ok := findShutdownEvent(events, ShutdownStageDraining, "admission stopped"); !ok {
+		t.Fatalf("operational events = %#v, want Drain acceptance", events)
+	}
+	for _, event := range events {
+		if _, ok := event.(CandidateDiscoveryRecovered); ok {
+			t.Fatalf("operational events = %#v, reported recovery after Drain acceptance", events)
+		}
+	}
+	if strings.Contains(output.String(), "admission resumed") {
+		t.Fatalf("plain output reported recovery after Drain acceptance: %q", output.String())
+	}
+}
+
 func TestRunnerControlAndOutputDoNotWaitForOperationalEventDelivery(t *testing.T) {
 	pollInterval := 50 * time.Millisecond
 	github := &fakeGitHub{

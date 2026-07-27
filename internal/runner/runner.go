@@ -185,6 +185,19 @@ func (g *admissionGate) stopped() bool {
 	return g.draining
 }
 
+// whileActive linearizes Admission reporting with Drain acceptance. If Drain
+// wins first, the report is suppressed; otherwise it is published before Drain
+// can be accepted.
+func (g *admissionGate) whileActive(report func()) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.draining {
+		return false
+	}
+	report()
+	return true
+}
+
 // finishNatural linearizes one-shot exhaustion with Drain acceptance. A
 // signal accepted first prevents natural-exhaustion presentation and policy;
 // otherwise the complete final decision precedes any later Drain request.
@@ -367,7 +380,10 @@ func (r *Runner) Run(ctx context.Context) error {
 				})
 			} else {
 				if candidateDiscoveryFailures > 0 {
-					r.emit(CandidateDiscoveryRecovered{OccurredAt: r.Now().UTC(), Failures: candidateDiscoveryFailures})
+					failures := candidateDiscoveryFailures
+					admission.whileActive(func() {
+						r.emit(CandidateDiscoveryRecovered{OccurredAt: r.Now().UTC(), Failures: failures})
+					})
 					candidateDiscoveryFailures = 0
 				}
 				plan := scheduler.Plan(scheduler.Snapshot{Candidates: candidates, Runs: current.Runs, Leases: current.Leases}, r.Config.MaxConcurrentIssues)
