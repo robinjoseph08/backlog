@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -491,22 +490,4 @@ func openURL(ctx context.Context, url string) error {
 		return err
 	}
 	return command.Process.Release()
-}
-
-func plainRunRequested(args []string) bool {
-	for _, argument := range args {
-		if argument == "--plain" || argument == "-plain" {
-			return true
-		}
-		for _, prefix := range []string{"--plain=", "-plain="} {
-			if !strings.HasPrefix(argument, prefix) {
-				continue
-			}
-			plain, err := strconv.ParseBool(strings.TrimPrefix(argument, prefix))
-			if err != nil || plain {
-				return true
-			}
-		}
-	}
-	return false
 }

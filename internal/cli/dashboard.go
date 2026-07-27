@@ -401,7 +401,7 @@ func (d *liveDashboard) redraw() {
 	d.mu.Unlock()
 
 	body := d.render(current, messages, stage, d.now())
-	_, err := io.WriteString(d.output, body)
+	_, err := d.output.Write([]byte(body))
 	if err != nil {
 		d.mu.Lock()
 		d.err = err
@@ -635,7 +635,7 @@ func (d *liveDashboard) finalSummary(current state.State) error {
 	messages := dashboardMessageTexts(d.messages)
 	d.mu.Unlock()
 	body := "Final aggregate summary\n" + d.render(current, messages, dashboardFinished, d.now())
-	_, err := io.WriteString(d.output, body)
+	_, err := d.output.Write([]byte(body))
 	return err
 }
 

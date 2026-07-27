@@ -359,7 +359,8 @@ while IFS= read -r ignored; do :; done
 		}, &stdout, &stderr, nil, func(io.Writer) bool { return true })
 	}()
 	waitForFile(t, activityEmitted)
-	time.Sleep(2 * dashboardActivityInterval)
+	waitForBuffer(t, &stdout, "Deepest operation: bash")
+	waitForBuffer(t, &stdout, "Observed tokens: 1200")
 	if err := os.WriteFile(releaseWorker, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -672,6 +673,34 @@ func TestPlainRunOutputRemovesSplitTerminalControls(t *testing.T) {
 	}
 	if got, want := output.String(), "discovery failed\nnext line\nissue link\ncontrols removed\n"; got != want {
 		t.Fatalf("sanitized plain output = %q, want %q", got, want)
+	}
+}
+
+type dashboardWriterContractProbe struct {
+	bytes.Buffer
+	writeCalls       int
+	writeStringCalls int
+}
+
+func (b *dashboardWriterContractProbe) Write(content []byte) (int, error) {
+	b.writeCalls++
+	return b.Buffer.Write(content)
+}
+
+func (b *dashboardWriterContractProbe) WriteString(content string) (int, error) {
+	b.writeStringCalls++
+	return b.Buffer.WriteString(content)
+}
+
+func TestDashboardRenderingUsesSynchronizedWriterContract(t *testing.T) {
+	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+	source := &dashboardTestSource{current: current}
+	var output dashboardWriterContractProbe
+	dashboard := newLiveDashboard(&output, source, current, time.Now)
+
+	dashboard.redraw()
+	if output.writeCalls != 1 || output.writeStringCalls != 0 {
+		t.Fatalf("dashboard writes = %d Write and %d WriteString calls, want 1 synchronized Write call", output.writeCalls, output.writeStringCalls)
 	}
 }
 
