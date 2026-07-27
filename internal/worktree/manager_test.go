@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -59,7 +60,6 @@ func TestManagerRetriesTransientFetchFailures(t *testing.T) {
 	root := t.TempDir()
 	logPath := filepath.Join(root, "git.log")
 	attemptPath := filepath.Join(root, "fetch-attempts")
-	gitPath := filepath.Join(root, "git")
 	script := `#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> ` + shellQuote(logPath) + `
@@ -76,9 +76,7 @@ if [ "$3" = "fetch" ]; then
 	fi
 fi
 `
-	if err := os.WriteFile(gitPath, []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	gitPath := writeTestExecutable(t, filepath.Join(root, "git"), script)
 	var delays []time.Duration
 	manager := Manager{
 		GitExecutable: gitPath,
@@ -248,10 +246,7 @@ func fakeGit(t *testing.T, logPath string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "git")
 	script := "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >> " + shellQuote(logPath) + "\n"
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	return path
+	return writeTestExecutable(t, path, script)
 }
 
 func failingGit(t *testing.T, logPath string) string {
@@ -259,7 +254,22 @@ func failingGit(t *testing.T, logPath string) string {
 	path := filepath.Join(t.TempDir(), "git")
 	attemptPath := logPath + ".attempts"
 	script := "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >> " + shellQuote(logPath) + "\nattempts=0\nif [ -f " + shellQuote(attemptPath) + " ]; then attempts=$(cat " + shellQuote(attemptPath) + "); fi\nattempts=$((attempts+1))\nprintf '%s\\n' \"$attempts\" > " + shellQuote(attemptPath) + "\necho \"git attempt $attempts failed: Permission denied (publickey).\" >&2\nexit 128\n"
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+	return writeTestExecutable(t, path, script)
+}
+
+func writeTestExecutable(t *testing.T, path, content string) string {
+	t.Helper()
+	source := path + ".source"
+	if err := os.WriteFile(source, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A concurrent fork can inherit a writable descriptor and make Linux reject
+	// execution with ETXTBSY. Create the executable in a child process so this
+	// parallel test process never opens its inode for writing.
+	if output, err := exec.Command("cp", source, path).CombinedOutput(); err != nil {
+		t.Fatalf("copy test executable: %v\n%s", err, output)
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	return path
