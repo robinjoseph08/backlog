@@ -254,11 +254,19 @@ func TestTerminalDashboardKeepsRunFinishedDuringInvocation(t *testing.T) {
 	repository := initializeFollowRepository(t)
 	stateDir := t.TempDir()
 	started := time.Now().Add(-time.Minute)
+	logPath := filepath.Join(stateDir, "run-44.jsonl")
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeActivityEntries(t, activity.PathForLog(logPath), activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: time.Now().Add(-10 * time.Minute), Kind: "turn",
+		Description: "Worker turn completed", TurnDelta: 1,
+	})
 	run := scheduler.Run{
 		Issue: 44, IssueTitle: "Merge while watching", IssueURL: "https://github.com/acme/widgets/issues/44",
 		RunID: "run-44", Status: scheduler.StatusWaitingForMerge, WorkerMode: scheduler.WorkerModeRPC,
 		Branch: "agent/issue-44-run-44", SessionID: "backlog-run-44", SessionDir: filepath.Join(stateDir, "sessions", "run-44"),
-		StartedAt: started, UpdatedAt: started,
+		LogPath: logPath, StartedAt: started, UpdatedAt: started,
 	}
 	if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{
 		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
@@ -285,7 +293,10 @@ esac
 		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
 	}
 	finalFrame := lastDashboardFrame(stdout.String())
-	for _, want := range []string{"Final aggregate summary", "Recently Finished (1)", "#44  Merge while watching", "State: merged"} {
+	for _, want := range []string{
+		"Final aggregate summary", "Recently Finished (1)", "#44  Merge while watching", "State: merged",
+		"(quiet)", "Turns: Worker 1 | Subagent n/a",
+	} {
 		if !strings.Contains(finalFrame, want) {
 			t.Fatalf("terminal final frame missing %q: %q", want, finalFrame)
 		}
