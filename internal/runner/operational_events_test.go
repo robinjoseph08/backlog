@@ -197,6 +197,53 @@ func TestRunnerDoesNotReportAdmissionRecoveryAfterDrainIsAccepted(t *testing.T) 
 	}
 }
 
+func TestRunnerDoesNotRecoverOrExhaustAfterCanceledCandidateSuccess(t *testing.T) {
+	calls := 0
+	retryStarted := make(chan struct{})
+	github := &fakeGitHub{candidatesFunc: func(ctx context.Context) ([]scheduler.Candidate, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New("temporary failure")
+		}
+		close(retryStarted)
+		<-ctx.Done()
+		// Simulate an adapter that reports success after its parent context was
+		// canceled instead of returning the cancellation error.
+		return nil, nil
+	}}
+	runner := testRunner(github, newFakeWorkers(), &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+	runner.Config.PollInterval = time.Millisecond
+	var output bytes.Buffer
+	runner.Output = &output
+	recorder := &operationalEventRecorder{}
+	runner.OnOperationalEvent = recorder.record
+	summaries := 0
+	runner.FinalSummary = func(state.State) error {
+		summaries++
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	<-retryStarted
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	runner.WaitForOperationalEventDelivery()
+
+	events := recorder.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("operational events = %#v, want only the pre-cancellation failure", events)
+	}
+	if _, ok := events[0].(CandidateDiscoveryFailed); !ok {
+		t.Fatalf("operational event = %T, want CandidateDiscoveryFailed", events[0])
+	}
+	if summaries != 0 || strings.Contains(output.String(), "admission resumed") {
+		t.Fatalf("canceled Candidate success reported recovery or natural exhaustion: summaries=%d output=%q", summaries, output.String())
+	}
+}
+
 func TestRunnerDoesNotReportCandidateDiscoveryFailureAfterDrainIsAccepted(t *testing.T) {
 	candidateContext := make(chan context.Context, 1)
 	nowStarted := make(chan struct{})

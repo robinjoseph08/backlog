@@ -10,9 +10,11 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/robinjoseph08/backlog/internal/runner"
 	"golang.org/x/term"
 )
 
@@ -74,8 +76,16 @@ type PresentationTerminal struct {
 // PresentationControl gives presentation input one path into Runner shutdown.
 // Interrupt represents a raw-mode Ctrl-C key event.
 type PresentationControl struct {
-	Terminal PresentationTerminal
-	ingress  *orderedSignalIngress
+	Terminal          PresentationTerminal
+	ingress           *orderedSignalIngress
+	operationalEvents *presentationEventQueue
+}
+
+// NextOperationalEvent waits for the next typed Admission or shutdown event
+// from the hosted Runner. Events are returned in Runner delivery order without
+// requiring the presentation to parse compatible plain output.
+func (c PresentationControl) NextOperationalEvent(ctx context.Context) (runner.OperationalEvent, error) {
+	return c.operationalEvents.next(ctx)
 }
 
 // Interrupt submits a SIGINT-equivalent event to the Runner's ordered signal
@@ -108,6 +118,54 @@ func (e *PresentationFailure) Unwrap() []error {
 		return []error{e.Err}
 	}
 	return []error{e.Err, e.RunnerErr}
+}
+
+type presentationEventQueue struct {
+	mu     sync.Mutex
+	events []runner.OperationalEvent
+	wake   chan struct{}
+}
+
+func newPresentationEventQueue() *presentationEventQueue {
+	return &presentationEventQueue{wake: make(chan struct{}, 1)}
+}
+
+func (q *presentationEventQueue) publish(event runner.OperationalEvent) {
+	q.mu.Lock()
+	q.events = append(q.events, event)
+	q.mu.Unlock()
+	select {
+	case q.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (q *presentationEventQueue) next(ctx context.Context) (runner.OperationalEvent, error) {
+	for {
+		q.mu.Lock()
+		if len(q.events) > 0 {
+			event := q.events[0]
+			q.events = q.events[1:]
+			q.mu.Unlock()
+			return event, nil
+		}
+		q.mu.Unlock()
+		select {
+		case <-q.wake:
+		case <-ctx.Done():
+			// Prefer an event published concurrently with cancellation so the
+			// presentation can observe the Runner's terminal lifecycle stage.
+			q.mu.Lock()
+			if len(q.events) > 0 {
+				event := q.events[0]
+				q.events = q.events[1:]
+				q.mu.Unlock()
+				return event, nil
+			}
+			q.mu.Unlock()
+			return nil, ctx.Err()
+		}
+	}
 }
 
 type lifecycleSignal struct {
@@ -195,13 +253,19 @@ type runnerHost struct {
 	terminal TerminalDependencies
 }
 
-func (h runnerHost) run(ctx context.Context, run func(<-chan lifecycleSignal) error, presentation Presentation) error {
+func (h runnerHost) run(ctx context.Context, run func(<-chan lifecycleSignal, func(runner.OperationalEvent)) error, presentation Presentation) error {
 	hostCtx, stopHost := context.WithCancel(context.Background())
 	defer stopHost()
 	ingress := newOrderedSignalIngress(hostCtx, h.terminal.Signals)
+	var operationalEvents *presentationEventQueue
+	var publishOperationalEvent func(runner.OperationalEvent)
+	if presentation != nil {
+		operationalEvents = newPresentationEventQueue()
+		publishOperationalEvent = operationalEvents.publish
+	}
 
 	runnerDone := make(chan error, 1)
-	go func() { runnerDone <- run(ingress.events) }()
+	go func() { runnerDone <- run(ingress.events, publishOperationalEvent) }()
 	if presentation == nil {
 		return <-runnerDone
 	}
@@ -213,7 +277,7 @@ func (h runnerHost) run(ctx context.Context, run func(<-chan lifecycleSignal) er
 		Input: h.terminal.Input, Output: h.terminal.Output, ErrorOutput: h.terminal.ErrorOutput,
 		IsTerminal: h.terminal.IsTerminal, Dimensions: h.terminal.Dimensions,
 		ColorProfile: h.terminal.ColorProfile, Now: h.terminal.Now, OpenURL: h.terminal.OpenURL,
-	}, ingress: ingress}
+	}, ingress: ingress, operationalEvents: operationalEvents}
 	go func() {
 		defer func() {
 			if recovered := recover(); recovered != nil {

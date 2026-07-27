@@ -337,19 +337,19 @@ func (r *Runner) Run(ctx context.Context) error {
 
 		if !draining && candidateRetry == nil {
 			candidates, err := r.GitHub.Candidates(admissionCtx, r.Config.Repo)
-			if err != nil {
-				if admissionCtx.Err() != nil && ctx.Err() == nil {
-					select {
-					case event := <-signalEvents:
-						draining = r.handleSignal(event, len(localWorkers))
-						continue
-					case <-ctx.Done():
-						continue
-					}
-				}
+			if admissionCtx.Err() != nil {
 				if ctx.Err() != nil {
 					continue
 				}
+				select {
+				case event := <-signalEvents:
+					draining = r.handleSignal(event, len(localWorkers))
+					continue
+				case <-ctx.Done():
+					continue
+				}
+			}
+			if err != nil {
 				candidateDiscoveryFailures++
 				if candidateRetryTimer == nil {
 					candidateRetryTimer = time.NewTimer(r.Config.PollInterval)
@@ -381,7 +381,9 @@ func (r *Runner) Run(ctx context.Context) error {
 			} else {
 				if candidateDiscoveryFailures > 0 {
 					failures := candidateDiscoveryFailures
-					r.emitWhileAdmissionActive(admission, CandidateDiscoveryRecovered{OccurredAt: r.Now().UTC(), Failures: failures})
+					if !r.emitWhileAdmissionActive(admission, CandidateDiscoveryRecovered{OccurredAt: r.Now().UTC(), Failures: failures}) {
+						continue
+					}
 					candidateDiscoveryFailures = 0
 				}
 				plan := scheduler.Plan(scheduler.Snapshot{Candidates: candidates, Runs: current.Runs, Leases: current.Leases}, r.Config.MaxConcurrentIssues)
@@ -2136,16 +2138,17 @@ func (r *Runner) emit(event OperationalEvent) {
 
 // emitWhileAdmissionActive orders an Admission report with Drain without
 // holding the Admission gate across compatible plain-output backpressure.
-func (r *Runner) emitWhileAdmissionActive(admission *admissionGate, event OperationalEvent) {
+func (r *Runner) emitWhileAdmissionActive(admission *admissionGate, event OperationalEvent) bool {
 	active := admission.whileActive(func() {
 		if r.OnOperationalEvent != nil {
 			r.enqueueOperationalEvent(event)
 		}
 	})
 	if !active {
-		return
+		return false
 	}
 	r.writeOperationalEvent(event)
+	return true
 }
 
 func (r *Runner) writeOperationalEvent(event OperationalEvent) {

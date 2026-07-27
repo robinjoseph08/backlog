@@ -42,7 +42,7 @@ func TestRunnerHostOrdersExternalAndPresentationSignalsThroughOneIngress(t *test
 		<-ctx.Done()
 		return ctx.Err()
 	}
-	err := host.run(context.Background(), func(signals <-chan lifecycleSignal) error {
+	err := host.run(context.Background(), func(signals <-chan lifecycleSignal, _ func(runner.OperationalEvent)) error {
 		observed := make([]os.Signal, 0, 4)
 		for len(observed) < 4 {
 			event := <-signals
@@ -122,7 +122,7 @@ func TestRunnerHostPresentationFailureRequestsSuspensionAndWaitsForRunner(t *tes
 			done := make(chan error, 1)
 			host := runnerHost{terminal: TerminalDependencies{}}
 			go func() {
-				done <- host.run(context.Background(), func(signals <-chan lifecycleSignal) error {
+				done <- host.run(context.Background(), func(signals <-chan lifecycleSignal, _ func(runner.OperationalEvent)) error {
 					event := <-signals
 					if event.signal != syscall.SIGTERM {
 						t.Errorf("presentation failure signal = %v, want SIGTERM", event.signal)
@@ -164,7 +164,7 @@ func TestRunnerHostAcceptsCleanPresentationReturnAfterParentCancellation(t *test
 	host := runnerHost{terminal: TerminalDependencies{}}
 	done := make(chan error, 1)
 	go func() {
-		done <- host.run(ctx, func(signals <-chan lifecycleSignal) error {
+		done <- host.run(ctx, func(signals <-chan lifecycleSignal, _ func(runner.OperationalEvent)) error {
 			close(runnerStarted)
 			<-ctx.Done()
 			select {
@@ -212,7 +212,7 @@ func TestRunnerHostReportsRunnerFirstCompletionAsPresentationFailure(t *testing.
 	presentationStarted := make(chan struct{})
 	runnerErr := errors.New("Runner completed unsuccessfully")
 	host := runnerHost{terminal: TerminalDependencies{}}
-	err := host.run(context.Background(), func(<-chan lifecycleSignal) error {
+	err := host.run(context.Background(), func(<-chan lifecycleSignal, func(runner.OperationalEvent)) error {
 		<-presentationStarted
 		return runnerErr
 	}, func(ctx context.Context, _ PresentationControl) error {
@@ -313,6 +313,82 @@ exec sleep 30
 				t.Fatalf("stderr = %q", stderr.String())
 			}
 		})
+	}
+}
+
+func TestMainWithTerminalRoutesTypedOperationalEventsToSelectedPresentation(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	root := t.TempDir()
+	failedOnce := filepath.Join(root, "candidate-failed")
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef") printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
+    if ! test -f `+quote(failedOnce)+`; then touch `+quote(failedOnce)+`; echo "GitHub temporarily unavailable" >&2; exit 1; fi
+    printf '%s\n' '[]' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	var stdout, stderr bytes.Buffer
+	var events []runner.OperationalEvent
+	dependencies := TerminalDependencies{
+		Output: &stdout, ErrorOutput: &stderr, IsTerminal: func() bool { return true },
+	}
+	dependencies.Presentation = func(ctx context.Context, control PresentationControl) error {
+		interrupted := false
+		for {
+			event, err := control.NextOperationalEvent(ctx)
+			if err != nil {
+				return err
+			}
+			events = append(events, event)
+			if _, recovered := event.(runner.CandidateDiscoveryRecovered); recovered && !interrupted {
+				interrupted = true
+				if err := control.Interrupt(ctx); err != nil {
+					return err
+				}
+			}
+			if shutdown, ok := event.(runner.ShutdownEvent); ok && shutdown.Stage == runner.ShutdownStageDrainComplete {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+		}
+	}
+
+	exit := MainWithTerminal(context.Background(), []string{
+		"run", "--watch", "--repo-dir", repository, "--state-dir", filepath.Join(root, "state"), "--poll", "5ms", "--gh", gh,
+	}, dependencies)
+	if exit != 0 {
+		t.Fatalf("exit = %d, stdout = %q, stderr = %q", exit, stdout.String(), stderr.String())
+	}
+	if len(events) != 4 {
+		t.Fatalf("presentation events = %#v, want failure, recovery, Drain, and Drain completion", events)
+	}
+	if _, ok := events[0].(runner.CandidateDiscoveryFailed); !ok {
+		t.Fatalf("first presentation event = %T, want CandidateDiscoveryFailed", events[0])
+	}
+	if _, ok := events[1].(runner.CandidateDiscoveryRecovered); !ok {
+		t.Fatalf("second presentation event = %T, want CandidateDiscoveryRecovered", events[1])
+	}
+	for index, stage := range []runner.ShutdownStage{runner.ShutdownStageDraining, runner.ShutdownStageDrainComplete} {
+		shutdown, ok := events[index+2].(runner.ShutdownEvent)
+		if !ok || shutdown.Stage != stage {
+			t.Fatalf("presentation event %d = %#v, want shutdown stage %s", index+2, events[index+2], stage)
+		}
+	}
+	for _, message := range []string{
+		"candidate discovery failed; admission paused",
+		"candidate discovery recovered; admission resumed after 1 failure",
+		"Drain: admission stopped; 0 Workers remaining",
+		"Drain complete: 0 Workers remaining; exiting successfully",
+	} {
+		if !strings.Contains(stdout.String(), message) {
+			t.Fatalf("compatible plain output omitted %q: %q", message, stdout.String())
+		}
+	}
+	if strings.Contains(stdout.String(), "Backlog Run Dashboard") || strings.Contains(stdout.String(), "\x1b[") || stderr.Len() != 0 {
+		t.Fatalf("selected presentation output compatibility changed: stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
 }
 
