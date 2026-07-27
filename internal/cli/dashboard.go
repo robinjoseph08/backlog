@@ -65,8 +65,9 @@ type liveDashboard struct {
 }
 
 type dashboardMessage struct {
-	text     string
-	shutdown bool
+	text         string
+	shutdown     bool
+	plainMatched bool
 }
 
 type fileSignature struct {
@@ -199,6 +200,13 @@ func (d *liveDashboard) recordMessageLocked(message string) {
 	if d.messageOccurrences[message] <= d.shutdownOccurrences[message] {
 		// A typed event arrived first and already inserted this compatible
 		// rendering into history.
+		for index := range d.messages {
+			tracked := &d.messages[index]
+			if tracked.text == message && tracked.shutdown && !tracked.plainMatched {
+				tracked.plainMatched = true
+				break
+			}
+		}
 		d.reconcileOccurrencesLocked(message)
 		return
 	}
@@ -215,11 +223,27 @@ func (d *liveDashboard) trackOccurrenceLocked(message string, shutdown bool) {
 		d.messageOccurrences[message]++
 	}
 	for len(d.occurrenceOrder) > dashboardOccurrenceLimit {
-		oldest := d.occurrenceOrder[0]
-		d.occurrenceOrder = d.occurrenceOrder[1:]
-		delete(d.messageOccurrences, oldest)
-		delete(d.shutdownOccurrences, oldest)
+		pruneIndex := 0
+		for index, tracked := range d.occurrenceOrder {
+			if !d.hasVisibleUnmatchedShutdownLocked(tracked) {
+				pruneIndex = index
+				break
+			}
+		}
+		pruned := d.occurrenceOrder[pruneIndex]
+		d.occurrenceOrder = append(d.occurrenceOrder[:pruneIndex], d.occurrenceOrder[pruneIndex+1:]...)
+		delete(d.messageOccurrences, pruned)
+		delete(d.shutdownOccurrences, pruned)
 	}
+}
+
+func (d *liveDashboard) hasVisibleUnmatchedShutdownLocked(message string) bool {
+	for _, tracked := range d.messages {
+		if tracked.text == message && tracked.shutdown && !tracked.plainMatched {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *liveDashboard) reconcileOccurrencesLocked(message string) {
@@ -238,14 +262,16 @@ func (d *liveDashboard) reconcileOccurrencesLocked(message string) {
 
 func (d *liveDashboard) appendMessageLocked(message dashboardMessage) {
 	d.messages = append(d.messages, message)
-	if len(d.messages) > dashboardMessageLimit {
-		for index, retained := range d.messages {
-			if !retained.shutdown {
-				d.messages = append(d.messages[:index], d.messages[index+1:]...)
-				break
-			}
+	if len(d.messages) <= dashboardMessageLimit {
+		return
+	}
+	for index, retained := range d.messages {
+		if !retained.shutdown {
+			d.messages = append(d.messages[:index], d.messages[index+1:]...)
+			return
 		}
 	}
+	d.messages = d.messages[1:]
 }
 
 func normalizedDashboardMessage(message string) string {
@@ -292,6 +318,7 @@ func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
 		for index := len(d.messages) - 1; index >= 0; index-- {
 			if d.messages[index].text == message && !d.messages[index].shutdown {
 				d.messages[index].shutdown = true
+				d.messages[index].plainMatched = true
 				matched = true
 				break
 			}

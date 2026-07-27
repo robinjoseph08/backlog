@@ -190,20 +190,23 @@ func TestDashboardBoundsOccurrenceTrackingAndSuppressesTypedFirstOutput(t *testi
 	var output bytes.Buffer
 	dashboard := newLiveDashboard(&output, source, current, time.Now)
 
+	typedFirst := "Drain: typed event arrived before compatible output"
+	dashboard.operationalEvent(runner.ShutdownEvent{Stage: runner.ShutdownStageDraining, Message: typedFirst})
 	for index := range dashboardOccurrenceLimit * 4 {
 		if _, err := fmt.Fprintf(dashboard, "operational message %d\n", index); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if len(dashboard.messageOccurrences) > dashboardOccurrenceLimit || len(dashboard.shutdownOccurrences) > dashboardOccurrenceLimit || len(dashboard.occurrenceOrder) > dashboardOccurrenceLimit {
-		t.Fatalf("occurrence tracking grew beyond %d entries: messages=%d shutdown=%d order=%d", dashboardOccurrenceLimit, len(dashboard.messageOccurrences), len(dashboard.shutdownOccurrences), len(dashboard.occurrenceOrder))
+		t.Fatalf("occurrence tracking grew beyond %d entries before delayed output: messages=%d shutdown=%d order=%d", dashboardOccurrenceLimit, len(dashboard.messageOccurrences), len(dashboard.shutdownOccurrences), len(dashboard.occurrenceOrder))
 	}
 	if len(dashboard.messages) != dashboardMessageLimit {
 		t.Fatalf("visible message history = %d entries, want %d", len(dashboard.messages), dashboardMessageLimit)
 	}
+	if dashboard.shutdownOccurrences[typedFirst] != 1 {
+		t.Fatalf("typed-first occurrence was pruned while its shutdown history remained visible: %#v", dashboard.shutdownOccurrences)
+	}
 
-	typedFirst := "Drain: typed event arrived before compatible output"
-	dashboard.operationalEvent(runner.ShutdownEvent{Stage: runner.ShutdownStageDraining, Message: typedFirst})
 	if _, err := fmt.Fprintln(dashboard, typedFirst); err != nil {
 		t.Fatal(err)
 	}
@@ -217,13 +220,25 @@ func TestDashboardBoundsOccurrenceTrackingAndSuppressesTypedFirstOutput(t *testi
 		}
 	}
 	if matches != 1 {
-		t.Fatalf("typed-first message occurrences = %d, want 1", matches)
+		t.Fatalf("typed-first message occurrences after delayed plain output = %d, want 1", matches)
+	}
+	if len(dashboard.messageOccurrences) > dashboardOccurrenceLimit || len(dashboard.shutdownOccurrences) > dashboardOccurrenceLimit || len(dashboard.occurrenceOrder) > dashboardOccurrenceLimit {
+		t.Fatalf("occurrence tracking grew beyond %d entries after delayed output: messages=%d shutdown=%d order=%d", dashboardOccurrenceLimit, len(dashboard.messageOccurrences), len(dashboard.shutdownOccurrences), len(dashboard.occurrenceOrder))
 	}
 	if _, exists := dashboard.messageOccurrences[typedFirst]; exists {
 		t.Fatal("resolved plain occurrence remained tracked")
 	}
 	if _, exists := dashboard.shutdownOccurrences[typedFirst]; exists {
 		t.Fatal("resolved shutdown occurrence remained tracked")
+	}
+
+	for index := range dashboardOccurrenceLimit * 2 {
+		dashboard.operationalEvent(runner.ShutdownEvent{
+			Stage: runner.ShutdownStageDraining, Message: fmt.Sprintf("typed shutdown message %d", index),
+		})
+	}
+	if len(dashboard.messages) > dashboardMessageLimit || len(dashboard.messageOccurrences) > dashboardOccurrenceLimit || len(dashboard.shutdownOccurrences) > dashboardOccurrenceLimit || len(dashboard.occurrenceOrder) > dashboardOccurrenceLimit {
+		t.Fatalf("typed shutdown tracking exceeded its bounds: visible=%d messages=%d shutdown=%d order=%d", len(dashboard.messages), len(dashboard.messageOccurrences), len(dashboard.shutdownOccurrences), len(dashboard.occurrenceOrder))
 	}
 }
 
