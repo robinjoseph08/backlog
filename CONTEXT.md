@@ -16,6 +16,10 @@ _Avoid_: Related issue, prerequisite
 A candidate with no open blockers and no active or intervention-required run.
 _Avoid_: Ready issue, runnable ticket
 
+**Admission**:
+The transition that creates a Run and its Lease for an eligible candidate.
+_Avoid_: Claiming a ticket, starting a job
+
 **Lease**:
 A durable reservation preventing more than one run from owning an issue at a time.
 _Avoid_: Claim, lock
