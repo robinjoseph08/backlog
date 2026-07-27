@@ -1336,8 +1336,8 @@ func TestRunnerDrainFailsClosedWhenSettledWorkerExitIsUnverified(t *testing.T) {
 			incomplete = &shutdown
 		}
 	}
-	if incomplete == nil || incomplete.Action != "retaining Workers with unverified liveness" || incomplete.RemainingWorkers != 1 || incomplete.NextInterrupt != NextInterruptNone {
-		t.Fatalf("Drain incomplete event = %#v, want 1 remaining Worker and no next interrupt", incomplete)
+	if incomplete == nil || incomplete.Action != "retaining Workers with unverified liveness" || incomplete.RemainingWorkers != 0 || incomplete.NextInterrupt != NextInterruptNone {
+		t.Fatalf("Drain incomplete event = %#v, want 0 remaining supervised Owned Workers and no next interrupt", incomplete)
 	}
 	got := store.LoadValue()
 	run := findRun(got.Runs, fmt.Sprintf("run-%d", issue))

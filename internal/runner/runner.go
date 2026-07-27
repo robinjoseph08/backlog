@@ -185,16 +185,16 @@ func (g *admissionGate) stopped() bool {
 	return g.draining
 }
 
-// whileActive linearizes Admission reporting with Drain acceptance. If Drain
-// wins first, the report is suppressed; otherwise it is published before Drain
-// can be accepted.
-func (g *admissionGate) whileActive(report func()) bool {
+// whileActive linearizes Admission reporting with Drain acceptance. The
+// registration callback must not perform output: it runs under the gate only
+// long enough to order the report before a concurrent Drain transition.
+func (g *admissionGate) whileActive(register func()) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.draining {
 		return false
 	}
-	report()
+	register()
 	return true
 }
 
@@ -373,7 +373,7 @@ func (r *Runner) Run(ctx context.Context) error {
 						}
 					}
 				}
-				r.emit(CandidateDiscoveryFailed{
+				r.emitWhileAdmissionActive(admission, CandidateDiscoveryFailed{
 					Operation: operation, Issue: issue, Err: err,
 					OccurredAt: occurredAt, RetryAt: occurredAt.Add(r.Config.PollInterval),
 					ConsecutiveFailures: candidateDiscoveryFailures,
@@ -381,9 +381,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			} else {
 				if candidateDiscoveryFailures > 0 {
 					failures := candidateDiscoveryFailures
-					admission.whileActive(func() {
-						r.emit(CandidateDiscoveryRecovered{OccurredAt: r.Now().UTC(), Failures: failures})
-					})
+					r.emitWhileAdmissionActive(admission, CandidateDiscoveryRecovered{OccurredAt: r.Now().UTC(), Failures: failures})
 					candidateDiscoveryFailures = 0
 				}
 				plan := scheduler.Plan(scheduler.Snapshot{Candidates: candidates, Runs: current.Runs, Leases: current.Leases}, r.Config.MaxConcurrentIssues)
@@ -444,7 +442,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		} else if draining && len(localWorkers) == 0 {
 			if drainOperationalErr != nil {
 				if unverified := persistedWorkerCount(&current); unverified > 0 {
-					r.shutdownEvent(ShutdownStageDrainIncomplete, "retaining Workers with unverified liveness", unverified, NextInterruptNone, "Drain incomplete: 0 supervised Workers remaining; %s retained with unverified liveness", workerSummary(unverified))
+					r.shutdownEvent(ShutdownStageDrainIncomplete, "retaining Workers with unverified liveness", 0, NextInterruptNone, "Drain incomplete: 0 supervised Workers remaining; %s retained with unverified liveness", workerSummary(unverified))
 				} else {
 					r.shutdownEvent(ShutdownStageDrainComplete, "exiting after an operational failure", 0, NextInterruptNone, "Drain complete: 0 Workers remaining; exiting after an operational failure")
 				}
@@ -2133,6 +2131,24 @@ func (r *Runner) emit(event OperationalEvent) {
 	if r.OnOperationalEvent != nil {
 		r.enqueueOperationalEvent(event)
 	}
+	r.writeOperationalEvent(event)
+}
+
+// emitWhileAdmissionActive orders an Admission report with Drain without
+// holding the Admission gate across compatible plain-output backpressure.
+func (r *Runner) emitWhileAdmissionActive(admission *admissionGate, event OperationalEvent) {
+	active := admission.whileActive(func() {
+		if r.OnOperationalEvent != nil {
+			r.enqueueOperationalEvent(event)
+		}
+	})
+	if !active {
+		return
+	}
+	r.writeOperationalEvent(event)
+}
+
+func (r *Runner) writeOperationalEvent(event OperationalEvent) {
 	if message := FormatOperationalEvent(event); message != "" {
 		r.logf("%s", message)
 	}

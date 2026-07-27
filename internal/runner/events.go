@@ -69,9 +69,10 @@ const (
 )
 
 // ShutdownEvent reports a staged shutdown transition or progress update.
-// Message preserves the complete append-only plain rendering while Stage,
-// Action, RemainingWorkers, and NextInterrupt let terminal presentation avoid
-// deriving lifecycle state from that prose.
+// RemainingWorkers counts live Workers still supervised by this Runner
+// invocation. Message preserves the complete append-only plain rendering while
+// typed fields let terminal presentation avoid deriving lifecycle state from
+// that prose.
 type ShutdownEvent struct {
 	Stage            ShutdownStage
 	Action           string

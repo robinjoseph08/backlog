@@ -157,17 +157,17 @@ func TestDashboardReceivesShutdownStageWithoutParsingFormattedMessages(t *testin
 	if _, err := fmt.Fprintln(dashboard, shutdownMessage); err != nil {
 		t.Fatal(err)
 	}
-	// Runner event delivery is asynchronous, so the typed event may arrive
-	// after its compatible plain rendering.
-	dashboard.operationalEvent(runner.ShutdownEvent{
-		Stage: runner.ShutdownStageSuspending, Action: "establishing continuation boundaries", RemainingWorkers: 2,
-		NextInterrupt: runner.NextInterruptForceStops, Message: shutdownMessage,
-	})
+	// Runner event delivery is asynchronous, so enough newer plain output may
+	// evict the compatible rendering before its typed classification arrives.
 	for index := range 12 {
 		if _, err := fmt.Fprintf(dashboard, "ordinary lifecycle message %d\n", index); err != nil {
 			t.Fatal(err)
 		}
 	}
+	dashboard.operationalEvent(runner.ShutdownEvent{
+		Stage: runner.ShutdownStageSuspending, Action: "establishing continuation boundaries", RemainingWorkers: 2,
+		NextInterrupt: runner.NextInterruptForceStops, Message: shutdownMessage,
+	})
 	dashboard.redraw()
 	frame := lastDashboardFrame(output.String())
 	if !strings.Contains(frame, "Suspending: continuation boundaries are being established") {

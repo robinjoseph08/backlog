@@ -43,16 +43,17 @@ type liveDashboard struct {
 	source followStateSource
 	now    func() time.Time
 
-	mu                      sync.Mutex
-	current                 state.State
-	baselineStatuses        map[string]scheduler.Status
-	messages                []dashboardMessage
-	pendingShutdownMessages map[string]int
-	stage                   dashboardStage
-	lastActivity            map[string]fileSignature
-	observations            map[string]dashboardActivityObservation
-	pendingOutput           bytes.Buffer
-	err                     error
+	mu                  sync.Mutex
+	current             state.State
+	baselineStatuses    map[string]scheduler.Status
+	messages            []dashboardMessage
+	messageOccurrences  map[string]int
+	shutdownOccurrences map[string]int
+	stage               dashboardStage
+	lastActivity        map[string]fileSignature
+	observations        map[string]dashboardActivityObservation
+	pendingOutput       bytes.Buffer
+	err                 error
 
 	updates chan struct{}
 	stop    chan struct{}
@@ -88,7 +89,7 @@ func newLiveDashboard(output io.Writer, source followStateSource, initial state.
 	}
 	return &liveDashboard{
 		output: output, source: source, now: now, current: initial,
-		baselineStatuses: baseline, pendingShutdownMessages: make(map[string]int), stage: dashboardRunning,
+		baselineStatuses: baseline, messageOccurrences: make(map[string]int), shutdownOccurrences: make(map[string]int), stage: dashboardRunning,
 		lastActivity: activitySignatures(initial), observations: make(map[string]dashboardActivityObservation), updates: make(chan struct{}, 1),
 		stop: make(chan struct{}), done: make(chan struct{}),
 	}
@@ -191,14 +192,17 @@ func (d *liveDashboard) recordMessageLocked(message string) {
 	if message == "" {
 		return
 	}
-	shutdown := d.pendingShutdownMessages[message] > 0
-	if shutdown {
-		d.pendingShutdownMessages[message]--
-		if d.pendingShutdownMessages[message] == 0 {
-			delete(d.pendingShutdownMessages, message)
-		}
+	d.messageOccurrences[message]++
+	if d.messageOccurrences[message] <= d.shutdownOccurrences[message] {
+		// A typed event arrived first and already inserted this compatible
+		// rendering into history.
+		return
 	}
-	d.messages = append(d.messages, dashboardMessage{text: message, shutdown: shutdown})
+	d.appendMessageLocked(dashboardMessage{text: message})
+}
+
+func (d *liveDashboard) appendMessageLocked(message dashboardMessage) {
+	d.messages = append(d.messages, message)
 	if len(d.messages) > 12 {
 		for index, retained := range d.messages {
 			if !retained.shutdown {
@@ -248,6 +252,7 @@ func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
 	}
 	d.mu.Lock()
 	if message := normalizedDashboardMessage(shutdown.Message); message != "" {
+		d.shutdownOccurrences[message]++
 		matched := false
 		for index := len(d.messages) - 1; index >= 0; index-- {
 			if d.messages[index].text == message && !d.messages[index].shutdown {
@@ -257,7 +262,10 @@ func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
 			}
 		}
 		if !matched {
-			d.pendingShutdownMessages[message]++
+			// Event delivery may lag far enough behind output for the matching
+			// ordinary line to be evicted. Restore it as typed history. This also
+			// represents the line when the event arrives before plain output.
+			d.appendMessageLocked(dashboardMessage{text: message, shutdown: true})
 		}
 	}
 	if next > d.stage {

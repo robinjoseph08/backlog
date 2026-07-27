@@ -21,6 +21,18 @@ type operationalEventRecorder struct {
 	events []OperationalEvent
 }
 
+type blockingOperationalOutput struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (w *blockingOperationalOutput) Write(content []byte) (int, error) {
+	w.once.Do(func() { close(w.started) })
+	<-w.release
+	return len(content), nil
+}
+
 func (r *operationalEventRecorder) record(event OperationalEvent) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -182,6 +194,88 @@ func TestRunnerDoesNotReportAdmissionRecoveryAfterDrainIsAccepted(t *testing.T) 
 	}
 	if strings.Contains(output.String(), "admission resumed") {
 		t.Fatalf("plain output reported recovery after Drain acceptance: %q", output.String())
+	}
+}
+
+func TestRunnerDoesNotReportCandidateDiscoveryFailureAfterDrainIsAccepted(t *testing.T) {
+	candidateContext := make(chan context.Context, 1)
+	nowStarted := make(chan struct{})
+	releaseNow := make(chan struct{})
+	var nowOnce sync.Once
+	github := &fakeGitHub{candidatesFunc: func(ctx context.Context) ([]scheduler.Candidate, error) {
+		candidateContext <- ctx
+		return nil, errors.New("late discovery failure")
+	}}
+	signals := make(chan os.Signal, 1)
+	runner := testRunner(github, newFakeWorkers(), &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+	runner.Config.Watch = true
+	runner.Signals = signals
+	runner.Now = func() time.Time {
+		nowOnce.Do(func() {
+			close(nowStarted)
+			<-releaseNow
+		})
+		return time.Date(2026, 7, 2, 3, 4, 5, 0, time.UTC)
+	}
+	var output bytes.Buffer
+	runner.Output = &output
+	recorder := &operationalEventRecorder{}
+	runner.OnOperationalEvent = recorder.record
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	ctx := <-candidateContext
+	<-nowStarted
+	signals <- os.Interrupt
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Drain was not accepted while failure reporting was paused")
+	}
+	close(releaseNow)
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	runner.WaitForOperationalEventDelivery()
+
+	events := recorder.snapshot()
+	for _, event := range events {
+		if _, ok := event.(CandidateDiscoveryFailed); ok {
+			t.Fatalf("operational events = %#v, reported failure after Drain acceptance", events)
+		}
+	}
+	if strings.Contains(output.String(), "candidate discovery failed") {
+		t.Fatalf("plain output reported failure after Drain acceptance: %q", output.String())
+	}
+}
+
+func TestAdmissionOutputBackpressureDoesNotDelayDrainAcceptance(t *testing.T) {
+	candidateContext := make(chan context.Context, 1)
+	github := &fakeGitHub{candidatesFunc: func(ctx context.Context) ([]scheduler.Candidate, error) {
+		candidateContext <- ctx
+		return nil, errors.New("temporary failure")
+	}}
+	signals := make(chan os.Signal, 1)
+	runner := testRunner(github, newFakeWorkers(), &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+	runner.Config.Watch = true
+	runner.Signals = signals
+	output := &blockingOperationalOutput{started: make(chan struct{}), release: make(chan struct{})}
+	runner.Output = output
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	ctx := <-candidateContext
+	<-output.started
+	signals <- os.Interrupt
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		close(output.release)
+		t.Fatal("plain-output backpressure delayed Drain acceptance")
+	}
+	close(output.release)
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
 	}
 }
 
