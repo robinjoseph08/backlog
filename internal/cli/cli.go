@@ -356,23 +356,9 @@ func statusCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return err
 	}
 	store := state.FileStore{Path: filepath.Join(resolved, "state.json")}
-	current, migrationRequired, err := store.Preview()
+	current, _, err := store.Preview()
 	if err != nil {
 		return err
-	}
-	if migrationRequired {
-		lock, err := acquireRepositoryLock(commonDirectory)
-		if err != nil {
-			return fmt.Errorf("migrate state for status: %w", err)
-		}
-		defer func() { _ = lock.Release() }()
-		if err := bindStateDirectory(commonDirectory, resolved); err != nil {
-			return err
-		}
-		current, err = store.Load()
-		if err != nil {
-			return err
-		}
 	}
 	if *asJSON {
 		encoder := json.NewEncoder(stdout)
@@ -649,6 +635,7 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "  SIGTERM suspension exits 143, including later force escalation.")
 	fmt.Fprintln(writer, "")
 	fmt.Fprintln(writer, "Upgrade limits:")
-	fmt.Fprintln(writer, "  Version 1 and version 2 state migrate to version 3; legacy print-mode Runs cannot Resume.")
+	fmt.Fprintln(writer, "  Runner startup and successful lifecycle mutations migrate version 1 and version 2 state to version 3.")
+	fmt.Fprintln(writer, "  Passive inspection previews supported legacy state; legacy print-mode Runs cannot Resume.")
 	fmt.Fprintln(writer, "  State written by a newer unsupported version is refused.")
 }

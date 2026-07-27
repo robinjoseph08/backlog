@@ -1112,7 +1112,7 @@ exit 9
 	}
 }
 
-func TestCompiledExecutableMigratesV1StatusAndReconcilesStartup(t *testing.T) {
+func TestCompiledExecutablePreviewsV1StatusAndRunnerMigratesDuringStartup(t *testing.T) {
 	root := t.TempDir()
 	repository := filepath.Join(root, "repo")
 	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
@@ -1188,8 +1188,8 @@ func TestCompiledExecutableMigratesV1StatusAndReconcilesStartup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(persistedAfterStatus), `"paused"`) || strings.Contains(string(persistedAfterStatus), `"continuation"`) {
-		t.Fatalf("legacy paused state or implied continuation survived migration: %s", persistedAfterStatus)
+	if string(persistedAfterStatus) != legacy {
+		t.Fatalf("status persisted legacy migration:\n%s", persistedAfterStatus)
 	}
 
 	gh := writeExecutable(t, `#!/bin/sh
@@ -1223,6 +1223,13 @@ esac
 	runOutput, err := runCommand.CombinedOutput()
 	if err != nil {
 		t.Fatalf("compiled startup reconciliation after upgrade: %v\n%s", err, runOutput)
+	}
+	persistedAfterRun, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(persistedAfterRun), `"version": 3`) || strings.Contains(string(persistedAfterRun), `"paused"`) {
+		t.Fatalf("Runner did not persist legacy migration:\n%s", persistedAfterRun)
 	}
 	final, err := (state.FileStore{Path: statePath}).Load()
 	if err != nil {

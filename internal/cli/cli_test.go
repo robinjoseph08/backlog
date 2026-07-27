@@ -307,38 +307,109 @@ func TestStatusPrintsMachineReadableState(t *testing.T) {
 	}
 }
 
-func TestStatusDoesNotMigrateV1WhileRunnerLockIsHeld(t *testing.T) {
+func TestStatusPreviewsSupportedLegacyStateWhileRunnerOwnsCoordination(t *testing.T) {
 	t.Parallel()
 
 	repository := filepath.Join(t.TempDir(), "repo")
 	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
 		t.Fatalf("git init: %v\n%s", err, output)
 	}
-	stateDir := t.TempDir()
-	statePath := filepath.Join(stateDir, "state.json")
-	legacy := `{"version":1,"paused":true,"runs":[{"issue":1,"runId":"failed","status":"failed"}]}`
-	if err := os.WriteFile(statePath, []byte(legacy), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	lock, err := state.AcquireLock(filepath.Join(repository, ".git", legacyLockFile))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer lock.Release()
+	for _, test := range []struct {
+		name    string
+		fixture string
+		wantRun string
+	}{
+		{
+			name:    "version 1",
+			fixture: `{"version":1,"paused":true,"runs":[{"issue":1,"runId":"failed-v1","status":"failed"}]}`,
+			wantRun: "Run: failed-v1 | State: failed",
+		},
+		{
+			name:    "version 2",
+			fixture: `{"version":2,"repo":"acme/widgets","runs":[{"issue":2,"runId":"failed-v2","status":"failed","workerMode":"print"}],"leases":[]}`,
+			wantRun: "Run: failed-v2 | State: failed",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			statePath := filepath.Join(stateDir, "state.json")
+			if err := os.WriteFile(statePath, []byte(test.fixture), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			lock, err := acquireRepositoryLock(filepath.Join(repository, ".git"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lock.Release()
 
-	var stdout, stderr bytes.Buffer
-	if exit := Main(context.Background(), []string{"status", "--repo-dir", repository, "--state-dir", stateDir}, &stdout, &stderr); exit != 1 {
-		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+			var stdout, stderr bytes.Buffer
+			if exit := Main(context.Background(), []string{"status", "--repo-dir", repository, "--state-dir", stateDir}, &stdout, &stderr); exit != 0 {
+				t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+			}
+			if stderr.Len() != 0 || !strings.Contains(stdout.String(), test.wantRun) {
+				t.Fatalf("stdout = %q, stderr = %q, want rendered Run %q", stdout.String(), stderr.String(), test.wantRun)
+			}
+			persisted, err := os.ReadFile(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(persisted, []byte(test.fixture)) {
+				t.Fatalf("status persisted migration while Runner owned coordination:\n%s", persisted)
+			}
+		})
 	}
-	if !strings.Contains(stderr.String(), "runner already active") {
-		t.Fatalf("stderr = %q, want active runner refusal", stderr.String())
+}
+
+func TestStatusRejectsInvalidAndUnsupportedStateWithoutMutation(t *testing.T) {
+	t.Parallel()
+
+	repository := filepath.Join(t.TempDir(), "repo")
+	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, output)
 	}
-	persisted, err := os.ReadFile(statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(persisted), `"version":1`) || !strings.Contains(string(persisted), `"paused":true`) {
-		t.Fatalf("status migrated state despite active runner: %s", persisted)
+	for _, test := range []struct {
+		name       string
+		fixture    string
+		diagnostic string
+	}{
+		{
+			name:       "invalid version 1 state",
+			fixture:    `{"version":1,"runs":[{"issue":1,"runId":"invalid-v1","status":"unknown"}]}`,
+			diagnostic: `state contains unknown status "unknown"`,
+		},
+		{
+			name:       "invalid version 2 state",
+			fixture:    `{"version":2,"runs":[{"issue":1,"runId":"invalid-v2","status":"unknown","workerMode":"print"}],"leases":[]}`,
+			diagnostic: `state contains unknown status "unknown"`,
+		},
+		{
+			name:       "unsupported state version",
+			fixture:    `{"version":4,"runs":[],"leases":[]}`,
+			diagnostic: "unsupported state version 4",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			statePath := filepath.Join(stateDir, "state.json")
+			if err := os.WriteFile(statePath, []byte(test.fixture), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			var stdout, stderr bytes.Buffer
+			if exit := Main(context.Background(), []string{"status", "--repo-dir", repository, "--state-dir", stateDir}, &stdout, &stderr); exit != 1 {
+				t.Fatalf("exit = %d, stdout = %q, stderr = %q", exit, stdout.String(), stderr.String())
+			}
+			if stdout.Len() != 0 || !strings.Contains(stderr.String(), test.diagnostic) {
+				t.Fatalf("stdout = %q, stderr = %q, want diagnostic %q", stdout.String(), stderr.String(), test.diagnostic)
+			}
+			persisted, err := os.ReadFile(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(persisted, []byte(test.fixture)) {
+				t.Fatalf("rejected status changed state:\n%s", persisted)
+			}
+		})
 	}
 }
 
