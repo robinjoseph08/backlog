@@ -254,11 +254,19 @@ func TestTerminalDashboardKeepsRunFinishedDuringInvocation(t *testing.T) {
 	repository := initializeFollowRepository(t)
 	stateDir := t.TempDir()
 	started := time.Now().Add(-time.Minute)
+	logPath := filepath.Join(stateDir, "run-44.jsonl")
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeActivityEntries(t, activity.PathForLog(logPath), activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: time.Now().Add(-10 * time.Minute), Kind: "turn",
+		Description: "Worker turn completed", TurnDelta: 1,
+	})
 	run := scheduler.Run{
 		Issue: 44, IssueTitle: "Merge while watching", IssueURL: "https://github.com/acme/widgets/issues/44",
 		RunID: "run-44", Status: scheduler.StatusWaitingForMerge, WorkerMode: scheduler.WorkerModeRPC,
 		Branch: "agent/issue-44-run-44", SessionID: "backlog-run-44", SessionDir: filepath.Join(stateDir, "sessions", "run-44"),
-		StartedAt: started, UpdatedAt: started,
+		LogPath: logPath, StartedAt: started, UpdatedAt: started,
 	}
 	if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{
 		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
@@ -285,7 +293,10 @@ esac
 		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
 	}
 	finalFrame := lastDashboardFrame(stdout.String())
-	for _, want := range []string{"Final aggregate summary", "Recently Finished (1)", "#44  Merge while watching", "State: merged"} {
+	for _, want := range []string{
+		"Final aggregate summary", "Recently Finished (1)", "#44  Merge while watching", "State: merged",
+		"(quiet)", "Turns: Worker 1 | Subagent n/a",
+	} {
 		if !strings.Contains(finalFrame, want) {
 			t.Fatalf("terminal final frame missing %q: %q", want, finalFrame)
 		}
@@ -399,6 +410,61 @@ func TestDashboardRedrawsForActivityWithoutCreatingActivity(t *testing.T) {
 	}
 }
 
+func TestDashboardPresentsQuietAgeAndUnavailableTurnsFromSharedProgress(t *testing.T) {
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	logPath := filepath.Join(t.TempDir(), "quiet.jsonl")
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeActivityEntries(t, activity.PathForLog(logPath), activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: now.Add(-10 * time.Minute), Kind: "tool", Description: "Tool test started",
+	})
+	run := scheduler.Run{
+		Issue: 58, RunID: "quiet-dashboard", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint,
+		LogPath: logPath, StartedAt: now.Add(-time.Hour),
+	}
+	current := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1,
+		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+	}
+	source := &dashboardTestSource{current: current}
+	var output bytes.Buffer
+	dashboard := newLiveDashboard(&output, source, current, func() time.Time { return now })
+	dashboard.redraw()
+	got := lastDashboardFrame(output.String())
+	for _, want := range []string{
+		"State: running | Elapsed: 1h0m0s", "Activity age: 10m0s (quiet)",
+		"Turns: Worker n/a | Subagent n/a | Observed tokens: n/a",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("quiet dashboard output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(strings.ToLower(got), "stalled") {
+		t.Fatalf("quiet dashboard presentation implied a stalled state:\n%s", got)
+	}
+
+	writeActivityEntries(t, activity.PathForLog(logPath), activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: now.Add(-10 * time.Minute), Kind: "turn",
+		Description: "Worker turn completed", TurnDelta: 1,
+	})
+	run.Status = scheduler.StatusNeedsHuman
+	run.Error = "review Worker outcome"
+	current.Runs[0] = run
+	source.current = current
+	dashboard.update(current)
+	dashboard.redraw()
+	got = lastDashboardFrame(output.String())
+	for _, want := range []string{
+		"Attention Required (1)", "Activity age: 10m0s (quiet)",
+		"Turns: Worker 1 | Subagent n/a", "Diagnostic: review Worker outcome",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("attention dashboard output lost %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestDashboardElapsedTimerRedrawsWithoutStateActivity(t *testing.T) {
 	started := time.Now().Add(-time.Minute).Truncate(time.Second)
 	var clock atomic.Int64
@@ -483,17 +549,31 @@ func TestDashboardCloseShowsThatRunnerStopped(t *testing.T) {
 
 func TestDashboardKeepsTerminalRunsAndShutdownMessagesVisible(t *testing.T) {
 	now := time.Date(2026, 7, 26, 17, 0, 0, 0, time.UTC)
-	initial := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+	logPath := filepath.Join(t.TempDir(), "finished.jsonl")
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeActivityEntries(t, activity.PathForLog(logPath), activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: now.Add(-10 * time.Minute), Kind: "turn",
+		Description: "Worker turn completed", TurnDelta: 1,
+	})
+	running := scheduler.Run{
+		Issue: 42, IssueTitle: "Finished here", RunID: "run-42", Status: scheduler.StatusRunning,
+		LogPath: logPath, StartedAt: now.Add(-time.Hour),
+	}
+	initial := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1,
+		Runs: []scheduler.Run{running}, Leases: []scheduler.Lease{{LeaseID: running.RunID, Issue: running.Issue, RunID: running.RunID}},
+	}
 	source := &dashboardTestSource{current: initial}
 	var output bytes.Buffer
 	dashboard := newLiveDashboard(&output, source, initial, func() time.Time { return now })
+	dashboard.redraw()
 	finishedAt := now.Add(-time.Second)
-	terminal := scheduler.Run{
-		Issue: 42, IssueTitle: "Finished here", RunID: "run-42", Status: scheduler.StatusMerged,
-		StartedAt: now.Add(-time.Minute), UpdatedAt: finishedAt, CompletedAt: &finishedAt,
-	}
+	terminal := running
+	terminal.Status, terminal.UpdatedAt, terminal.CompletedAt = scheduler.StatusMerged, finishedAt, &finishedAt
 	current := initial
-	current.Runs = []scheduler.Run{terminal}
+	current.Runs, current.Leases = []scheduler.Run{terminal}, nil
 	source.current = current
 	dashboard.update(current)
 	if _, err := dashboard.Write([]byte("Drain: admission stopped; 1 Worker remaining; next SIGINT will be recorded as a suspension request\n")); err != nil {
@@ -501,7 +581,8 @@ func TestDashboardKeepsTerminalRunsAndShutdownMessagesVisible(t *testing.T) {
 	}
 	dashboard.redraw()
 	for _, want := range []string{
-		"Recently Finished (1)", "#42  Finished here", "Drain: admission stopped; 1 Worker remaining",
+		"Recently Finished (1)", "#42  Finished here", "Activity age: 10m0s (quiet)",
+		"Turns: Worker 1 | Subagent n/a", "Drain: admission stopped; 1 Worker remaining",
 		"Draining: admission is stopped; next Ctrl-C suspends unfinished Runs",
 	} {
 		if !strings.Contains(output.String(), want) {

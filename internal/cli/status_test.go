@@ -393,6 +393,97 @@ func TestStatusLoadsWhenRunningTelemetrySourceIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestStatusCommandPresentsElapsedQuietAgeAndUnavailableTurnsFromSharedProgress(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Second)
+	logPath := filepath.Join(stateDir, "quiet.jsonl")
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeActivityEntries(t, activity.PathForLog(logPath), activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: now.Add(-10 * time.Minute), Kind: "tool", Description: "Tool test started",
+	})
+	identity, err := pidStartIdentity(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	running := scheduler.Run{
+		Issue: 58, RunID: "quiet", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint,
+		PID: os.Getpid(), ProcessIdentity: identity, LogPath: logPath, StartedAt: now.Add(-time.Hour),
+	}
+	withoutStart := scheduler.Run{Issue: 59, RunID: "not-started", Status: scheduler.StatusClaimed, WorkerMode: scheduler.WorkerModePrint}
+	current := state.State{
+		Version: state.CurrentVersion, Runs: []scheduler.Run{running, withoutStart},
+		Leases: []scheduler.Lease{
+			{LeaseID: running.RunID, Issue: running.Issue, RunID: running.RunID},
+			{LeaseID: withoutStart.RunID, Issue: withoutStart.Issue, RunID: withoutStart.RunID},
+		},
+	}
+	if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(current); err != nil {
+		t.Fatal(err)
+	}
+	got := runStatusCommand(t, repository, stateDir)
+	quietStart := strings.Index(got, "Run: quiet | State: running")
+	if quietStart < 0 {
+		t.Fatalf("running status Run missing:\n%s", got)
+	}
+	quietEnd := strings.Index(got[quietStart:], "Run: not-started | State: claimed")
+	if quietEnd < 0 {
+		t.Fatalf("claimed status Run missing:\n%s", got)
+	}
+	quietOutput := got[quietStart : quietStart+quietEnd]
+	for _, want := range []string{"Elapsed: 1h0m", "(quiet)", "Turns: Worker n/a | Subagent n/a"} {
+		if !strings.Contains(quietOutput, want) {
+			t.Fatalf("quiet status output missing %q:\n%s", want, quietOutput)
+		}
+	}
+	if !strings.Contains(got, "Run: not-started | State: claimed\n    Elapsed: n/a") {
+		t.Fatalf("status did not show unavailable elapsed time:\n%s", got)
+	}
+	if strings.Contains(strings.ToLower(got), "stalled") {
+		t.Fatalf("quiet status presentation implied a stalled state:\n%s", got)
+	}
+}
+
+func TestStatusDisplaysElapsedForEveryRunState(t *testing.T) {
+	t.Parallel()
+
+	startedAt := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+	now := startedAt.Add(2 * time.Hour)
+	terminalUpdate := startedAt.Add(30 * time.Minute)
+	completedAt := startedAt.Add(time.Hour)
+	for _, status := range []scheduler.Status{
+		scheduler.StatusClaimed, scheduler.StatusWorktreeReady, scheduler.StatusRunning,
+		scheduler.StatusWaitingForMerge, scheduler.StatusSuspended, scheduler.StatusResetting,
+		scheduler.StatusReset, scheduler.StatusMerged, scheduler.StatusFailed, scheduler.StatusNeedsHuman,
+	} {
+		status := status
+		t.Run(string(status), func(t *testing.T) {
+			t.Parallel()
+			run := scheduler.Run{Issue: 58, RunID: string(status), Status: status, StartedAt: startedAt, UpdatedAt: terminalUpdate}
+			want := "Elapsed: 2h0m0s"
+			if scheduler.IsTerminal(status) {
+				want = "Elapsed: 30m0s"
+			}
+			if status == scheduler.StatusMerged {
+				run.CompletedAt = &completedAt
+				want = "Elapsed: 1h0m0s"
+			}
+			observed := runObservation{run: run, observed: now}
+			var output bytes.Buffer
+			printer := statusPrinter{output: &output}
+			printer.run(statusRun{run: run, observation: observed})
+			if printer.err != nil {
+				t.Fatal(printer.err)
+			}
+			if !strings.Contains(output.String(), want) {
+				t.Fatalf("status output missing %q:\n%s", want, output.String())
+			}
+		})
+	}
+}
+
 func TestStatusUsesExactSharedActivityAge(t *testing.T) {
 	stateDir := t.TempDir()
 	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)

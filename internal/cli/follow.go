@@ -23,6 +23,7 @@ import (
 const (
 	followPollInterval        = 50 * time.Millisecond
 	followObservationInterval = time.Second
+	quietActivityThreshold    = 5 * time.Minute
 )
 
 type followStateSource interface {
@@ -357,6 +358,7 @@ type followMetrics struct {
 	latest              time.Time
 	operation           string
 	turns               int
+	turnsObserved       bool
 	turnsUnavailable    bool
 	tokens              int64
 	tokensKnown         bool
@@ -390,6 +392,9 @@ func (m *followMetrics) apply(entry activity.Entry) {
 	}
 	if entry.OperationChanged {
 		m.operation = entry.Operation
+	}
+	if entry.Kind == "turn" || entry.TurnDelta != 0 {
+		m.turnsObserved = true
 	}
 	if entry.TurnDelta < 0 || entry.TurnDelta > 1 {
 		m.turnsUnavailable = true
@@ -778,6 +783,7 @@ type runProgress struct {
 	elapsed          string
 	activityAge      string
 	workerOperation  string
+	workerTurns      string
 	workerTokens     string
 	activeSubagents  int
 	deepestOperation string
@@ -795,13 +801,17 @@ func summarizeRunProgress(run scheduler.Run, metrics followMetrics, now time.Tim
 		elapsedEnd = run.UpdatedAt
 	}
 	progress := runProgress{
-		elapsed: "n/a", activityAge: "n/a", workerOperation: valueOr(metrics.operation, "n/a"), workerTokens: "n/a",
+		elapsed: "n/a", activityAge: "n/a", workerOperation: valueOr(metrics.operation, "n/a"),
+		workerTurns: "n/a", workerTokens: "n/a",
 	}
 	if !run.StartedAt.IsZero() {
 		progress.elapsed = displayDuration(elapsedEnd.Sub(run.StartedAt))
 	}
 	if !metrics.latest.IsZero() {
-		progress.activityAge = displayDuration(now.Sub(metrics.latest))
+		progress.activityAge = displayActivityAge(now.Sub(metrics.latest))
+	}
+	if metrics.turnsObserved && !metrics.turnsUnavailable {
+		progress.workerTurns = fmt.Sprintf("%d", metrics.turns)
 	}
 	if metrics.tokensKnown {
 		progress.workerTokens = fmt.Sprintf("%d", metrics.tokens)
@@ -829,12 +839,8 @@ func printFollowSummary(output io.Writer, run scheduler.Run, metrics followMetri
 		issue += "  " + run.IssueURL
 	}
 	progress := summarizeRunProgress(run, metrics, now)
-	workerTurns := fmt.Sprintf("%d", metrics.turns)
-	if metrics.turnsUnavailable {
-		workerTurns = "n/a"
-	}
 	if _, err := fmt.Fprintf(output, "Run: %s\nIssue: %s\nState: %s\nRunner supervision: %s\nWorker liveness: %s\nElapsed: %s\nActivity age: %s\nCurrent Worker operation: %s\nCompleted Worker turns: %s\nCompleted Worker tokens: %s\nSubagents: %d (%d active)\nDeepest current operation: %s\nApproximate Subagent turns: %s\nApproximate Subagent tool uses: %s\nApproximate Subagent tokens: %s\nObserved tokens: %s\n",
-		run.RunID, issue, run.Status, observation.supervision, observation.workerLiveness, progress.elapsed, progress.activityAge, progress.workerOperation, workerTurns, progress.workerTokens, len(metrics.subagents), progress.activeSubagents,
+		run.RunID, issue, run.Status, observation.supervision, observation.workerLiveness, progress.elapsed, progress.activityAge, progress.workerOperation, progress.workerTurns, progress.workerTokens, len(metrics.subagents), progress.activeSubagents,
 		progress.deepestOperation, progress.subagentTurns, progress.subagentToolUses, progress.subagentTokens, progress.observedTokens); err != nil {
 		return err
 	}
@@ -975,8 +981,20 @@ func printActivityEntry(output io.Writer, entry activity.Entry) error {
 	if !entry.ObservedAt.IsZero() {
 		observed = entry.ObservedAt.Format(time.RFC3339)
 	}
-	_, err := fmt.Fprintf(output, "  %s  %s\n", observed, entry.Description)
+	description := entry.Description
+	if entry.Subagent != nil {
+		description += " | duration: " + displaySubagentDuration(entry.Subagent.DurationMillis, false, time.Time{}, time.Time{})
+	}
+	_, err := fmt.Fprintf(output, "  %s  %s\n", observed, description)
 	return err
+}
+
+func displayActivityAge(age time.Duration) string {
+	displayed := displayDuration(age)
+	if age >= quietActivityThreshold {
+		return displayed + " (quiet)"
+	}
+	return displayed
 }
 
 func displayDuration(duration time.Duration) string {

@@ -321,20 +321,24 @@ func (d *liveDashboard) observeSections(current state.State, now time.Time) map[
 			continue
 		}
 		observation := runObservation{run: run, process: observeFollowRun(d.source, run), observed: now}
-		if run.Status == scheduler.StatusRunning {
-			cached, exists := d.observations[run.RunID]
-			if !exists || cached.logPath != run.LogPath {
-				observed, source := observeRunOnce(d.source, run, io.Discard, d.now)
-				cached = dashboardActivityObservation{logPath: run.LogPath, metrics: observed.metrics, source: source}
-			} else if cached.source != nil {
-				consumeActivity(&cached.metrics, cached.source)
-			}
-			d.observations[run.RunID] = cached
-			observation.metrics = cached.metrics
+		if run.LogPath != "" {
+			observation.metrics = d.observeActivity(run)
 		}
 		sections[section] = append(sections[section], statusRun{run: run, observation: observation})
 	}
 	return sections
+}
+
+func (d *liveDashboard) observeActivity(run scheduler.Run) followMetrics {
+	cached, exists := d.observations[run.RunID]
+	if !exists || cached.logPath != run.LogPath {
+		observed, source := observeRunOnce(d.source, run, io.Discard, d.now)
+		cached = dashboardActivityObservation{logPath: run.LogPath, metrics: observed.metrics, source: source}
+	} else if cached.source != nil {
+		consumeActivity(&cached.metrics, cached.source)
+	}
+	d.observations[run.RunID] = cached
+	return cached.metrics
 }
 
 func (d *liveDashboard) recentlyFinished(current state.State, sections map[statusSection][]statusRun, now time.Time) []statusRun {
@@ -355,6 +359,9 @@ func (d *liveDashboard) recentlyFinished(current state.State, sections map[statu
 			continue
 		}
 		observation := runObservation{run: run, process: observeFollowRun(d.source, run), observed: now}
+		if run.LogPath != "" {
+			observation.metrics = d.observeActivity(run)
+		}
 		recent = append(recent, statusRun{run: run, observation: observation})
 	}
 	return recent
@@ -373,10 +380,6 @@ func renderDashboardSection(output *strings.Builder, name string, runs []statusR
 			identity += "  " + title
 		}
 		progress := summarizeRunProgress(run, observed.observation.metrics, now)
-		workerTurns := "n/a"
-		if len(observed.observation.metrics.entries) > 0 && !observed.observation.metrics.turnsUnavailable {
-			workerTurns = fmt.Sprintf("%d", observed.observation.metrics.turns)
-		}
 		fmt.Fprintf(output, "  %s\n", identity)
 		if run.IssueURL != "" {
 			fmt.Fprintf(output, "    Issue: %s\n", plainStatusValue(run.IssueURL))
@@ -386,7 +389,7 @@ func renderDashboardSection(output *strings.Builder, name string, runs []statusR
 		fmt.Fprintf(output, "    Activity age: %s | Deepest operation: %s\n",
 			progress.activityAge, plainStatusValue(progress.deepestOperation))
 		fmt.Fprintf(output, "    Turns: Worker %s | Subagent %s | Observed tokens: %s\n",
-			workerTurns, progress.subagentTurns, progress.observedTokens)
+			progress.workerTurns, progress.subagentTurns, progress.observedTokens)
 		if run.Error != "" {
 			fmt.Fprintf(output, "    Diagnostic: %s\n", plainStatusValue(strings.TrimSpace(run.Error)))
 		}

@@ -1058,6 +1058,57 @@ func TestSplitFollowArgumentsAcceptsRunIDBeforeOrAfterFlags(t *testing.T) {
 	}
 }
 
+func TestFollowCommandPresentsUnavailableTurnsQuietAgeAndSafeFeedDurations(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	logPath := filepath.Join(stateDir, "presentation.jsonl")
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	duration, negativeDuration := int64(2500), int64(-1)
+	writeActivityEntries(t, activity.PathForLog(logPath),
+		activity.Entry{
+			Version: activity.CurrentVersion, ObservedAt: now.Add(-10 * time.Minute), Kind: "subagent",
+			Description: "Subagent duration available", Subagent: &activity.SubagentSnapshot{ID: "available", DurationMillis: &duration},
+		},
+		activity.Entry{
+			Version: activity.CurrentVersion, ObservedAt: now.Add(-10 * time.Minute), Kind: "subagent",
+			Description: "Subagent duration unavailable", Subagent: &activity.SubagentSnapshot{ID: "unavailable"},
+		},
+		activity.Entry{
+			Version: activity.CurrentVersion, ObservedAt: now.Add(-10 * time.Minute), Kind: "subagent",
+			Description: "Subagent duration invalid", Subagent: &activity.SubagentSnapshot{ID: "invalid", DurationMillis: &negativeDuration},
+		},
+	)
+	run := scheduler.Run{
+		Issue: 58, RunID: "shared-presentation", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint,
+		LogPath: logPath, StartedAt: now.Add(-time.Hour), UpdatedAt: now,
+	}
+	if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{
+		Version: state.CurrentVersion, Runs: []scheduler.Run{run},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := followCommand(context.Background(), []string{run.RunID, "--repo-dir", repository, "--state-dir", stateDir}, &output, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	for _, want := range []string{
+		"State: merged", "Completed Worker turns: n/a", "(quiet)",
+		"Subagent duration available | duration: 2.5s", "Subagent duration unavailable | duration: n/a",
+		"Subagent duration invalid | duration: n/a",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("shared Follow presentation missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(strings.ToLower(got), "stalled") {
+		t.Fatalf("quiet Follow presentation implied a stalled state:\n%s", got)
+	}
+}
+
 func TestFollowNormalizedReplaysSemanticWorkerActivityWithUsageAndPrivacy(t *testing.T) {
 	directory := t.TempDir()
 	logPath := filepath.Join(directory, "worker.jsonl")
@@ -1347,6 +1398,11 @@ func TestFollowSummaryRejectsOverflowingTelemetry(t *testing.T) {
 	if duration := displaySubagentDuration(&maxTokens, false, time.Time{}, time.Time{}); duration != "n/a" {
 		t.Fatalf("overflow duration = %q", duration)
 	}
+	maxSafeMilliseconds := math.MaxInt64 / int64(time.Millisecond)
+	observedAt := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	if duration := displaySubagentDuration(&maxSafeMilliseconds, true, observedAt, observedAt.Add(time.Millisecond)); duration != "n/a" {
+		t.Fatalf("active overflow duration = %q", duration)
+	}
 }
 
 func TestFollowNormalizedRefreshesAgeForSuppressedSubagentActivityAndRetainsMilestones(t *testing.T) {
@@ -1444,6 +1500,46 @@ func TestFollowNormalizedLimitsInitialProjectionToLatestTwentyAndReportsAge(t *t
 	}
 	if strings.Contains(strings.ToLower(got), "stalled") {
 		t.Fatalf("quiet Activity age was labeled stalled:\n%s", got)
+	}
+}
+
+func TestSummarizeRunProgressPreservesWorkerTurnAvailability(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name  string
+		entry *activity.Entry
+		want  string
+	}{
+		{name: "unobserved", want: "n/a"},
+		{name: "observed zero", entry: &activity.Entry{Kind: "turn"}, want: "0"},
+		{name: "invalid upper delta", entry: &activity.Entry{Kind: "turn", TurnDelta: 2}, want: "n/a"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			metrics := followMetrics{}
+			if test.entry != nil {
+				metrics.apply(*test.entry)
+			}
+			if got := summarizeRunProgress(scheduler.Run{}, metrics, time.Time{}).workerTurns; got != test.want {
+				t.Fatalf("Worker turns = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestDisplayActivityAgeUsesFixedQuietThreshold(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		age  time.Duration
+		want string
+	}{
+		{age: quietActivityThreshold - time.Second, want: "4m59s"},
+		{age: quietActivityThreshold, want: "5m0s (quiet)"},
+	} {
+		if got := displayActivityAge(test.age); got != test.want {
+			t.Fatalf("Activity age %s = %q, want %q", test.age, got, test.want)
+		}
 	}
 }
 
