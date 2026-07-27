@@ -321,7 +321,7 @@ func (d *liveDashboard) observeSections(current state.State, now time.Time) map[
 			continue
 		}
 		observation := runObservation{run: run, process: observeFollowRun(d.source, run), observed: now}
-		if run.Status == scheduler.StatusRunning {
+		if run.LogPath != "" {
 			observation.metrics = d.observeActivity(run)
 		}
 		sections[section] = append(sections[section], statusRun{run: run, observation: observation})

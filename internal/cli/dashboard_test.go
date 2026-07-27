@@ -443,6 +443,26 @@ func TestDashboardPresentsQuietAgeAndUnavailableTurnsFromSharedProgress(t *testi
 	if strings.Contains(strings.ToLower(got), "stalled") {
 		t.Fatalf("quiet dashboard presentation implied a stalled state:\n%s", got)
 	}
+
+	writeActivityEntries(t, activity.PathForLog(logPath), activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: now.Add(-10 * time.Minute), Kind: "turn",
+		Description: "Worker turn completed", TurnDelta: 1,
+	})
+	run.Status = scheduler.StatusNeedsHuman
+	run.Error = "review Worker outcome"
+	current.Runs[0] = run
+	source.current = current
+	dashboard.update(current)
+	dashboard.redraw()
+	got = lastDashboardFrame(output.String())
+	for _, want := range []string{
+		"Attention Required (1)", "Activity age: 10m0s (quiet)",
+		"Turns: Worker 1 | Subagent n/a", "Diagnostic: review Worker outcome",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("attention dashboard output lost %q:\n%s", want, got)
+		}
+	}
 }
 
 func TestDashboardElapsedTimerRedrawsWithoutStateActivity(t *testing.T) {
