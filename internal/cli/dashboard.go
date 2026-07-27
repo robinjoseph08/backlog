@@ -322,19 +322,23 @@ func (d *liveDashboard) observeSections(current state.State, now time.Time) map[
 		}
 		observation := runObservation{run: run, process: observeFollowRun(d.source, run), observed: now}
 		if run.Status == scheduler.StatusRunning {
-			cached, exists := d.observations[run.RunID]
-			if !exists || cached.logPath != run.LogPath {
-				observed, source := observeRunOnce(d.source, run, io.Discard, d.now)
-				cached = dashboardActivityObservation{logPath: run.LogPath, metrics: observed.metrics, source: source}
-			} else if cached.source != nil {
-				consumeActivity(&cached.metrics, cached.source)
-			}
-			d.observations[run.RunID] = cached
-			observation.metrics = cached.metrics
+			observation.metrics = d.observeActivity(run)
 		}
 		sections[section] = append(sections[section], statusRun{run: run, observation: observation})
 	}
 	return sections
+}
+
+func (d *liveDashboard) observeActivity(run scheduler.Run) followMetrics {
+	cached, exists := d.observations[run.RunID]
+	if !exists || cached.logPath != run.LogPath {
+		observed, source := observeRunOnce(d.source, run, io.Discard, d.now)
+		cached = dashboardActivityObservation{logPath: run.LogPath, metrics: observed.metrics, source: source}
+	} else if cached.source != nil {
+		consumeActivity(&cached.metrics, cached.source)
+	}
+	d.observations[run.RunID] = cached
+	return cached.metrics
 }
 
 func (d *liveDashboard) recentlyFinished(current state.State, sections map[statusSection][]statusRun, now time.Time) []statusRun {
@@ -355,6 +359,9 @@ func (d *liveDashboard) recentlyFinished(current state.State, sections map[statu
 			continue
 		}
 		observation := runObservation{run: run, process: observeFollowRun(d.source, run), observed: now}
+		if run.LogPath != "" {
+			observation.metrics = d.observeActivity(run)
+		}
 		recent = append(recent, statusRun{run: run, observation: observation})
 	}
 	return recent

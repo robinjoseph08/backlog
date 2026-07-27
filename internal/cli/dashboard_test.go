@@ -518,17 +518,31 @@ func TestDashboardCloseShowsThatRunnerStopped(t *testing.T) {
 
 func TestDashboardKeepsTerminalRunsAndShutdownMessagesVisible(t *testing.T) {
 	now := time.Date(2026, 7, 26, 17, 0, 0, 0, time.UTC)
-	initial := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+	logPath := filepath.Join(t.TempDir(), "finished.jsonl")
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeActivityEntries(t, activity.PathForLog(logPath), activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: now.Add(-10 * time.Minute), Kind: "turn",
+		Description: "Worker turn completed", TurnDelta: 1,
+	})
+	running := scheduler.Run{
+		Issue: 42, IssueTitle: "Finished here", RunID: "run-42", Status: scheduler.StatusRunning,
+		LogPath: logPath, StartedAt: now.Add(-time.Hour),
+	}
+	initial := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1,
+		Runs: []scheduler.Run{running}, Leases: []scheduler.Lease{{LeaseID: running.RunID, Issue: running.Issue, RunID: running.RunID}},
+	}
 	source := &dashboardTestSource{current: initial}
 	var output bytes.Buffer
 	dashboard := newLiveDashboard(&output, source, initial, func() time.Time { return now })
+	dashboard.redraw()
 	finishedAt := now.Add(-time.Second)
-	terminal := scheduler.Run{
-		Issue: 42, IssueTitle: "Finished here", RunID: "run-42", Status: scheduler.StatusMerged,
-		StartedAt: now.Add(-time.Minute), UpdatedAt: finishedAt, CompletedAt: &finishedAt,
-	}
+	terminal := running
+	terminal.Status, terminal.UpdatedAt, terminal.CompletedAt = scheduler.StatusMerged, finishedAt, &finishedAt
 	current := initial
-	current.Runs = []scheduler.Run{terminal}
+	current.Runs, current.Leases = []scheduler.Run{terminal}, nil
 	source.current = current
 	dashboard.update(current)
 	if _, err := dashboard.Write([]byte("Drain: admission stopped; 1 Worker remaining; next SIGINT will be recorded as a suspension request\n")); err != nil {
@@ -536,7 +550,8 @@ func TestDashboardKeepsTerminalRunsAndShutdownMessagesVisible(t *testing.T) {
 	}
 	dashboard.redraw()
 	for _, want := range []string{
-		"Recently Finished (1)", "#42  Finished here", "Drain: admission stopped; 1 Worker remaining",
+		"Recently Finished (1)", "#42  Finished here", "Activity age: 10m0s (quiet)",
+		"Turns: Worker 1 | Subagent n/a", "Drain: admission stopped; 1 Worker remaining",
 		"Draining: admission is stopped; next Ctrl-C suspends unfinished Runs",
 	} {
 		if !strings.Contains(output.String(), want) {
