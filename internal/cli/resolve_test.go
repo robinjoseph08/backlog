@@ -614,9 +614,11 @@ esac
 func TestCompiledResolveTreatsAbsentRemoteBranchWithStderrAsRetired(t *testing.T) {
 	fixture := newLocalArtifactResetFixture(t, false)
 	gh := localArtifactResolveGitHub(t, fixture)
+	called := filepath.Join(t.TempDir(), "ls-remote-called")
 	git := writeExecutable(t, `#!/bin/sh
 case "$*" in
   *" ls-remote --exit-code --heads origin refs/heads/`+fixture.branch+`")
+    touch `+quote(called)+`
     echo 'Warning: Permanently added github.com to the list of known hosts.' >&2
     exit 2 ;;
 esac
@@ -625,6 +627,9 @@ exec `+quote(fixture.git)+` "$@"
 	binary := buildExecutable(t, t.TempDir())
 	command := exec.Command(binary, localArtifactResolveArgs(fixture, git, gh, "--dry-run")...)
 	output, err := command.CombinedOutput()
+	if _, statErr := os.Stat(called); statErr != nil {
+		t.Fatalf("compiled dry-run bypassed warning shim: %v\n%s", statErr, output)
+	}
 	if err != nil {
 		t.Fatalf("compiled dry-run with absent remote branch warning: %v\n%s", err, output)
 	}
@@ -634,6 +639,38 @@ exec `+quote(fixture.git)+` "$@"
 	}
 	if !strings.Contains(plan, "remove local worktree") {
 		t.Fatalf("dry-run did not continue after absent remote branch inspection:\n%s", plan)
+	}
+}
+
+func TestCompiledResolveFailsClosedWhenRemoteBranchInspectionIsUnknown(t *testing.T) {
+	fixture := newLocalArtifactResetFixture(t, false)
+	gh := localArtifactResolveGitHub(t, fixture)
+	git := writeExecutable(t, `#!/bin/sh
+case "$*" in
+  *" ls-remote --exit-code --heads origin refs/heads/`+fixture.branch+`")
+    echo 'remote inspection unavailable' >&2
+    exit 1 ;;
+esac
+exec `+quote(fixture.git)+` "$@"
+`)
+	beforeState := fileDigest(t, fixture.store.Path)
+	beforeGitHub := fileDigest(t, fixture.githubState)
+	binary := buildExecutable(t, t.TempDir())
+	command := exec.Command(binary, localArtifactResolveArgs(fixture, git, gh, "--yes")...)
+	output, err := command.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "git exited 1; state is unknown") {
+		t.Fatalf("compiled Resolve accepted unknown remote branch state: %v\n%s", err, output)
+	}
+	if fileDigest(t, fixture.store.Path) != beforeState || fileDigest(t, fixture.githubState) != beforeGitHub {
+		t.Fatal("unknown remote branch inspection changed Run state or GitHub labels")
+	}
+	for _, path := range []string{fixture.worktree, fixture.sessionDir} {
+		if _, statErr := os.Stat(path); statErr != nil {
+			t.Fatalf("unknown remote branch inspection removed %s: %v", path, statErr)
+		}
+	}
+	if _, statErr := os.Stat(fixture.archiveDir); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("unknown remote branch inspection created session archive: %v", statErr)
 	}
 }
 
