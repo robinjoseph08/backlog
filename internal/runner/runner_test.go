@@ -1188,6 +1188,54 @@ func TestRunnerSuspensionCancelsBlockedCompletionReconciliation(t *testing.T) {
 	}
 }
 
+func TestRunnerDrainCompletesPostSettlementExternalResolution(t *testing.T) {
+	const issue = 16
+	github := &fakeGitHub{
+		candidates:  []scheduler.Candidate{{Number: issue, CreatedAt: time.Now()}},
+		completions: map[int]ghadapter.CompletionOutcome{issue: {IssueClosed: true}},
+	}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	signals := make(chan os.Signal, 1)
+	output := newSynchronizedOutput()
+	runner := testRunner(github, workers, store, 1)
+	runner.Signals = signals
+	runner.Output = output
+	var resolutionCalls atomic.Int32
+	runner.ExternalResolution = externalResolutionFunc(func(_ context.Context, run scheduler.Run) (bool, error) {
+		resolutionCalls.Add(1)
+		persisted := store.LoadValue()
+		settled := findRun(persisted.Runs, run.RunID)
+		if workers.runningCount() != 0 || settled.WorkerLogOpen {
+			return true, fmt.Errorf("Drain resolution started before Worker exit and durable log closure: running=%d run=%#v", workers.runningCount(), settled)
+		}
+		settled.Status = scheduler.StatusResolvedExternally
+		settledAt := runner.Now().UTC()
+		settled.ResolvedExternallyAt = &settledAt
+		settled.ClosureReason = "completed"
+		replaceRun(&persisted, settled)
+		removeLease(&persisted, run.RunID)
+		return true, store.Save(persisted)
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, issue)
+	signals <- os.Interrupt
+	output.waitFor(t, "Drain: admission stopped; 1 Worker remaining")
+	workers.complete(issue, worker.Result{ExitCode: 0})
+
+	if err := <-done; err != nil {
+		t.Fatalf("Drain post-settlement External Resolution: %v", err)
+	}
+	got := store.LoadValue()
+	run := findRun(got.Runs, fmt.Sprintf("run-%d", issue))
+	if resolutionCalls.Load() != 1 || run.Status != scheduler.StatusResolvedExternally || run.WorkerLogOpen || len(got.Leases) != 0 {
+		t.Fatalf("Drain post-settlement External Resolution state = %#v, calls=%d", got, resolutionCalls.Load())
+	}
+	output.waitFor(t, "Drain complete: 0 Workers remaining; exiting successfully")
+}
+
 func TestRunnerDrainsEveryOwnedWorkerAndReportsProgress(t *testing.T) {
 	t.Parallel()
 
@@ -2373,8 +2421,9 @@ func TestRunnerResolvesClosedIssueImmediatelyAfterNormalWorkerSettlement(t *test
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 5)
-	// Several watch ticks while the issue is already closed must not inspect or
-	// control the Owned Worker. Close remains part of normal settlement only.
+	// Several polling and reconciliation ticks while the issue is already closed
+	// must not inspect or control the Owned Worker. Close remains part of normal
+	// settlement only.
 	time.Sleep(20 * time.Millisecond)
 	if resolutionCalls.Load() != 0 || workers.runningCount() != 1 || workers.abortedCount() != 0 || workers.suspendedCount() != 0 || workers.closedCount() != 0 || workers.authorizedForceStopCount() != 0 {
 		t.Fatalf("closure controlled Owned Worker: resolutions=%d running=%d aborts=%d suspends=%d closes=%d force-stops=%d", resolutionCalls.Load(), workers.runningCount(), workers.abortedCount(), workers.suspendedCount(), workers.closedCount(), workers.authorizedForceStopCount())
@@ -2395,6 +2444,76 @@ func TestRunnerResolvesClosedIssueImmediatelyAfterNormalWorkerSettlement(t *test
 	}
 	if branches := github.completionBranchSnapshot(); len(branches) != 2 || branches[0] != branches[1] {
 		t.Fatalf("Completion branches = %q, want initial and final checks of the expected branch", branches)
+	}
+}
+
+func TestRunnerRefillsCapacityOnlyAfterPostSettlementExternalResolutionReleasesLease(t *testing.T) {
+	first := scheduler.Candidate{Number: 5, CreatedAt: time.Now()}
+	second := scheduler.Candidate{Number: 6, CreatedAt: first.CreatedAt.Add(time.Second)}
+	github := &fakeGitHub{
+		candidates: []scheduler.Candidate{first, second},
+		completions: map[int]ghadapter.CompletionOutcome{
+			first.Number:  {IssueClosed: true},
+			second.Number: mergedOutcome(second.Number),
+		},
+	}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	resolutionStarted := make(chan struct{})
+	finishResolution := make(chan struct{})
+	admissionErr := make(chan error, 1)
+	workers.onStart = func(issue int) {
+		if issue != second.Number {
+			return
+		}
+		persisted := store.LoadValue()
+		resolved := findRun(persisted.Runs, fmt.Sprintf("run-%d", first.Number))
+		if resolved.Status != scheduler.StatusResolvedExternally || findActiveRun(&persisted, first.Number).RunID != "" || len(persisted.Leases) != 1 || persisted.Leases[0].Issue != second.Number {
+			admissionErr <- fmt.Errorf("second Admission preceded durable External Resolution: %#v", persisted)
+		}
+	}
+	runner := testRunner(github, workers, store, 1)
+	runner.ExternalResolution = externalResolutionFunc(func(_ context.Context, run scheduler.Run) (bool, error) {
+		close(resolutionStarted)
+		<-finishResolution
+		persisted := store.LoadValue()
+		resolved := findRun(persisted.Runs, run.RunID)
+		resolved.Status = scheduler.StatusResolvedExternally
+		resolvedAt := runner.Now().UTC()
+		resolved.ResolvedExternallyAt = &resolvedAt
+		resolved.ClosureReason = "completed"
+		replaceRun(&persisted, resolved)
+		removeLease(&persisted, run.RunID)
+		github.setCandidates([]scheduler.Candidate{second})
+		return true, store.Save(persisted)
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, first.Number)
+	workers.complete(first.Number, worker.Result{ExitCode: 0})
+	<-resolutionStarted
+	if workers.wasStarted(second.Number) {
+		t.Fatal("second Candidate started while the first Run still owned its Lease")
+	}
+	persisted := store.LoadValue()
+	if active := findActiveRun(&persisted, first.Number); active.RunID == "" || len(persisted.Leases) != 1 || persisted.Leases[0].Issue != first.Number {
+		t.Fatalf("ownership released before durable External Resolution: %#v", persisted)
+	}
+	close(finishResolution)
+	workers.waitForStarts(t, second.Number)
+	select {
+	case err := <-admissionErr:
+		t.Fatal(err)
+	default:
+	}
+	workers.complete(second.Number, worker.Result{ExitCode: 0})
+	if err := <-done; err != nil {
+		t.Fatalf("capacity refill after External Resolution: %v", err)
+	}
+	got := store.LoadValue()
+	if findRun(got.Runs, "run-5").Status != scheduler.StatusResolvedExternally || findRun(got.Runs, "run-6").Status != scheduler.StatusMerged || len(got.Leases) != 0 {
+		t.Fatalf("capacity refill state = %#v", got)
 	}
 }
 
