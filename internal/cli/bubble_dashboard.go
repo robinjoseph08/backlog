@@ -21,8 +21,9 @@ import (
 )
 
 const (
-	dashboardOutputUpdateLimit = 64
-	dashboardNavigationHelp    = "Nav: ↑↓/jk PgUp/Dn/f/b Home/End g/G a:Attention Enter:Toggle"
+	dashboardOutputUpdateLimit     = 64
+	dashboardNavigationHelp        = "Nav: d:Diagnostics ↑↓/jk PgUp/Dn/f/b Home/End g/G a:Attention Enter:Toggle"
+	dashboardCompactNavigationHelp = "N:jk/fb Pg H/E gG a d Ent"
 )
 
 type dashboardConfiguredMsg struct {
@@ -933,7 +934,7 @@ func dashboardChromeLines(header, footer []string, pendingAttention int, stage d
 	footerGroups := dashboardChromeGroups(lifecycle)
 	compactNavigation := append([]string(nil), footer...)
 	if len(compactNavigation) > 2 {
-		compactNavigation[2] = "N:jk/fb Pg H/E gG a Enter"
+		compactNavigation[2] = dashboardCompactNavigationHelp
 	}
 	compactNavigation = styledDashboardFooterItems(compactNavigation, stage, styler)
 	compactHeader := styledDashboardHeaderItems(compactDashboardHeader(header), pendingAttention, true, styler)
@@ -1003,7 +1004,7 @@ func compactDashboardFooter(footer []string) []string {
 	for _, line := range footer {
 		line = strings.Replace(line, "Runner stage: ", "S:", 1)
 		line = strings.Replace(line, "Next Ctrl-C: ", "^C:", 1)
-		line = strings.Replace(line, dashboardNavigationHelp, "N:jk/fb Pg H/E gG a Enter", 1)
+		line = strings.Replace(line, dashboardNavigationHelp, dashboardCompactNavigationHelp, 1)
 		compact = append(compact, line)
 	}
 	return compact

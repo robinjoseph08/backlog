@@ -67,6 +67,7 @@ func assertBubbleDashboardFits(t *testing.T, model bubbleDashboardModel, width, 
 		{name: "Worker capacity", variants: []string{"Worker capacity:", "W:"}},
 		{name: "Runner stage", variants: []string{"Runner stage: Running", "S:Running"}},
 		{name: "next Ctrl-C", variants: []string{"Next Ctrl-C: start Drain", "^C:start Drain"}},
+		{name: "Diagnostics help", variants: []string{"d:Diagnostics", "a d Ent"}},
 	} {
 		found := false
 		for _, variant := range expected.variants {
@@ -689,7 +690,7 @@ func TestBubbleDashboardMarksAndJumpsToNewOffscreenAttention(t *testing.T) {
 	if want := model.styler.attention.Render("NEW ATTENTION (1): press a"); !strings.Contains(rendered, want) {
 		t.Fatalf("offscreen Attention marker did not use Attention styling: %q", rendered)
 	}
-	for _, want := range []string{"Next Ctrl-C:", "Nav:", "a:Attention"} {
+	for _, want := range []string{"Next Ctrl-C:", "Nav:", "d:Diagnostics", "a:Attention"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("fixed footer omitted %q:\n%s", want, view)
 		}
@@ -1141,7 +1142,7 @@ func TestBubbleDashboardResponsiveDensityAndSelectedDetails(t *testing.T) {
 
 	minimal := newModel(11)
 	minimalView := ansi.Strip(minimal.View().Content)
-	for _, want := range []string{"acme/widgets", "Health:1 healthy, 0 anomalous", "Attention:1", "#69", "N:jk", "Enter"} {
+	for _, want := range []string{"acme/widgets", "Health:1 healthy, 0 anomalous", "Attention:1", "#69", "N:jk/fb", "a d Ent"} {
 		if !strings.Contains(minimalView, want) {
 			t.Fatalf("sub-12-row layout omitted %q:\n%s", want, minimalView)
 		}
@@ -1467,6 +1468,7 @@ func TestBubbleDashboardConstrainedChromeKeepsRequiredLifecycleInformation(t *te
 			{name: "Runner stage", variants: []string{"Runner stage:", "S:"}},
 			{name: "next Ctrl-C", variants: []string{"Next Ctrl-C:", "^C:"}},
 			{name: "navigation", variants: []string{"Nav:", "N:"}},
+			{name: "Diagnostics", variants: []string{"d:Diagnostics", "a d Ent"}},
 			{name: "f/b shortcuts", variants: []string{"f/b", "fb"}},
 		} {
 			found := false
@@ -1552,8 +1554,8 @@ func TestBubbleDashboardAdaptiveNavigationIncludesEnterGuidance(t *testing.T) {
 		7,
 	)
 	fixedFooter := strings.Join(chrome.bottom, "\n")
-	if !strings.Contains(fixedFooter, "N:jk/fb Pg H/E gG a Enter") {
-		t.Fatalf("adaptive navigation omitted Enter guidance: %#v", chrome)
+	if !strings.Contains(fixedFooter, dashboardCompactNavigationHelp) {
+		t.Fatalf("adaptive navigation omitted compact Diagnostics and Enter guidance: %#v", chrome)
 	}
 }
 
@@ -1576,7 +1578,7 @@ func TestBubbleDashboardConstrainedFallbackKeepsGuidanceInFixedFooter(t *testing
 		t.Fatal("constrained dashboard moved fixed-footer guidance above the body")
 	}
 	fixedFooter := strings.Join(chrome.bottom, "\n")
-	for _, want := range []string{"^C:start Drain and stop Admission", "N:jk/fb Pg H/E gG a Enter"} {
+	for _, want := range []string{"^C:start Drain and stop Admission", dashboardCompactNavigationHelp} {
 		if !strings.Contains(fixedFooter, want) {
 			t.Fatalf("constrained fixed footer omitted %q: %#v", want, chrome)
 		}

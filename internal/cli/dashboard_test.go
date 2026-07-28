@@ -530,6 +530,40 @@ func TestDashboardDiagnosticsLabelsExpiredReferencesHonestly(t *testing.T) {
 	}
 }
 
+func TestDashboardStopsIncompleteAdmissionAfterRunnerLeavesRunningStage(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name  string
+		stage dashboardStage
+	}{
+		{name: "Drain", stage: dashboardDraining},
+		{name: "suspension", stage: dashboardSuspending},
+		{name: "Drain complete", stage: dashboardDrainComplete},
+		{name: "suspension complete", stage: dashboardSuspensionComplete},
+		{name: "stopped", stage: dashboardStopped},
+		{name: "natural completion", stage: dashboardFinished},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, func() time.Time { return now })
+			dashboard.stage = test.stage
+
+			_, body, _ := dashboard.renderParts(now)
+			if !strings.Contains(body, "Admission: stopped | Candidate snapshot not completed") || strings.Contains(body, "Admission: checking") {
+				t.Fatalf("non-running stage retained active Admission check:\n%s", body)
+			}
+
+			admission := dashboardSectionAnchor("Admission health")
+			_, compact, _ := dashboard.renderResponsiveParts(now, responsiveDashboardOptions{
+				density: dashboardDensityConstrained, width: 80, selected: admission,
+				expansionOverrides: map[string]bool{admission: false},
+			})
+			if !strings.Contains(compact.text, "Admission: stopped | Candidate snapshot not completed") || strings.Contains(compact.text, "Admission: checking") {
+				t.Fatalf("compact non-running stage retained active Admission check:\n%s", compact.text)
+			}
+		})
+	}
+}
+
 func TestDashboardStopsAdmissionRetryCountdownDuringShutdown(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	dashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, func() time.Time { return now })

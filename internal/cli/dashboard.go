@@ -1180,7 +1180,7 @@ func renderAdmissionDetails(output *strings.Builder, admission dashboardAdmissio
 		}
 		writeDashboardStyledLine(output, styler, dashboardSemanticWarning, cause)
 	} else if !admission.snapshotComplete {
-		writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, "  Admission: checking | Candidate snapshot not yet complete")
+		writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, incompleteAdmissionStatus(stage))
 	} else {
 		health := "  Admission: healthy" + admissionRecoverySummary(admission, now)
 		writeDashboardStyledLine(output, styler, dashboardSemanticActive, health)
@@ -1190,7 +1190,7 @@ func renderAdmissionDetails(output *strings.Builder, admission dashboardAdmissio
 
 func renderCompactAdmissionStatus(output *strings.Builder, admission dashboardAdmission, stage dashboardStage, now time.Time, options responsiveDashboardOptions) {
 	semantic := dashboardAdmissionSemantic(admission)
-	line := "  Admission: checking | Candidate snapshot not yet complete"
+	line := incompleteAdmissionStatus(stage)
 	if admission.degraded {
 		noun := "failures"
 		if admission.consecutiveFailures == 1 {
@@ -1215,6 +1215,13 @@ func renderCompactAdmissionStatus(output *strings.Builder, admission dashboardAd
 		line = "  Admission: healthy" + admissionRecoverySummary(admission, now)
 	}
 	writeDashboardStyledLine(output, options.styler, semantic, truncateDashboardContent(line, options.width))
+}
+
+func incompleteAdmissionStatus(stage dashboardStage) string {
+	if stage == dashboardRunning {
+		return "  Admission: checking | Candidate snapshot not yet complete"
+	}
+	return "  Admission: stopped | Candidate snapshot not completed"
 }
 
 func admissionRecoverySummary(admission dashboardAdmission, now time.Time) string {
