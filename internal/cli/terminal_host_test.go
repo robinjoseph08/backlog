@@ -1132,6 +1132,80 @@ while :; do sleep 1; done
 	}
 }
 
+type armedPresentationFailureWriter struct {
+	output synchronizedBuffer
+	armed  atomic.Bool
+	failed atomic.Bool
+}
+
+func (w *armedPresentationFailureWriter) Write(content []byte) (int, error) {
+	written, err := w.output.Write(content)
+	if err == nil && len(content) > 0 && w.armed.Load() && w.failed.CompareAndSwap(false, true) {
+		return written, errors.New("terminal output lost")
+	}
+	return written, err
+}
+
+func (w *armedPresentationFailureWriter) String() string {
+	return w.output.String()
+}
+
+func TestDefaultDashboardPresentationFailurePrintsSuspendedOwnedWorkerInFinalSummary(t *testing.T) {
+	fixture := newPresentationWorkerFixture(t, presentationSuspendingWorkerScript)
+	suspensionStarted := filepath.Join(fixture.root, "suspension-started")
+	var stdout armedPresentationFailureWriter
+	var stderr bytes.Buffer
+	dependencies := TerminalDependencies{
+		Input: strings.NewReader(""), Output: &stdout, ErrorOutput: &stderr,
+		IsTerminal: func() bool { return true },
+		Dimensions: func() (TerminalDimensions, error) {
+			return TerminalDimensions{Width: 80, Height: 24}, nil
+		},
+		ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+	}
+	done := make(chan int, 1)
+	go func() { done <- MainWithTerminal(context.Background(), fixture.args, dependencies) }()
+	waitForFile(t, fixture.workerStarted)
+	stdout.armed.Store(true)
+	waitForFile(t, suspensionStarted)
+	if err := os.WriteFile(filepath.Join(fixture.root, "release-worker"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case exit := <-done:
+		if exit != 1 {
+			t.Fatalf("exit = %d, want presentation failure 1", exit)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("default dashboard did not return after presentation-failure suspension")
+	}
+
+	current, err := (state.FileStore{Path: fixture.statePath}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.Runs) != 1 || current.Runs[0].Status != scheduler.StatusSuspended || current.Runs[0].Continuation == nil || len(current.Leases) != 1 {
+		t.Fatalf("final state after default-dashboard presentation failure = %#v", current)
+	}
+	raw := stdout.String()
+	summaryAt := strings.LastIndex(raw, "Final aggregate summary")
+	if summaryAt < 0 {
+		t.Fatalf("default dashboard omitted final static summary: %q", raw)
+	}
+	summary := raw[summaryAt:]
+	for _, want := range []string{"Active (1)", "#65  Terminal host  suspended", "Attention Required (0)"} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("final static summary omitted %q after suspension:\n%s", want, summary)
+		}
+	}
+	if strings.Contains(summary, "Active (0)") {
+		t.Fatalf("final static summary used stale pre-suspension state:\n%s", summary)
+	}
+	if !stdout.failed.Load() || !strings.Contains(stderr.String(), "error: presentation failed: write terminal presentation: terminal output lost") {
+		t.Fatalf("presentation failure was not exercised: failed=%t stderr=%q", stdout.failed.Load(), stderr.String())
+	}
+}
+
 func TestMainWithTerminalPresentationFailureSuspendsOwnedWorkerBeforeReturning(t *testing.T) {
 	fixture := newPresentationWorkerFixture(t, presentationSuspendingWorkerScript)
 	suspensionStarted := filepath.Join(fixture.root, "suspension-started")
