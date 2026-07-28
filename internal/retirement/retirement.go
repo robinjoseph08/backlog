@@ -1244,6 +1244,9 @@ func runGitInspection(ctx context.Context, executable, repositoryRoot string, ar
 	if err == nil {
 		return output, 0, nil
 	}
+	if contextErr := ctx.Err(); contextErr != nil {
+		return output, -1, contextErr
+	}
 	var exitError *exec.ExitError
 	if errors.As(err, &exitError) {
 		return output, exitError.ExitCode(), nil

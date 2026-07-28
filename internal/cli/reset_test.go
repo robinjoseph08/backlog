@@ -1679,6 +1679,90 @@ func TestResetStopsAtStatePersistenceFailuresWithLeaseRetained(t *testing.T) {
 	}
 }
 
+func TestResetCancellationDuringGitHubMutationRetainsOwnershipAndStopsActions(t *testing.T) {
+	fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "spec"})
+	underlyingGH := fixture.gh
+	started := filepath.Join(t.TempDir(), "mutation-started")
+	calls := filepath.Join(t.TempDir(), "mutation-calls")
+	fixture.gh = writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "issue edit 42 --repo acme/widgets --remove-label in-progress")
+    printf '%s\n' remove >> `+quote(calls)+`
+    touch `+quote(started)+`
+    kill -STOP $$ ;;
+  "issue edit 42 --repo acme/widgets --add-label ready-for-agent")
+    printf '%s\n' add >> `+quote(calls)+` ;;
+esac
+exec `+quote(underlyingGH)+` "$@"
+`)
+	commonDirectory, err := gitCommonDirectory(context.Background(), fixture.git, fixture.repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := resetExecutor{
+		store: fixture.store, github: ghadapter.Client{Executable: fixture.gh, Dir: fixture.repository}, issue: 42,
+		repositoryRoot: fixture.repository, commonDirectory: commonDirectory, stateDirectory: fixture.stateDir, gitExecutable: fixture.git,
+	}
+	approved, err := executor.inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- executor.apply(ctx, approved) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			cancel()
+			t.Fatal(err)
+		}
+		select {
+		case err := <-done:
+			cancel()
+			t.Fatalf("Reset returned before cancellation: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("GitHub mutation did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Reset cancellation error = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Reset did not stop after cancellation")
+	}
+
+	callData, err := os.ReadFile(calls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(callData) != "remove\n" {
+		t.Fatalf("GitHub actions after cancellation = %q, want only blocked removal", callData)
+	}
+	if labels := strings.Join(fixture.labels(t), ","); labels != "in-progress,spec" {
+		t.Fatalf("labels after cancellation = %q", labels)
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.Runs) != 1 || current.Runs[0].RunID != "run-42" || current.Runs[0].Status != scheduler.StatusResetting ||
+		len(current.Leases) != 1 || current.Leases[0].LeaseID != "lease-42" || current.Leases[0].RunID != "run-42" {
+		t.Fatalf("canceled Reset released ownership: %#v", current)
+	}
+}
+
 func TestResetUsesRevalidatedRepositoryForLabelMutation(t *testing.T) {
 	fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "ready-for-agent", "spec"})
 	commonDirectory, err := gitCommonDirectory(context.Background(), fixture.git, fixture.repository)

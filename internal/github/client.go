@@ -612,6 +612,9 @@ func (c Client) command(ctx context.Context, args ...string) error {
 	if err == nil {
 		return nil
 	}
+	if contextErr := ctx.Err(); contextErr != nil {
+		return fmt.Errorf("gh %s: %w", strings.Join(args, " "), contextErr)
+	}
 	message := strings.TrimSpace(string(output))
 	if message != "" {
 		return fmt.Errorf("gh %s: %s", strings.Join(args, " "), message)
@@ -628,6 +631,9 @@ func (c Client) jsonCommand(ctx context.Context, target any, args ...string) err
 	command.Dir = c.Dir
 	output, err := command.Output()
 	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return fmt.Errorf("gh %s: %w", strings.Join(args, " "), contextErr)
+		}
 		if exitError, ok := err.(*exec.ExitError); ok {
 			message := strings.TrimSpace(string(exitError.Stderr))
 			if message != "" {
