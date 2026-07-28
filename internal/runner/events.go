@@ -57,6 +57,16 @@ const (
 	ShutdownStageSuspensionIncomplete ShutdownStage = "suspension-incomplete"
 )
 
+// ShutdownResult identifies whether a terminal shutdown outcome preserves a
+// successful Runner result or accompanies a fatal result.
+type ShutdownResult string
+
+const (
+	ShutdownResultNone    ShutdownResult = ""
+	ShutdownResultSuccess ShutdownResult = "success"
+	ShutdownResultFailure ShutdownResult = "failure"
+)
+
 // NextInterruptBehavior identifies what another SIGINT does in the current
 // shutdown stage.
 type NextInterruptBehavior string
@@ -75,6 +85,7 @@ const (
 // that prose.
 type ShutdownEvent struct {
 	Stage            ShutdownStage
+	Result           ShutdownResult
 	Action           string
 	RemainingWorkers int
 	NextInterrupt    NextInterruptBehavior

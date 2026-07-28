@@ -303,7 +303,7 @@ func TestDashboardClosePreservesIncompleteShutdownStages(t *testing.T) {
 		want  string
 	}{
 		{name: "Drain incomplete", stage: runner.ShutdownStageDrainIncomplete, want: "Drain incomplete: Worker liveness remains unverified"},
-		{name: "Suspension incomplete", stage: runner.ShutdownStageSuspensionIncomplete, want: "Suspension finished: no further interrupt has an effect before exit"},
+		{name: "Suspension incomplete", stage: runner.ShutdownStageSuspensionIncomplete, want: "Suspension incomplete: one or more Runs lack a continuation boundary"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}

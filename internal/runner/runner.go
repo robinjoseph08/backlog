@@ -446,7 +446,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				if unverified := persistedWorkerCount(&current); unverified > 0 {
 					r.shutdownEvent(ShutdownStageDrainIncomplete, "retaining Workers with unverified liveness", 0, NextInterruptNone, "Drain incomplete: 0 supervised Workers remaining; %s retained with unverified liveness", workerSummary(unverified))
 				} else {
-					r.shutdownEvent(ShutdownStageDrainComplete, "exiting after an operational failure", 0, NextInterruptNone, "Drain complete: 0 Workers remaining; exiting after an operational failure")
+					r.shutdownResultEvent(ShutdownStageDrainComplete, ShutdownResultFailure, "exiting after an operational failure", 0, NextInterruptNone, "Drain complete: 0 Workers remaining; exiting after an operational failure")
 				}
 				return drainOperationalErr
 			}
@@ -2227,11 +2227,22 @@ func invokeOperationalEvent(deliver func(OperationalEvent), event OperationalEve
 }
 
 func (r *Runner) shutdownEvent(stage ShutdownStage, action string, workers int, next NextInterruptBehavior, format string, args ...any) {
+	result := ShutdownResultNone
+	switch stage {
+	case ShutdownStageDrainComplete:
+		result = ShutdownResultSuccess
+	case ShutdownStageDrainIncomplete, ShutdownStageSuspensionIncomplete:
+		result = ShutdownResultFailure
+	}
+	r.shutdownResultEvent(stage, result, action, workers, next, format, args...)
+}
+
+func (r *Runner) shutdownResultEvent(stage ShutdownStage, result ShutdownResult, action string, workers int, next NextInterruptBehavior, format string, args ...any) {
 	if stage == ShutdownStageForceStopping {
 		r.forceStopping.Store(true)
 	}
 	r.emit(ShutdownEvent{
-		Stage: stage, Action: action, RemainingWorkers: workers, NextInterrupt: next,
+		Stage: stage, Result: result, Action: action, RemainingWorkers: workers, NextInterrupt: next,
 		Message: fmt.Sprintf(format, args...),
 	})
 }

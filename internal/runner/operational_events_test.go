@@ -446,7 +446,7 @@ func TestRunnerReportsStructuredDrainStages(t *testing.T) {
 		t.Fatalf("Drain event = %#v", draining)
 	}
 	complete := <-events
-	if complete.Stage != ShutdownStageDrainComplete || complete.Action != "exiting successfully" || complete.RemainingWorkers != 0 || complete.NextInterrupt != NextInterruptNone {
+	if complete.Stage != ShutdownStageDrainComplete || complete.Result != ShutdownResultSuccess || complete.Action != "exiting successfully" || complete.RemainingWorkers != 0 || complete.NextInterrupt != NextInterruptNone {
 		t.Fatalf("Drain completion event = %#v", complete)
 	}
 }
@@ -564,7 +564,7 @@ func TestRunnerReportsStructuredIncompleteSuspension(t *testing.T) {
 		return ok
 	})
 	incomplete, _ := findShutdownEvent(events, ShutdownStageSuspensionIncomplete, "exiting with incomplete suspension")
-	if incomplete.RemainingWorkers != 0 || incomplete.NextInterrupt != NextInterruptNone {
+	if incomplete.Result != ShutdownResultFailure || incomplete.RemainingWorkers != 0 || incomplete.NextInterrupt != NextInterruptNone {
 		t.Fatalf("Suspension incomplete event = %#v", incomplete)
 	}
 }

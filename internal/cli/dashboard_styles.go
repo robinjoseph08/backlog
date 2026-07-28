@@ -136,7 +136,7 @@ func dashboardStageSemantic(stage dashboardStage) dashboardSemantic {
 		return dashboardSemanticActive
 	case dashboardDraining, dashboardSuspending, dashboardSuspensionComplete, dashboardStopped:
 		return dashboardSemanticWarning
-	case dashboardForceStopping, dashboardDrainIncomplete:
+	case dashboardForceStopping, dashboardDrainFailed, dashboardDrainIncomplete, dashboardSuspensionIncomplete:
 		return dashboardSemanticAttention
 	case dashboardDrainComplete, dashboardFinished:
 		return dashboardSemanticCompletion

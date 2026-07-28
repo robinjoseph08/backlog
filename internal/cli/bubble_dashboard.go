@@ -680,8 +680,7 @@ func (m bubbleDashboardModel) View() tea.View {
 
 	lines := make([]string, 0, m.height)
 	if frame.titleHeight > 0 {
-		title := m.styler.active.Render(frame.title)
-		lines = append(lines, lipgloss.NewStyle().Bold(true).Render(title))
+		lines = append(lines, renderDashboardTitle(frame.title))
 	}
 	for _, line := range frame.chrome.top {
 		lines = append(lines, m.styler.render(frame.chrome.topSemantic, line))
@@ -724,6 +723,10 @@ func (m bubbleDashboardModel) dashboardFrame() dashboardFrame {
 		bodyStart:   titleHeight + len(chrome.top),
 		bodyHeight:  max(0, m.height-chromeHeight-titleHeight),
 	}
+}
+
+func renderDashboardTitle(title string) string {
+	return lipgloss.NewStyle().Bold(true).Render(title)
 }
 
 type dashboardChrome struct {

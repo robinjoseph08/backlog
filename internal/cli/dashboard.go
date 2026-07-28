@@ -31,8 +31,10 @@ const (
 	dashboardSuspending
 	dashboardForceStopping
 	dashboardDrainComplete
+	dashboardDrainFailed
 	dashboardDrainIncomplete
 	dashboardSuspensionComplete
+	dashboardSuspensionIncomplete
 	dashboardStopped
 	dashboardFinished
 	dashboardStageCount
@@ -334,11 +336,13 @@ func dashboardOperationalEventSemantic(event runner.OperationalEvent) dashboardS
 	case runner.CandidateDiscoveryRecovered:
 		return dashboardSemanticActive
 	case runner.ShutdownEvent:
+		if event.Result == runner.ShutdownResultFailure {
+			return dashboardSemanticAttention
+		}
 		switch event.Stage {
-		case runner.ShutdownStageDraining, runner.ShutdownStageSuspending,
-			runner.ShutdownStageSuspensionComplete, runner.ShutdownStageSuspensionIncomplete:
+		case runner.ShutdownStageDraining, runner.ShutdownStageSuspending, runner.ShutdownStageSuspensionComplete:
 			return dashboardSemanticWarning
-		case runner.ShutdownStageForceStopping:
+		case runner.ShutdownStageForceStopping, runner.ShutdownStageDrainIncomplete, runner.ShutdownStageSuspensionIncomplete:
 			return dashboardSemanticAttention
 		case runner.ShutdownStageDrainComplete:
 			return dashboardSemanticCompletion
@@ -363,11 +367,16 @@ func dashboardStageForOperationalEvent(event runner.OperationalEvent) (dashboard
 	case runner.ShutdownStageForceStopping:
 		return dashboardForceStopping, true
 	case runner.ShutdownStageDrainComplete:
+		if shutdown.Result == runner.ShutdownResultFailure {
+			return dashboardDrainFailed, true
+		}
 		return dashboardDrainComplete, true
 	case runner.ShutdownStageDrainIncomplete:
 		return dashboardDrainIncomplete, true
-	case runner.ShutdownStageSuspensionComplete, runner.ShutdownStageSuspensionIncomplete:
+	case runner.ShutdownStageSuspensionComplete:
 		return dashboardSuspensionComplete, true
+	case runner.ShutdownStageSuspensionIncomplete:
+		return dashboardSuspensionIncomplete, true
 	default:
 		return dashboardRunning, false
 	}
@@ -748,6 +757,12 @@ func dashboardStagePresentationFor(stage dashboardStage) dashboardStagePresentat
 			stage:         "Drain complete",
 			nextInterrupt: "no effect",
 		}
+	case dashboardDrainFailed:
+		return dashboardStagePresentation{
+			summary:       "Drain complete: no Owned Workers remain, but the Runner is exiting after an operational failure.",
+			stage:         "Drain complete after operational failure",
+			nextInterrupt: "no effect",
+		}
 	case dashboardDrainIncomplete:
 		return dashboardStagePresentation{
 			summary:       "Drain incomplete: Worker liveness remains unverified; no further interrupt has an effect before exit.",
@@ -758,6 +773,12 @@ func dashboardStagePresentationFor(stage dashboardStage) dashboardStagePresentat
 		return dashboardStagePresentation{
 			summary:       "Suspension finished: no further interrupt has an effect before exit.",
 			stage:         "Suspension finished",
+			nextInterrupt: "no effect",
+		}
+	case dashboardSuspensionIncomplete:
+		return dashboardStagePresentation{
+			summary:       "Suspension incomplete: one or more Runs lack a continuation boundary; no further interrupt has an effect before exit.",
+			stage:         "Suspension incomplete",
 			nextInterrupt: "no effect",
 		}
 	case dashboardStopped:

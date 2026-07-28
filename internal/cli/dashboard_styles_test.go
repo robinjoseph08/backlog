@@ -96,6 +96,8 @@ func TestDashboardChromeUsesTypedStageStylesWithoutRemovingNavigation(t *testing
 		{stage: dashboardDraining, line: "changed draining presentation | changed navigation", style: styler.warning},
 		{stage: dashboardDrainComplete, line: "changed completion presentation | changed navigation", style: styler.completion},
 		{stage: dashboardForceStopping, line: "changed fatal presentation | changed navigation", style: styler.attention},
+		{stage: dashboardDrainFailed, line: "changed failed drain presentation | changed navigation", style: styler.attention},
+		{stage: dashboardSuspensionIncomplete, line: "changed incomplete suspension presentation | changed navigation", style: styler.attention},
 	} {
 		got := styler.render(dashboardStageSemantic(test.stage), test.line)
 		if ansi.Strip(got) != test.line || got != test.style.Render(test.line) {
@@ -114,7 +116,9 @@ func TestDashboardOperationalMessagesUseTypedEventSemantics(t *testing.T) {
 		{event: runner.CandidateDiscoveryFailed{}, semantic: dashboardSemanticWarning, style: styler.warning},
 		{event: runner.CandidateDiscoveryRecovered{}, semantic: dashboardSemanticActive, style: styler.active},
 		{event: runner.ShutdownEvent{Stage: runner.ShutdownStageForceStopping, Message: "presentation wording changed"}, semantic: dashboardSemanticAttention, style: styler.attention},
-		{event: runner.ShutdownEvent{Stage: runner.ShutdownStageDrainComplete, Message: "presentation wording changed"}, semantic: dashboardSemanticCompletion, style: styler.completion},
+		{event: runner.ShutdownEvent{Stage: runner.ShutdownStageDrainComplete, Result: runner.ShutdownResultSuccess, Message: "presentation wording changed"}, semantic: dashboardSemanticCompletion, style: styler.completion},
+		{event: runner.ShutdownEvent{Stage: runner.ShutdownStageDrainComplete, Result: runner.ShutdownResultFailure, Message: "presentation wording changed"}, semantic: dashboardSemanticAttention, style: styler.attention},
+		{event: runner.ShutdownEvent{Stage: runner.ShutdownStageSuspensionIncomplete, Message: "presentation wording changed"}, semantic: dashboardSemanticAttention, style: styler.attention},
 	} {
 		if got := dashboardOperationalEventSemantic(test.event); got != test.semantic {
 			t.Fatalf("typed event semantic = %d, want %d", got, test.semantic)
@@ -123,6 +127,32 @@ func TestDashboardOperationalMessagesUseTypedEventSemantics(t *testing.T) {
 		if got := styler.render(dashboardOperationalEventSemantic(test.event), line); got != test.style.Render(line) {
 			t.Fatalf("typed event style = %q, want %q", got, test.style.Render(line))
 		}
+	}
+
+	for _, test := range []struct {
+		event runner.ShutdownEvent
+		stage dashboardStage
+	}{
+		{event: runner.ShutdownEvent{Stage: runner.ShutdownStageDrainComplete, Result: runner.ShutdownResultFailure}, stage: dashboardDrainFailed},
+		{event: runner.ShutdownEvent{Stage: runner.ShutdownStageSuspensionIncomplete}, stage: dashboardSuspensionIncomplete},
+	} {
+		if got, ok := dashboardStageForOperationalEvent(test.event); !ok || got != test.stage {
+			t.Fatalf("fatal shutdown stage = %d, %t, want %d, true", got, ok, test.stage)
+		}
+	}
+}
+
+func TestDashboardTitleUsesStructuralEmphasisWithoutActiveWorkColor(t *testing.T) {
+	title := "Backlog Run Dashboard"
+	got := renderDashboardTitle(title)
+	if ansi.Strip(got) != title {
+		t.Fatalf("styled title = %q, want unchanged text", got)
+	}
+	if strings.Contains(got, "38;2;") {
+		t.Fatalf("static title received semantic foreground styling: %q", got)
+	}
+	if want := lipgloss.NewStyle().Bold(true).Render(title); got != want {
+		t.Fatalf("styled title = %q, want structural emphasis %q", got, want)
 	}
 }
 
