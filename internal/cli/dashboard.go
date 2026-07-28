@@ -307,6 +307,13 @@ func normalizedDashboardMessage(message string) string {
 	return plainStatusValue(strings.TrimSpace(message))
 }
 
+func normalizedDashboardDiagnostic(message string) string {
+	message = strings.ReplaceAll(message, "\r", "\n")
+	state := terminalText
+	filtered := filterTerminalControls([]byte(message), &state, true)
+	return strings.Join(strings.Fields(string(filtered)), " ")
+}
+
 func dashboardMessageTexts(messages []dashboardMessage) []string {
 	texts := make([]string, len(messages))
 	for index, message := range messages {
@@ -657,7 +664,7 @@ func renderAdmissionDiagnostics(output *strings.Builder, failures []runner.Candi
 		return
 	}
 	for _, failure := range failures {
-		fmt.Fprintf(output, "  [%s] Full error/command: %s\n", formatAdmissionTime(failure.OccurredAt), normalizedDashboardMessage(runner.FormatOperationalEvent(failure)))
+		fmt.Fprintf(output, "  [%s] Full error/command: %s\n", formatAdmissionTime(failure.OccurredAt), normalizedDashboardDiagnostic(runner.FormatOperationalEvent(failure)))
 	}
 }
 

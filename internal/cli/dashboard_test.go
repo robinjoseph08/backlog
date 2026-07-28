@@ -140,6 +140,112 @@ esac
 	}
 }
 
+func TestAutomaticDashboardPresentsCandidateDiscoveryFailureThroughAdmission(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	historical := scheduler.Run{
+		Issue: 55, IssueTitle: "Existing outcome remains reachable", RunID: "historical-55",
+		Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, Error: "retained outcome evidence",
+	}
+	if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
+		Runs: []scheduler.Run{historical},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	attemptsPath := filepath.Join(t.TempDir(), "attempts")
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef") printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
+    attempts=0
+    if [ -f `+quote(attemptsPath)+` ]; then attempts=$(cat `+quote(attemptsPath)+`); fi
+    attempts=$((attempts + 1))
+    printf '%s\n' "$attempts" > `+quote(attemptsPath)+`
+    printf '%s\n' "TLS handshake timeout" "retained stderr evidence for attempt $attempts" >&2
+    exit 1 ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	input, writeInput := io.Pipe()
+	defer input.Close()
+	defer writeInput.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout synchronizedBuffer
+	var stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- MainWithTerminal(ctx, []string{
+			"run", "--watch", "--repo-dir", repository, "--state-dir", stateDir, "--max-workers", "1", "--poll", "150ms", "--gh", gh,
+		}, TerminalDependencies{
+			Input: input, Output: &stdout, ErrorOutput: &stderr,
+			IsTerminal:   func() bool { return true },
+			Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 100, Height: 12}, nil },
+			ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+		})
+	}()
+
+	waitForBuffer(t, &stdout, "2 consecutive failures")
+	closedOutput := stdout.String()
+	if !strings.Contains(closedOutput, "Admission health") || !strings.Contains(closedOutput, "DEGRADED") || !strings.Contains(closedOutput, "Diagnostics: closed") {
+		t.Fatalf("automatic dashboard did not render closed Admission health: %q", closedOutput)
+	}
+	if strings.Contains(closedOutput, "retained stderr evidence") || strings.Contains(closedOutput, "Operational messages") || strings.Contains(closedOutput, "candidate discovery failed; admission paused") {
+		t.Fatalf("closed automatic dashboard exposed full evidence or duplicated Admission as operational rows: %q", closedOutput)
+	}
+
+	diagnosticsOffset := len(stdout.String())
+	if _, err := writeInput.Write([]byte("d" + strings.Repeat("j", 12))); err != nil {
+		t.Fatalf("open and scroll Diagnostics: %v", err)
+	}
+	waitForDashboardOutputAfter(t, &stdout, diagnosticsOffset, "retained stderr evidence")
+
+	sectionsOffset := len(stdout.String())
+	if _, err := writeInput.Write([]byte(strings.Repeat("j", 80))); err != nil {
+		t.Fatalf("scroll to existing dashboard sections: %v", err)
+	}
+	waitForDashboardOutputAfter(t, &stdout, sectionsOffset, "Outcomes to Acknowledge")
+	waitForDashboardOutputAfter(t, &stdout, sectionsOffset, "Diagnostic: retained outcome evidence")
+
+	if _, err := writeInput.Write([]byte(strings.Repeat("k", 100))); err != nil {
+		t.Fatalf("return to Admission: %v", err)
+	}
+	drainOffset := len(stdout.String())
+	if _, err := writeInput.Write([]byte{0x03}); err != nil {
+		t.Fatalf("start Drain: %v", err)
+	}
+	waitForDashboardOutputAfter(t, &stdout, drainOffset, "Retry: stopped")
+	select {
+	case exit := <-done:
+		if exit != 0 {
+			t.Fatalf("Drain exit = %d, stderr = %q", exit, stderr.String())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("automatic dashboard did not finish Drain")
+	}
+	if output := stdout.String(); !strings.Contains(output, "\x1b[?1049h") || !strings.Contains(output, "\x1b[?1049l") || stderr.Len() != 0 {
+		t.Fatalf("automatic dashboard terminal lifecycle changed: stdout=%q stderr=%q", output, stderr.String())
+	}
+}
+
+func waitForDashboardOutputAfter(t *testing.T, output *synchronizedBuffer, offset int, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		current := output.String()
+		if offset > len(current) {
+			offset = len(current)
+		}
+		if strings.Contains(current[offset:], want) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("dashboard output after byte %d never contained %q: %q", offset, want, output.String())
+}
+
 func TestAutomaticBubbleDashboardRawCtrlCCompletesDrainThroughTerminalInput(t *testing.T) {
 	repository := initializeFollowRepository(t)
 	discovered := filepath.Join(t.TempDir(), "discovered")
@@ -341,6 +447,22 @@ func TestDashboardAggregatesAdmissionFailuresAndBoundsDiagnostics(t *testing.T) 
 		!strings.Contains(body, "full gh command 4") || !strings.Contains(body, "full gh command 23") ||
 		strings.Contains(body, "full gh command 3") {
 		t.Fatalf("Diagnostics did not contain exactly the latest 20 full failures:\n%s", body)
+	}
+}
+
+func TestDashboardDiagnosticsPreserveReadableWhitespaceAndRemoveControls(t *testing.T) {
+	var output strings.Builder
+	renderAdmissionDiagnostics(&output, []runner.CandidateDiscoveryFailed{{
+		Operation:  runner.CandidateDiscoveryList,
+		Err:        errors.New("gh issue list:\nTLS\thandshake\r\n\x1b[31mtemporary\x1b[0m\a failure"),
+		OccurredAt: time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC),
+	}})
+	got := output.String()
+	if !strings.Contains(got, "gh issue list: TLS handshake temporary failure") {
+		t.Fatalf("full Diagnostics lost readable separation: %q", got)
+	}
+	if strings.ContainsAny(got, "\x1b\r\t\a") || strings.Contains(got, "[31m") {
+		t.Fatalf("full Diagnostics retained terminal controls: %q", got)
 	}
 }
 
