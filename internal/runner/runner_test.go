@@ -2323,24 +2323,58 @@ func TestRunnerAcceptsFinalizedAutomaticResolutionAfterVerificationReadFailure(t
 	}
 }
 
-func TestRunnerRetainsLeaseAndActionableDiagnosticWhenAutomaticResolutionIsRefused(t *testing.T) {
+func TestRunnerRetainsLeaseAndAdoptsPersistedProgressWhenAutomaticResolutionIsRefused(t *testing.T) {
 	t.Parallel()
 
-	store := &memoryStore{value: state.State{
-		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
-		Runs:   []scheduler.Run{{Issue: 3, RunID: "partial", Status: scheduler.StatusResolvingExternally, WorkerMode: scheduler.WorkerModePrint, Error: "earlier failure"}},
-		Leases: []scheduler.Lease{{LeaseID: "partial", Issue: 3, RunID: "partial"}},
-	}}
-	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
-	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
-		return true, errors.New("remote branch liveness is unknown")
-	})
+	for _, test := range []struct {
+		name           string
+		persist        bool
+		wantStatus     scheduler.Status
+		wantWorktree   string
+		wantDiagnostic string
+	}{
+		{
+			name: "active Run requires intervention", wantStatus: scheduler.StatusNeedsHuman, wantWorktree: "/tmp/run-3",
+			wantDiagnostic: "earlier failure; automatic External Resolution refused: remote branch liveness is unknown",
+		},
+		{
+			name: "durable partial progress is adopted", persist: true, wantStatus: scheduler.StatusResolvingExternally,
+			wantDiagnostic: "durable partial cleanup; automatic External Resolution refused: remote branch liveness is unknown",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &memoryStore{value: state.State{
+				Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+				Runs: []scheduler.Run{{
+					Issue: 3, RunID: "partial", Status: scheduler.StatusWaitingForMerge, WorkerMode: scheduler.WorkerModePrint,
+					Worktree: "/tmp/run-3", Error: "earlier failure",
+				}},
+				Leases: []scheduler.Lease{{LeaseID: "partial", Issue: 3, RunID: "partial"}},
+			}}
+			runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+			runner.Output = io.Discard
+			runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+				if test.persist {
+					persisted := store.LoadValue()
+					persisted.Runs[0].Status = scheduler.StatusResolvingExternally
+					persisted.Runs[0].Worktree = ""
+					persisted.Runs[0].Error = "durable partial cleanup"
+					if err := store.Save(persisted); err != nil {
+						return true, err
+					}
+				}
+				return true, errors.New("remote branch liveness is unknown")
+			})
+			current := store.LoadValue()
 
-	assertInterventionRequired(t, runner.Run(context.Background()), 1)
-	got := store.LoadValue()
-	wantDiagnostic := "earlier failure; automatic External Resolution refused: remote branch liveness is unknown"
-	if got.Runs[0].Status != scheduler.StatusResolvingExternally || len(got.Leases) != 1 || got.Runs[0].Error != wantDiagnostic {
-		t.Fatalf("refused automatic External Resolution = %#v, want diagnostic %q", got, wantDiagnostic)
+			if err := runner.reconcileExternalResolutions(context.Background(), &current, nil); err != nil {
+				t.Fatalf("refused automatic External Resolution: %v", err)
+			}
+			got := store.LoadValue()
+			if got.Runs[0].Status != test.wantStatus || len(got.Leases) != 1 || got.Runs[0].Worktree != test.wantWorktree || got.Runs[0].Error != test.wantDiagnostic {
+				t.Fatalf("refused automatic External Resolution = %#v, want status %s, worktree %q, diagnostic %q", got, test.wantStatus, test.wantWorktree, test.wantDiagnostic)
+			}
+		})
 	}
 }
 
