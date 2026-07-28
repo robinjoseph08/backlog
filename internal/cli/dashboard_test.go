@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -489,7 +490,6 @@ while IFS= read -r ignored; do :; done
 	}()
 	waitForFile(t, activityEmitted)
 	waitForBuffer(t, &stdout, "Deepest operation: bash")
-	waitForBuffer(t, &stdout, "Observed tokens: 1200")
 	if err := os.WriteFile(releaseWorker, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -791,6 +791,38 @@ func TestDashboardCapacityMatchesSchedulerSemantics(t *testing.T) {
 	}
 }
 
+func TestDashboardRenderersShareProjectionMetadata(t *testing.T) {
+	now := time.Date(2026, 7, 28, 14, 0, 0, 0, time.UTC)
+	active := scheduler.Run{Issue: 69, RunID: "active", Status: scheduler.StatusRunning, StartedAt: now.Add(-time.Minute)}
+	attention := scheduler.Run{Issue: 70, RunID: "attention", Status: scheduler.StatusNeedsHuman}
+	current := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 2,
+		Runs: []scheduler.Run{active, attention},
+		Leases: []scheduler.Lease{
+			{LeaseID: active.RunID, Issue: active.Issue, RunID: active.RunID},
+			{LeaseID: attention.RunID, Issue: attention.Issue, RunID: attention.RunID},
+		},
+	}
+	dashboard := newLiveDashboard(io.Discard, &dashboardTestSource{current: current}, current, func() time.Time { return now })
+	dashboard.recordMessage("observation changed")
+	responsive, responsiveLayout, _ := dashboard.renderResponsiveParts(now, responsiveDashboardOptions{
+		density: dashboardDensityConstrained, width: 120,
+	})
+	plainHeader, plainLayout, plainFooter := dashboard.renderPartsForWithLayout(current, []dashboardMessage{{text: "observation changed"}}, dashboardRunning, now, dashboardStyler{})
+
+	if responsive.header != plainHeader || responsive.footer != plainFooter || !maps.Equal(responsiveLayout.attention, plainLayout.attention) {
+		t.Fatalf("responsive and plain projection metadata drifted:\nresponsive header: %q\nplain header: %q\nresponsive footer: %q\nplain footer: %q\nresponsive Attention: %#v\nplain Attention: %#v",
+			responsive.header, plainHeader, responsive.footer, plainFooter, responsiveLayout.attention, plainLayout.attention)
+	}
+	responsive.header = "presentation labels changed independently"
+	minimal := minimalDashboardHeader(responsive.metadata, len(responsiveLayout.attention), 0)
+	for _, want := range []string{"Backlog: acme/widgets", "R:acme/widgets", "W:1u/1a/2t", "Health:0 healthy, 1 anomalous", "Attention:1"} {
+		if !strings.Contains(minimal, want) {
+			t.Fatalf("minimal projection omitted structured metadata %q after display header changed:\n%s", want, minimal)
+		}
+	}
+}
+
 func TestPlainRunOutputRemovesSplitTerminalControls(t *testing.T) {
 	var output bytes.Buffer
 	writer := &terminalControlWriter{output: &output}
@@ -856,6 +888,50 @@ func TestDashboardCloseShowsThatRunnerStopped(t *testing.T) {
 	dashboard.close()
 	if !strings.Contains(output.String(), "Stopped: the runner is exiting; interrupts have no further effect.") {
 		t.Fatalf("closed dashboard retained an active footer:\n%s", output.String())
+	}
+}
+
+func TestDashboardWorkerExpectationFollowsRunLifecycle(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []scheduler.Status{
+		scheduler.StatusClaimed,
+		scheduler.StatusWorktreeReady,
+		scheduler.StatusRunning,
+		scheduler.StatusWaitingForMerge,
+		scheduler.StatusSuspended,
+		scheduler.StatusResetting,
+		scheduler.StatusReset,
+		scheduler.StatusMerged,
+		scheduler.StatusFailed,
+		scheduler.StatusNeedsHuman,
+	} {
+		status := status
+		t.Run(string(status), func(t *testing.T) {
+			t.Parallel()
+
+			run := scheduler.Run{Status: status, PID: 42, ProcessIdentity: "42:retained"}
+			observed := statusRun{run: run, observation: runObservation{process: followObservation{
+				supervision:         "UNSUPERVISED",
+				workerLiveness:      "dead",
+				workerLivenessState: workerLivenessDead,
+			}}}
+			wantExpected := status == scheduler.StatusRunning
+			if got := dashboardRunExpectsWorker(run); got != wantExpected {
+				t.Fatalf("Worker expectation = %t, want %t", got, wantExpected)
+			}
+			promotions := dashboardLivenessPromotions(observed)
+			healthy, anomalous := dashboardWorkerHealth([]statusRun{observed})
+			if wantExpected {
+				if len(promotions) == 0 || healthy != 0 || anomalous != 1 {
+					t.Fatalf("running Worker promotions = %q, health = %d healthy and %d anomalous", promotions, healthy, anomalous)
+				}
+				return
+			}
+			if len(promotions) != 0 || healthy != 0 || anomalous != 0 {
+				t.Fatalf("Run without an expected Worker promotions = %q, health = %d healthy and %d anomalous", promotions, healthy, anomalous)
+			}
+		})
 	}
 }
 
