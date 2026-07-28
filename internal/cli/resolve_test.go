@@ -412,7 +412,7 @@ func TestResolveRequiresYesNonInteractivelyAndCompiledExecutableRefusesRunnerLoc
 		t.Run(mode.name, func(t *testing.T) {
 			command := exec.Command(binary, append([]string{"resolve"}, mode.args...)...)
 			output, commandErr := command.CombinedOutput()
-			if commandErr == nil || !strings.Contains(string(output), "Runner owns repository coordination") || !strings.Contains(string(output), "supervising Runner handles automatic reconciliation at startup and during watch polling once the Run has no Owned Worker") {
+			if commandErr == nil || !strings.Contains(string(output), "Runner owns repository coordination") || !strings.Contains(string(output), "supervising Runner handles automatic reconciliation at startup, during watch polling, and after normal Worker settlement") {
 				t.Fatalf("compiled lock error = %v\n%s", commandErr, output)
 			}
 		})
@@ -641,6 +641,127 @@ func TestCompiledRunWatchUsesCompleteExternalResolutionDuringPolling(t *testing.
 	}
 	if _, err := os.Stat(workerStarted); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("watch External Resolution launched a Worker: %v", err)
+	}
+}
+
+func TestCompiledRunResolvesIssueClosedWhileOwnedWorkerIsActiveAfterSettlement(t *testing.T) {
+	root := t.TempDir()
+	repository := filepath.Join(root, "repo")
+	runGit(t, root, "init", "-b", "main", repository)
+	runGit(t, repository, "config", "user.email", "test@example.com")
+	runGit(t, repository, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(repository, "README.md"), []byte("fixture\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repository, "add", "README.md")
+	runGit(t, repository, "commit", "-m", "fixture")
+	runGit(t, repository, "remote", "add", "origin", "git@github.com:acme/widgets.git")
+	base := strings.TrimSpace(gitOutput(t, repository, "rev-parse", "HEAD"))
+	runGit(t, repository, "update-ref", "refs/remotes/origin/main", base)
+
+	stateDir := filepath.Join(root, "state")
+	statePath := filepath.Join(stateDir, "state.json")
+	workerStarted := filepath.Join(root, "worker-started")
+	issueClosed := filepath.Join(root, "issue-closed")
+	closedIssuePolled := filepath.Join(root, "closed-issue-polled")
+	settleWorker := filepath.Join(root, "settle-worker")
+	workerExited := filepath.Join(root, "worker-exited")
+	removedReady := filepath.Join(root, "removed-ready")
+	removedProgress := filepath.Join(root, "removed-progress")
+
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef")
+    printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
+    if test -f `+quote(issueClosed)+`; then touch `+quote(closedIssuePolled)+`; printf '%s\n' '[]'; else printf '%s\n' '[{"number":84,"title":"Settlement closure","createdAt":"2026-07-28T00:00:00Z","url":"https://github.com/acme/widgets/issues/84"}]'; fi ;;
+  "issue view 84 --repo acme/widgets --json number,title,body,state,url,createdAt")
+    printf '%s\n' '{"number":84,"title":"Settlement closure","body":"","state":"OPEN","url":"https://github.com/acme/widgets/issues/84","createdAt":"2026-07-28T00:00:00Z"}' ;;
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/84/comments?per_page=100 --paginate --slurp"|\
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/84/dependencies/blocked_by?per_page=100 --paginate --slurp")
+    printf '%s\n' '[[]]' ;;
+  "pr list --repo acme/widgets --state all --head agent/issue-84-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository"|\
+  "pr list --repo acme/widgets --state all --head agent/issue-84-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    printf '%s\n' '[]' ;;
+  "issue view 84 --repo acme/widgets --json number,state,title,url")
+    if test -f `+quote(issueClosed)+`; then state=CLOSED; else state=OPEN; fi
+    printf '{"number":84,"state":"%s","title":"Settlement closure","url":"https://github.com/acme/widgets/issues/84"}\n' "$state" ;;
+  "issue view 84 --repo acme/widgets --json number,url,state,stateReason")
+    if test -f `+quote(issueClosed)+`; then printf '%s\n' '{"number":84,"url":"https://github.com/acme/widgets/issues/84","state":"CLOSED","stateReason":"NOT_PLANNED"}'; else printf '%s\n' '{"number":84,"url":"https://github.com/acme/widgets/issues/84","state":"OPEN","stateReason":null}'; fi ;;
+  "issue view 84 --repo acme/widgets --json number,url,state,labels")
+    labels=""
+    if ! test -f `+quote(removedProgress)+`; then labels='{"name":"in-progress"}'; fi
+    if ! test -f `+quote(removedReady)+`; then if test -n "$labels"; then labels="$labels,"; fi; labels="${labels}{\"name\":\"ready-for-agent\"}"; fi
+    printf '{"number":84,"url":"https://github.com/acme/widgets/issues/84","state":"CLOSED","labels":[%s]}\n' "$labels" ;;
+  "issue edit 84 --repo acme/widgets --remove-label in-progress") touch `+quote(removedProgress)+` ;;
+  "issue edit 84 --repo acme/widgets --remove-label ready-for-agent") touch `+quote(removedReady)+` ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	git := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  *" fetch origin main") exit 0 ;;
+  *" ls-remote --exit-code --heads origin refs/heads/agent/issue-84-"*) exit 2 ;;
+  *) exec git "$@" ;;
+esac
+`)
+	pi := writeExecutable(t, `#!/bin/sh
+set -eu
+session_dir=""
+session_id=""
+while test "$#" -gt 0; do
+  if test "$1" = "--session-dir"; then session_dir=$2; shift 2; continue; fi
+  if test "$1" = "--session-id"; then session_id=$2; shift 2; continue; fi
+  shift
+done
+printf '{"type":"session","id":"%s","cwd":"%s"}\n' "$session_id" "$PWD" >"$session_dir/session.jsonl"
+IFS= read -r prompt
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
+touch `+quote(workerStarted)+`
+while ! test -f `+quote(settleWorker)+`; do sleep 0.01; done
+printf '%s\n' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+while IFS= read -r ignored; do :; done
+touch `+quote(workerExited)+`
+`)
+
+	binary := buildExecutable(t, root)
+	command := exec.Command(binary, "run", "--plain", "--repo-dir", repository, "--state-dir", stateDir,
+		"--max-workers", "1", "--poll", "5ms", "--git", git, "--gh", gh, "--pi", pi)
+	var output bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = &output
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitForFile(t, workerStarted)
+	if err := os.WriteFile(issueClosed, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitForFile(t, closedIssuePolled)
+	active, err := (state.FileStore{Path: statePath}).Load()
+	if err != nil || len(active.Runs) != 1 || active.Runs[0].Status != scheduler.StatusRunning || len(active.Leases) != 1 {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatalf("issue closure controlled Owned Worker: state=%#v err=%v output=%s", active, err, output.String())
+	}
+	if _, err := os.Stat(workerExited); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Worker exited before normal settlement: %v", err)
+	}
+	if err := os.WriteFile(settleWorker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err != nil {
+		t.Fatalf("compiled post-settlement External Resolution: %v\n%s", err, output.String())
+	}
+	waitForFile(t, workerExited)
+	current, err := (state.FileStore{Path: statePath}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.Runs) != 1 || current.Runs[0].Status != scheduler.StatusResolvedExternally || current.Runs[0].ClosureReason != "not-planned" || current.Runs[0].WorkerLogOpen || len(current.Leases) != 0 {
+		t.Fatalf("compiled post-settlement state = %#v\n%s", current, output.String())
 	}
 }
 

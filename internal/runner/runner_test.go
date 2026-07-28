@@ -389,6 +389,11 @@ func TestRunnerFailsClosedWhenRPCOutputBreaksAfterSettlement(t *testing.T) {
 	workers := newFakeWorkers()
 	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
 	runner := testRunner(github, workers, store, 1)
+	var resolutionCalls atomic.Int32
+	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+		resolutionCalls.Add(1)
+		return true, errors.New("External Resolution must not override failed RPC stream validation")
+	})
 	worktrees := runner.Worktrees.(*fakeWorktrees)
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
@@ -409,6 +414,51 @@ func TestRunnerFailsClosedWhenRPCOutputBreaksAfterSettlement(t *testing.T) {
 	}
 	if len(got.Leases) != 1 || got.Leases[0].Issue != 10 {
 		t.Fatalf("Leases = %#v, want issue 10 retained", got.Leases)
+	}
+	if resolutionCalls.Load() != 0 || len(github.completionBranchSnapshot()) != 1 {
+		t.Fatalf("unsafe post-settlement reconciliation: resolutions=%d Completion checks=%d", resolutionCalls.Load(), len(github.completionBranchSnapshot()))
+	}
+}
+
+func TestRunnerPostSettlementCloseFailureSkipsExternalResolution(t *testing.T) {
+	var completionCalls atomic.Int32
+	github := &fakeGitHub{
+		candidates: []scheduler.Candidate{{Number: 14, CreatedAt: time.Now()}},
+		completionFunc: func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
+			if completionCalls.Add(1) == 1 {
+				return ghadapter.CompletionOutcome{IssueClosed: true, PRFound: true, PullRequest: "https://example.test/14", AutoMergeArmed: true}, nil
+			}
+			return ghadapter.CompletionOutcome{IssueClosed: true}, nil
+		},
+	}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+	var resolutionCalls atomic.Int32
+	runner.ExternalResolution = externalResolutionFunc(func(_ context.Context, run scheduler.Run) (bool, error) {
+		resolutionCalls.Add(1)
+		persisted := store.LoadValue()
+		resolved := findRun(persisted.Runs, run.RunID)
+		resolved.Status = scheduler.StatusResolvedExternally
+		replaceRun(&persisted, resolved)
+		removeLease(&persisted, run.RunID)
+		return true, store.Save(persisted)
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 14)
+	workers.setCloseResult(14, worker.Result{LogClosed: true, GroupExited: true, Err: errors.New("RPC close validation failed")})
+	workers.complete(14, worker.Result{ExitCode: 0})
+	assertInterventionRequired(t, <-done, 1)
+
+	got := store.LoadValue()
+	run := findRun(got.Runs, "run-14")
+	if completionCalls.Load() != 1 || resolutionCalls.Load() != 0 || run.Status != scheduler.StatusNeedsHuman || len(got.Leases) != 1 {
+		t.Fatalf("failed RPC close state = %#v, Completion checks=%d resolutions=%d", got, completionCalls.Load(), resolutionCalls.Load())
+	}
+	if runner.Worktrees.(*fakeWorktrees).cleanupCount() != 0 {
+		t.Fatal("failed RPC close started cleanup")
 	}
 }
 
@@ -1136,6 +1186,74 @@ func TestRunnerSuspensionCancelsBlockedCompletionReconciliation(t *testing.T) {
 	if got := store.LoadValue().Runs[0].Status; got != scheduler.StatusSuspended {
 		t.Fatalf("Run status = %q, want suspended", got)
 	}
+}
+
+func TestRunnerDrainResolvesIssueClosedDuringSettledWorkerClose(t *testing.T) {
+	const issue = 16
+	var issueClosed atomic.Bool
+	var completionCalls atomic.Int32
+	var issueStateCalls atomic.Int32
+	github := &fakeGitHub{
+		candidates: []scheduler.Candidate{{Number: issue, CreatedAt: time.Now()}},
+		completionFunc: func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
+			completionCalls.Add(1)
+			return ghadapter.CompletionOutcome{
+				PullRequest: "https://example.test/pr/16", PRFound: true, AutoMergeArmed: true,
+				IssueClosed: issueClosed.Load(),
+			}, nil
+		},
+		issueStateFunc: func(int) (ghadapter.IssueState, error) {
+			issueStateCalls.Add(1)
+			return ghadapter.IssueState{Open: !issueClosed.Load()}, nil
+		},
+	}
+	workers := newFakeWorkers()
+	workers.onSettledClose = func(int) error {
+		if completionCalls.Load() != 1 {
+			return fmt.Errorf("Worker closed after %d initial Completion checks, want 1", completionCalls.Load())
+		}
+		issueClosed.Store(true)
+		return nil
+	}
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	signals := make(chan os.Signal, 1)
+	output := newSynchronizedOutput()
+	runner := testRunner(github, workers, store, 1)
+	runner.Signals = signals
+	runner.Output = output
+	var resolutionCalls atomic.Int32
+	runner.ExternalResolution = externalResolutionFunc(func(_ context.Context, run scheduler.Run) (bool, error) {
+		resolutionCalls.Add(1)
+		persisted := store.LoadValue()
+		settled := findRun(persisted.Runs, run.RunID)
+		if workers.runningCount() != 0 || settled.WorkerLogOpen {
+			return true, fmt.Errorf("Drain resolution started before Worker exit and durable log closure: running=%d run=%#v", workers.runningCount(), settled)
+		}
+		settled.Status = scheduler.StatusResolvedExternally
+		settledAt := runner.Now().UTC()
+		settled.ResolvedExternallyAt = &settledAt
+		settled.ClosureReason = "completed"
+		replaceRun(&persisted, settled)
+		removeLease(&persisted, run.RunID)
+		return true, store.Save(persisted)
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, issue)
+	signals <- os.Interrupt
+	output.waitFor(t, "Drain: admission stopped; 1 Worker remaining")
+	workers.complete(issue, worker.Result{ExitCode: 0})
+
+	if err := <-done; err != nil {
+		t.Fatalf("Drain late-closure External Resolution: %v", err)
+	}
+	got := store.LoadValue()
+	run := findRun(got.Runs, fmt.Sprintf("run-%d", issue))
+	if completionCalls.Load() != 2 || issueStateCalls.Load() != 1 || resolutionCalls.Load() != 1 || run.Status != scheduler.StatusResolvedExternally || run.WorkerLogOpen || len(got.Leases) != 0 {
+		t.Fatalf("Drain late-closure state = %#v, Completion checks=%d issue-state checks=%d resolutions=%d", got, completionCalls.Load(), issueStateCalls.Load(), resolutionCalls.Load())
+	}
+	output.waitFor(t, "Drain complete: 0 Workers remaining; exiting successfully")
 }
 
 func TestRunnerDrainsEveryOwnedWorkerAndReportsProgress(t *testing.T) {
@@ -2286,6 +2404,433 @@ func TestRunnerNeverAutomaticallyResolvesRunWithOwnedWorker(t *testing.T) {
 	}
 	if calls.Load() != 0 || current.Runs[0].Status != scheduler.StatusRunning || len(current.Leases) != 1 {
 		t.Fatalf("Owned Worker entered automatic External Resolution: calls=%d state=%#v", calls.Load(), current)
+	}
+}
+
+func TestRunnerResolvesClosedIssueImmediatelyAfterNormalWorkerSettlement(t *testing.T) {
+	github := &fakeGitHub{
+		candidates:  []scheduler.Candidate{{Number: 5, CreatedAt: time.Now()}},
+		completions: map[int]ghadapter.CompletionOutcome{5: {IssueClosed: true}},
+	}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+	var resolutionCalls atomic.Int32
+	runner.ExternalResolution = externalResolutionFunc(func(_ context.Context, run scheduler.Run) (bool, error) {
+		resolutionCalls.Add(1)
+		persisted := store.LoadValue()
+		settled := findRun(persisted.Runs, run.RunID)
+		if workers.runningCount() != 0 || settled.WorkerLogOpen {
+			return true, fmt.Errorf("resolution started before Worker exit and durable log closure: running=%d run=%#v", workers.runningCount(), settled)
+		}
+		settled.Status = scheduler.StatusResolvedExternally
+		settledAt := runner.Now().UTC()
+		settled.ResolvedExternallyAt = &settledAt
+		settled.ClosureReason = "completed"
+		replaceRun(&persisted, settled)
+		removeLease(&persisted, run.RunID)
+		github.setCandidates(nil)
+		return true, store.Save(persisted)
+	})
+	var summary state.State
+	runner.FinalSummary = func(current state.State) error {
+		summary = cloneState(current)
+		return nil
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 5)
+	// Several polling and reconciliation ticks while the issue is already closed
+	// must not inspect or control the Owned Worker. Close remains part of normal
+	// settlement only.
+	time.Sleep(20 * time.Millisecond)
+	if resolutionCalls.Load() != 0 || workers.runningCount() != 1 || workers.abortedCount() != 0 || workers.suspendedCount() != 0 || workers.closedCount() != 0 || workers.authorizedForceStopCount() != 0 {
+		t.Fatalf("closure controlled Owned Worker: resolutions=%d running=%d aborts=%d suspends=%d closes=%d force-stops=%d", resolutionCalls.Load(), workers.runningCount(), workers.abortedCount(), workers.suspendedCount(), workers.closedCount(), workers.authorizedForceStopCount())
+	}
+	workers.complete(5, worker.Result{ExitCode: 0})
+	if err := <-done; err != nil {
+		t.Fatalf("post-settlement External Resolution: %v", err)
+	}
+	got := store.LoadValue()
+	if resolutionCalls.Load() != 1 || got.Runs[0].Status != scheduler.StatusResolvedExternally || got.Runs[0].WorkerLogOpen || len(got.Leases) != 0 {
+		t.Fatalf("post-settlement External Resolution state = %#v, calls=%d", got, resolutionCalls.Load())
+	}
+	if workers.closedCount() != 1 || workers.abortedCount() != 0 || workers.suspendedCount() != 0 || workers.authorizedForceStopCount() != 0 {
+		t.Fatalf("normal settlement controls: closes=%d aborts=%d suspends=%d force-stops=%d", workers.closedCount(), workers.abortedCount(), workers.suspendedCount(), workers.authorizedForceStopCount())
+	}
+	if len(summary.Leases) != 0 || summary.Runs[0].Status != scheduler.StatusResolvedExternally {
+		t.Fatalf("final summary used pre-resolution state: %#v", summary)
+	}
+	if branches := github.completionBranchSnapshot(); len(branches) != 2 || branches[0] != branches[1] {
+		t.Fatalf("Completion branches = %q, want initial and final checks of the expected branch", branches)
+	}
+}
+
+func TestRunnerRefillsCapacityOnlyAfterPostSettlementExternalResolutionReleasesLease(t *testing.T) {
+	first := scheduler.Candidate{Number: 5, CreatedAt: time.Now()}
+	second := scheduler.Candidate{Number: 6, CreatedAt: first.CreatedAt.Add(time.Second)}
+	github := &fakeGitHub{
+		candidates: []scheduler.Candidate{first, second},
+		completions: map[int]ghadapter.CompletionOutcome{
+			first.Number:  {IssueClosed: true},
+			second.Number: mergedOutcome(second.Number),
+		},
+	}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	resolutionStarted := make(chan struct{})
+	finishResolution := make(chan struct{})
+	admissionErr := make(chan error, 1)
+	workers.onStart = func(issue int) {
+		if issue != second.Number {
+			return
+		}
+		persisted := store.LoadValue()
+		resolved := findRun(persisted.Runs, fmt.Sprintf("run-%d", first.Number))
+		if resolved.Status != scheduler.StatusResolvedExternally || findActiveRun(&persisted, first.Number).RunID != "" || len(persisted.Leases) != 1 || persisted.Leases[0].Issue != second.Number {
+			admissionErr <- fmt.Errorf("second Admission preceded durable External Resolution: %#v", persisted)
+		}
+	}
+	runner := testRunner(github, workers, store, 1)
+	runner.ExternalResolution = externalResolutionFunc(func(_ context.Context, run scheduler.Run) (bool, error) {
+		close(resolutionStarted)
+		<-finishResolution
+		persisted := store.LoadValue()
+		resolved := findRun(persisted.Runs, run.RunID)
+		resolved.Status = scheduler.StatusResolvedExternally
+		resolvedAt := runner.Now().UTC()
+		resolved.ResolvedExternallyAt = &resolvedAt
+		resolved.ClosureReason = "completed"
+		replaceRun(&persisted, resolved)
+		removeLease(&persisted, run.RunID)
+		github.setCandidates([]scheduler.Candidate{second})
+		return true, store.Save(persisted)
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, first.Number)
+	workers.complete(first.Number, worker.Result{ExitCode: 0})
+	<-resolutionStarted
+	if workers.wasStarted(second.Number) {
+		t.Fatal("second Candidate started while the first Run still owned its Lease")
+	}
+	persisted := store.LoadValue()
+	if active := findActiveRun(&persisted, first.Number); active.RunID == "" || len(persisted.Leases) != 1 || persisted.Leases[0].Issue != first.Number {
+		t.Fatalf("ownership released before durable External Resolution: %#v", persisted)
+	}
+	close(finishResolution)
+	workers.waitForStarts(t, second.Number)
+	select {
+	case err := <-admissionErr:
+		t.Fatal(err)
+	default:
+	}
+	workers.complete(second.Number, worker.Result{ExitCode: 0})
+	if err := <-done; err != nil {
+		t.Fatalf("capacity refill after External Resolution: %v", err)
+	}
+	got := store.LoadValue()
+	if findRun(got.Runs, "run-5").Status != scheduler.StatusResolvedExternally || findRun(got.Runs, "run-6").Status != scheduler.StatusMerged || len(got.Leases) != 0 {
+		t.Fatalf("capacity refill state = %#v", got)
+	}
+}
+
+func TestRunnerRecordsLateCompletionAfterWorkerExitBeforeExternalResolution(t *testing.T) {
+	var completionCalls atomic.Int32
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 6, CreatedAt: time.Now()}}}
+	github.completionFunc = func(_ context.Context, _ int, branch string) (ghadapter.CompletionOutcome, error) {
+		github.mu.Lock()
+		github.completionBranches = append(github.completionBranches, branch)
+		github.mu.Unlock()
+		if completionCalls.Add(1) == 1 {
+			return ghadapter.CompletionOutcome{IssueClosed: true}, nil
+		}
+		github.setCandidates(nil)
+		return mergedOutcome(6), nil
+	}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+	var resolutionCalls atomic.Int32
+	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+		resolutionCalls.Add(1)
+		return true, errors.New("External Resolution must not replace late Completion")
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 6)
+	workers.complete(6, worker.Result{ExitCode: 0})
+	if err := <-done; err != nil {
+		t.Fatalf("late Completion: %v", err)
+	}
+	got := store.LoadValue()
+	if completionCalls.Load() != 2 || resolutionCalls.Load() != 0 || got.Runs[0].Status != scheduler.StatusMerged || got.Runs[0].WorkerLogOpen || len(got.Leases) != 0 {
+		t.Fatalf("late Completion state = %#v, completion calls=%d resolution calls=%d", got, completionCalls.Load(), resolutionCalls.Load())
+	}
+	if runner.Worktrees.(*fakeWorktrees).cleanupCount() != 1 {
+		t.Fatal("late Completion did not clean up after Worker exit")
+	}
+}
+
+func TestRunnerPostSettlementReopeningRetainsLease(t *testing.T) {
+	var completionCalls atomic.Int32
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 7, CreatedAt: time.Now()}}}
+	github.completionFunc = func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
+		if completionCalls.Add(1) == 1 {
+			return ghadapter.CompletionOutcome{IssueClosed: true}, nil
+		}
+		return ghadapter.CompletionOutcome{}, nil
+	}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+	var resolutionCalls atomic.Int32
+	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+		resolutionCalls.Add(1)
+		return true, errors.New("External Resolution must not start after reopening")
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 7)
+	workers.complete(7, worker.Result{ExitCode: 0})
+	assertInterventionRequired(t, <-done, 1)
+	got := store.LoadValue()
+	if completionCalls.Load() != 2 || resolutionCalls.Load() != 0 || got.Runs[0].Status != scheduler.StatusFailed || got.Runs[0].WorkerLogOpen || len(got.Leases) != 1 {
+		t.Fatalf("reopened post-settlement state = %#v, completion calls=%d resolution calls=%d", got, completionCalls.Load(), resolutionCalls.Load())
+	}
+}
+
+func TestRunnerUncertainSettledProcessGroupRetainsLeaseWithoutResolution(t *testing.T) {
+	github := &fakeGitHub{
+		candidates:  []scheduler.Candidate{{Number: 8, CreatedAt: time.Now()}},
+		completions: map[int]ghadapter.CompletionOutcome{8: {IssueClosed: true}},
+	}
+	workers := newFakeWorkers()
+	workers.startupCloseResult = worker.Result{LogClosed: true}
+	workers.settledCloseLeavesGroup = true
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+	var resolutionCalls atomic.Int32
+	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+		resolutionCalls.Add(1)
+		return true, errors.New("must not clean up with uncertain process-group liveness")
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 8)
+	workers.complete(8, worker.Result{ExitCode: 0})
+	assertInterventionRequired(t, <-done, 1)
+	got := store.LoadValue()
+	run := got.Runs[0]
+	if resolutionCalls.Load() != 0 || run.Status != scheduler.StatusNeedsHuman || run.PID != 1008 || run.ProcessIdentity == "" || run.WorkerLogOpen || len(got.Leases) != 1 {
+		t.Fatalf("closed-log, live-process-group state = %#v, calls=%d", got, resolutionCalls.Load())
+	}
+	if runner.Worktrees.(*fakeWorktrees).cleanupCount() != 0 {
+		t.Fatal("uncertain process-group liveness started cleanup")
+	}
+}
+
+func TestRunnerSignalAfterUnverifiedSettledExitSnapshotReportsIncompleteSuspension(t *testing.T) {
+	github := &fakeGitHub{
+		candidates:  []scheduler.Candidate{{Number: 15, CreatedAt: time.Now()}},
+		completions: map[int]ghadapter.CompletionOutcome{15: {IssueClosed: true}},
+	}
+	workers := newFakeWorkers()
+	workers.startupCloseResult = worker.Result{LogClosed: true}
+	workers.settledCloseLeavesGroup = true
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	signals := make(chan os.Signal, 1)
+	runner := testRunner(github, workers, store, 1)
+	runner.Signals = signals
+	var resolutionCalls atomic.Int32
+	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+		resolutionCalls.Add(1)
+		return true, errors.New("must not resolve an unverified process group")
+	})
+	var signalOnce sync.Once
+	store.beforeSave = func(value state.State) {
+		run := findRun(value.Runs, "run-15")
+		if run.Status != scheduler.StatusNeedsHuman || run.PID != 1015 {
+			return
+		}
+		signalOnce.Do(func() {
+			signals <- syscall.SIGTERM
+			<-runner.suspensionEventReady
+		})
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 15)
+	workers.complete(15, worker.Result{ExitCode: 0})
+	err := <-done
+	var signalExit *SignalExit
+	if !errors.As(err, &signalExit) || signalExit.Code != 143 || signalExit.Cause == nil || !strings.Contains(signalExit.Cause.Error(), "continuation boundary") {
+		t.Fatalf("raced suspension result = %v, want incomplete signal exit 143", err)
+	}
+	got := store.LoadValue()
+	run := findRun(got.Runs, "run-15")
+	if run.Status != scheduler.StatusNeedsHuman || run.PID != 1015 || run.ProcessIdentity != "identity-1015" || len(got.Leases) != 1 || resolutionCalls.Load() != 0 {
+		t.Fatalf("raced unverified process-group state = %#v, resolutions=%d", got, resolutionCalls.Load())
+	}
+	if runner.Worktrees.(*fakeWorktrees).cleanupCount() != 0 {
+		t.Fatal("raced unverified process group started cleanup")
+	}
+}
+
+func TestRunnerReportsUnverifiedSettledExitPersistenceFailureWithoutWaitingTwice(t *testing.T) {
+	github := &fakeGitHub{
+		candidates:  []scheduler.Candidate{{Number: 12, CreatedAt: time.Now()}},
+		completions: map[int]ghadapter.CompletionOutcome{12: {IssueClosed: true}},
+	}
+	workers := newFakeWorkers()
+	workers.settledCloseLeavesGroup = true
+	// Automatic-resolution startup and reconciled initialization are saves 1
+	// and 2; admission, worktree, logs, identity, and the initial outcome are
+	// saves 3 through 8. Retaining the unverified process group is save 9.
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 9}
+	runner := testRunner(github, workers, store, 1)
+	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+		return true, errors.New("must not inspect an unverified process group")
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 12)
+	workers.complete(12, worker.Result{ExitCode: 0})
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "persist unverified Worker") {
+			t.Fatalf("unverified-exit persistence error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Runner waited for an already-consumed Worker completion")
+	}
+}
+
+func TestRunnerPostSettlementCompletionCheckFailurePreservesAttention(t *testing.T) {
+	var completionCalls atomic.Int32
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 10, CreatedAt: time.Now()}}}
+	github.completionFunc = func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
+		if completionCalls.Add(1) == 1 {
+			return ghadapter.CompletionOutcome{IssueClosed: true}, nil
+		}
+		return ghadapter.CompletionOutcome{}, errors.New("GitHub unavailable")
+	}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+	var resolutionCalls atomic.Int32
+	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+		resolutionCalls.Add(1)
+		return true, nil
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 10)
+	workers.complete(10, worker.Result{ExitCode: 0})
+	assertInterventionRequired(t, <-done, 1)
+	got := store.LoadValue()
+	if completionCalls.Load() != 2 || resolutionCalls.Load() != 0 || got.Runs[0].Status != scheduler.StatusNeedsHuman || len(got.Leases) != 1 || !strings.Contains(got.Runs[0].Error, "recheck GitHub Completion after Worker settlement") {
+		t.Fatalf("failed final Completion check = %#v, completion calls=%d resolution calls=%d", got, completionCalls.Load(), resolutionCalls.Load())
+	}
+}
+
+func TestRunnerPostSettlementPreconditionsAndPersistenceFailClosed(t *testing.T) {
+	base := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs: []scheduler.Run{{
+			Issue: 11, RunID: "run-11", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModeRPC,
+			Branch: "agent/issue-11-run-11", Worktree: "/tmp/run-11",
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "run-11", Issue: 11, RunID: "run-11"}},
+	}
+
+	t.Run("open issue probe failure skips redundant Completion recheck", func(t *testing.T) {
+		current := cloneState(base)
+		current.Runs[0].Status = scheduler.StatusWaitingForMerge
+		var issueStateCalls atomic.Int32
+		var completionCalls atomic.Int32
+		github := &fakeGitHub{
+			issueStateFunc: func(int) (ghadapter.IssueState, error) {
+				issueStateCalls.Add(1)
+				return ghadapter.IssueState{}, errors.New("transient late-closure probe failure")
+			},
+			completionFunc: func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
+				completionCalls.Add(1)
+				return ghadapter.CompletionOutcome{}, errors.New("redundant Completion lookup")
+			},
+		}
+		runner := testRunner(github, newFakeWorkers(), &memoryStore{value: cloneState(current)}, 1)
+		var resolutionCalls atomic.Int32
+		runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+			resolutionCalls.Add(1)
+			return true, errors.New("must not inspect an unverified closure")
+		})
+		if err := runner.reconcileAfterWorkerSettlement(context.Background(), &current, "run-11", false); err != nil {
+			t.Fatalf("open issue post-settlement reconciliation: %v", err)
+		}
+		if issueStateCalls.Load() != 1 || completionCalls.Load() != 0 || resolutionCalls.Load() != 0 || current.Runs[0].Status != scheduler.StatusWaitingForMerge || len(current.Leases) != 1 {
+			t.Fatalf("open issue post-settlement state = %#v, issue-state checks=%d Completion checks=%d resolutions=%d", current, issueStateCalls.Load(), completionCalls.Load(), resolutionCalls.Load())
+		}
+	})
+
+	t.Run("durable log closure", func(t *testing.T) {
+		current := cloneState(base)
+		current.Runs[0].WorkerLogOpen = true
+		runner := testRunner(&fakeGitHub{}, newFakeWorkers(), &memoryStore{value: cloneState(current)}, 1)
+		runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+			return true, errors.New("must not inspect before log closure")
+		})
+		if err := runner.reconcileAfterWorkerSettlement(context.Background(), &current, "run-11", true); err == nil || !strings.Contains(err.Error(), "before durable Worker log closure") {
+			t.Fatalf("open-log post-settlement error = %v", err)
+		}
+	})
+
+	t.Run("Completion persistence", func(t *testing.T) {
+		current := cloneState(base)
+		store := &memoryStore{value: cloneState(current)}
+		store.failNext()
+		runner := testRunner(&fakeGitHub{completions: map[int]ghadapter.CompletionOutcome{11: mergedOutcome(11)}}, newFakeWorkers(), store, 1)
+		runner.Output = io.Discard
+		runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+			return true, errors.New("must not replace Completion")
+		})
+		if err := runner.reconcileAfterWorkerSettlement(context.Background(), &current, "run-11", true); err == nil || !strings.Contains(err.Error(), "persist post-settlement Completion") {
+			t.Fatalf("Completion persistence error = %v", err)
+		}
+		if got := store.LoadValue(); len(got.Leases) != 1 || got.Runs[0].Status != scheduler.StatusFailed {
+			t.Fatalf("failed Completion persistence released ownership: %#v", got)
+		}
+	})
+}
+
+func TestRunnerPostSettlementResolutionFailurePreservesAttention(t *testing.T) {
+	github := &fakeGitHub{
+		candidates:  []scheduler.Candidate{{Number: 9, CreatedAt: time.Now()}},
+		completions: map[int]ghadapter.CompletionOutcome{9: {IssueClosed: true}},
+	}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+		return true, errors.New("owned worktree cleanup failed")
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 9)
+	workers.complete(9, worker.Result{ExitCode: 0})
+	assertInterventionRequired(t, <-done, 1)
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusFailed || len(got.Leases) != 1 || !strings.Contains(got.Runs[0].Error, "automatic External Resolution refused: owned worktree cleanup failed") {
+		t.Fatalf("failed post-settlement cleanup = %#v", got)
 	}
 }
 
@@ -4439,6 +4984,7 @@ type memoryStore struct {
 	failAtSave         int
 	failAtLoad         int
 	failSavesRemaining int
+	beforeSave         func(state.State)
 }
 
 func (s *memoryStore) Load() (state.State, error) {
@@ -4453,6 +4999,9 @@ func (s *memoryStore) Load() (state.State, error) {
 func (s *memoryStore) Save(value state.State) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.beforeSave != nil {
+		s.beforeSave(cloneState(value))
+	}
 	s.saveCount++
 	if s.failSavesRemaining > 0 || s.failAtSave > 0 && s.saveCount == s.failAtSave {
 		if s.failSavesRemaining > 0 {
@@ -4765,6 +5314,7 @@ func (p *fakeProcess) Abort() error {
 }
 func (p *fakeProcess) Suspend(ctx context.Context, request worker.ContinuationRequest) (worker.Continuation, error) {
 	p.owner.mu.Lock()
+	p.owner.suspendCount++
 	suspendFunc := p.owner.suspendFunc
 	p.owner.mu.Unlock()
 	if suspendFunc != nil {
@@ -4783,7 +5333,12 @@ func (p *fakeProcess) Wait() worker.Result {
 	return <-p.done
 }
 func (p *fakeProcess) Close() worker.Result {
-	p.closeOnce.Do(func() { p.owner.finished(p.issue) })
+	p.closeOnce.Do(func() {
+		p.owner.mu.Lock()
+		p.owner.closeCount++
+		p.owner.mu.Unlock()
+		p.owner.finished(p.issue)
+	})
 	return p.closeResult
 }
 func (p *fakeProcess) CloseWithForceContext(ctx context.Context, authorizeKill func() error) worker.Result {
@@ -4791,10 +5346,17 @@ func (p *fakeProcess) CloseWithForceContext(ctx context.Context, authorizeKill f
 	blockSettledClose := p.owner.blockSettledClose
 	settledCloseLeavesGroup := p.owner.settledCloseLeavesGroup
 	settledCloseStarted := p.owner.settledCloseStarted
+	onSettledClose := p.owner.onSettledClose
 	authorizeClose := p.owner.authorizeClose
 	p.owner.mu.Unlock()
 	if !blockSettledClose {
 		result := p.Close()
+		if onSettledClose != nil {
+			if err := onSettledClose(p.issue); err != nil {
+				result.Err = err
+				return result
+			}
+		}
 		if !settledCloseLeavesGroup {
 			result.GroupExited = true
 		}
@@ -4857,6 +5419,7 @@ type fakeWorkers struct {
 	onStart                 func(int)
 	onRelease               func(int)
 	onCloseContext          func(int) error
+	onSettledClose          func(int) error
 	authorizeClose          bool
 	waitForForce            bool
 	blockSettledClose       bool
@@ -4864,6 +5427,8 @@ type fakeWorkers struct {
 	abortClosesProcessGroup bool
 	authorizedForceStops    int
 	abortCount              int
+	suspendCount            int
+	closeCount              int
 	startErr                error
 	omitLogPaths            bool
 	releaseErr              error
@@ -4921,6 +5486,16 @@ func (w *fakeWorkers) abortedCount() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.abortCount
+}
+func (w *fakeWorkers) suspendedCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.suspendCount
+}
+func (w *fakeWorkers) closedCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.closeCount
 }
 func (w *fakeWorkers) released(issue int) {
 	w.mu.Lock()
