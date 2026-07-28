@@ -1285,7 +1285,7 @@ func inspectRemoteBranch(ctx context.Context, gitExecutable, repositoryRoot, bra
 	if err != nil {
 		return Branch{}, fmt.Errorf("inspect remote branch %s: %w", branch, err)
 	}
-	if exit == 2 && len(bytes.TrimSpace(output)) == 0 {
+	if exit == 2 {
 		return Branch{Name: branch}, nil
 	}
 	if exit != 0 {

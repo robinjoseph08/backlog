@@ -611,6 +611,32 @@ esac
 	}
 }
 
+func TestCompiledResolveTreatsAbsentRemoteBranchWithStderrAsRetired(t *testing.T) {
+	fixture := newLocalArtifactResetFixture(t, false)
+	gh := localArtifactResolveGitHub(t, fixture)
+	git := writeExecutable(t, `#!/bin/sh
+case "$*" in
+  *" ls-remote --exit-code --heads origin refs/heads/`+fixture.branch+`")
+    echo 'Warning: Permanently added github.com to the list of known hosts.' >&2
+    exit 2 ;;
+esac
+exec `+quote(fixture.git)+` "$@"
+`)
+	binary := buildExecutable(t, t.TempDir())
+	command := exec.Command(binary, localArtifactResolveArgs(fixture, git, gh, "--dry-run")...)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("compiled dry-run with absent remote branch warning: %v\n%s", err, output)
+	}
+	plan := string(output)
+	if strings.Contains(plan, "delete remote branch") {
+		t.Fatalf("dry-run did not treat absent remote branch as retired:\n%s", plan)
+	}
+	if !strings.Contains(plan, "remove local worktree") {
+		t.Fatalf("dry-run did not continue after absent remote branch inspection:\n%s", plan)
+	}
+}
+
 func TestResolveRerunsOnlyRemainingLocalActionsAfterEveryMutationBoundary(t *testing.T) {
 	for _, test := range []struct {
 		name            string
