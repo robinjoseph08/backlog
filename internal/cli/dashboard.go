@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -47,7 +48,6 @@ type liveDashboard struct {
 
 	mu                  sync.Mutex
 	current             state.State
-	baselineStatuses    map[string]scheduler.Status
 	messages            []dashboardMessage
 	messageOccurrences  map[string]int
 	shutdownOccurrences map[string]int
@@ -87,13 +87,9 @@ func newLiveDashboard(output io.Writer, source followStateSource, initial state.
 		now = time.Now
 	}
 	initial = cloneDashboardState(initial)
-	baseline := make(map[string]scheduler.Status, len(initial.Runs))
-	for _, run := range initial.Runs {
-		baseline[run.RunID] = run.Status
-	}
 	return &liveDashboard{
 		output: output, source: source, now: now, current: initial,
-		baselineStatuses: baseline, messageOccurrences: make(map[string]int), shutdownOccurrences: make(map[string]int), stage: dashboardRunning,
+		messageOccurrences: make(map[string]int), shutdownOccurrences: make(map[string]int), stage: dashboardRunning,
 		lastActivity: activitySignatures(initial), observations: make(map[string]dashboardActivityObservation), updates: make(chan struct{}, 1),
 		stop: make(chan struct{}), done: make(chan struct{}),
 	}
@@ -154,6 +150,10 @@ func cloneDashboardState(current state.State) state.State {
 		if run.CompletedAt != nil {
 			value := *run.CompletedAt
 			run.CompletedAt = &value
+		}
+		if run.AcknowledgedAt != nil {
+			value := *run.AcknowledgedAt
+			run.AcknowledgedAt = &value
 		}
 	}
 	return cloned
@@ -425,9 +425,6 @@ func (d *liveDashboard) renderParts(now time.Time) (string, string, string) {
 
 func (d *liveDashboard) renderPartsFor(current state.State, messages []string, stage dashboardStage, now time.Time) (string, string, string) {
 	sections := d.observeSections(current, now)
-	active := sections[statusActive]
-	attention := sections[statusAttention]
-	recent := d.recentlyFinished(current, sections, now)
 	capacity := "Worker capacity: pending configuration"
 	if current.MaxConcurrentIssues > 0 {
 		used := dashboardUsedCapacity(current)
@@ -438,9 +435,10 @@ func (d *liveDashboard) renderPartsFor(current state.State, messages []string, s
 	header := fmt.Sprintf("Backlog Run Dashboard\nRepository: %s\n%s",
 		valueOr(plainStatusValue(current.Repo), "not initialized"), capacity)
 	var body strings.Builder
-	renderDashboardSection(&body, "Active Runs", active, now)
-	renderDashboardSection(&body, "Attention Required", attention, now)
-	renderDashboardSection(&body, "Recently Finished", recent, now)
+	renderDashboardSection(&body, "Active Runs", sections[statusActive], now)
+	renderDashboardSection(&body, "Attention Required", sections[statusAttention], now)
+	renderDashboardSection(&body, "Outcomes to Acknowledge", sections[statusOutcomes], now)
+	renderDashboardCompletions(&body, sections[statusCompletions], now)
 	if len(messages) > 0 {
 		body.WriteString("\nOperational messages\n")
 		for _, message := range messages {
@@ -450,29 +448,72 @@ func (d *liveDashboard) renderPartsFor(current state.State, messages []string, s
 	return header, strings.TrimPrefix(body.String(), "\n"), dashboardFooterParts(stage)
 }
 
+// observeSections applies the shared status ownership and history projection.
+// Only Activity observation remains dashboard-specific so redraws can reuse an
+// open normalized Activity stream.
 func (d *liveDashboard) observeSections(current state.State, now time.Time) map[statusSection][]statusRun {
 	leasedRuns := make(map[string]struct{}, len(current.Leases))
 	for _, lease := range current.Leases {
 		leasedRuns[lease.RunID] = struct{}{}
 	}
+	recentCompletions := selectRecentCompletions(current.Runs)
 	sections := map[statusSection][]statusRun{
-		statusActive:    {},
-		statusAttention: {},
-		statusHistory:   {},
+		statusActive: {}, statusAttention: {}, statusOutcomes: {}, statusCompletions: {},
 	}
 	for _, run := range current.Runs {
 		_, leased := leasedRuns[run.RunID]
 		section := statusSectionFor(run, leased)
 		if section == statusHistory {
-			continue
+			switch {
+			case (run.Status == scheduler.StatusFailed || run.Status == scheduler.StatusNeedsHuman) && run.AcknowledgedAt == nil:
+				section = statusOutcomes
+			case run.Status == scheduler.StatusMerged && recentCompletions[run.RunID]:
+				section = statusCompletions
+			default:
+				continue
+			}
 		}
 		observation := runObservation{run: run, process: observeFollowRun(d.source, run), observed: now}
-		if run.LogPath != "" {
+		if leased && run.LogPath != "" {
 			observation.metrics = d.observeActivity(run)
 		}
 		sections[section] = append(sections[section], statusRun{run: run, observation: observation})
 	}
+	sortDashboardActiveRuns(sections[statusActive])
+	sortStatusRuns(sections[statusAttention])
+	sortStatusRuns(sections[statusOutcomes])
+	sortDashboardCompletions(sections[statusCompletions])
 	return sections
+}
+
+func sortDashboardActiveRuns(runs []statusRun) {
+	sort.SliceStable(runs, func(i, j int) bool {
+		leftAnomaly := dashboardActiveLivenessAnomaly(runs[i])
+		rightAnomaly := dashboardActiveLivenessAnomaly(runs[j])
+		if leftAnomaly != rightAnomaly {
+			return leftAnomaly
+		}
+		left, right := runs[i].run, runs[j].run
+		if left.StartedAt.Equal(right.StartedAt) {
+			return left.RunID < right.RunID
+		}
+		return left.StartedAt.Before(right.StartedAt)
+	})
+}
+
+func dashboardActiveLivenessAnomaly(observed statusRun) bool {
+	return observed.run.Status == scheduler.StatusRunning &&
+		observed.observation.process.workerLivenessState != workerLivenessAlive
+}
+
+func sortDashboardCompletions(runs []statusRun) {
+	sort.SliceStable(runs, func(i, j int) bool {
+		left, right := completionTime(runs[i].run), completionTime(runs[j].run)
+		if left.Equal(right) {
+			return runs[i].run.RunID > runs[j].run.RunID
+		}
+		return left.After(right)
+	})
 }
 
 func (d *liveDashboard) observeActivity(run scheduler.Run) followMetrics {
@@ -487,30 +528,33 @@ func (d *liveDashboard) observeActivity(run scheduler.Run) followMetrics {
 	return cached.metrics
 }
 
-func (d *liveDashboard) recentlyFinished(current state.State, sections map[statusSection][]statusRun, now time.Time) []statusRun {
-	attention := make(map[string]struct{}, len(sections[statusAttention]))
-	for _, run := range sections[statusAttention] {
-		attention[run.run.RunID] = struct{}{}
+func renderDashboardCompletions(output *strings.Builder, runs []statusRun, now time.Time) {
+	fmt.Fprintf(output, "\nRecent Completions (%d)\n", len(runs))
+	if len(runs) == 0 {
+		output.WriteString("  none\n")
+		return
 	}
-	var recent []statusRun
-	for _, run := range current.Runs {
-		if !scheduler.IsTerminal(run.Status) {
-			continue
+	visible := min(3, len(runs))
+	for _, observed := range runs[:visible] {
+		run := observed.run
+		identity := fmt.Sprintf("#%d", run.Issue)
+		if title := plainStatusValue(run.IssueTitle); title != "" {
+			identity += "  " + title
 		}
-		if _, needsAttention := attention[run.RunID]; needsAttention {
-			continue
+		progress := summarizeRunProgress(run, followMetrics{}, now)
+		pullRequest := ""
+		if run.PullRequest != "" {
+			pullRequest = " | PR: " + plainStatusValue(run.PullRequest)
 		}
-		baseline, existed := d.baselineStatuses[run.RunID]
-		if existed && scheduler.IsTerminal(baseline) {
-			continue
+		completed := "n/a"
+		if run.CompletedAt != nil && !run.CompletedAt.IsZero() {
+			completed = displayDuration(now.Sub(*run.CompletedAt)) + " ago"
 		}
-		observation := runObservation{run: run, process: observeFollowRun(d.source, run), observed: now}
-		if run.LogPath != "" {
-			observation.metrics = d.observeActivity(run)
-		}
-		recent = append(recent, statusRun{run: run, observation: observation})
+		fmt.Fprintf(output, "  %s%s | Elapsed: %s | Completed: %s\n", identity, pullRequest, progress.elapsed, completed)
 	}
-	return recent
+	if remainder := len(runs) - visible; remainder > 0 {
+		fmt.Fprintf(output, "  %d more completions\n", remainder)
+	}
 }
 
 func renderDashboardSection(output *strings.Builder, name string, runs []statusRun, now time.Time) {

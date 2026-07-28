@@ -285,12 +285,11 @@ func (p *statusPrinter) printRunning(observed runObservation) {
 }
 
 func (p *statusPrinter) printNeedsHuman(observed runObservation) {
-	liveness := observed.process.workerLiveness
-	if liveness == "absent" {
+	if observed.process.workerLivenessState == workerLivenessAbsent {
 		p.printf("    Intervention: human judgment required; Worker not active\n")
 		return
 	}
-	p.printf("    Intervention: human judgment required; retained Worker liveness: %s\n", plainStatusValue(liveness))
+	p.printf("    Intervention: human judgment required; retained Worker liveness: %s\n", plainStatusValue(observed.process.workerLiveness))
 }
 
 func (p *statusPrinter) printBranch(run scheduler.Run) {
