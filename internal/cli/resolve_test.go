@@ -1143,6 +1143,46 @@ exec `+quote(gh)+` "$@"
 	}
 }
 
+func TestCompiledResolveRefusesCompletionAfterExpectedPullRequestCommitChanges(t *testing.T) {
+	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusWaitingForMerge, false, false, false)
+	gh := githubArtifactResolveGitHub(t, fixture)
+	counter := filepath.Join(t.TempDir(), "pull-request-inspections")
+	replacement := strings.Repeat("b", 40)
+	racingGitHub := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "pr list --repo acme/widgets --state all --head `+fixture.branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    count=0
+    if [ -f `+quote(counter)+` ]; then count=$(cat `+quote(counter)+`); fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > `+quote(counter)+`
+    if [ "$count" -eq 3 ]; then
+      temporary=`+quote(fixture.githubState)+`.tmp
+      jq --arg replacement `+quote(replacement)+` '.pr="MERGED" | .merged=true | .auto=false | .head=$replacement' `+quote(fixture.githubState)+` > "$temporary"
+      mv "$temporary" `+quote(fixture.githubState)+`
+    fi ;;
+esac
+exec `+quote(gh)+` "$@"
+`)
+
+	binary := buildExecutable(t, t.TempDir())
+	command := exec.Command(binary, githubArtifactResolveArgs(fixture, fixture.git, racingGitHub, "--yes")...)
+	output, err := command.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "expected commit identity changed") {
+		t.Fatalf("force-pushed merge error = %v\n%s", err, output)
+	}
+	current, loadErr := fixture.store.Load()
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if current.Runs[0].Status != scheduler.StatusResolvingExternally || len(current.Leases) != 1 {
+		t.Fatalf("force-pushed merge released unapproved ownership: %#v", current)
+	}
+	if strings.Contains(string(output), "Completion recorded") {
+		t.Fatalf("force-pushed merge reported Completion: %s", output)
+	}
+}
+
 func TestCompiledResolveRecordsCompletionWhenExpectedPullRequestMergesDuringDisarm(t *testing.T) {
 	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusWaitingForMerge, false, true, false)
 	gh := writeExecutable(t, `#!/bin/sh

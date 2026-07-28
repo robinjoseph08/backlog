@@ -229,7 +229,7 @@ func (e Service) Retire(ctx context.Context, approved Plan) error {
 		return err
 	}
 	if e.policy.MarkProgressBeforeMutation && len(approved.Actions) != 0 && approved.Actions[0].kind == actionMarkProgress {
-		if err := e.markProgress(); err != nil {
+		if err := e.markProgress(approved.Snapshot); err != nil {
 			return err
 		}
 		approved.Snapshot.Run.Status = e.policy.ProgressStatus
@@ -246,7 +246,7 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 	if err := e.validateMutation(plan); err != nil {
 		return err
 	}
-	if completed, err := e.completeMergedPlan(ctx, plan); completed {
+	if completed, err := e.completeMergedPlanWithContinuity(ctx, approved.Snapshot, plan); completed {
 		return err
 	}
 	if !executablePlansEqual(approved, plan) {
@@ -276,7 +276,7 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 					return err
 				}
 			}
-			if err := e.markProgress(); err != nil {
+			if err := e.markProgress(plan.Snapshot); err != nil {
 				return err
 			}
 			continue
@@ -290,7 +290,7 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return fmt.Errorf("pull request #%d is not ready for auto-merge disablement", action.pullRequest)
 			}
 			if err := e.github.DisablePullRequestAutoMerge(ctx, before.Snapshot.Repository, pull.Number); err != nil {
-				return e.reconcileMutationFailure(ctx, fmt.Errorf("disable auto-merge for pull request #%d: %w", pull.Number, err))
+				return e.reconcileMutationFailure(ctx, approved, fmt.Errorf("disable auto-merge for pull request #%d: %w", pull.Number, err))
 			}
 			after, completed, err := e.inspectMutationPostcondition(ctx, approved)
 			if err != nil || completed {
@@ -310,7 +310,7 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return fmt.Errorf("pull request #%d is not ready for the %s explanation", action.pullRequest, e.policy.Operation)
 			}
 			if err := e.github.CommentOnPullRequest(ctx, before.Snapshot.Repository, pull.Number, e.policy.Explanation(before.Snapshot.Run)); err != nil {
-				return e.reconcileMutationFailure(ctx, fmt.Errorf("%s on pull request #%d: %w", e.policy.ExplanationAction, pull.Number, err))
+				return e.reconcileMutationFailure(ctx, approved, fmt.Errorf("%s on pull request #%d: %w", e.policy.ExplanationAction, pull.Number, err))
 			}
 			after, completed, err := e.inspectMutationPostcondition(ctx, approved)
 			if err != nil || completed {
@@ -330,7 +330,7 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return fmt.Errorf("pull request #%d is not ready for safe closure", action.pullRequest)
 			}
 			if err := e.github.ClosePullRequest(ctx, before.Snapshot.Repository, pull.Number); err != nil {
-				return e.reconcileMutationFailure(ctx, fmt.Errorf("close unmerged pull request #%d: %w", pull.Number, err))
+				return e.reconcileMutationFailure(ctx, approved, fmt.Errorf("close unmerged pull request #%d: %w", pull.Number, err))
 			}
 			after, completed, err := e.inspectMutationPostcondition(ctx, approved)
 			if err != nil || completed {
@@ -400,7 +400,7 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return err
 			}
 			session := before.Snapshot.Session
-			if err := archiveSession(session, e.stateDirectory, e.filesystemSync); err != nil {
+			if err := archiveSession(before.Snapshot.Run, session, e.stateDirectory, e.filesystemSync); err != nil {
 				return err
 			}
 			after, completed, err := e.inspectMutationPostcondition(ctx, approved)
@@ -458,7 +458,7 @@ func (e Service) revalidatePlan(ctx context.Context, current, approved Plan, act
 	if err := e.validateMutation(fresh); err != nil {
 		return Plan{}, false, err
 	}
-	if completed, err := e.completeMergedPlan(ctx, fresh); completed {
+	if completed, err := e.completeMergedPlanWithContinuity(ctx, approved.Snapshot, fresh); completed {
 		return Plan{}, true, err
 	}
 	if err := e.verifyGitHubIdentityContinuity(approved.Snapshot, fresh.Snapshot); err != nil {
@@ -629,7 +629,7 @@ func deleteLocalBranch(ctx context.Context, gitExecutable, repositoryRoot string
 	return nil
 }
 
-func archiveSession(session Session, stateDirectory string, syncPath func(string) error) error {
+func archiveSession(run scheduler.Run, session Session, stateDirectory string, syncPath func(string) error) error {
 	if !session.Present || session.Archived || session.Dir == "" || session.ArchiveDir == "" {
 		return errors.New("Pi session is not ready for atomic archival")
 	}
@@ -651,8 +651,22 @@ func archiveSession(session Session, stateDirectory string, syncPath func(string
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect historical Pi session archive: %w", err)
 	}
+	if _, present, err := inspectSessionDirectory(session.Dir, run); err != nil {
+		return fmt.Errorf("active Pi session identity changed immediately before archival: %w", err)
+	} else if !present {
+		return errors.New("active Pi session disappeared immediately before archival")
+	}
 	if err := os.Rename(session.Dir, session.ArchiveDir); err != nil {
 		return fmt.Errorf("atomically archive Pi session %s: %w", session.ID, err)
+	}
+	if _, archived, err := inspectSessionDirectory(session.ArchiveDir, run); err != nil || !archived {
+		if restoreErr := os.Rename(session.ArchiveDir, session.Dir); restoreErr != nil {
+			return fmt.Errorf("verify archived Pi session identity: %v; restore active session: %w", err, restoreErr)
+		}
+		if err != nil {
+			return fmt.Errorf("refuse Pi session archival after source identity changed: %w", err)
+		}
+		return errors.New("refuse Pi session archival because the renamed source disappeared")
 	}
 	return syncArchivedSession(session, stateDirectory, syncPath)
 }
@@ -760,7 +774,7 @@ func (e Service) inspectMutationPostcondition(ctx context.Context, approved Plan
 	if err != nil {
 		return Plan{}, false, err
 	}
-	if completed, err := e.completeMergedPlan(ctx, after); completed {
+	if completed, err := e.completeMergedPlanWithContinuity(ctx, approved.Snapshot, after); completed {
 		return Plan{}, true, err
 	}
 	if err := e.verifyGitHubIdentityContinuity(approved.Snapshot, after.Snapshot); err != nil {
@@ -769,19 +783,29 @@ func (e Service) inspectMutationPostcondition(ctx context.Context, approved Plan
 	return after, false, nil
 }
 
-func (e Service) reconcileMutationFailure(ctx context.Context, mutationErr error) error {
-	if completed, completionErr := e.completeLateMerge(ctx); completed {
+func (e Service) reconcileMutationFailure(ctx context.Context, approved Plan, mutationErr error) error {
+	if completed, completionErr := e.completeLateMerge(ctx, approved); completed {
 		return completionErr
 	}
 	return mutationErr
 }
 
-func (e Service) completeLateMerge(ctx context.Context) (bool, error) {
+func (e Service) completeLateMerge(ctx context.Context, approved Plan) (bool, error) {
 	fresh, err := e.inspect(ctx)
 	if err != nil {
 		return false, nil
 	}
-	return e.completeMergedPlan(ctx, fresh)
+	return e.completeMergedPlanWithContinuity(ctx, approved.Snapshot, fresh)
+}
+
+func (e Service) completeMergedPlanWithContinuity(ctx context.Context, approved Snapshot, plan Plan) (bool, error) {
+	if !e.policy.AllowMergedCompletion || plan.TerminalState != scheduler.StatusMerged {
+		return false, nil
+	}
+	if err := e.verifyGitHubIdentityContinuity(approved, plan.Snapshot); err != nil {
+		return true, err
+	}
+	return e.completeMergedPlan(ctx, plan)
 }
 
 func (e Service) completeMergedPlan(ctx context.Context, plan Plan) (bool, error) {
@@ -794,7 +818,7 @@ func (e Service) completeMergedPlan(ctx context.Context, plan Plan) (bool, error
 	return true, e.finalizeCompletion(ctx, plan, plan.Actions[0].pullRequest)
 }
 
-func (e Service) markProgress() error {
+func (e Service) markProgress(expected Snapshot) error {
 	current, _, err := e.store.Preview()
 	if err != nil {
 		return err
@@ -802,6 +826,9 @@ func (e Service) markProgress() error {
 	run, lease, err := e.policy.SelectRun(current)
 	if err != nil {
 		return err
+	}
+	if run.RunID != expected.Run.RunID || run.Issue != expected.Run.Issue || run.Status != expected.Run.Status || lease != expected.Lease {
+		return errors.New("Run or Lease identity changed before recording retirement progress")
 	}
 	if run.Status == e.policy.TerminalStatus || run.Status == e.policy.ProgressStatus {
 		return nil
@@ -899,7 +926,10 @@ func (e Service) finalize(ctx context.Context, verified Plan) error {
 	if err != nil {
 		return err
 	}
-	if completed, err := e.completeMergedPlan(ctx, fresh); completed {
+	if completed, err := e.completeMergedPlanWithContinuity(ctx, verified.Snapshot, fresh); completed {
+		return err
+	}
+	if err := e.verifyGitHubIdentityContinuity(verified.Snapshot, fresh.Snapshot); err != nil {
 		return err
 	}
 	if !executablePlansEqual(verified, fresh) {
