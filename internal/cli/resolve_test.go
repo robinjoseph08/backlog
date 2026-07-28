@@ -47,7 +47,7 @@ func newResolveFixture(t *testing.T, labels []string, reason string) resolveFixt
 	encodedLabels, _ := json.Marshal(labels)
 	encodedReason, _ := json.Marshal(reason)
 	githubState := filepath.Join(root, "github.json")
-	if err := os.WriteFile(githubState, []byte(`{"labels":`+string(encodedLabels)+`,"reason":`+string(encodedReason)+`}`), 0o600); err != nil {
+	if err := os.WriteFile(githubState, []byte(`{"labels":`+string(encodedLabels)+`,"reason":`+string(encodedReason)+`,"state":"CLOSED","reopenAfterFirstMutation":false}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	gh := writeExecutable(t, `#!/bin/sh
@@ -57,12 +57,14 @@ case "$*" in
     printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
   "issue view 42 --repo acme/widgets --json number,url,state,labels")
     labels=$(jq -c '[.labels[] | {name:.}]' `+quote(githubState)+`)
-    printf '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","labels":%s}\n' "$labels" ;;
+    state=$(jq -r '.state' `+quote(githubState)+`)
+    printf '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"%s","labels":%s}\n' "$state" "$labels" ;;
   "issue view 42 --repo acme/widgets --json number,url,state,stateReason")
-    reason=$(jq -r '.reason' `+quote(githubState)+`)
-    printf '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","stateReason":"%s"}\n' "$reason" ;;
+    jq -c '{number:42,url:"https://github.com/acme/widgets/issues/42",state:.state,stateReason:.reason}' `+quote(githubState)+` ;;
   "issue edit 42 --repo acme/widgets --remove-label in-progress")
-    tmp=`+quote(githubState)+`.tmp; jq '.labels |= map(select(ascii_downcase != "in-progress"))' `+quote(githubState)+` > "$tmp"; mv "$tmp" `+quote(githubState)+` ;;
+    tmp=`+quote(githubState)+`.tmp
+    jq '(.labels |= map(select(ascii_downcase != "in-progress"))) | if .reopenAfterFirstMutation then .state = "OPEN" else . end' `+quote(githubState)+` > "$tmp"
+    mv "$tmp" `+quote(githubState)+` ;;
   "issue edit 42 --repo acme/widgets --remove-label ready-for-agent")
     tmp=`+quote(githubState)+`.tmp; jq '.labels |= map(select(ascii_downcase != "ready-for-agent"))' `+quote(githubState)+` > "$tmp"; mv "$tmp" `+quote(githubState)+` ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
@@ -237,6 +239,113 @@ func TestCompiledResolveFinalizesAndRerunsIdempotently(t *testing.T) {
 	_ = json.Unmarshal(data, &github)
 	if strings.Join(github.Labels, ",") != "needs-info,spec" {
 		t.Fatalf("preserved labels = %v", github.Labels)
+	}
+}
+
+func TestResolveRecordsAndReportsCompletionFromMergedExpectedPullRequest(t *testing.T) {
+	fixture := newResolveFixture(t, []string{"in-progress", "spec"}, "COMPLETED")
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := "agent/issue-42-run-42"
+	pullRequest := "https://github.com/acme/widgets/pull/9"
+	logPath := filepath.Join(fixture.stateDir, "run-42.jsonl")
+	if err := os.WriteFile(logPath, []byte("worker history\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	current.Runs[1].Status = scheduler.StatusWaitingForMerge
+	current.Runs[1].Branch = branch
+	current.Runs[1].Worktree = filepath.Join(fixture.stateDir, "worktrees", "issue-42-run-42")
+	current.Runs[1].PullRequest = pullRequest
+	current.Runs[1].LogPath = logPath
+	current.Runs[1].WorkerLogOpen = true
+	if err := fixture.store.Save(current); err != nil {
+		t.Fatal(err)
+	}
+	commit := strings.Repeat("a", 40)
+	fixture.git = writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  *" remote get-url origin") printf '%s\n' 'git@github.com:acme/widgets.git' ;;
+  *" ls-remote --exit-code --heads origin refs/heads/`+branch+`") exit 2 ;;
+  *" for-each-ref --format=%(objectname) refs/heads/`+branch+`") exit 0 ;;
+  *" worktree list --porcelain -z") exit 0 ;;
+  *) exec git "$@" ;;
+esac
+`)
+	fixture.gh = writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef")
+    printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","labels":[{"name":"in-progress"},{"name":"spec"}]}' ;;
+  "issue view 42 --repo acme/widgets --json number,url,state,stateReason")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","stateReason":"COMPLETED"}' ;;
+  "pr list --repo acme/widgets --state all --head `+branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    printf '%s\n' '[{"number":9,"url":"`+pullRequest+`","state":"MERGED","mergedAt":"2026-07-28T01:01:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"`+branch+`","headRefOid":"`+commit+`","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+
+	var stdout, stderr bytes.Buffer
+	if err := resolveCommandWithInput(context.Background(), fixture.args("run-42", "--yes"), strings.NewReader(""), false, &stdout, &stderr); err != nil {
+		t.Fatalf("resolve Completion fallback: %v, stderr=%q, stdout=%q", err, stderr.String(), stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "Completion recorded for Run run-42 from merged expected pull request "+pullRequest) || strings.Contains(stdout.String(), "External Resolution complete") {
+		t.Fatalf("Completion fallback output = %q", stdout.String())
+	}
+	persisted, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := persisted.Runs[1]
+	if run.Status != scheduler.StatusMerged || run.PullRequest != pullRequest || run.CompletedAt == nil || run.WorkerLogOpen || run.ResolvedExternallyAt != nil || run.ClosureReason != "" || len(persisted.Leases) != 0 {
+		t.Fatalf("Completion fallback state = %#v", persisted)
+	}
+	if !run.UpdatedAt.Equal(*run.CompletedAt) {
+		t.Fatalf("Completion timestamps = updated %s, completed %s", run.UpdatedAt, run.CompletedAt)
+	}
+}
+
+func TestResolveRefusesFinalizationWhenIssueReopensAfterFirstLabelMutation(t *testing.T) {
+	fixture := newResolveFixture(t, []string{"in-progress", "ready-for-agent", "spec"}, "COMPLETED")
+	data, err := os.ReadFile(fixture.githubState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = bytes.Replace(data, []byte(`"reopenAfterFirstMutation":false`), []byte(`"reopenAfterFirstMutation":true`), 1)
+	if err := os.WriteFile(fixture.githubState, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err = resolveCommandWithInput(context.Background(), fixture.args("run-42", "--yes"), strings.NewReader(""), false, &stdout, &stderr)
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "open") {
+		t.Fatalf("reopen race error = %v, stderr=%q, stdout=%q", err, stderr.String(), stdout.String())
+	}
+	if strings.Contains(stdout.String(), "External Resolution complete") || strings.Contains(stdout.String(), "Completion recorded") {
+		t.Fatalf("reopen race reported success: %q", stdout.String())
+	}
+	persisted, loadErr := fixture.store.Load()
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	run := persisted.Runs[1]
+	if run.Status != scheduler.StatusResolvingExternally || run.ResolvedExternallyAt != nil || len(persisted.Leases) != 1 || persisted.Leases[0].RunID != run.RunID {
+		t.Fatalf("reopen race state = %#v", persisted)
+	}
+	var github struct {
+		Labels []string `json:"labels"`
+		State  string   `json:"state"`
+	}
+	data, err = os.ReadFile(fixture.githubState)
+	if err != nil || json.Unmarshal(data, &github) != nil {
+		t.Fatalf("read GitHub race state: %v", err)
+	}
+	if github.State != "OPEN" || strings.Join(github.Labels, ",") != "ready-for-agent,spec" {
+		t.Fatalf("GitHub race state = %#v", github)
 	}
 }
 

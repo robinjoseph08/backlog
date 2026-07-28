@@ -16,7 +16,7 @@ func TestFileStoreMigratesV3ToV4Losslessly(t *testing.T) {
 	acknowledgedAt := time.Date(2026, 7, 28, 1, 2, 3, 0, time.UTC)
 	fixture := State{Version: 3, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 2,
 		Runs: []scheduler.Run{
-			{Issue: 1, RunID: "active", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, Branch: "agent/active", Worktree: "/worktree", LogPath: "/log", StderrPath: "/stderr", Error: "diagnostic"},
+			{Issue: 1, RunID: "active", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, Branch: "agent/active", Worktree: "/worktree", LogPath: "/log", StderrPath: "/stderr", WorkerLogOpen: true, Error: "diagnostic"},
 			{Issue: 2, RunID: "history", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint, AcknowledgedAt: &acknowledgedAt},
 		}, Leases: []scheduler.Lease{{LeaseID: "lease", Issue: 1, RunID: "active"}}}
 	path := filepath.Join(t.TempDir(), "state.json")
@@ -50,10 +50,14 @@ func TestFileStoreValidatesExternalResolutionLeaseAndMetadata(t *testing.T) {
 	if err := store.Save(State{Version: CurrentVersion, Runs: []scheduler.Run{resolved}}); err != nil {
 		t.Fatal(err)
 	}
+	resolvedWithOpenLog := resolved
+	resolvedWithOpenLog.LogPath = "/retained/worker.jsonl"
+	resolvedWithOpenLog.WorkerLogOpen = true
 	for _, value := range []State{
 		{Version: CurrentVersion, Runs: []scheduler.Run{{Issue: 1, RunID: "progress", Status: scheduler.StatusResolvingExternally, WorkerMode: scheduler.WorkerModePrint}}},
 		{Version: CurrentVersion, Runs: []scheduler.Run{resolved}, Leases: []scheduler.Lease{{LeaseID: "lease", Issue: 1, RunID: "resolved"}}},
 		{Version: CurrentVersion, Runs: []scheduler.Run{{Issue: 1, RunID: "missing", Status: scheduler.StatusResolvedExternally, WorkerMode: scheduler.WorkerModePrint}}},
+		{Version: CurrentVersion, Runs: []scheduler.Run{resolvedWithOpenLog}},
 	} {
 		if err := store.Save(value); err == nil {
 			t.Fatalf("accepted invalid state %#v", value)

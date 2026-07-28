@@ -415,7 +415,7 @@ func validate(value State, recoverUnsafeContinuation bool) error {
 			}
 		}
 		if run.Status == scheduler.StatusResolvedExternally {
-			if leased || run.ResolvedExternallyAt == nil || run.ResolvedExternallyAt.IsZero() || run.CompletedAt != nil || run.CleanupPending ||
+			if leased || run.ResolvedExternallyAt == nil || run.ResolvedExternallyAt.IsZero() || run.CompletedAt != nil || run.CleanupPending || run.WorkerLogOpen ||
 				(run.ClosureReason != "completed" && run.ClosureReason != "not-planned") {
 				return fmt.Errorf("state contains externally resolved Run %q with invalid resolution metadata", run.RunID)
 			}

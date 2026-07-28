@@ -14,6 +14,7 @@ import (
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
 	"github.com/robinjoseph08/backlog/internal/resolution"
 	"github.com/robinjoseph08/backlog/internal/retirement"
+	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 )
 
@@ -84,8 +85,9 @@ func resolveCommandWithInput(ctx context.Context, args []string, stdin io.Reader
 	if err != nil {
 		return err
 	}
+	store := state.FileStore{Path: filepath.Join(resolvedState, "state.json")}
 	module, err := retirement.New(retirement.Config{
-		Store:          state.FileStore{Path: filepath.Join(resolvedState, "state.json")},
+		Store:          store,
 		GitHub:         ghadapter.Client{Executable: *ghExecutable, Dir: repositoryRoot},
 		RepositoryRoot: repositoryRoot, CommonDirectory: commonDirectory,
 		StateDirectory: resolvedState, GitExecutable: *gitExecutable,
@@ -157,8 +159,29 @@ func resolveCommandWithInput(ctx context.Context, args []string, stdin io.Reader
 	if err := module.Retire(ctx, plan); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(stdout, "External Resolution complete for Run %s. No replacement Run was created.\n", plan.Snapshot.Run.RunID)
-	return err
+	return writeResolveOutcome(stdout, store, plan.Snapshot.Run.RunID)
+}
+
+func writeResolveOutcome(output io.Writer, store state.FileStore, runID string) error {
+	current, err := store.Load()
+	if err != nil {
+		return fmt.Errorf("read completed Resolution outcome: %w", err)
+	}
+	for _, run := range current.Runs {
+		if run.RunID != runID {
+			continue
+		}
+		switch run.Status {
+		case scheduler.StatusMerged:
+			_, err = fmt.Fprintf(output, "Completion recorded for Run %s from merged expected pull request %s. No replacement Run was created.\n", run.RunID, run.PullRequest)
+		case scheduler.StatusResolvedExternally:
+			_, err = fmt.Fprintf(output, "External Resolution complete for Run %s. No replacement Run was created.\n", run.RunID)
+		default:
+			return fmt.Errorf("Resolution for Run %s ended with unexpected status %s", run.RunID, run.Status)
+		}
+		return err
+	}
+	return fmt.Errorf("Resolution outcome for Run %s is absent", runID)
 }
 
 type resolveOutputWriter struct {
