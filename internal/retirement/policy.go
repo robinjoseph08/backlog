@@ -3,6 +3,7 @@ package retirement
 import (
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
@@ -38,12 +39,15 @@ func (p Policy) validate() error {
 		!p.statusEligible(p.ProgressStatus) || !p.statusEligible(p.TerminalStatus) {
 		return fmt.Errorf("owned Run retirement policy has incomplete lifecycle states")
 	}
+	if p.ProgressStatus == p.TerminalStatus {
+		return fmt.Errorf("owned Run retirement policy must have distinct progress and terminal states")
+	}
 	if len(p.Labels.Add) == 0 && len(p.Labels.Remove) == 0 {
 		return fmt.Errorf("owned Run retirement policy has no label outcome")
 	}
 	add := make(map[string]struct{}, len(p.Labels.Add))
 	for _, label := range p.Labels.Add {
-		normalized := strings.ToLower(label)
+		normalized := foldLabel(label)
 		if strings.TrimSpace(label) == "" {
 			return fmt.Errorf("owned Run retirement policy has an empty label to add")
 		}
@@ -54,7 +58,7 @@ func (p Policy) validate() error {
 	}
 	remove := make(map[string]struct{}, len(p.Labels.Remove))
 	for _, label := range p.Labels.Remove {
-		normalized := strings.ToLower(label)
+		normalized := foldLabel(label)
 		if strings.TrimSpace(label) == "" {
 			return fmt.Errorf("owned Run retirement policy has an empty label to remove")
 		}
@@ -81,16 +85,30 @@ func (p Policy) statusEligible(status scheduler.Status) bool {
 func (p Policy) desiredLabels(labels []string) (add, remove []string) {
 	current := normalizedLabelSet(labels)
 	for _, label := range p.Labels.Remove {
-		if current[strings.ToLower(label)] {
+		if current[foldLabel(label)] {
 			remove = append(remove, label)
 		}
 	}
 	for _, label := range p.Labels.Add {
-		if !current[strings.ToLower(label)] {
+		if !current[foldLabel(label)] {
 			add = append(add, label)
 		}
 	}
 	return add, remove
+}
+
+// foldLabel produces the canonical representative of each Unicode simple-fold
+// cycle, matching strings.EqualFold semantics without losing map lookups.
+func foldLabel(label string) string {
+	return strings.Map(func(r rune) rune {
+		canonical := r
+		for candidate := unicode.SimpleFold(r); candidate != r; candidate = unicode.SimpleFold(candidate) {
+			if candidate < canonical {
+				canonical = candidate
+			}
+		}
+		return canonical
+	}, label)
 }
 
 func (p Policy) labelsSatisfied(labels []string) bool {

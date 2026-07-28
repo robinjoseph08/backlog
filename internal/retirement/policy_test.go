@@ -42,55 +42,65 @@ func TestBuildAppliesLifecyclePolicyWithoutOwningLifecycleDecisions(t *testing.T
 	}
 }
 
-func TestServiceAppliesDistinctResumePolicy(t *testing.T) {
+func TestModuleAppliesDistinctExternalResolutionPolicy(t *testing.T) {
+	const (
+		statusResolvingExternally scheduler.Status = "resolving-externally"
+		statusResolvedExternally  scheduler.Status = "resolved-externally"
+	)
 	policy := testPolicy()
-	policy.Operation = "Resume"
-	policy.SelectRun = func(current state.State) (scheduler.Run, scheduler.Lease, error) {
-		return current.Runs[0], current.Leases[0], nil
+	policy.Operation = "External Resolution"
+	policy.EligibleStatuses = []scheduler.Status{
+		scheduler.StatusFailed, statusResolvingExternally, statusResolvedExternally,
 	}
-	policy.EligibleStatuses = []scheduler.Status{scheduler.StatusSuspended, scheduler.StatusRunning, scheduler.StatusMerged}
-	policy.Labels = LabelOutcome{Remove: []string{"ready-for-agent"}, Add: []string{"in-progress"}}
-	policy.ProgressStatus = scheduler.StatusRunning
-	policy.TerminalStatus = scheduler.StatusMerged
+	policy.Labels = LabelOutcome{Remove: []string{"ready-for-agent", "in-progress"}}
+	policy.ProgressStatus = statusResolvingExternally
+	policy.TerminalStatus = statusResolvedExternally
 
-	run := scheduler.Run{Issue: 42, RunID: "run-42", Status: scheduler.StatusSuspended}
+	run := scheduler.Run{Issue: 42, RunID: "run-42", Status: scheduler.StatusFailed}
 	lease := scheduler.Lease{LeaseID: "lease-42", Issue: 42, RunID: "run-42"}
 	snapshot := Snapshot{
 		Run: run, Lease: lease,
-		Issue: Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", Open: true, Labels: []string{"ready-for-agent"}},
+		Issue: Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", Labels: []string{"ready-for-agent", "in-progress"}},
 	}
 	plan, err := Build(policy, snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
-		"mark Run run-42 running while retaining Lease lease-42",
+		"mark Run run-42 resolving-externally while retaining Lease lease-42",
 		"remove issue label ready-for-agent from https://github.com/acme/widgets/issues/42",
-		"add issue label in-progress to https://github.com/acme/widgets/issues/42",
-		"mark Run run-42 merged and release Lease lease-42",
+		"remove issue label in-progress from https://github.com/acme/widgets/issues/42",
+		"mark Run run-42 resolved-externally and release Lease lease-42",
 	}
 	if strings.Join(plan.Actions, "\n") != strings.Join(want, "\n") {
-		t.Fatalf("Resume actions = %q, want %q", plan.Actions, want)
+		t.Fatalf("External Resolution actions = %q, want %q", plan.Actions, want)
 	}
 	var output bytes.Buffer
 	WritePlan(&output, plan)
-	if !strings.Contains(output.String(), "Resume Plan for issue #42") {
-		t.Fatalf("Resume operation missing from plan output: %q", output.String())
+	if !strings.Contains(output.String(), "External Resolution Plan for issue #42") {
+		t.Fatalf("External Resolution operation missing from plan output: %q", output.String())
 	}
 
-	store := &policyStateStore{current: state.State{Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{lease}}}
 	module, err := New(Config{
-		Store: store, RepositoryRoot: "/repo", CommonDirectory: "/repo/.git",
+		Store: &policyStateStore{}, RepositoryRoot: "/repo", CommonDirectory: "/repo/.git",
 		StateDirectory: "/state", GitExecutable: "git",
 	}, policy)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := module.(*Service).markProgress(); err != nil {
-		t.Fatal(err)
+	if err := module.Validate(plan); err != nil {
+		t.Fatalf("External Resolution plan validation: %v", err)
 	}
-	if store.saves != 1 || store.current.Runs[0].Status != scheduler.StatusRunning || store.current.Leases[0] != lease {
-		t.Fatalf("Resume progress persistence = %#v after %d saves", store.current, store.saves)
+	terminal := plan
+	terminal.Snapshot.Run.Status = statusResolvedExternally
+	terminal.Snapshot.Lease = scheduler.Lease{}
+	if err := module.Validate(terminal); err != nil {
+		t.Fatalf("External Resolution terminal validation: %v", err)
+	}
+	outsidePolicy := plan
+	outsidePolicy.Snapshot.Run.Status = scheduler.StatusResetting
+	if err := module.Validate(outsidePolicy); err == nil || !strings.Contains(err.Error(), "not eligible for External Resolution") {
+		t.Fatalf("External Resolution eligibility error = %v", err)
 	}
 }
 
@@ -102,12 +112,18 @@ func TestPolicyValidationRefusesEveryIncompletePolicyShape(t *testing.T) {
 	}{
 		{name: "core behavior", mutate: func(policy *Policy) { policy.Explanation = nil }, want: "policy is incomplete"},
 		{name: "lifecycle states", mutate: func(policy *Policy) { policy.ProgressStatus = "" }, want: "incomplete lifecycle states"},
+		{name: "equal lifecycle states", mutate: func(policy *Policy) { policy.TerminalStatus = policy.ProgressStatus }, want: "distinct progress and terminal states"},
 		{name: "label outcome", mutate: func(policy *Policy) { policy.Labels = LabelOutcome{} }, want: "no label outcome"},
 		{name: "empty add label", mutate: func(policy *Policy) { policy.Labels.Add = append(policy.Labels.Add, " ") }, want: "empty label to add"},
 		{name: "empty remove label", mutate: func(policy *Policy) { policy.Labels.Remove = append(policy.Labels.Remove, "") }, want: "empty label to remove"},
 		{name: "duplicate add label", mutate: func(policy *Policy) { policy.Labels.Add = append(policy.Labels.Add, "AVAILABLE") }, want: "duplicate label"},
+		{name: "Unicode duplicate add label", mutate: func(policy *Policy) { policy.Labels.Add = []string{"Σ", "ς"} }, want: "duplicate label"},
 		{name: "duplicate remove label", mutate: func(policy *Policy) { policy.Labels.Remove = append(policy.Labels.Remove, "OWNED") }, want: "duplicate label"},
+		{name: "Unicode duplicate remove label", mutate: func(policy *Policy) { policy.Labels.Remove = []string{"Σ", "ς"} }, want: "duplicate label"},
 		{name: "overlapping label", mutate: func(policy *Policy) { policy.Labels.Remove = append(policy.Labels.Remove, "AVAILABLE") }, want: "both add and remove"},
+		{name: "Unicode overlapping label", mutate: func(policy *Policy) {
+			policy.Labels = LabelOutcome{Add: []string{"Σ"}, Remove: []string{"ς"}}
+		}, want: "both add and remove"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

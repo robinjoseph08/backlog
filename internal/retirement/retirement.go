@@ -684,7 +684,7 @@ func syncFilesystemPath(path string) error {
 func normalizedLabelSet(labels []string) map[string]bool {
 	result := make(map[string]bool, len(labels))
 	for _, label := range labels {
-		result[strings.ToLower(label)] = true
+		result[foldLabel(label)] = true
 	}
 	return result
 }
@@ -692,10 +692,10 @@ func normalizedLabelSet(labels []string) map[string]bool {
 func verifyLabelMutation(before, after []string, added, removed string) error {
 	expected := normalizedLabelSet(before)
 	if added != "" {
-		expected[strings.ToLower(added)] = true
+		expected[foldLabel(added)] = true
 	}
 	if removed != "" {
-		delete(expected, strings.ToLower(removed))
+		delete(expected, foldLabel(removed))
 	}
 	actual := normalizedLabelSet(after)
 	if len(expected) == len(actual) {
