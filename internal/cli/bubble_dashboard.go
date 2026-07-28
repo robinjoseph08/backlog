@@ -22,6 +22,7 @@ import (
 
 const (
 	dashboardOutputUpdateLimit     = 64
+	dashboardURLOpenTimeout        = 15 * time.Second
 	dashboardURLDiagnosticTimeout  = 5 * time.Second
 	dashboardNavigationHelp        = "Nav: d:Diagnostics ↑↓/jk PgUp/Dn/f/b Home/End g/G a:Attention o:Issue p:PR Enter:Toggle"
 	dashboardCompactNavigationHelp = "N:jk/fb op a d Ent"
@@ -324,6 +325,7 @@ type bubbleDashboardModel struct {
 	interruptsWaiting int
 	pendingFlushes    []dashboardFlushMsg
 	flushAfter        func(time.Duration) <-chan time.Time
+	urlOpenInFlight   bool
 	urlDiagnostic     string
 	urlDiagnosticID   uint64
 	startup           *atomic.Bool
@@ -427,18 +429,25 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case ".":
 			m.dashboard.moveDiagnosticPage(1)
 		case "o":
-			if command := m.openSelectedURL(selection.identity, dashboardIssueResource); command != nil {
-				commands = append(commands, command)
+			if !m.urlOpenInFlight {
+				if command := m.openSelectedURL(selection.identity, dashboardIssueResource); command != nil {
+					m.urlOpenInFlight = true
+					commands = append(commands, command)
+				}
 			}
 		case "p":
-			if command := m.openSelectedURL(selection.identity, dashboardPullRequestResource); command != nil {
-				commands = append(commands, command)
+			if !m.urlOpenInFlight {
+				if command := m.openSelectedURL(selection.identity, dashboardPullRequestResource); command != nil {
+					m.urlOpenInFlight = true
+					commands = append(commands, command)
+				}
 			}
 		}
 		if msg.String() == "enter" {
 			m.toggleExpansion()
 		}
 	case dashboardOpenURLResultMsg:
+		m.urlOpenInFlight = false
 		if msg.err != nil {
 			m.urlDiagnosticID++
 			id := m.urlDiagnosticID
@@ -564,7 +573,9 @@ func (m bubbleDashboardModel) openSelectedURL(identity string, resource dashboar
 		if m.control.Terminal.OpenURL == nil {
 			return dashboardOpenURLResultMsg{resource: resource, err: errors.New("URL opener unavailable")}
 		}
-		return dashboardOpenURLResultMsg{resource: resource, err: m.control.Terminal.OpenURL(m.ctx, target)}
+		ctx, cancel := context.WithTimeout(m.ctx, dashboardURLOpenTimeout)
+		defer cancel()
+		return dashboardOpenURLResultMsg{resource: resource, err: m.control.Terminal.OpenURL(ctx, target)}
 	}
 }
 

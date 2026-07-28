@@ -81,12 +81,12 @@ func TestBubbleDashboardLinksSafeIssueIdentitiesAndPullRequests(t *testing.T) {
 			t.Fatalf("linked dashboard body missing %q:\n%q", want, body)
 		}
 	}
-	if strings.Contains(body, "\x1b]8;;javascript:") || strings.Contains(body, "PR #not-a-number") {
-		t.Fatalf("unsafe resource metadata became a hyperlink or guessed PR number:\n%q", body)
+	if strings.Contains(body, "\x1b]8;;javascript:") || strings.Contains(body, "PR #not-a-number") || strings.Contains(body, "https://attacker.test") {
+		t.Fatalf("unsafe resource metadata became a hyperlink, leaked an attacker target, or guessed a PR number:\n%q", body)
 	}
 }
 
-func TestBubbleDashboardKeyboardOpensSelectedIssueAndPullRequest(t *testing.T) {
+func TestBubbleDashboardKeyboardOpensSelectedIssueAndPullRequestAsynchronously(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	current := state.State{
 		Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1,
@@ -96,12 +96,26 @@ func TestBubbleDashboardKeyboardOpensSelectedIssueAndPullRequest(t *testing.T) {
 		}},
 		Leases: []scheduler.Lease{{LeaseID: "current", Issue: 12, RunID: "current"}},
 	}
-	opened := make(chan string, 2)
+	type openInvocation struct {
+		target   string
+		deadline time.Time
+	}
+	opened := make(chan openInvocation, 1)
+	release := make(chan struct{})
 	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{
 		Now: func() time.Time { return now },
-		OpenURL: func(_ context.Context, target string) error {
-			opened <- target
-			return nil
+		OpenURL: func(ctx context.Context, target string) error {
+			deadline, hasDeadline := ctx.Deadline()
+			if !hasDeadline {
+				return errors.New("opener context has no deadline")
+			}
+			opened <- openInvocation{target: target, deadline: deadline}
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		},
 	}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 16})
 	updated, _ := model.Update(dashboardConfiguredMsg{initial: current, source: &dashboardTestSource{current: current}})
@@ -123,18 +137,62 @@ func TestBubbleDashboardKeyboardOpensSelectedIssueAndPullRequest(t *testing.T) {
 		{key: 'o', want: "https://github.com/acme/widgets/issues/12"},
 		{key: 'p', want: "https://github.com/acme/widgets/pull/112"},
 	} {
-		updated, command := model.Update(tea.KeyPressMsg(tea.Key{Code: test.key, Text: string(test.key)}))
+		key := tea.KeyPressMsg(tea.Key{Code: test.key, Text: string(test.key)})
+		updated, command := model.Update(key)
 		model = updated.(bubbleDashboardModel)
 		if command == nil {
 			t.Fatalf("%c did not return an asynchronous opener command", test.key)
 		}
-		result := command()
-		if message, ok := result.(dashboardOpenURLResultMsg); !ok || message.err != nil {
-			t.Fatalf("%c opener result = %#v", test.key, result)
+		select {
+		case invocation := <-opened:
+			t.Fatalf("%c invoked opener inside Update: %#v", test.key, invocation)
+		default:
 		}
-		if got := <-opened; got != test.want {
-			t.Fatalf("%c opened %q, want %q", test.key, got, test.want)
+
+		result := make(chan tea.Msg, 1)
+		go func() { result <- command() }()
+		var invocation openInvocation
+		select {
+		case invocation = <-opened:
+		case <-time.After(time.Second):
+			t.Fatalf("%c asynchronous opener did not start", test.key)
 		}
+		if invocation.target != test.want {
+			t.Fatalf("%c opened %q, want %q", test.key, invocation.target, test.want)
+		}
+		remaining := time.Until(invocation.deadline)
+		if remaining <= 0 || remaining > dashboardURLOpenTimeout {
+			t.Fatalf("%c opener deadline remaining = %s, want within (0, %s]", test.key, remaining, dashboardURLOpenTimeout)
+		}
+		updated, repeated := model.Update(key)
+		model = updated.(bubbleDashboardModel)
+		if repeated != nil {
+			t.Fatalf("%c key repeat started another opener while one was in flight", test.key)
+		}
+
+		release <- struct{}{}
+		var message tea.Msg
+		select {
+		case message = <-result:
+		case <-time.After(time.Second):
+			t.Fatalf("%c asynchronous opener did not finish", test.key)
+		}
+		openResult, ok := message.(dashboardOpenURLResultMsg)
+		if !ok || openResult.err != nil {
+			t.Fatalf("%c opener result = %#v", test.key, message)
+		}
+		updated, _ = model.Update(openResult)
+		model = updated.(bubbleDashboardModel)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	model.ctx = ctx
+	updated, command := model.Update(tea.KeyPressMsg(tea.Key{Code: 'o', Text: "o"}))
+	model = updated.(bubbleDashboardModel)
+	cancel()
+	result := command().(dashboardOpenURLResultMsg)
+	if !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("canceled opener result = %#v, want context cancellation", result)
 	}
 }
 
