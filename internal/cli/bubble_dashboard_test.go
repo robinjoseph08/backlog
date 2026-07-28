@@ -655,6 +655,7 @@ func TestBubbleDashboardConstrainedFallbackKeepsGuidanceInFixedFooter(t *testing
 	chrome := dashboardChromeLines(
 		[]string{"Repository: acme/widgets", "Worker capacity: 1 used | 2 available | 3 total"},
 		footer,
+		dashboardRunning,
 		120,
 		2,
 	)

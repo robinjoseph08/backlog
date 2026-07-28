@@ -299,6 +299,7 @@ type bubbleDashboardModel struct {
 	header       string
 	footer       string
 	layout       dashboardBodyLayout
+	stage        dashboardStage
 	colorProfile TerminalColorProfile
 	styler       dashboardStyler
 
@@ -325,7 +326,7 @@ func newBubbleDashboardModel(ctx context.Context, control PresentationControl, s
 		dashboard: newLiveDashboard(io.Discard, nil, empty, control.Terminal.Now),
 		viewport:  view, width: dimensions.Width, height: dimensions.Height,
 		attentionKnown: make(map[string]struct{}), attentionPending: make(map[string]struct{}),
-		colorProfile: profile, styler: newDashboardStyler(profile, true), startup: &atomic.Bool{},
+		colorProfile: profile, startup: &atomic.Bool{},
 	}
 	model.refreshViewport(dashboardSelection{})
 	model.selectViewportAnchor()
@@ -491,10 +492,11 @@ type dashboardSelection struct {
 }
 
 func (m *bubbleDashboardModel) refreshViewport(selection dashboardSelection) {
-	header, layout, footer := m.dashboard.renderPartsWithLayout(m.dashboard.now())
+	header, layout, footer, stage := m.dashboard.renderPartsWithLayout(m.dashboard.now(), m.styler)
 	m.header = dashboardHeaderWithAttention(header, len(m.attentionPending))
 	m.footer = footer + "\n" + dashboardNavigationHelp
 	m.layout = layout
+	m.stage = stage
 	m.resizeViewport()
 	m.viewport.SetContent(layout.text)
 	if selection.valid {
@@ -682,15 +684,13 @@ func (m bubbleDashboardModel) View() tea.View {
 		lines = append(lines, lipgloss.NewStyle().Bold(true).Render(title))
 	}
 	for _, line := range frame.chrome.top {
-		lines = append(lines, m.styler.chrome(line))
+		lines = append(lines, m.styler.render(frame.chrome.topSemantic, line))
 	}
 	if frame.bodyHeight > 0 {
-		view := m.viewport
-		view.SetContent(m.styler.body(m.layout.text))
-		lines = append(lines, strings.Split(view.View(), "\n")...)
+		lines = append(lines, strings.Split(m.viewport.View(), "\n")...)
 	}
 	for _, line := range frame.chrome.bottom {
-		lines = append(lines, m.styler.chrome(line))
+		lines = append(lines, m.styler.render(frame.chrome.bottomSemantic, line))
 	}
 	for index := range lines {
 		lines[index] = fitDashboardLine(lines[index], m.width)
@@ -711,7 +711,7 @@ type dashboardFrame struct {
 
 func (m bubbleDashboardModel) dashboardFrame() dashboardFrame {
 	headerLines := strings.SplitN(m.header, "\n", 3)
-	chrome := dashboardChromeLines(headerLines[1:], strings.Split(m.footer, "\n"), m.width, m.height)
+	chrome := dashboardChromeLines(headerLines[1:], strings.Split(m.footer, "\n"), m.stage, m.width, m.height)
 	chromeHeight := len(chrome.top) + len(chrome.bottom)
 	titleHeight := 0
 	if chromeHeight+1 < m.height {
@@ -727,11 +727,13 @@ func (m bubbleDashboardModel) dashboardFrame() dashboardFrame {
 }
 
 type dashboardChrome struct {
-	top    []string
-	bottom []string
+	top            []string
+	bottom         []string
+	topSemantic    dashboardSemantic
+	bottomSemantic dashboardSemantic
 }
 
-func dashboardChromeLines(header, footer []string, width, height int) dashboardChrome {
+func dashboardChromeLines(header, footer []string, stage dashboardStage, width, height int) dashboardChrome {
 	if width <= 0 || height <= 0 {
 		return dashboardChrome{}
 	}
@@ -747,15 +749,16 @@ func dashboardChromeLines(header, footer []string, width, height int) dashboardC
 	}
 	compactHeader := compactDashboardHeader(header)
 	compactFooter := compactDashboardFooter(footer)
+	stageSemantic := dashboardStageSemantic(stage)
 	candidates := []dashboardChrome{
-		{top: wrapDashboardChrome(headerGroups, width), bottom: wrapDashboardChrome(footerGroups, width)},
-		{top: wrapDashboardChrome(headerGroups, width), bottom: wrapDashboardChrome(dashboardChromeGroups(compactNavigation), width)},
-		{top: wrapDashboardChrome([][]string{header}, width), bottom: wrapDashboardChrome([][]string{footer}, width)},
-		{top: wrapDashboardChrome([][]string{compactHeader}, width), bottom: wrapDashboardChrome([][]string{compactFooter}, width)},
+		{top: wrapDashboardChrome(headerGroups, width), bottom: wrapDashboardChrome(footerGroups, width), topSemantic: dashboardSemanticMetadata, bottomSemantic: stageSemantic},
+		{top: wrapDashboardChrome(headerGroups, width), bottom: wrapDashboardChrome(dashboardChromeGroups(compactNavigation), width), topSemantic: dashboardSemanticMetadata, bottomSemantic: stageSemantic},
+		{top: wrapDashboardChrome([][]string{header}, width), bottom: wrapDashboardChrome([][]string{footer}, width), topSemantic: dashboardSemanticMetadata, bottomSemantic: stageSemantic},
+		{top: wrapDashboardChrome([][]string{compactHeader}, width), bottom: wrapDashboardChrome([][]string{compactFooter}, width), topSemantic: dashboardSemanticMetadata, bottomSemantic: stageSemantic},
 		// A one-line terminal cannot have distinct header and footer rows. Keep
 		// the whole compact chrome in the footer row so lifecycle guidance and
 		// navigation are never moved above the scrollable body.
-		{bottom: wrapDashboardChrome([][]string{append(append([]string(nil), compactHeader...), compactFooter...)}, width)},
+		{bottom: wrapDashboardChrome([][]string{append(append([]string(nil), compactHeader...), compactFooter...)}, width), bottomSemantic: stageSemantic},
 	}
 	for _, candidate := range candidates {
 		if len(candidate.top)+len(candidate.bottom) <= chromeLimit {
@@ -780,9 +783,9 @@ func dashboardChromeLines(header, footer []string, width, height int) dashboardC
 		if len(top) > remaining {
 			top = top[:remaining]
 		}
-		return dashboardChrome{top: top, bottom: bottom}
+		return dashboardChrome{top: top, bottom: bottom, topSemantic: stageSemantic, bottomSemantic: stageSemantic}
 	}
-	return dashboardChrome{bottom: bottom}
+	return dashboardChrome{bottom: bottom, bottomSemantic: stageSemantic}
 }
 
 func dashboardChromeGroups(lines []string) [][]string {

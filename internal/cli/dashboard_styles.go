@@ -2,9 +2,9 @@ package cli
 
 import (
 	"image/color"
-	"strings"
 
 	"charm.land/lipgloss/v2"
+	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
 
 type dashboardStyler struct {
@@ -53,147 +53,94 @@ func newDashboardStyler(profile TerminalColorProfile, darkBackground bool) dashb
 	}
 }
 
-func (s dashboardStyler) body(content string) string {
-	if !s.enabled || content == "" {
-		return content
+type dashboardSemantic uint8
+
+const (
+	dashboardSemanticNone dashboardSemantic = iota
+	dashboardSemanticMetadata
+	dashboardSemanticActive
+	dashboardSemanticCompletion
+	dashboardSemanticWarning
+	dashboardSemanticAttention
+)
+
+func (s dashboardStyler) render(semantic dashboardSemantic, text string) string {
+	if !s.enabled || text == "" {
+		return text
 	}
-	lines := strings.Split(content, "\n")
-	section := ""
-	for index, line := range lines {
-		switch {
-		case strings.HasPrefix(line, "Active Runs ("):
-			section = "active"
-			lines[index] = s.active.Render(line)
-		case strings.HasPrefix(line, "Attention Required ("):
-			section = "attention"
-			lines[index] = s.attention.Render(line)
-		case strings.HasPrefix(line, "Outcomes to Acknowledge ("):
-			section = "attention"
-			lines[index] = s.attention.Render(line)
-		case strings.HasPrefix(line, "Recent Completions ("):
-			section = "completion"
-			lines[index] = s.completion.Render(line)
-		case line == "Operational messages":
-			section = "messages"
-			lines[index] = s.metadata.Render(line)
-		case strings.HasPrefix(line, "  #"):
-			lines[index] = s.styleRunIdentity(lines, index, section)
-		case strings.HasPrefix(line, "    State: "):
-			lines[index] = s.styleStateLine(line, section)
-		case strings.HasPrefix(line, "    Diagnostic: "):
-			lines[index] = s.attention.Render(line)
-		case strings.HasPrefix(line, "  ") && section == "messages":
-			lines[index] = s.styleOperationalMessage(line)
-		case strings.HasPrefix(line, "    "), strings.HasPrefix(line, "  none"):
-			lines[index] = s.metadata.Render(line)
-		}
+	switch semantic {
+	case dashboardSemanticMetadata:
+		return s.metadata.Render(text)
+	case dashboardSemanticActive:
+		return s.active.Render(text)
+	case dashboardSemanticCompletion:
+		return s.completion.Render(text)
+	case dashboardSemanticWarning:
+		return s.warning.Render(text)
+	case dashboardSemanticAttention:
+		return s.attention.Render(text)
+	default:
+		return text
 	}
-	return strings.Join(lines, "\n")
 }
 
-func (s dashboardStyler) styleRunIdentity(lines []string, index int, section string) string {
-	line := lines[index]
+func dashboardSectionSemantic(section statusSection) dashboardSemantic {
 	switch section {
-	case "attention":
-		return s.attention.Render(line)
-	case "completion":
-		identity, metadata, found := strings.Cut(line, " | ")
-		if !found {
-			return s.completion.Render(line)
-		}
-		return s.completion.Render(identity) + s.metadata.Render(" | "+metadata)
-	case "active":
-		style := s.active
-		for next := index + 1; next < len(lines) && !strings.HasPrefix(lines[next], "  #") && !dashboardSectionHeading(lines[next]); next++ {
-			if activeRunIsWarning(lines[next]) {
-				style = s.warning
-				break
-			}
-		}
-		return style.Render(line)
+	case statusActive:
+		return dashboardSemanticActive
+	case statusAttention, statusOutcomes:
+		return dashboardSemanticAttention
+	case statusCompletions:
+		return dashboardSemanticCompletion
 	default:
-		return line
+		return dashboardSemanticNone
 	}
 }
 
-func dashboardSectionHeading(line string) bool {
-	return strings.HasPrefix(line, "Active Runs (") || strings.HasPrefix(line, "Attention Required (") ||
-		strings.HasPrefix(line, "Outcomes to Acknowledge (") || strings.HasPrefix(line, "Recent Completions (") ||
-		line == "Operational messages"
-}
-
-func activeRunIsWarning(line string) bool {
-	if strings.HasPrefix(line, "    State: ") {
-		state := strings.TrimPrefix(strings.SplitN(line, " | ", 2)[0], "    State: ")
-		switch state {
-		case "waiting-for-merge", "suspended", "suspending", "resetting":
-			return true
-		case "running":
-			return strings.Contains(line, "Worker liveness: absent") || strings.Contains(line, "Worker liveness: dead") || strings.Contains(line, "Worker liveness: unknown")
+// dashboardRunSemantic is the single typed classification used for both a
+// Run's identity and its displayed lifecycle state.
+func dashboardRunSemantic(observed statusRun, section statusSection) dashboardSemantic {
+	if semantic := dashboardSectionSemantic(section); semantic != dashboardSemanticActive {
+		return semantic
+	}
+	run := observed.run
+	if displayedRunIsSuspending(run, observed.observation.process) {
+		return dashboardSemanticWarning
+	}
+	switch run.Status {
+	case scheduler.StatusWaitingForMerge, scheduler.StatusSuspended, scheduler.StatusResetting:
+		return dashboardSemanticWarning
+	case scheduler.StatusRunning:
+		if observed.observation.process.workerLivenessState != workerLivenessAlive {
+			return dashboardSemanticWarning
 		}
 	}
-	return false
+	return dashboardSemanticActive
 }
 
-func (s dashboardStyler) styleOperationalMessage(line string) string {
-	switch {
-	case strings.Contains(line, "Force stop:"):
-		return s.attention.Render(line)
-	case strings.Contains(line, "Drain complete:"):
-		return s.completion.Render(line)
-	case strings.Contains(line, "candidate discovery recovered; admission resumed"):
-		return s.active.Render(line)
-	case strings.Contains(line, "candidate discovery failed; admission paused"), strings.Contains(line, "Drain:"), strings.Contains(line, "Suspension:"):
-		return s.warning.Render(line)
+func dashboardLivenessSemantic(observed statusRun) dashboardSemantic {
+	switch observed.observation.process.workerLivenessState {
+	case workerLivenessDead, workerLivenessUnknown:
+		return dashboardSemanticWarning
+	case workerLivenessAbsent:
+		if observed.run.Status == scheduler.StatusRunning {
+			return dashboardSemanticWarning
+		}
+	}
+	return dashboardSemanticMetadata
+}
+
+func dashboardStageSemantic(stage dashboardStage) dashboardSemantic {
+	switch stage {
+	case dashboardRunning:
+		return dashboardSemanticActive
+	case dashboardDraining, dashboardSuspending, dashboardSuspensionComplete, dashboardStopped:
+		return dashboardSemanticWarning
+	case dashboardForceStopping, dashboardDrainIncomplete:
+		return dashboardSemanticAttention
+	case dashboardDrainComplete, dashboardFinished:
+		return dashboardSemanticCompletion
 	default:
-		return s.metadata.Render(line)
-	}
-}
-
-func (s dashboardStyler) styleStateLine(line, section string) string {
-	parts := strings.Split(line, " | ")
-	state := strings.TrimPrefix(parts[0], "    State: ")
-	stateStyle := s.active
-	if section == "attention" {
-		stateStyle = s.attention
-	} else {
-		switch state {
-		case "waiting-for-merge", "suspended", "suspending", "resetting":
-			stateStyle = s.warning
-		case "merged":
-			stateStyle = s.completion
-		case "failed", "needs-human":
-			stateStyle = s.attention
-		}
-	}
-	parts[0] = stateStyle.Render(parts[0])
-	for index := 1; index < len(parts); index++ {
-		style := s.metadata
-		if strings.HasPrefix(parts[index], "Worker liveness: dead") || strings.HasPrefix(parts[index], "Worker liveness: unknown") ||
-			(state == "running" && strings.HasPrefix(parts[index], "Worker liveness: absent")) {
-			style = s.warning
-		}
-		parts[index] = style.Render(parts[index])
-	}
-	return strings.Join(parts, s.metadata.Render(" | "))
-}
-
-func (s dashboardStyler) chrome(line string) string {
-	if !s.enabled || line == "" {
-		return line
-	}
-	switch {
-	case strings.Contains(line, "Force stopping"), strings.Contains(line, "Drain incomplete"), strings.Contains(line, "S:Force stopping"), strings.Contains(line, "S:Drain incomplete"):
-		return s.attention.Render(line)
-	case strings.Contains(line, "Suspending"), strings.Contains(line, "Draining"), strings.Contains(line, "Suspension finished"), strings.Contains(line, "Stopped;"), strings.Contains(line, "S:Suspending"), strings.Contains(line, "S:Draining"), strings.Contains(line, "S:Suspension finished"), strings.Contains(line, "S:Stopped;"):
-		return s.warning.Render(line)
-	case strings.Contains(line, "Drain complete"), strings.Contains(line, "Complete;"), strings.Contains(line, "S:Drain complete"), strings.Contains(line, "S:Complete;"):
-		return s.completion.Render(line)
-	case strings.Contains(line, "Runner stage: Running"), strings.Contains(line, "S:Running"):
-		return s.active.Render(line)
-	case strings.HasPrefix(line, "Repository: "), strings.HasPrefix(line, "Worker capacity: "), strings.HasPrefix(line, "R:"), strings.HasPrefix(line, "W:"):
-		return s.metadata.Render(line)
-	default:
-		return line
+		return dashboardSemanticNone
 	}
 }

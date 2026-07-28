@@ -10,47 +10,46 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/robinjoseph08/backlog/internal/runner"
+	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
 
-func TestDashboardStylingPairsSemanticColorsWithLabels(t *testing.T) {
+func TestDashboardStylingUsesTypedRunSemanticsWithoutChangingLabels(t *testing.T) {
 	styler := newDashboardStyler(TerminalColorTrueColor, true)
-	plain := "Active Runs (4)\n" +
-		"  #1  Active work\n" +
-		"    State: running | Elapsed: 1m0s | Worker liveness: alive (PID 1 and process-start identity verified)\n" +
-		"  #6  Degraded work\n" +
-		"    State: running | Elapsed: 1m0s | Worker liveness: unknown (PID liveness could not be verified)\n" +
-		"  #2  Waiting work\n" +
-		"    State: waiting-for-merge | Elapsed: 2m0s | Worker liveness: absent\n" +
-		"  #3  Suspended work\n" +
-		"    State: suspended | Elapsed: 3m0s | Worker liveness: absent\n" +
-		"Attention Required (1)\n" +
-		"  #4  Fatal work\n" +
-		"    State: needs-human | Elapsed: 4m0s | Worker liveness: dead (recorded PID 4 is absent)\n" +
-		"    Diagnostic: Worker exited without a verified outcome\n" +
-		"Recent Completions (1)\n" +
-		"  #5  Completed work | PR: https://example.test/5 | Elapsed: 5m0s | Completed: 1m0s ago\n" +
-		"Operational messages\n" +
-		"  candidate discovery failed; admission paused\n" +
-		"  Force stop: additional signal accepted"
+	now := time.Date(2026, 7, 27, 20, 0, 0, 0, time.UTC)
+	active := []statusRun{
+		{run: scheduler.Run{Issue: 1, IssueTitle: "Active work", Status: scheduler.StatusRunning, StartedAt: now.Add(-time.Minute)}, observation: runObservation{process: followObservation{workerLiveness: "healthy presentation", workerLivenessState: workerLivenessAlive}}},
+		{run: scheduler.Run{Issue: 6, IssueTitle: "Degraded work", Status: scheduler.StatusRunning, StartedAt: now.Add(-time.Minute)}, observation: runObservation{process: followObservation{workerLiveness: "wording that does not identify a warning", workerLivenessState: workerLivenessUnknown}}},
+		{run: scheduler.Run{Issue: 2, IssueTitle: "Waiting work", Status: scheduler.StatusWaitingForMerge, StartedAt: now.Add(-2 * time.Minute)}, observation: runObservation{process: followObservation{workerLiveness: "absent", workerLivenessState: workerLivenessAbsent}}},
+		{run: scheduler.Run{Issue: 3, IssueTitle: "Suspended work", Status: scheduler.StatusSuspended, StartedAt: now.Add(-3 * time.Minute)}, observation: runObservation{process: followObservation{workerLiveness: "absent", workerLivenessState: workerLivenessAbsent}}},
+	}
+	attention := []statusRun{{run: scheduler.Run{Issue: 4, IssueTitle: "Fatal work", Status: scheduler.StatusNeedsHuman, Error: "Worker exited without a verified outcome", StartedAt: now.Add(-4 * time.Minute)}, observation: runObservation{process: followObservation{workerLiveness: "different dead wording", workerLivenessState: workerLivenessDead}}}}
+	completedAt := now.Add(-time.Minute)
+	completions := []statusRun{{run: scheduler.Run{Issue: 5, IssueTitle: "Completed work", Status: scheduler.StatusMerged, PullRequest: "https://example.test/5", StartedAt: now.Add(-5 * time.Minute), CompletedAt: &completedAt}}}
 
-	got := styler.body(plain)
-	if stripped := ansi.Strip(got); stripped != plain {
+	var styled, plain strings.Builder
+	renderDashboardSection(&styled, statusActive, "Active Runs", active, now, styler)
+	renderDashboardSection(&styled, statusAttention, "Attention Required", attention, now, styler)
+	renderDashboardCompletions(&styled, completions, now, styler)
+	renderDashboardSection(&plain, statusActive, "Active Runs", active, now, dashboardStyler{})
+	renderDashboardSection(&plain, statusAttention, "Attention Required", attention, now, dashboardStyler{})
+	renderDashboardCompletions(&plain, completions, now, dashboardStyler{})
+	got := styled.String()
+	if stripped := ansi.Strip(got); stripped != plain.String() {
 		t.Fatalf("styling changed semantic labels:\n%s", stripped)
 	}
 	for _, want := range []string{
 		styler.active.Render("  #1  Active work"),
 		styler.active.Render("    State: running"),
 		styler.warning.Render("  #6  Degraded work"),
-		styler.warning.Render("Worker liveness: unknown (PID liveness could not be verified)"),
+		styler.warning.Render("Worker liveness: wording that does not identify a warning"),
 		styler.warning.Render("  #2  Waiting work"),
 		styler.warning.Render("    State: waiting-for-merge"),
 		styler.warning.Render("  #3  Suspended work"),
 		styler.attention.Render("Attention Required (1)"),
 		styler.attention.Render("    Diagnostic: Worker exited without a verified outcome"),
 		styler.completion.Render("  #5  Completed work"),
-		styler.metadata.Render("Elapsed: 1m0s"),
-		styler.warning.Render("  candidate discovery failed; admission paused"),
-		styler.attention.Render("  Force stop: additional signal accepted"),
+		styler.metadata.Render(" | Elapsed: 1m0s | "),
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("styled dashboard omitted semantic span %q:\n%q", ansi.Strip(want), got)
@@ -73,7 +72,7 @@ func TestDashboardPaletteAdaptsToBackgroundAndReducedProfiles(t *testing.T) {
 				t.Fatalf("profile %d metadata foreground was not visually muted from semantic state", profile)
 			}
 		}
-		got := dark.body("Active Runs (0)\n  none")
+		got := dark.render(dashboardSemanticActive, "Active Runs (0)") + "\n" + dark.render(dashboardSemanticMetadata, "  none")
 		if ansi.Strip(got) != "Active Runs (0)\n  none" || !strings.Contains(got, "\x1b[") {
 			t.Fatalf("profile %d did not preserve readable text while styling: %q", profile, got)
 		}
@@ -86,21 +85,43 @@ func TestDashboardPaletteAdaptsToBackgroundAndReducedProfiles(t *testing.T) {
 	}
 }
 
-func TestDashboardChromeUsesSemanticStylesWithoutRemovingNavigation(t *testing.T) {
+func TestDashboardChromeUsesTypedStageStylesWithoutRemovingNavigation(t *testing.T) {
 	styler := newDashboardStyler(TerminalColorTrueColor, true)
 	for _, test := range []struct {
+		stage dashboardStage
 		line  string
 		style lipgloss.Style
 	}{
-		{line: "Runner stage: Running | Next Ctrl-C: start Drain", style: styler.active},
-		{line: "Runner stage: Draining | Next Ctrl-C: suspend", style: styler.warning},
-		{line: "Runner stage: Drain complete | Next Ctrl-C: no effect", style: styler.completion},
-		{line: "Runner stage: Force stopping | Next Ctrl-C: repeat", style: styler.attention},
-		{line: "Repository: acme/widgets | Worker capacity: 1 used", style: styler.metadata},
+		{stage: dashboardRunning, line: "changed running presentation | changed navigation", style: styler.active},
+		{stage: dashboardDraining, line: "changed draining presentation | changed navigation", style: styler.warning},
+		{stage: dashboardDrainComplete, line: "changed completion presentation | changed navigation", style: styler.completion},
+		{stage: dashboardForceStopping, line: "changed fatal presentation | changed navigation", style: styler.attention},
 	} {
-		got := styler.chrome(test.line)
+		got := styler.render(dashboardStageSemantic(test.stage), test.line)
 		if ansi.Strip(got) != test.line || got != test.style.Render(test.line) {
 			t.Fatalf("styled chrome = %q, want labeled %q", got, test.line)
+		}
+	}
+}
+
+func TestDashboardOperationalMessagesUseTypedEventSemantics(t *testing.T) {
+	styler := newDashboardStyler(TerminalColorTrueColor, true)
+	for _, test := range []struct {
+		event    runner.OperationalEvent
+		semantic dashboardSemantic
+		style    lipgloss.Style
+	}{
+		{event: runner.CandidateDiscoveryFailed{}, semantic: dashboardSemanticWarning, style: styler.warning},
+		{event: runner.CandidateDiscoveryRecovered{}, semantic: dashboardSemanticActive, style: styler.active},
+		{event: runner.ShutdownEvent{Stage: runner.ShutdownStageForceStopping, Message: "presentation wording changed"}, semantic: dashboardSemanticAttention, style: styler.attention},
+		{event: runner.ShutdownEvent{Stage: runner.ShutdownStageDrainComplete, Message: "presentation wording changed"}, semantic: dashboardSemanticCompletion, style: styler.completion},
+	} {
+		if got := dashboardOperationalEventSemantic(test.event); got != test.semantic {
+			t.Fatalf("typed event semantic = %d, want %d", got, test.semantic)
+		}
+		line := "presentation wording changed"
+		if got := styler.render(dashboardOperationalEventSemantic(test.event), line); got != test.style.Render(line) {
+			t.Fatalf("typed event style = %q, want %q", got, test.style.Render(line))
 		}
 	}
 }
@@ -109,28 +130,33 @@ func TestDashboardStylingDisablesColorsForNoColorProfile(t *testing.T) {
 	styler := newDashboardStyler(TerminalColorNone, true)
 	plainBody := "Active Runs (1)\n  #1  Active work\n    State: running | Elapsed: 1s | Worker liveness: alive"
 	plainChrome := "Runner stage: Running | Next Ctrl-C: start Drain and stop Admission"
-	if got := styler.body(plainBody); got != plainBody || strings.Contains(got, "\x1b[") {
+	if got := styler.render(dashboardSemanticActive, plainBody); got != plainBody || strings.Contains(got, "\x1b[") {
 		t.Fatalf("colorless body changed: %q", got)
 	}
-	if got := styler.chrome(plainChrome); got != plainChrome || strings.Contains(got, "\x1b[") {
+	if got := styler.render(dashboardStageSemantic(dashboardRunning), plainChrome); got != plainChrome || strings.Contains(got, "\x1b[") {
 		t.Fatalf("colorless navigation changed: %q", got)
 	}
 }
 
-func TestBubbleDashboardAdaptsPaletteFromTerminalBackgroundResponse(t *testing.T) {
+func TestBubbleDashboardUsesReadableFallbackUntilBackgroundResponse(t *testing.T) {
 	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{
 		Now: time.Now, ColorProfile: func() TerminalColorProfile { return TerminalColorTrueColor },
 	}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 12})
-	darkActive := model.styler.active.GetForeground()
+	if model.styler.enabled || strings.Contains(model.styler.render(dashboardSemanticActive, "Active"), "\x1b[") {
+		t.Fatal("dashboard applied a background-specific palette before the terminal background response")
+	}
+
 	updated, _ := model.Update(tea.BackgroundColorMsg{Color: color.White})
 	model = updated.(bubbleDashboardModel)
-	if sameColor(darkActive, model.styler.active.GetForeground()) {
-		t.Fatal("light terminal background response did not adapt the dashboard palette")
+	light := newDashboardStyler(TerminalColorTrueColor, false)
+	if !model.styler.enabled || !sameColor(light.active.GetForeground(), model.styler.active.GetForeground()) {
+		t.Fatal("light terminal background response did not apply the light palette")
 	}
 	updated, _ = model.Update(tea.BackgroundColorMsg{Color: color.Black})
 	model = updated.(bubbleDashboardModel)
-	if !sameColor(darkActive, model.styler.active.GetForeground()) {
-		t.Fatal("dark terminal background response did not restore the dark palette")
+	dark := newDashboardStyler(TerminalColorTrueColor, true)
+	if !sameColor(dark.active.GetForeground(), model.styler.active.GetForeground()) {
+		t.Fatal("dark terminal background response did not apply the dark palette")
 	}
 }
 

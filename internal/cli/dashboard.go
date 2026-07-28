@@ -66,6 +66,7 @@ type liveDashboard struct {
 
 type dashboardMessage struct {
 	text         string
+	semantic     dashboardSemantic
 	shutdown     bool
 	plainMatched bool
 }
@@ -283,45 +284,28 @@ func normalizedDashboardMessage(message string) string {
 	return plainStatusValue(strings.TrimSpace(message))
 }
 
-func dashboardMessageTexts(messages []dashboardMessage) []string {
-	texts := make([]string, len(messages))
-	for index, message := range messages {
-		texts[index] = message.text
-	}
-	return texts
+func cloneDashboardMessages(messages []dashboardMessage) []dashboardMessage {
+	return append([]dashboardMessage(nil), messages...)
 }
 
 // operationalEvent receives lifecycle state directly from the Runner. Message
-// formatting remains independent, so presentation never infers shutdown stage
-// from append-only prose.
+// formatting remains independent, so presentation never infers semantics from
+// append-only prose.
 func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
-	shutdown, ok := event.(runner.ShutdownEvent)
-	if !ok {
+	message := normalizedDashboardMessage(runner.FormatOperationalEvent(event))
+	semantic := dashboardOperationalEventSemantic(event)
+	next, hasNext := dashboardStageForOperationalEvent(event)
+	if message == "" && !hasNext {
 		return
 	}
-	var next dashboardStage
-	switch shutdown.Stage {
-	case runner.ShutdownStageDraining:
-		next = dashboardDraining
-	case runner.ShutdownStageSuspending:
-		next = dashboardSuspending
-	case runner.ShutdownStageForceStopping:
-		next = dashboardForceStopping
-	case runner.ShutdownStageDrainComplete:
-		next = dashboardDrainComplete
-	case runner.ShutdownStageDrainIncomplete:
-		next = dashboardDrainIncomplete
-	case runner.ShutdownStageSuspensionComplete, runner.ShutdownStageSuspensionIncomplete:
-		next = dashboardSuspensionComplete
-	default:
-		return
-	}
+
 	d.mu.Lock()
-	if message := normalizedDashboardMessage(shutdown.Message); message != "" {
+	if message != "" {
 		d.trackOccurrenceLocked(message, true)
 		matched := false
 		for index := len(d.messages) - 1; index >= 0; index-- {
 			if d.messages[index].text == message && !d.messages[index].shutdown {
+				d.messages[index].semantic = semantic
 				d.messages[index].shutdown = true
 				d.messages[index].plainMatched = true
 				matched = true
@@ -332,15 +316,61 @@ func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
 			// Event delivery may lag far enough behind output for the matching
 			// ordinary line to be evicted. Restore it as typed history. This also
 			// represents the line when the event arrives before plain output.
-			d.appendMessageLocked(dashboardMessage{text: message, shutdown: true})
+			d.appendMessageLocked(dashboardMessage{text: message, semantic: semantic, shutdown: true})
 		}
 		d.reconcileOccurrencesLocked(message)
 	}
-	if next > d.stage {
+	if hasNext && next > d.stage {
 		d.stage = next
 	}
 	d.mu.Unlock()
 	d.requestRedraw()
+}
+
+func dashboardOperationalEventSemantic(event runner.OperationalEvent) dashboardSemantic {
+	switch event := event.(type) {
+	case runner.CandidateDiscoveryFailed:
+		return dashboardSemanticWarning
+	case runner.CandidateDiscoveryRecovered:
+		return dashboardSemanticActive
+	case runner.ShutdownEvent:
+		switch event.Stage {
+		case runner.ShutdownStageDraining, runner.ShutdownStageSuspending,
+			runner.ShutdownStageSuspensionComplete, runner.ShutdownStageSuspensionIncomplete:
+			return dashboardSemanticWarning
+		case runner.ShutdownStageForceStopping:
+			return dashboardSemanticAttention
+		case runner.ShutdownStageDrainComplete:
+			return dashboardSemanticCompletion
+		default:
+			return dashboardSemanticMetadata
+		}
+	default:
+		return dashboardSemanticMetadata
+	}
+}
+
+func dashboardStageForOperationalEvent(event runner.OperationalEvent) (dashboardStage, bool) {
+	shutdown, ok := event.(runner.ShutdownEvent)
+	if !ok {
+		return dashboardRunning, false
+	}
+	switch shutdown.Stage {
+	case runner.ShutdownStageDraining:
+		return dashboardDraining, true
+	case runner.ShutdownStageSuspending:
+		return dashboardSuspending, true
+	case runner.ShutdownStageForceStopping:
+		return dashboardForceStopping, true
+	case runner.ShutdownStageDrainComplete:
+		return dashboardDrainComplete, true
+	case runner.ShutdownStageDrainIncomplete:
+		return dashboardDrainIncomplete, true
+	case runner.ShutdownStageSuspensionComplete, runner.ShutdownStageSuspensionIncomplete:
+		return dashboardSuspensionComplete, true
+	default:
+		return dashboardRunning, false
+	}
 }
 
 func (d *liveDashboard) activityChanged() bool {
@@ -396,7 +426,7 @@ func (d *liveDashboard) redraw() {
 		return
 	}
 	current := d.current
-	messages := dashboardMessageTexts(d.messages)
+	messages := cloneDashboardMessages(d.messages)
 	stage := d.stage
 	d.mu.Unlock()
 
@@ -444,26 +474,37 @@ func (b *dashboardBodyBuilder) anchor(identity string) {
 func dashboardSectionAnchor(name string) string { return "section:" + name }
 func dashboardRunAnchor(runID string) string    { return "run:" + runID }
 
-func (d *liveDashboard) render(current state.State, messages []string, stage dashboardStage, now time.Time) string {
-	header, body, _ := d.renderPartsFor(current, messages, stage, now)
+func (d *liveDashboard) render(current state.State, messages []dashboardMessage, stage dashboardStage, now time.Time) string {
+	header, body, _ := d.renderPartsFor(current, messages, stage, now, dashboardStyler{})
 	return header + "\n" + body + "\n\n" + dashboardFooter(stage) + "\n"
 }
 
-func (d *liveDashboard) renderPartsWithLayout(now time.Time) (string, dashboardBodyLayout, string) {
-	d.mu.Lock()
-	current := cloneDashboardState(d.current)
-	messages := dashboardMessageTexts(d.messages)
-	stage := d.stage
-	d.mu.Unlock()
-	return d.renderPartsForWithLayout(current, messages, stage, now)
+func (d *liveDashboard) renderParts(now time.Time) (string, string, string) {
+	header, body, footer, _ := d.renderStyledParts(now, dashboardStyler{})
+	return header, body, footer
 }
 
-func (d *liveDashboard) renderPartsFor(current state.State, messages []string, stage dashboardStage, now time.Time) (string, string, string) {
-	header, layout, footer := d.renderPartsForWithLayout(current, messages, stage, now)
+func (d *liveDashboard) renderPartsWithLayout(now time.Time, styler dashboardStyler) (string, dashboardBodyLayout, string, dashboardStage) {
+	d.mu.Lock()
+	current := cloneDashboardState(d.current)
+	messages := cloneDashboardMessages(d.messages)
+	stage := d.stage
+	d.mu.Unlock()
+	header, layout, footer := d.renderPartsForWithLayout(current, messages, stage, now, styler)
+	return header, layout, footer, stage
+}
+
+func (d *liveDashboard) renderStyledParts(now time.Time, styler dashboardStyler) (string, string, string, dashboardStage) {
+	header, layout, footer, stage := d.renderPartsWithLayout(now, styler)
+	return header, layout.text, footer, stage
+}
+
+func (d *liveDashboard) renderPartsFor(current state.State, messages []dashboardMessage, stage dashboardStage, now time.Time, styler dashboardStyler) (string, string, string) {
+	header, layout, footer := d.renderPartsForWithLayout(current, messages, stage, now, styler)
 	return header, layout.text, footer
 }
 
-func (d *liveDashboard) renderPartsForWithLayout(current state.State, messages []string, stage dashboardStage, now time.Time) (string, dashboardBodyLayout, string) {
+func (d *liveDashboard) renderPartsForWithLayout(current state.State, messages []dashboardMessage, stage dashboardStage, now time.Time, styler dashboardStyler) (string, dashboardBodyLayout, string) {
 	sections := d.observeSections(current, now)
 	capacity := "Worker capacity: pending configuration"
 	if current.MaxConcurrentIssues > 0 {
@@ -475,16 +516,16 @@ func (d *liveDashboard) renderPartsForWithLayout(current state.State, messages [
 	header := fmt.Sprintf("Backlog Run Dashboard\nRepository: %s\n%s",
 		valueOr(plainStatusValue(current.Repo), "not initialized"), capacity)
 	body := dashboardBodyBuilder{}
-	body.renderSection("Active Runs", sections[statusActive], now)
-	body.renderSection("Attention Required", sections[statusAttention], now)
-	body.renderSection("Outcomes to Acknowledge", sections[statusOutcomes], now)
-	body.renderCompletions(sections[statusCompletions], now)
+	body.renderSection(statusActive, "Active Runs", sections[statusActive], now, styler)
+	body.renderSection(statusAttention, "Attention Required", sections[statusAttention], now, styler)
+	body.renderSection(statusOutcomes, "Outcomes to Acknowledge", sections[statusOutcomes], now, styler)
+	body.renderCompletions(sections[statusCompletions], now, styler)
 	if len(messages) > 0 {
 		body.separate()
 		body.anchor(dashboardSectionAnchor("Operational messages"))
-		body.write("Operational messages\n")
+		body.write(styler.render(dashboardSemanticMetadata, "Operational messages") + "\n")
 		for _, message := range messages {
-			body.write(fmt.Sprintf("  %s\n", message))
+			body.write(styler.render(message.semantic, "  "+message.text) + "\n")
 		}
 	}
 	attention := make(map[string]struct{}, len(sections[statusAttention]))
@@ -574,18 +615,19 @@ func (d *liveDashboard) observeActivity(run scheduler.Run) followMetrics {
 	return cached.metrics
 }
 
-func renderDashboardCompletions(output *strings.Builder, runs []statusRun, now time.Time) {
+func renderDashboardCompletions(output *strings.Builder, runs []statusRun, now time.Time, styler dashboardStyler) {
 	body := dashboardBodyBuilder{}
-	body.renderCompletions(runs, now)
+	body.renderCompletions(runs, now, styler)
 	_, _ = output.WriteString("\n" + body.body.String())
 }
 
-func (b *dashboardBodyBuilder) renderCompletions(runs []statusRun, now time.Time) {
+func (b *dashboardBodyBuilder) renderCompletions(runs []statusRun, now time.Time, styler dashboardStyler) {
 	b.separate()
 	b.anchor(dashboardSectionAnchor("Recent Completions"))
-	b.write(fmt.Sprintf("Recent Completions (%d)\n", len(runs)))
+	heading := fmt.Sprintf("Recent Completions (%d)", len(runs))
+	b.write(styler.render(dashboardSemanticCompletion, heading) + "\n")
 	if len(runs) == 0 {
-		b.write("  none\n")
+		b.write(styler.render(dashboardSemanticMetadata, "  none") + "\n")
 		return
 	}
 	visible := min(3, len(runs))
@@ -597,27 +639,36 @@ func (b *dashboardBodyBuilder) renderCompletions(runs []statusRun, now time.Time
 			identity += "  " + title
 		}
 		progress := summarizeRunProgress(run, followMetrics{}, now)
-		pullRequest := ""
+		line := styler.render(dashboardSemanticCompletion, "  "+identity)
 		if run.PullRequest != "" {
-			pullRequest = " | PR: " + plainStatusValue(run.PullRequest)
+			line += styler.render(dashboardSemanticMetadata, " | PR: "+plainStatusValue(run.PullRequest))
 		}
 		completed := "n/a"
 		if run.CompletedAt != nil && !run.CompletedAt.IsZero() {
 			completed = displayDuration(now.Sub(*run.CompletedAt)) + " ago"
 		}
-		b.write(fmt.Sprintf("  %s%s | Elapsed: %s | Completed: %s\n", identity, pullRequest, progress.elapsed, completed))
+		line += styler.render(dashboardSemanticMetadata, fmt.Sprintf(" | Elapsed: %s | Completed: %s", progress.elapsed, completed))
+		b.write(line + "\n")
 	}
 	if remainder := len(runs) - visible; remainder > 0 {
-		b.write(fmt.Sprintf("  %d more completions\n", remainder))
+		line := fmt.Sprintf("  %d more completions", remainder)
+		b.write(styler.render(dashboardSemanticMetadata, line) + "\n")
 	}
 }
 
-func (b *dashboardBodyBuilder) renderSection(name string, runs []statusRun, now time.Time) {
+func renderDashboardSection(output *strings.Builder, section statusSection, name string, runs []statusRun, now time.Time, styler dashboardStyler) {
+	body := dashboardBodyBuilder{}
+	body.renderSection(section, name, runs, now, styler)
+	_, _ = output.WriteString("\n" + body.body.String())
+}
+
+func (b *dashboardBodyBuilder) renderSection(section statusSection, name string, runs []statusRun, now time.Time, styler dashboardStyler) {
 	b.separate()
 	b.anchor(dashboardSectionAnchor(name))
-	b.write(fmt.Sprintf("%s (%d)\n", name, len(runs)))
+	heading := fmt.Sprintf("%s (%d)", name, len(runs))
+	b.write(styler.render(dashboardSectionSemantic(section), heading) + "\n")
 	if len(runs) == 0 {
-		b.write("  none\n")
+		b.write(styler.render(dashboardSemanticMetadata, "  none") + "\n")
 		return
 	}
 	for _, observed := range runs {
@@ -628,18 +679,24 @@ func (b *dashboardBodyBuilder) renderSection(name string, runs []statusRun, now 
 			identity += "  " + title
 		}
 		progress := summarizeRunProgress(run, observed.observation.metrics, now)
-		b.write(fmt.Sprintf("  %s\n", identity))
+		b.write(styler.render(dashboardRunSemantic(observed, section), "  "+identity) + "\n")
 		if run.IssueURL != "" {
-			b.write(fmt.Sprintf("    Issue: %s\n", plainStatusValue(run.IssueURL)))
+			line := "    Issue: " + plainStatusValue(run.IssueURL)
+			b.write(styler.render(dashboardSemanticMetadata, line) + "\n")
 		}
-		b.write(fmt.Sprintf("    State: %s | Elapsed: %s | Worker liveness: %s\n",
-			displayedRunState(run, observed.observation.process), progress.elapsed, plainStatusValue(observed.observation.process.workerLiveness)))
-		b.write(fmt.Sprintf("    Activity age: %s | Deepest operation: %s\n",
-			progress.activityAge, plainStatusValue(progress.deepestOperation)))
-		b.write(fmt.Sprintf("    Turns: Worker %s | Subagent %s | Observed tokens: %s\n",
-			progress.workerTurns, progress.subagentTurns, progress.observedTokens))
+		state := "    State: " + displayedRunState(run, observed.observation.process)
+		line := styler.render(dashboardRunSemantic(observed, section), state)
+		line += styler.render(dashboardSemanticMetadata, " | Elapsed: "+progress.elapsed+" | ")
+		liveness := "Worker liveness: " + plainStatusValue(observed.observation.process.workerLiveness)
+		line += styler.render(dashboardLivenessSemantic(observed), liveness)
+		b.write(line + "\n")
+		line = fmt.Sprintf("    Activity age: %s | Deepest operation: %s", progress.activityAge, plainStatusValue(progress.deepestOperation))
+		b.write(styler.render(dashboardSemanticMetadata, line) + "\n")
+		line = fmt.Sprintf("    Turns: Worker %s | Subagent %s | Observed tokens: %s", progress.workerTurns, progress.subagentTurns, progress.observedTokens)
+		b.write(styler.render(dashboardSemanticMetadata, line) + "\n")
 		if run.Error != "" {
-			b.write(fmt.Sprintf("    Diagnostic: %s\n", plainStatusValue(strings.TrimSpace(run.Error))))
+			line = "    Diagnostic: " + plainStatusValue(strings.TrimSpace(run.Error))
+			b.write(styler.render(dashboardSemanticAttention, line) + "\n")
 		}
 	}
 }
@@ -738,7 +795,7 @@ func (d *liveDashboard) finalSummary(current state.State) error {
 	d.stopLoop()
 	d.mu.Lock()
 	d.stage = dashboardFinished
-	messages := dashboardMessageTexts(d.messages)
+	messages := cloneDashboardMessages(d.messages)
 	d.mu.Unlock()
 	body := "Final aggregate summary\n" + d.render(current, messages, dashboardFinished, d.now())
 	_, err := d.output.Write([]byte(body))
