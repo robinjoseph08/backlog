@@ -22,7 +22,7 @@ import (
 
 const (
 	dashboardOutputUpdateLimit = 64
-	dashboardNavigationHelp    = "Nav: ↑↓/jk PgUp/Dn Home/End g/G a:Attention"
+	dashboardNavigationHelp    = "Nav: ↑↓/jk PgUp/Dn/f/b Home/End g/G a:Attention"
 )
 
 type dashboardConfiguredMsg struct {
@@ -584,9 +584,9 @@ func (m *bubbleDashboardModel) navigateViewport(msg tea.Msg) bool {
 			m.viewport.ScrollDown(1)
 		case "up", "k":
 			m.viewport.ScrollUp(1)
-		case "pgdown":
+		case "pgdown", "f":
 			m.viewport.PageDown()
-		case "pgup":
+		case "pgup", "b":
 			m.viewport.PageUp()
 		case "home", "g":
 			m.viewport.GotoTop()
@@ -716,13 +716,19 @@ func dashboardChromeLines(header, footer []string, width, height int) dashboardC
 	footerGroups := dashboardChromeGroups(footer)
 	compactNavigation := append([]string(nil), footer...)
 	if len(compactNavigation) > 2 {
-		compactNavigation[2] = "N:jk/Pg/Home/End/gG/a"
+		compactNavigation[2] = "N:jk/fb Pg H/E gG a"
 	}
+	compactHeader := compactDashboardHeader(header)
+	compactFooter := compactDashboardFooter(footer)
 	candidates := []dashboardChrome{
 		{top: wrapDashboardChrome(headerGroups, width), bottom: wrapDashboardChrome(footerGroups, width)},
 		{top: wrapDashboardChrome(headerGroups, width), bottom: wrapDashboardChrome(dashboardChromeGroups(compactNavigation), width)},
 		{top: wrapDashboardChrome([][]string{header}, width), bottom: wrapDashboardChrome([][]string{footer}, width)},
-		{top: wrapDashboardChrome([][]string{append(append([]string(nil), header...), footer...)}, width)},
+		{top: wrapDashboardChrome([][]string{compactHeader}, width), bottom: wrapDashboardChrome([][]string{compactFooter}, width)},
+		// A one-line terminal cannot have distinct header and footer rows. Keep
+		// the whole compact chrome in the footer row so lifecycle guidance and
+		// navigation are never moved above the scrollable body.
+		{bottom: wrapDashboardChrome([][]string{append(append([]string(nil), compactHeader...), compactFooter...)}, width)},
 	}
 	for _, candidate := range candidates {
 		if len(candidate.top)+len(candidate.bottom) <= chromeLimit {
@@ -730,7 +736,38 @@ func dashboardChromeLines(header, footer []string, width, height int) dashboardC
 		}
 	}
 
-	compact := make([]string, 0, len(header)+len(footer))
+	// When not all chrome can fit, spend the available rows on the fixed footer
+	// before retaining header details. Keep next-interrupt guidance and
+	// navigation in separately allocated rows whenever the terminal permits it.
+	next, navigation := compactFooterLine(compactFooter, 1), compactFooterLine(compactFooter, 2)
+	bottom := wrapDashboardChrome([][]string{{next, navigation}}, width)
+	if len(bottom) > chromeLimit && chromeLimit >= 2 {
+		bottom = []string{fitDashboardLine(next, width), fitDashboardLine(navigation, width)}
+	}
+	if len(bottom) > chromeLimit {
+		bottom = bottom[:chromeLimit]
+	}
+	remaining := chromeLimit - len(bottom)
+	if remaining > 0 {
+		top := wrapDashboardChrome([][]string{append(compactHeader, compactFooterLine(compactFooter, 0))}, width)
+		if len(top) > remaining {
+			top = top[:remaining]
+		}
+		return dashboardChrome{top: top, bottom: bottom}
+	}
+	return dashboardChrome{bottom: bottom}
+}
+
+func dashboardChromeGroups(lines []string) [][]string {
+	groups := make([][]string, 0, len(lines))
+	for _, line := range lines {
+		groups = append(groups, []string{line})
+	}
+	return groups
+}
+
+func compactDashboardHeader(header []string) []string {
+	compact := make([]string, 0, len(header))
 	for _, line := range header {
 		if strings.HasPrefix(line, "Worker capacity: ") {
 			line = compactDashboardCapacity(line)
@@ -740,25 +777,25 @@ func dashboardChromeLines(header, footer []string, width, height int) dashboardC
 		}
 		compact = append(compact, line)
 	}
+	return compact
+}
+
+func compactDashboardFooter(footer []string) []string {
+	compact := make([]string, 0, len(footer))
 	for _, line := range footer {
 		line = strings.Replace(line, "Runner stage: ", "S:", 1)
 		line = strings.Replace(line, "Next Ctrl-C: ", "^C:", 1)
-		line = strings.Replace(line, dashboardNavigationHelp, "N:jk/Pg/Home/End/gG/a", 1)
+		line = strings.Replace(line, dashboardNavigationHelp, "N:jk/fb Pg H/E gG a", 1)
 		compact = append(compact, line)
 	}
-	lines := wrapDashboardChrome([][]string{compact}, width)
-	if len(lines) > chromeLimit {
-		lines = lines[:chromeLimit]
-	}
-	return dashboardChrome{top: lines}
+	return compact
 }
 
-func dashboardChromeGroups(lines []string) [][]string {
-	groups := make([][]string, 0, len(lines))
-	for _, line := range lines {
-		groups = append(groups, []string{line})
+func compactFooterLine(footer []string, index int) string {
+	if index >= len(footer) {
+		return ""
 	}
-	return groups
+	return footer[index]
 }
 
 func wrapDashboardChrome(groups [][]string, width int) []string {

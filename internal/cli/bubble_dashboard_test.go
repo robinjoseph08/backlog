@@ -132,6 +132,7 @@ func TestBubbleDashboardViewportSupportsDocumentedKeyboardNavigation(t *testing.
 		{name: "down arrow", key: tea.Key{Code: tea.KeyDown}},
 		{name: "j", key: tea.Key{Code: 'j', Text: "j"}},
 		{name: "page down", key: tea.Key{Code: tea.KeyPgDown}},
+		{name: "f", key: tea.Key{Code: 'f', Text: "f"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			model := press(newModel(), test.key)
@@ -148,6 +149,7 @@ func TestBubbleDashboardViewportSupportsDocumentedKeyboardNavigation(t *testing.
 		{name: "up arrow", down: tea.Key{Code: tea.KeyDown}, up: tea.Key{Code: tea.KeyUp}},
 		{name: "k", down: tea.Key{Code: 'j', Text: "j"}, up: tea.Key{Code: 'k', Text: "k"}},
 		{name: "page up", down: tea.Key{Code: tea.KeyPgDown}, up: tea.Key{Code: tea.KeyPgUp}},
+		{name: "b", down: tea.Key{Code: 'f', Text: "f"}, up: tea.Key{Code: 'b', Text: "b"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			model := press(press(newModel(), test.down), test.up)
@@ -506,9 +508,23 @@ func TestBubbleDashboardConstrainedChromeKeepsRequiredLifecycleInformation(t *te
 		model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: time.Now}}, newBubbleDashboardSession(time.Now), dimensions)
 		model.dashboard.update(current)
 		plain := ansi.Strip(model.View().Content)
-		for _, want := range []string{"acme/widgets", "Worker capacity:", "Runner stage:", "Next Ctrl-C:"} {
-			if !strings.Contains(plain, want) {
-				t.Fatalf("%dx%d dashboard omitted %q:\n%s", dimensions.Width, dimensions.Height, want, plain)
+		for _, expected := range []struct {
+			name     string
+			variants []string
+		}{
+			{name: "repository", variants: []string{"acme/widgets"}},
+			{name: "Worker capacity", variants: []string{"Worker capacity:", "W:"}},
+			{name: "Runner stage", variants: []string{"Runner stage:", "S:"}},
+			{name: "next Ctrl-C", variants: []string{"Next Ctrl-C:", "^C:"}},
+			{name: "navigation", variants: []string{"Nav:", "N:"}},
+			{name: "f/b shortcuts", variants: []string{"f/b", "fb"}},
+		} {
+			found := false
+			for _, variant := range expected.variants {
+				found = found || strings.Contains(plain, variant)
+			}
+			if !found {
+				t.Fatalf("%dx%d dashboard omitted %s:\n%s", dimensions.Width, dimensions.Height, expected.name, plain)
 			}
 		}
 		lines := strings.Split(plain, "\n")
@@ -519,6 +535,29 @@ func TestBubbleDashboardConstrainedChromeKeepsRequiredLifecycleInformation(t *te
 			if lipgloss.Width(line) > dimensions.Width {
 				t.Fatalf("%dx%d dashboard overflowed with %q", dimensions.Width, dimensions.Height, line)
 			}
+		}
+	}
+}
+
+func TestBubbleDashboardConstrainedFallbackKeepsGuidanceInFixedFooter(t *testing.T) {
+	footer := []string{
+		"Runner stage: Running",
+		"Next Ctrl-C: start Drain and stop Admission",
+		dashboardNavigationHelp,
+	}
+	chrome := dashboardChromeLines(
+		[]string{"Repository: acme/widgets", "Worker capacity: 1 used | 2 available | 3 total"},
+		footer,
+		120,
+		2,
+	)
+	if len(chrome.bottom) == 0 {
+		t.Fatal("constrained dashboard moved fixed-footer guidance above the body")
+	}
+	fixedFooter := strings.Join(chrome.bottom, "\n")
+	for _, want := range []string{"Next Ctrl-C: start Drain and stop Admission", "Nav: ↑↓/jk PgUp/Dn/f/b Home/End g/G a:Attention"} {
+		if !strings.Contains(fixedFooter, want) {
+			t.Fatalf("constrained fixed footer omitted %q: %#v", want, chrome)
 		}
 	}
 }
