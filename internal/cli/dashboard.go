@@ -1182,20 +1182,7 @@ func renderAdmissionDetails(output *strings.Builder, admission dashboardAdmissio
 	} else if !admission.snapshotComplete {
 		writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, "  Admission: checking | Candidate snapshot not yet complete")
 	} else {
-		health := "  Admission: healthy"
-		if !admission.recoveredAt.IsZero() {
-			age := now.Sub(admission.recoveredAt)
-			if age < 0 {
-				age = 0
-			}
-			if age < admissionRecoveryNotice {
-				noun := "failures"
-				if admission.recoveredFailures == 1 {
-					noun = "failure"
-				}
-				health += fmt.Sprintf(" | Recovered %s ago after %d %s", displayDuration(age), admission.recoveredFailures, noun)
-			}
-		}
+		health := "  Admission: healthy" + admissionRecoverySummary(admission, now)
 		writeDashboardStyledLine(output, styler, dashboardSemanticActive, health)
 	}
 	renderAdmissionDiagnosticsState(output, admission.failures, diagnosticsOpen, styler, 0)
@@ -1225,9 +1212,27 @@ func renderCompactAdmissionStatus(output *strings.Builder, admission dashboardAd
 			line += " | Retry: stopped"
 		}
 	} else if admission.snapshotComplete {
-		line = "  Admission: healthy"
+		line = "  Admission: healthy" + admissionRecoverySummary(admission, now)
 	}
 	writeDashboardStyledLine(output, options.styler, semantic, truncateDashboardContent(line, options.width))
+}
+
+func admissionRecoverySummary(admission dashboardAdmission, now time.Time) string {
+	if admission.recoveredAt.IsZero() {
+		return ""
+	}
+	age := now.Sub(admission.recoveredAt)
+	if age < 0 {
+		age = 0
+	}
+	if age >= admissionRecoveryNotice {
+		return ""
+	}
+	noun := "failures"
+	if admission.recoveredFailures == 1 {
+		noun = "failure"
+	}
+	return fmt.Sprintf(" | Recovered %s ago after %d %s", displayDuration(age), admission.recoveredFailures, noun)
 }
 
 func renderAdmissionDiagnosticsState(output *strings.Builder, failures []runner.CandidateDiscoveryFailed, diagnosticsOpen bool, styler dashboardStyler, width int) {

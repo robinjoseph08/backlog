@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/robinjoseph08/backlog/internal/dependencies"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
@@ -625,20 +626,56 @@ func (c Client) command(ctx context.Context, args ...string) error {
 	return fmt.Errorf("gh %s: %w", strings.Join(args, " "), err)
 }
 
+// commandDiagnosticByteLimit retains complete stderr evidence through 64 KiB
+// per command record. Larger evidence is cut at a UTF-8 boundary and labeled.
+const commandDiagnosticByteLimit = 64 << 10
+
+const commandDiagnosticTruncation = "\n... [command diagnostic truncated at 65536 bytes]"
+
 type commandError struct {
 	command string
-	detail  string
+	detail  []byte
 	err     error
 }
 
 func (e *commandError) Error() string {
-	if e.detail != "" {
+	if len(e.detail) > 0 {
 		return fmt.Sprintf("gh %s: %s", e.command, e.detail)
 	}
 	return fmt.Sprintf("gh %s: %v", e.command, e.err)
 }
 
 func (e *commandError) Unwrap() error { return e.err }
+
+func newCommandError(command string, err error) *commandError {
+	failure := &commandError{command: command, err: err}
+	exitError, ok := err.(*exec.ExitError)
+	if !ok || len(exitError.Stderr) == 0 {
+		return failure
+	}
+	failure.detail = boundedCommandDiagnostic(exitError.Stderr)
+	// ProcessState preserves exit-status semantics without retaining stderr a
+	// second time through exec.ExitError after detail has been snapshotted.
+	failure.err = &exec.ExitError{ProcessState: exitError.ProcessState}
+	return failure
+}
+
+func boundedCommandDiagnostic(stderr []byte) []byte {
+	detail := bytes.TrimSpace(stderr)
+	if len(detail) <= commandDiagnosticByteLimit {
+		return bytes.Clone(detail)
+	}
+	prefixLimit := commandDiagnosticByteLimit - len(commandDiagnosticTruncation)
+	if utf8.Valid(detail) {
+		for prefixLimit > 0 && !utf8.RuneStart(detail[prefixLimit]) {
+			prefixLimit--
+		}
+	}
+	bounded := make([]byte, 0, commandDiagnosticByteLimit)
+	bounded = append(bounded, detail[:prefixLimit]...)
+	bounded = append(bounded, commandDiagnosticTruncation...)
+	return bounded
+}
 
 func newCandidateDiscoveryError(operation CandidateDiscoveryOperation, issue int, err error) *CandidateDiscoveryError {
 	return &CandidateDiscoveryError{Operation: operation, Issue: issue, Err: err, Cause: conciseCandidateDiscoveryCause(err)}
@@ -647,8 +684,8 @@ func newCandidateDiscoveryError(operation CandidateDiscoveryOperation, issue int
 func conciseCandidateDiscoveryCause(err error) string {
 	var command *commandError
 	if errors.As(err, &command) {
-		if command.detail != "" {
-			return boundedCandidateDiscoveryCause(command.detail)
+		if len(command.detail) > 0 {
+			return boundedCandidateDiscoveryCause(string(command.detail))
 		}
 		if command.err != nil {
 			return boundedCandidateDiscoveryCause(command.err.Error())
@@ -692,13 +729,7 @@ func (c Client) jsonCommand(ctx context.Context, target any, args ...string) err
 		if contextErr := ctx.Err(); contextErr != nil {
 			return fmt.Errorf("gh %s: %w", strings.Join(args, " "), contextErr)
 		}
-		if exitError, ok := err.(*exec.ExitError); ok {
-			message := strings.TrimSpace(string(exitError.Stderr))
-			if message != "" {
-				return &commandError{command: strings.Join(args, " "), detail: message, err: err}
-			}
-		}
-		return &commandError{command: strings.Join(args, " "), err: err}
+		return newCommandError(strings.Join(args, " "), err)
 	}
 	if err := rejectDuplicateJSONFields(output); err != nil {
 		return fmt.Errorf("decode gh %s output: %w", strings.Join(args, " "), err)

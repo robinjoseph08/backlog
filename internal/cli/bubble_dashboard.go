@@ -506,10 +506,13 @@ func (m *bubbleDashboardModel) renderPendingFlushes() []tea.Cmd {
 	if m.control.operationalEvents != nil && !m.control.operationalEvents.idle() {
 		return nil
 	}
-	delay := dashboardFlushDelay(m.dashboard, m.dashboard.now())
 	commands := make([]tea.Cmd, 0, len(m.pendingFlushes))
 	for _, pending := range m.pendingFlushes {
 		message := pending
+		delay := time.Second / 30
+		if pending.naturalExit {
+			delay = dashboardFlushDelay(m.dashboard, m.dashboard.now())
+		}
 		commands = append(commands, func() tea.Msg {
 			<-m.flushAfter(delay)
 			return dashboardFlushRenderedMsg{acknowledged: message.acknowledged}

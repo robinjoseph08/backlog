@@ -720,6 +720,19 @@ func TestDashboardAdmissionRecoveryNoticeExpiresAfterTenSeconds(t *testing.T) {
 	if remaining := dashboard.recoveryNoticeRemaining(recoveredAt.Add(9 * time.Second)); remaining != time.Second {
 		t.Fatalf("recovery notice remaining = %s, want 1s", remaining)
 	}
+	admission := dashboardSectionAnchor("Admission health")
+	options := responsiveDashboardOptions{
+		density: dashboardDensityConstrained, width: 100, selected: admission,
+		expansionOverrides: map[string]bool{admission: false},
+	}
+	_, collapsed, _ := dashboard.renderResponsiveParts(recoveredAt.Add(9*time.Second), options)
+	if !strings.Contains(collapsed.text, "> Admission health [collapsed]") || !strings.Contains(collapsed.text, "Admission: healthy | Recovered 9s ago after 1 failure") {
+		t.Fatalf("selected collapsed Admission omitted active recovery notice:\n%s", collapsed.text)
+	}
+	_, collapsed, _ = dashboard.renderResponsiveParts(recoveredAt.Add(10*time.Second), options)
+	if !strings.Contains(collapsed.text, "Admission: healthy") || strings.Contains(collapsed.text, "Recovered") {
+		t.Fatalf("selected collapsed Admission retained expired recovery notice:\n%s", collapsed.text)
+	}
 	_, body, _ = dashboard.renderParts(recoveredAt.Add(10 * time.Second))
 	if !strings.Contains(body, "Admission: healthy") || strings.Contains(body, "Recovered") {
 		t.Fatalf("expired recovery notice = %q", body)

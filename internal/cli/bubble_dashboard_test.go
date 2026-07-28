@@ -1695,6 +1695,55 @@ func TestBubbleDashboardFinalFlushWaitsForRecoveryNoticeBeforeAcknowledgingNatur
 	}
 }
 
+func TestBubbleDashboardPromptShutdownFlushUsesOneRenderFrameDuringRecoveryNotice(t *testing.T) {
+	recoveredAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	now := recoveredAt.Add(2 * time.Second)
+	session := newBubbleDashboardSession(time.Now)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	flushDone := make(chan error, 1)
+	go func() { flushDone <- session.flush(ctx) }()
+	msg, err := session.next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flush, ok := msg.(dashboardFlushMsg)
+	if !ok || flush.naturalExit {
+		t.Fatalf("prompt shutdown flush = %#v, want non-natural flush", msg)
+	}
+
+	requestedDelay := make(chan time.Duration, 1)
+	clockFired := make(chan time.Time, 1)
+	model := newBubbleDashboardModel(
+		context.Background(),
+		PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}},
+		session,
+		TerminalDimensions{Width: 100, Height: 20},
+	)
+	model.flushAfter = func(delay time.Duration) <-chan time.Time {
+		requestedDelay <- delay
+		return clockFired
+	}
+	model.dashboard.operationalEvent(runner.CandidateDiscoveryRecovered{OccurredAt: recoveredAt, Failures: 3})
+	updated, command := model.Update(flush)
+	model = updated.(bubbleDashboardModel)
+	batch, ok := command().(tea.BatchMsg)
+	if !ok || len(batch) < 1 {
+		t.Fatalf("prompt shutdown Update command = %T, want a render batch", command)
+	}
+	rendered := make(chan tea.Msg, 1)
+	go func() { rendered <- batch[0]() }()
+	if delay := <-requestedDelay; delay != time.Second/30 {
+		t.Fatalf("prompt shutdown flush delay = %s, want one render frame %s", delay, time.Second/30)
+	}
+	clockFired <- now.Add(time.Second / 30)
+	updated, _ = model.Update(<-rendered)
+	_ = updated.(bubbleDashboardModel)
+	if err := <-flushDone; err != nil {
+		t.Fatalf("prompt shutdown terminal restoration: %v", err)
+	}
+}
+
 func TestBubbleDashboardFlushFailsWhenPresentationAlreadyStopped(t *testing.T) {
 	session := newBubbleDashboardSession(time.Now)
 	close(session.done)

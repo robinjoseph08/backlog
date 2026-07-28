@@ -1,6 +1,7 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -183,6 +184,46 @@ esac`)
 	}
 	if !strings.Contains(discovery.Error(), "gh issue list --repo acme/widgets") || !strings.Contains(discovery.Error(), discovery.Cause) || !strings.Contains(discovery.Error(), "complete verbose stderr detail") {
 		t.Fatalf("full error lost command or stderr evidence: %q", discovery.Error())
+	}
+}
+
+func TestTwentyCommandErrorsBoundOversizedStderrWithoutRetainingItTwice(t *testing.T) {
+	const recordLimit = 20
+	records := make([]*CandidateDiscoveryError, 0, recordLimit)
+	for record := 1; record <= recordLimit; record++ {
+		stderr := bytes.Repeat([]byte(fmt.Sprintf("oversized stderr evidence %d ", record)), commandDiagnosticByteLimit/8)
+		exitError := &exec.ExitError{Stderr: stderr}
+		command := fmt.Sprintf("issue view %d --repo acme/widgets", record)
+		failure := newCommandError(command, exitError)
+
+		if len(failure.detail) != commandDiagnosticByteLimit {
+			t.Fatalf("record %d retained command detail bytes = %d, want %d", record, len(failure.detail), commandDiagnosticByteLimit)
+		}
+		if !bytes.HasSuffix(failure.detail, []byte(commandDiagnosticTruncation)) {
+			t.Fatalf("record %d omitted honest truncation marker: %q", record, failure.detail[len(failure.detail)-100:])
+		}
+		if &failure.detail[0] == &stderr[0] {
+			t.Fatalf("record %d detail aliases the oversized stderr backing array", record)
+		}
+		var retainedExit *exec.ExitError
+		if !errors.As(failure, &retainedExit) {
+			t.Fatalf("record %d lost exit-error semantics: %v", record, failure)
+		}
+		if len(retainedExit.Stderr) != 0 {
+			t.Fatalf("record %d retained duplicate stderr bytes = %d", record, len(retainedExit.Stderr))
+		}
+		records = append(records, newCandidateDiscoveryError(CandidateDiscoveryInspect, record, failure))
+	}
+
+	for record, discovery := range records {
+		text := discovery.Error()
+		command := fmt.Sprintf("gh issue view %d --repo acme/widgets", record+1)
+		if !strings.Contains(text, command) || !strings.Contains(text, "oversized stderr evidence") || !strings.Contains(text, "truncated at 65536 bytes") {
+			t.Fatalf("record %d lost command, evidence, or truncation honesty: %q", record+1, text)
+		}
+		if len([]rune(discovery.Cause)) > 200 {
+			t.Fatalf("record %d concise cause has %d runes, want at most 200", record+1, len([]rune(discovery.Cause)))
+		}
 	}
 }
 
