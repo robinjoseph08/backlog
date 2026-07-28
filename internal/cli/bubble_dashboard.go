@@ -450,6 +450,7 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	m.refreshViewport(selection)
 	if configured {
+		m.selectRoomyInitialRun()
 		m.attentionKnown = cloneDashboardIdentities(m.layout.attention)
 		clear(m.attentionPending)
 	} else if trackAttention {
@@ -522,6 +523,24 @@ func (m *bubbleDashboardModel) refreshViewport(selection dashboardSelection) {
 		}
 	}
 	m.selectViewportAnchor()
+}
+
+func (m *bubbleDashboardModel) selectRoomyInitialRun() {
+	if dashboardDensityForHeight(m.height) != dashboardDensityRoomy {
+		return
+	}
+	for _, anchor := range m.layout.anchors {
+		if !strings.HasPrefix(anchor.identity, "run:") {
+			continue
+		}
+		m.selectedAnchor = anchor.identity
+		m.refreshViewport(dashboardSelection{
+			identity: anchor.identity,
+			relative: m.dashboardBodyStart(),
+			valid:    true,
+		})
+		return
+	}
 }
 
 func (m *bubbleDashboardModel) toggleExpansion() {

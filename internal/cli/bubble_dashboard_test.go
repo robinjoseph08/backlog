@@ -654,14 +654,14 @@ func TestBubbleDashboardResponsiveDensityAndSelectedDetails(t *testing.T) {
 	}
 	newModel := func(height int) bubbleDashboardModel {
 		model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 160, Height: height})
-		model.dashboard.source = &dashboardTestSource{current: current}
-		model.dashboard.update(current)
-		model.selectedAnchor = dashboardRunAnchor(active.RunID)
-		model.refreshViewport(dashboardSelection{identity: model.selectedAnchor, relative: model.dashboardBodyStart(), valid: true})
-		return model
+		updated, _ := model.Update(dashboardConfiguredMsg{initial: current, source: &dashboardTestSource{current: current}})
+		return updated.(bubbleDashboardModel)
 	}
 
 	roomy := newModel(24)
+	if roomy.selectedAnchor != dashboardRunAnchor(active.RunID) {
+		t.Fatalf("roomy initial selection = %q, want active Run %q", roomy.selectedAnchor, active.RunID)
+	}
 	roomyBody := roomy.viewport.GetContent()
 	activeRow := dashboardContentLine(t, roomyBody, "#69  Responsive layouts")
 	for _, want := range []string{"PR #169", "State: running", "Elapsed: 1m0s", "Deepest operation: edit", "Activity: 5s", "Turns: 1"} {
@@ -745,6 +745,33 @@ func TestBubbleDashboardEnterExpandsRunsAndSections(t *testing.T) {
 		if strings.Contains(completionDetails, omitted) {
 			t.Fatalf("expanded Completion included %q:\n%s", omitted, completionDetails)
 		}
+	}
+}
+
+func TestCompactDashboardActiveRowPrioritizesElapsedBeforeVariableFields(t *testing.T) {
+	now := time.Date(2026, 7, 28, 14, 0, 0, 0, time.UTC)
+	observed := statusRun{
+		run: scheduler.Run{
+			Issue: 69, IssueTitle: "Responsive layouts", RunID: "run-responsive", Status: scheduler.StatusRunning,
+			PullRequest: "https://github.com/acme/widgets/pull/169", StartedAt: now.Add(-time.Minute),
+		},
+		observation: runObservation{
+			metrics: followMetrics{operation: strings.Repeat("deep-operation-", 8)},
+			process: followObservation{
+				workerLivenessState: workerLivenessAbsent,
+				supervision:         "UNSUPERVISED",
+			},
+		},
+	}
+	full := compactDashboardRun(observed, now, false, 68)
+	for _, variable := range []string{"Liveness: missing", "Deepest operation:"} {
+		if elapsed, field := strings.Index(full, "Elapsed: 1m0s"), strings.Index(full, variable); elapsed < 0 || field < 0 || elapsed > field {
+			t.Fatalf("elapsed did not precede %q in compact Active row: %q", variable, full)
+		}
+	}
+	row := truncateDashboardContent("  "+full, 70)
+	if !strings.Contains(row, "Elapsed: 1m0s") {
+		t.Fatalf("compact Active row dropped elapsed behind variable fields: %q", row)
 	}
 }
 

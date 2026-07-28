@@ -671,8 +671,15 @@ func compactDashboardRun(observed statusRun, now time.Time, completion bool, wid
 	progress := summarizeRunProgress(run, observed.observation.metrics, now)
 	if !completion {
 		parts = append(parts, "State: "+displayedRunState(run, observed.observation.process))
+		if progress.elapsed != "n/a" {
+			parts = append(parts, "Elapsed: "+progress.elapsed)
+		}
 	}
-	parts[0] = compactDashboardIssueIdentity(run, parts, width)
+	detailReserve := width / 2
+	if completion {
+		detailReserve = width / 3
+	}
+	parts[0] = compactDashboardIssueIdentity(run, parts, width, detailReserve)
 	if completion {
 		if progress.elapsed != "n/a" {
 			parts = append(parts, "Elapsed: "+progress.elapsed)
@@ -695,19 +702,16 @@ func compactDashboardRun(observed statusRun, now time.Time, completion bool, wid
 	if progress.workerTurns != "n/a" {
 		parts = append(parts, "Turns: "+progress.workerTurns)
 	}
-	if progress.elapsed != "n/a" {
-		parts = append(parts, "Elapsed: "+progress.elapsed)
-	}
 	return strings.Join(parts, " | ")
 }
 
-func compactDashboardIssueIdentity(run scheduler.Run, mandatory []string, width int) string {
+func compactDashboardIssueIdentity(run scheduler.Run, mandatory []string, width, detailReserve int) string {
 	identity := mandatory[0]
 	title := plainStatusValue(run.IssueTitle)
 	if title == "" || width <= 0 {
 		return identity
 	}
-	available := width - ansi.StringWidth(strings.Join(mandatory, " | ")) - width/3 - 2
+	available := width - ansi.StringWidth(strings.Join(mandatory, " | ")) - detailReserve - 2
 	if available <= 0 {
 		return identity
 	}
