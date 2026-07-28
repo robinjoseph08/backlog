@@ -47,7 +47,7 @@ func newResolveFixture(t *testing.T, labels []string, reason string) resolveFixt
 	encodedLabels, _ := json.Marshal(labels)
 	encodedReason, _ := json.Marshal(reason)
 	githubState := filepath.Join(root, "github.json")
-	if err := os.WriteFile(githubState, []byte(`{"labels":`+string(encodedLabels)+`,"reason":`+string(encodedReason)+`,"state":"CLOSED","reopenAfterFirstMutation":false}`), 0o600); err != nil {
+	if err := os.WriteFile(githubState, []byte(`{"labels":`+string(encodedLabels)+`,"reason":`+string(encodedReason)+`,"state":"CLOSED","reopenAfterFirstMutation":false,"changeReasonAfterFirstMutation":false}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	gh := writeExecutable(t, `#!/bin/sh
@@ -63,7 +63,7 @@ case "$*" in
     jq -c '{number:42,url:"https://github.com/acme/widgets/issues/42",state:.state,stateReason:.reason}' `+quote(githubState)+` ;;
   "issue edit 42 --repo acme/widgets --remove-label in-progress")
     tmp=`+quote(githubState)+`.tmp
-    jq '(.labels |= map(select(ascii_downcase != "in-progress"))) | if .reopenAfterFirstMutation then .state = "OPEN" else . end' `+quote(githubState)+` > "$tmp"
+    jq '(.labels |= map(select(ascii_downcase != "in-progress"))) | if .reopenAfterFirstMutation then .state = "OPEN" else . end | if .changeReasonAfterFirstMutation then .reason = "NOT_PLANNED" else . end' `+quote(githubState)+` > "$tmp"
     mv "$tmp" `+quote(githubState)+` ;;
   "issue edit 42 --repo acme/widgets --remove-label ready-for-agent")
     tmp=`+quote(githubState)+`.tmp; jq '.labels |= map(select(ascii_downcase != "ready-for-agent"))' `+quote(githubState)+` > "$tmp"; mv "$tmp" `+quote(githubState)+` ;;
@@ -170,6 +170,36 @@ func TestCompiledResolveDryRunAndInteractiveCancellation(t *testing.T) {
 			}
 			assertResolveStateBindingsAbsent(t, fixture.repository)
 		})
+	}
+}
+
+func TestResolveInteractiveYesFinalizesExternalResolution(t *testing.T) {
+	fixture := newResolveFixture(t, []string{"in-progress", "ready-for-agent", "spec"}, "COMPLETED")
+
+	var stdout, stderr bytes.Buffer
+	if err := resolveCommandWithInput(context.Background(), fixture.args("run-42"), strings.NewReader("yes\n"), true, &stdout, &stderr); err != nil {
+		t.Fatalf("interactive Resolve: %v, stderr=%q, stdout=%q", err, stderr.String(), stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "Proceed with External Resolution? [y/N]") || !strings.Contains(stdout.String(), "External Resolution complete for Run run-42") {
+		t.Fatalf("interactive Resolve output = %q", stdout.String())
+	}
+	persisted, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := persisted.Runs[1]
+	if run.Status != scheduler.StatusResolvedExternally || run.ResolvedExternallyAt == nil || run.ClosureReason != "completed" || run.CompletedAt != nil || len(persisted.Leases) != 0 {
+		t.Fatalf("interactive Resolve state = %#v", persisted)
+	}
+	var github struct {
+		Labels []string `json:"labels"`
+	}
+	data, err := os.ReadFile(fixture.githubState)
+	if err != nil || json.Unmarshal(data, &github) != nil {
+		t.Fatalf("read interactive GitHub state: %v", err)
+	}
+	if strings.Join(github.Labels, ",") != "spec" {
+		t.Fatalf("interactive Resolve labels = %v", github.Labels)
 	}
 }
 
@@ -437,6 +467,46 @@ func TestResolveRefusesFinalizationWhenIssueReopensAfterFirstLabelMutation(t *te
 	}
 	if github.State != "OPEN" || strings.Join(github.Labels, ",") != "ready-for-agent,spec" {
 		t.Fatalf("GitHub race state = %#v", github)
+	}
+}
+
+func TestResolveRefusesFinalizationWhenClosureReasonChangesAfterLabelMutation(t *testing.T) {
+	fixture := newResolveFixture(t, []string{"in-progress", "ready-for-agent", "spec"}, "COMPLETED")
+	data, err := os.ReadFile(fixture.githubState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = bytes.Replace(data, []byte(`"changeReasonAfterFirstMutation":false`), []byte(`"changeReasonAfterFirstMutation":true`), 1)
+	if err := os.WriteFile(fixture.githubState, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err = resolveCommandWithInput(context.Background(), fixture.args("run-42", "--yes"), strings.NewReader(""), false, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "closure reason changed") {
+		t.Fatalf("closure-reason race error = %v, stderr=%q, stdout=%q", err, stderr.String(), stdout.String())
+	}
+	if strings.Contains(stdout.String(), "External Resolution complete") || strings.Contains(stdout.String(), "Completion recorded") {
+		t.Fatalf("closure-reason race reported success: %q", stdout.String())
+	}
+	persisted, loadErr := fixture.store.Load()
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	run := persisted.Runs[1]
+	if run.Status != scheduler.StatusResolvingExternally || run.ResolvedExternallyAt != nil || run.ClosureReason != "" || len(persisted.Leases) != 1 || persisted.Leases[0].RunID != run.RunID {
+		t.Fatalf("closure-reason race state = %#v", persisted)
+	}
+	var github struct {
+		Labels []string `json:"labels"`
+		Reason string   `json:"reason"`
+	}
+	data, err = os.ReadFile(fixture.githubState)
+	if err != nil || json.Unmarshal(data, &github) != nil {
+		t.Fatalf("read GitHub closure-reason race state: %v", err)
+	}
+	if github.Reason != "NOT_PLANNED" || strings.Join(github.Labels, ",") != "ready-for-agent,spec" {
+		t.Fatalf("GitHub closure-reason race state = %#v", github)
 	}
 }
 

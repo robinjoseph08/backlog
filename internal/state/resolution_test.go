@@ -44,25 +44,68 @@ func TestFileStoreMigratesV3ToV4Losslessly(t *testing.T) {
 }
 
 func TestFileStoreValidatesExternalResolutionLeaseAndMetadata(t *testing.T) {
-	at := time.Now().UTC()
+	at := time.Date(2026, 7, 28, 1, 2, 3, 0, time.UTC)
 	store := FileStore{Path: filepath.Join(t.TempDir(), "state.json")}
-	resolved := scheduler.Run{Issue: 1, RunID: "resolved", Status: scheduler.StatusResolvedExternally, WorkerMode: scheduler.WorkerModePrint, ResolvedExternallyAt: &at, ClosureReason: "completed"}
-	if err := store.Save(State{Version: CurrentVersion, Runs: []scheduler.Run{resolved}}); err != nil {
-		t.Fatal(err)
-	}
-	resolvedWithOpenLog := resolved
-	resolvedWithOpenLog.LogPath = "/retained/worker.jsonl"
-	resolvedWithOpenLog.WorkerLogOpen = true
-	for _, value := range []State{
-		{Version: CurrentVersion, Runs: []scheduler.Run{{Issue: 1, RunID: "progress", Status: scheduler.StatusResolvingExternally, WorkerMode: scheduler.WorkerModePrint}}},
-		{Version: CurrentVersion, Runs: []scheduler.Run{resolved}, Leases: []scheduler.Lease{{LeaseID: "lease", Issue: 1, RunID: "resolved"}}},
-		{Version: CurrentVersion, Runs: []scheduler.Run{{Issue: 1, RunID: "missing", Status: scheduler.StatusResolvedExternally, WorkerMode: scheduler.WorkerModePrint}}},
-		{Version: CurrentVersion, Runs: []scheduler.Run{resolvedWithOpenLog}},
-	} {
-		if err := store.Save(value); err == nil {
-			t.Fatalf("accepted invalid state %#v", value)
+	resolved := scheduler.Run{Issue: 1, RunID: "resolved", Status: scheduler.StatusResolvedExternally, WorkerMode: scheduler.WorkerModePrint, LogPath: "/retained/worker.jsonl", WorkerLogOpen: false, ResolvedExternallyAt: &at, ClosureReason: "completed"}
+	for _, reason := range []string{"completed", "not-planned"} {
+		valid := resolved
+		valid.ClosureReason = reason
+		if err := store.Save(State{Version: CurrentVersion, Runs: []scheduler.Run{valid}}); err != nil {
+			t.Fatalf("supported closure reason %q: %v", reason, err)
 		}
 	}
+
+	invalid := []struct {
+		name, want string
+		mutate     func(*State)
+	}{
+		{name: "missing resolution timestamp", want: "invalid resolution metadata", mutate: func(value *State) {
+			value.Runs[0].ResolvedExternallyAt = nil
+		}},
+		{name: "zero resolution timestamp", want: "invalid resolution metadata", mutate: func(value *State) {
+			zero := time.Time{}
+			value.Runs[0].ResolvedExternallyAt = &zero
+		}},
+		{name: "unsupported closure reason", want: "invalid resolution metadata", mutate: func(value *State) {
+			value.Runs[0].ClosureReason = "future"
+		}},
+		{name: "Completion timestamp", want: "invalid resolution metadata", mutate: func(value *State) {
+			value.Runs[0].CompletedAt = &at
+		}},
+		{name: "pending Completion cleanup", want: "pending Completion cleanup", mutate: func(value *State) {
+			value.Runs[0].CleanupPending = true
+		}},
+		{name: "open Worker-log marker", want: "invalid resolution metadata", mutate: func(value *State) {
+			value.Runs[0].WorkerLogOpen = true
+		}},
+		{name: "active Lease", want: "references externally resolved Run", mutate: func(value *State) {
+			value.Leases = []scheduler.Lease{{LeaseID: "lease", Issue: 1, RunID: "resolved"}}
+		}},
+		{name: "resolution timestamp on other status", want: "External Resolution metadata", mutate: func(value *State) {
+			value.Runs[0].Status = scheduler.StatusFailed
+			value.Runs[0].ClosureReason = ""
+		}},
+		{name: "closure reason on other status", want: "External Resolution metadata", mutate: func(value *State) {
+			value.Runs[0].Status = scheduler.StatusFailed
+			value.Runs[0].ResolvedExternallyAt = nil
+		}},
+		{name: "diagnostic warning on other status", want: "External Resolution metadata", mutate: func(value *State) {
+			value.Runs[0].Status = scheduler.StatusFailed
+			value.Runs[0].ResolvedExternallyAt = nil
+			value.Runs[0].ClosureReason = ""
+			value.Runs[0].DiagnosticWarning = "historical warning"
+		}},
+	}
+	for _, test := range invalid {
+		t.Run(test.name, func(t *testing.T) {
+			value := State{Version: CurrentVersion, Runs: []scheduler.Run{resolved}}
+			test.mutate(&value)
+			if err := store.Save(value); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Save() error = %v, want rejection containing %q for %#v", err, test.want, value)
+			}
+		})
+	}
+
 	progress := scheduler.Run{Issue: 2, RunID: "progress", Status: scheduler.StatusResolvingExternally, WorkerMode: scheduler.WorkerModePrint}
 	if err := store.Save(State{Version: CurrentVersion, Runs: []scheduler.Run{progress}, Leases: []scheduler.Lease{{LeaseID: "progress", Issue: 2, RunID: "progress"}}}); err != nil {
 		t.Fatal(err)
