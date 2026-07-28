@@ -94,7 +94,7 @@ func (s *bubbleDashboardSession) presentation(ctx context.Context, control Prese
 		tea.WithInput(control.Terminal.Input),
 		tea.WithOutput(control.Terminal.Output),
 		tea.WithWindowSize(dimensions.Width, dimensions.Height),
-		tea.WithColorProfile(bubbleColorProfile(control.Terminal.ColorProfile())),
+		tea.WithColorProfile(bubbleColorProfile(model.colorProfile)),
 		tea.WithoutSignalHandler(),
 	)
 	_, err = program.Run()
@@ -289,16 +289,18 @@ func (s bubbleDashboardStore) Save(current state.State) error {
 }
 
 type bubbleDashboardModel struct {
-	ctx       context.Context
-	control   PresentationControl
-	session   *bubbleDashboardSession
-	dashboard *liveDashboard
-	viewport  viewport.Model
-	width     int
-	height    int
-	header    string
-	footer    string
-	layout    dashboardBodyLayout
+	ctx          context.Context
+	control      PresentationControl
+	session      *bubbleDashboardSession
+	dashboard    *liveDashboard
+	viewport     viewport.Model
+	width        int
+	height       int
+	header       string
+	footer       string
+	layout       dashboardBodyLayout
+	colorProfile TerminalColorProfile
+	styler       dashboardStyler
 
 	selectedAnchor   string
 	attentionKnown   map[string]struct{}
@@ -312,6 +314,10 @@ type bubbleDashboardModel struct {
 func newBubbleDashboardModel(ctx context.Context, control PresentationControl, session *bubbleDashboardSession, dimensions TerminalDimensions) bubbleDashboardModel {
 	empty := state.State{Version: state.CurrentVersion}
 	view := viewport.New(viewport.WithWidth(dimensions.Width))
+	profile := TerminalColorNone
+	if control.Terminal.ColorProfile != nil {
+		profile = control.Terminal.ColorProfile()
+	}
 	view.SoftWrap = true
 	view.FillHeight = true
 	model := bubbleDashboardModel{
@@ -319,7 +325,7 @@ func newBubbleDashboardModel(ctx context.Context, control PresentationControl, s
 		dashboard: newLiveDashboard(io.Discard, nil, empty, control.Terminal.Now),
 		viewport:  view, width: dimensions.Width, height: dimensions.Height,
 		attentionKnown: make(map[string]struct{}), attentionPending: make(map[string]struct{}),
-		startup: &atomic.Bool{},
+		colorProfile: profile, styler: newDashboardStyler(profile, true), startup: &atomic.Bool{},
 	}
 	model.refreshViewport(dashboardSelection{})
 	model.selectViewportAnchor()
@@ -333,7 +339,11 @@ func (m bubbleDashboardModel) started() bool {
 func (m bubbleDashboardModel) Init() tea.Cmd {
 	m.startup.Store(true)
 	m.session.signalStartup(nil)
-	return tea.Batch(m.waitForSessionUpdate(), m.waitForOperationalEvent(), dashboardElapsedTick(), dashboardActivityTick())
+	commands := []tea.Cmd{m.waitForSessionUpdate(), m.waitForOperationalEvent(), dashboardElapsedTick(), dashboardActivityTick()}
+	if m.colorProfile != TerminalColorNone {
+		commands = append(commands, tea.RequestBackgroundColor)
+	}
+	return tea.Batch(commands...)
 }
 
 func (m bubbleDashboardModel) waitForSessionUpdate() tea.Cmd {
@@ -372,6 +382,8 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = max(1, msg.Width), max(1, msg.Height)
+	case tea.BackgroundColorMsg:
+		m.styler = newDashboardStyler(m.colorProfile, msg.IsDark())
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" {
 			m.interruptsWaiting++
@@ -666,13 +678,20 @@ func (m bubbleDashboardModel) View() tea.View {
 
 	lines := make([]string, 0, m.height)
 	if frame.titleHeight > 0 {
-		lines = append(lines, lipgloss.NewStyle().Bold(true).Render(frame.title))
+		title := m.styler.active.Render(frame.title)
+		lines = append(lines, lipgloss.NewStyle().Bold(true).Render(title))
 	}
-	lines = append(lines, frame.chrome.top...)
+	for _, line := range frame.chrome.top {
+		lines = append(lines, m.styler.chrome(line))
+	}
 	if frame.bodyHeight > 0 {
-		lines = append(lines, strings.Split(m.viewport.View(), "\n")...)
+		view := m.viewport
+		view.SetContent(m.styler.body(m.layout.text))
+		lines = append(lines, strings.Split(view.View(), "\n")...)
 	}
-	lines = append(lines, frame.chrome.bottom...)
+	for _, line := range frame.chrome.bottom {
+		lines = append(lines, m.styler.chrome(line))
+	}
 	for index := range lines {
 		lines[index] = fitDashboardLine(lines[index], m.width)
 	}
