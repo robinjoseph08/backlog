@@ -421,6 +421,67 @@ func TestResolveRequiresYesNonInteractivelyAndCompiledExecutableRefusesRunnerLoc
 	}
 }
 
+func TestCompiledRunStartupResumesPartialExternalResolutionBeforeCandidateAdmission(t *testing.T) {
+	fixture := newResolveFixture(t, []string{"ready-for-agent", "spec"}, "COMPLETED")
+	partial, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	partial.Runs[1].Status = scheduler.StatusResolvingExternally
+	if err := fixture.store.Save(partial); err != nil {
+		t.Fatal(err)
+	}
+
+	candidateChecked := filepath.Join(t.TempDir(), "candidate-checked")
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
+    if jq -e '.labels | any(. == "ready-for-agent")' `+quote(fixture.githubState)+` >/dev/null; then
+      echo 'Candidate Admission observed the unretired ready-for-agent label' >&2
+      exit 9
+    fi
+    touch `+quote(candidateChecked)+`
+    printf '%s\n' '[]' ;;
+  *) exec `+quote(fixture.gh)+` "$@" ;;
+esac
+`)
+	workerStarted := filepath.Join(t.TempDir(), "worker-started")
+	pi := writeExecutable(t, "#!/bin/sh\ntouch "+quote(workerStarted)+"\nexit 9\n")
+	binary := buildExecutable(t, t.TempDir())
+	command := exec.Command(binary, "run", "--plain", "--repo-dir", fixture.repository, "--state-dir", fixture.stateDir,
+		"--max-workers", "1", "--git", fixture.git, "--gh", gh, "--pi", pi)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("compiled startup partial External Resolution: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(candidateChecked); err != nil {
+		t.Fatalf("Candidate Admission did not run after External Resolution: %v", err)
+	}
+	if _, err := os.Stat(workerStarted); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("External Resolution created a replacement Worker: %v", err)
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.Leases) != 0 || current.Runs[1].Status != scheduler.StatusResolvedExternally {
+		t.Fatalf("startup partial External Resolution state = %#v", current)
+	}
+	labelsData, err := os.ReadFile(fixture.githubState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var githubState struct {
+		Labels []string `json:"labels"`
+	}
+	if err := json.Unmarshal(labelsData, &githubState); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(githubState.Labels, ",") != "spec" {
+		t.Fatalf("startup partial External Resolution restored Candidate labels: %v", githubState.Labels)
+	}
+}
+
 func TestCompiledRunWatchUsesCompleteExternalResolutionDuringPolling(t *testing.T) {
 	fixture := newResolveFixture(t, []string{"in-progress", "ready-for-agent", "spec"}, "COMPLETED")
 	fixtureState, err := os.ReadFile(fixture.githubState)
