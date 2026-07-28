@@ -2157,6 +2157,40 @@ func TestRestoreDashboardTerminalReturnsOutputFailure(t *testing.T) {
 	}
 }
 
+type boundedRecoveryWriter struct {
+	bytes.Buffer
+	limit  int
+	writes int
+}
+
+func (w *boundedRecoveryWriter) Write(content []byte) (int, error) {
+	w.writes++
+	if len(content) > w.limit {
+		content = content[:w.limit]
+	}
+	return w.Buffer.Write(content)
+}
+
+func TestRestoreDashboardTerminalCompletesNilErrorShortWrites(t *testing.T) {
+	output := &boundedRecoveryWriter{limit: 3}
+	if err := restoreDashboardTerminal(output); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != dashboardTerminalRestoration || !strings.HasSuffix(output.String(), "\x1b[?1049l\x1b[?25h") || output.writes <= 1 {
+		t.Fatalf("short-write restoration = %q in %d writes, want complete alternate-screen and cursor restoration in multiple writes", output.String(), output.writes)
+	}
+}
+
+func TestRestoreDashboardTerminalReturnsShortWriteAfterNoProgress(t *testing.T) {
+	output := &boundedRecoveryWriter{}
+	if err := restoreDashboardTerminal(output); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("zero-progress restoration error = %v, want %v", err, io.ErrShortWrite)
+	}
+	if output.writes != 1 || output.Len() != 0 {
+		t.Fatalf("zero-progress restoration made %d writes and produced %q", output.writes, output.String())
+	}
+}
+
 type statefulTerminalWriter struct {
 	visible      bytes.Buffer
 	pending      bytes.Buffer
