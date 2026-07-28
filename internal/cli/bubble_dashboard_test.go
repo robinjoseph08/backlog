@@ -150,7 +150,7 @@ func TestBubbleDashboardURLFailureIsTemporaryDiagnosticOnly(t *testing.T) {
 		OpenURL: func(context.Context, string) error {
 			return errors.New("opener unavailable")
 		},
-	}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 16})
+	}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 2})
 	updated, _ := model.Update(dashboardConfiguredMsg{initial: current, source: &dashboardTestSource{current: current}})
 	model = updated.(bubbleDashboardModel)
 	line, _ := model.anchorVisualLine(dashboardRunAnchor("current"))

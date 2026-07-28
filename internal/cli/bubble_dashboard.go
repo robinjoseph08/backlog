@@ -1024,12 +1024,31 @@ func dashboardChromeLines(header, footer []string, pendingAttention int, stage d
 	}
 
 	// When not all chrome can fit, spend the available rows on the fixed footer
-	// before retaining header details. Keep next-interrupt guidance and
-	// navigation in separately allocated rows whenever the terminal permits it.
+	// before retaining header details. Supplemental footer diagnostics come
+	// first so a temporary error remains visible, followed by next-interrupt
+	// guidance and navigation in separately allocated rows when space permits.
 	next, navigation := compactFooterLine(compactFooter, 1), compactFooterLine(compactFooter, 2)
-	bottom := wrapDashboardChrome([][]string{{next, navigation}}, width)
+	supplemental := strings.Join(compactFooter[min(3, len(compactFooter)):], " | ")
+	priorityFooter := []string{next, navigation}
+	if supplemental != "" {
+		priorityFooter = append([]string{supplemental}, priorityFooter...)
+	}
+	bottom := wrapDashboardChrome([][]string{priorityFooter}, width)
 	if len(bottom) > chromeLimit && chromeLimit >= 2 {
-		bottom = []string{fitDashboardLine(next, width), fitDashboardLine(navigation, width)}
+		if supplemental == "" {
+			bottom = []string{fitDashboardLine(next, width), fitDashboardLine(navigation, width)}
+		} else if chromeLimit == 2 {
+			bottom = []string{
+				fitDashboardLine(supplemental, width),
+				fitDashboardLine(strings.Join([]string{next, navigation}, " | "), width),
+			}
+		} else {
+			bottom = []string{
+				fitDashboardLine(supplemental, width),
+				fitDashboardLine(next, width),
+				fitDashboardLine(navigation, width),
+			}
+		}
 	}
 	if len(bottom) > chromeLimit {
 		bottom = bottom[:chromeLimit]
