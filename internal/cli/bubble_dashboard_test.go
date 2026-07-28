@@ -110,20 +110,25 @@ func TestBubbleDashboardElapsedTickAdvancesAndReschedulesWithoutExternalUpdates(
 	}
 }
 
-func TestBubbleDashboardTogglesAdmissionDiagnosticsWithD(t *testing.T) {
+func TestBubbleDashboardTogglesAdmissionDiagnosticsWithDWithoutScrolling(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
-	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 100, Height: 30})
-	model.dashboard.operationalEvent(runner.CandidateDiscoveryFailed{
-		Operation: runner.CandidateDiscoveryList, Err: errors.New("gh issue list --repo acme/widgets: connection refused"), Cause: "connection refused",
-		OccurredAt: now, RetryAt: now.Add(30 * time.Second), ConsecutiveFailures: 1,
-	})
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 100, Height: 14})
+	for failure := 1; failure <= 8; failure++ {
+		model.dashboard.operationalEvent(runner.CandidateDiscoveryFailed{
+			Operation: runner.CandidateDiscoveryList, Err: fmt.Errorf("gh issue list --repo acme/widgets: connection refused %d", failure), Cause: "connection refused",
+			OccurredAt: now, RetryAt: now.Add(30 * time.Second), ConsecutiveFailures: failure,
+		})
+	}
 	if view := ansi.Strip(model.View().Content); strings.Contains(view, "gh issue list") {
 		t.Fatalf("closed Diagnostics exposed full command:\n%s", view)
 	}
 	updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}))
 	model = updated.(bubbleDashboardModel)
-	if view := ansi.Strip(model.View().Content); !strings.Contains(view, "Diagnostics (1 recent Candidate discovery failure; d to close)") || !strings.Contains(view, "gh issue list") {
+	if view := ansi.Strip(model.View().Content); !strings.Contains(view, "Diagnostics (8 recent Candidate discovery failures; d to close)") || !strings.Contains(model.viewport.GetContent(), "gh issue list") {
 		t.Fatalf("d did not open Diagnostics:\n%s", view)
+	}
+	if !model.viewport.AtTop() {
+		t.Fatalf("d also scrolled the viewport to offset %d", model.viewport.YOffset())
 	}
 	updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}))
 	model = updated.(bubbleDashboardModel)

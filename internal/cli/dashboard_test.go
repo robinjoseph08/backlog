@@ -344,6 +344,26 @@ func TestDashboardAggregatesAdmissionFailuresAndBoundsDiagnostics(t *testing.T) 
 	}
 }
 
+func TestDashboardStopsAdmissionRetryCountdownDuringShutdown(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	dashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, func() time.Time { return now })
+	dashboard.operationalEvent(runner.CandidateDiscoveryFailed{
+		Operation: runner.CandidateDiscoveryList, Cause: "connection refused",
+		OccurredAt: now, RetryAt: now.Add(30 * time.Second), ConsecutiveFailures: 1,
+	})
+
+	_, body, _ := dashboard.renderParts(now)
+	if !strings.Contains(body, "Next retry: 30s") {
+		t.Fatalf("running Admission omitted retry countdown:\n%s", body)
+	}
+
+	dashboard.operationalEvent(runner.ShutdownEvent{Stage: runner.ShutdownStageDraining})
+	_, body, _ = dashboard.renderParts(now.Add(5 * time.Second))
+	if !strings.Contains(body, "Admission: DEGRADED") || !strings.Contains(body, "Retry: stopped") || strings.Contains(body, "Next retry:") {
+		t.Fatalf("shutdown Admission rendered an actionable retry:\n%s", body)
+	}
+}
+
 func TestPresentationQueuePreservesAdmissionAggregateThroughDashboard(t *testing.T) {
 	firstFailure := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	queue := newPresentationEventQueue()

@@ -354,6 +354,7 @@ func dashboardActivityTick() tea.Cmd {
 
 func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var commands []tea.Cmd
+	forwardToViewport := true
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = max(1, msg.Width), max(1, msg.Height)
@@ -367,6 +368,7 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(commands...)
 		case "d":
 			m.dashboard.toggleDiagnostics()
+			forwardToViewport = false
 		}
 	case dashboardInterruptResultMsg:
 		if m.interruptsWaiting > 0 {
@@ -418,10 +420,12 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.resizeViewport()
 	_, body, _ := m.dashboard.renderParts(m.dashboard.now())
 	m.viewport.SetContent(body)
-	updated, command := m.viewport.Update(msg)
-	m.viewport = updated
-	if command != nil {
-		commands = append(commands, command)
+	if forwardToViewport {
+		updated, command := m.viewport.Update(msg)
+		m.viewport = updated
+		if command != nil {
+			commands = append(commands, command)
+		}
 	}
 	return m, tea.Batch(commands...)
 }

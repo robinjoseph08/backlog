@@ -569,7 +569,7 @@ func (d *liveDashboard) renderPartsFor(current state.State, messages []string, s
 	admission := cloneDashboardAdmission(d.admission)
 	diagnosticsOpen := d.diagnosticsOpen
 	d.mu.Unlock()
-	renderAdmissionHealth(&body, admission, diagnosticsOpen, now)
+	renderAdmissionHealth(&body, admission, diagnosticsOpen, stage, now)
 	renderDashboardSection(&body, "Active Runs", sections[statusActive], now)
 	renderDashboardSection(&body, "Attention Required", sections[statusAttention], now)
 	renderDashboardSection(&body, "Outcomes to Acknowledge", sections[statusOutcomes], now)
@@ -597,7 +597,7 @@ func cloneDashboardAdmission(admission dashboardAdmission) dashboardAdmission {
 	return admission
 }
 
-func renderAdmissionHealth(output *strings.Builder, admission dashboardAdmission, diagnosticsOpen bool, now time.Time) {
+func renderAdmissionHealth(output *strings.Builder, admission dashboardAdmission, diagnosticsOpen bool, stage dashboardStage, now time.Time) {
 	output.WriteString("\nAdmission health\n")
 	if admission.degraded {
 		noun := "failures"
@@ -605,8 +605,12 @@ func renderAdmissionHealth(output *strings.Builder, admission dashboardAdmission
 			noun = "failure"
 		}
 		fmt.Fprintf(output, "  Admission: DEGRADED | %d consecutive %s\n", admission.consecutiveFailures, noun)
-		fmt.Fprintf(output, "    First failure: %s | Latest failure: %s | Next retry: %s\n",
-			formatAdmissionTime(admission.firstFailure), formatAdmissionTime(admission.latestFailure), admissionRetryCountdown(admission.retryAt, now))
+		fmt.Fprintf(output, "    First failure: %s | Latest failure: %s", formatAdmissionTime(admission.firstFailure), formatAdmissionTime(admission.latestFailure))
+		if stage == dashboardRunning {
+			fmt.Fprintf(output, " | Next retry: %s\n", admissionRetryCountdown(admission.retryAt, now))
+		} else {
+			output.WriteString(" | Retry: stopped\n")
+		}
 		fmt.Fprintf(output, "    Operation: %s", plainStatusValue(string(admission.operation)))
 		if admission.issue != nil {
 			fmt.Fprintf(output, " | Issue: #%d", *admission.issue)
