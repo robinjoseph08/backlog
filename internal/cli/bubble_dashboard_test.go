@@ -387,6 +387,45 @@ func TestBubbleDashboardMarksAndJumpsToNewOffscreenAttention(t *testing.T) {
 	}
 }
 
+func TestBubbleDashboardMarksAndJumpsToNewAttentionInCollapsedSection(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	current := navigationTestState(now, 4)
+	source := &dashboardTestSource{current: current}
+	model := configuredNavigationTestModel(t, now, current, source)
+	section := dashboardSectionAnchor("Attention Required")
+	model.expansionOverrides[section] = false
+	model.refreshViewport(model.currentSelection())
+
+	attention := scheduler.Run{Issue: 100, IssueTitle: "Collapsed intervention", RunID: "attention-collapsed", Status: scheduler.StatusNeedsHuman, StartedAt: now, UpdatedAt: now, Error: "inspect outcome"}
+	current.Runs = append(current.Runs, attention)
+	current.Leases = append(current.Leases, scheduler.Lease{LeaseID: attention.RunID, Issue: attention.Issue, RunID: attention.RunID})
+	source.current = current
+	updated, _ := model.Update(dashboardStateMsg(current))
+	model = updated.(bubbleDashboardModel)
+	if _, pending := model.attentionPending[attention.RunID]; !pending {
+		t.Fatal("new Attention in collapsed section was not marked pending")
+	}
+	if _, exists := model.anchorVisualLine(dashboardRunAnchor(attention.RunID)); exists {
+		t.Fatal("collapsed Attention section unexpectedly exposed the new Run anchor")
+	}
+
+	updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: 'a', Text: "a"}))
+	model = updated.(bubbleDashboardModel)
+	if model.selectedAnchor != dashboardRunAnchor(attention.RunID) {
+		t.Fatalf("Attention jump selected %q, want Run %q", model.selectedAnchor, attention.RunID)
+	}
+	if expanded := model.expansionOverrides[section]; !expanded {
+		t.Fatal("Attention jump did not expand the collapsed section")
+	}
+	line, exists := model.anchorVisualLine(model.selectedAnchor)
+	if !exists || !model.visualLineVisible(line) {
+		t.Fatal("Attention jump did not reveal the new Run")
+	}
+	if _, pending := model.attentionPending[attention.RunID]; pending {
+		t.Fatal("revealed Attention Run remained pending")
+	}
+}
+
 func TestBubbleDashboardClearsPendingAttentionWhenRefreshRevealsRun(t *testing.T) {
 	for _, refresh := range []string{"resize", "state update"} {
 		t.Run(refresh, func(t *testing.T) {
@@ -698,12 +737,36 @@ func TestBubbleDashboardResponsiveDensityAndSelectedDetails(t *testing.T) {
 	}
 }
 
+func TestBubbleDashboardSelectsRunDetailsWhenResizedFromMediumToRoomy(t *testing.T) {
+	now := time.Date(2026, 7, 28, 14, 0, 0, 0, time.UTC)
+	current := navigationTestState(now, 2)
+	model := configuredNavigationTestModel(t, now, current, &dashboardTestSource{current: current})
+	section := dashboardSectionAnchor("Attention Required")
+	model.selectedAnchor = section
+	model.refreshViewport(dashboardSelection{identity: section, valid: true})
+
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 64, Height: 24})
+	model = updated.(bubbleDashboardModel)
+	if model.selectedAnchor != dashboardRunAnchor("run-0") {
+		t.Fatalf("roomy resize selection = %q, want first Run", model.selectedAnchor)
+	}
+	if !strings.Contains(model.viewport.GetContent(), "Run: run-0") {
+		t.Fatalf("roomy resize did not show selected Run details:\n%s", model.viewport.GetContent())
+	}
+}
+
 func TestBubbleDashboardEnterExpandsRunsAndSections(t *testing.T) {
 	now := time.Date(2026, 7, 28, 14, 0, 0, 0, time.UTC)
 	completedAt := now.Add(-time.Minute)
 	completion := scheduler.Run{Issue: 68, IssueTitle: "Only completion fields", RunID: "completion-secret", Status: scheduler.StatusMerged, PullRequest: "https://github.com/acme/widgets/pull/168", StartedAt: now.Add(-time.Hour), CompletedAt: &completedAt}
+	secondCompletedAt := now.Add(-2 * time.Minute)
+	thirdCompletedAt := now.Add(-3 * time.Minute)
+	fourthCompletedAt := now.Add(-4 * time.Minute)
+	secondCompletion := scheduler.Run{Issue: 67, IssueTitle: "Second completion", RunID: "completion-second", Status: scheduler.StatusMerged, StartedAt: now.Add(-time.Hour), CompletedAt: &secondCompletedAt}
+	thirdCompletion := scheduler.Run{Issue: 66, IssueTitle: "Third completion", RunID: "completion-third", Status: scheduler.StatusMerged, StartedAt: now.Add(-time.Hour), CompletedAt: &thirdCompletedAt}
+	fourthCompletion := scheduler.Run{Issue: 65, IssueTitle: "Fourth completion", RunID: "completion-fourth", Status: scheduler.StatusMerged, StartedAt: now.Add(-time.Hour), CompletedAt: &fourthCompletedAt}
 	active := scheduler.Run{Issue: 69, IssueTitle: "Expandable", IssueURL: "https://github.com/acme/widgets/issues/69", RunID: "run-expandable", Status: scheduler.StatusRunning, StartedAt: now.Add(-time.Minute)}
-	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1, Runs: []scheduler.Run{active, completion}, Leases: []scheduler.Lease{{LeaseID: active.RunID, Issue: active.Issue, RunID: active.RunID}}}
+	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1, Runs: []scheduler.Run{active, completion, secondCompletion, thirdCompletion, fourthCompletion}, Leases: []scheduler.Lease{{LeaseID: active.RunID, Issue: active.Issue, RunID: active.RunID}}}
 	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 72, Height: 18})
 	model.dashboard.source = &dashboardTestSource{current: current}
 	model.dashboard.update(current)
@@ -729,6 +792,20 @@ func TestBubbleDashboardEnterExpandsRunsAndSections(t *testing.T) {
 	model = updated.(bubbleDashboardModel)
 	if !strings.Contains(model.viewport.GetContent(), completion.IssueTitle) {
 		t.Fatalf("Enter did not expand collapsed completion section:\n%s", model.viewport.GetContent())
+	}
+	fourthAnchor := dashboardRunAnchor(fourthCompletion.RunID)
+	if !strings.Contains(model.viewport.GetContent(), fourthCompletion.IssueTitle) {
+		t.Fatalf("expanded completion section remained capped before %q:\n%s", fourthCompletion.IssueTitle, model.viewport.GetContent())
+	}
+	if _, exists := model.anchorVisualLine(fourthAnchor); !exists {
+		t.Fatalf("expanded completion section omitted navigation anchor %q", fourthAnchor)
+	}
+	model.selectedAnchor = fourthAnchor
+	model.refreshViewport(dashboardSelection{identity: fourthAnchor, valid: true})
+	updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	model = updated.(bubbleDashboardModel)
+	if details := dashboardSectionOutput(t, model.viewport.GetContent(), "Recent Completions", ""); !strings.Contains(details, "Issue: #65  Fourth completion") {
+		t.Fatalf("additional Completion could not be expanded:\n%s", details)
 	}
 
 	model.selectedAnchor = dashboardRunAnchor(completion.RunID)

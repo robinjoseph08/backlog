@@ -379,6 +379,7 @@ func dashboardActivityTick() tea.Cmd {
 
 func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	selection := m.currentSelection()
+	previousDensity := dashboardDensityForHeight(m.height)
 	var commands []tea.Cmd
 	trackAttention := false
 	configured := false
@@ -449,8 +450,11 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	m.refreshViewport(selection)
+	enteredRoomy := previousDensity != dashboardDensityRoomy && dashboardDensityForHeight(m.height) == dashboardDensityRoomy
+	if configured || enteredRoomy {
+		m.ensureRoomyRunSelection()
+	}
 	if configured {
-		m.selectRoomyInitialRun()
 		m.attentionKnown = cloneDashboardIdentities(m.layout.attention)
 		clear(m.attentionPending)
 	} else if trackAttention {
@@ -525,9 +529,16 @@ func (m *bubbleDashboardModel) refreshViewport(selection dashboardSelection) {
 	m.selectViewportAnchor()
 }
 
-func (m *bubbleDashboardModel) selectRoomyInitialRun() {
+func (m *bubbleDashboardModel) ensureRoomyRunSelection() {
 	if dashboardDensityForHeight(m.height) != dashboardDensityRoomy {
 		return
+	}
+	if strings.HasPrefix(m.selectedAnchor, "run:") {
+		for _, anchor := range m.layout.anchors {
+			if anchor.identity == m.selectedAnchor {
+				return
+			}
+		}
 	}
 	for _, anchor := range m.layout.anchors {
 		if !strings.HasPrefix(anchor.identity, "run:") {
@@ -691,6 +702,10 @@ func dashboardAttentionJump(msg tea.Msg) bool {
 
 func (m *bubbleDashboardModel) jumpToAttention() {
 	identity := dashboardSectionAnchor("Attention Required")
+	if len(m.attentionPending) > 0 {
+		m.expansionOverrides[identity] = true
+		m.refreshViewport(m.currentSelection())
+	}
 	for _, anchor := range m.layout.anchors {
 		if !strings.HasPrefix(anchor.identity, "run:") {
 			continue
@@ -726,7 +741,8 @@ func (m *bubbleDashboardModel) trackNewAttention() bool {
 		if _, known := m.attentionKnown[runID]; known {
 			continue
 		}
-		if line, exists := m.anchorVisualLine(dashboardRunAnchor(runID)); exists && !m.visualLineVisible(line) {
+		line, exists := m.anchorVisualLine(dashboardRunAnchor(runID))
+		if !exists || !m.visualLineVisible(line) {
 			m.attentionPending[runID] = struct{}{}
 		}
 	}

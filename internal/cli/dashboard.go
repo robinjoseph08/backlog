@@ -616,11 +616,7 @@ func (b *dashboardBodyBuilder) renderResponsiveSection(name string, runs []statu
 		b.write(truncateDashboardContent("    none", options.width) + "\n")
 		return
 	}
-	visible := len(runs)
-	if completions && len(runs) > 3 {
-		visible = 3
-	}
-	for _, observed := range runs[:visible] {
+	for _, observed := range runs {
 		identity := dashboardRunAnchor(observed.run.RunID)
 		b.anchor(identity)
 		marker := "  "
@@ -635,9 +631,6 @@ func (b *dashboardBodyBuilder) renderResponsiveSection(name string, runs []statu
 				b.write(expandedDashboardRun(observed, now))
 			}
 		}
-	}
-	if remainder := len(runs) - visible; remainder > 0 {
-		b.write(truncateDashboardContent(fmt.Sprintf("    %d more completions", remainder), options.width) + "\n")
 	}
 }
 
