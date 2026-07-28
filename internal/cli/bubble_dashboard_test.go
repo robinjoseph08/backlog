@@ -134,35 +134,40 @@ func TestBubbleDashboardViewportSupportsDocumentedKeyboardNavigation(t *testing.
 	}
 
 	for _, test := range []struct {
-		name string
-		key  tea.Key
+		name      string
+		key       tea.Key
+		startPage bool
+		wantPage  bool
+		wantTop   bool
+		wantDelta int
 	}{
-		{name: "down arrow", key: tea.Key{Code: tea.KeyDown}},
-		{name: "j", key: tea.Key{Code: 'j', Text: "j"}},
-		{name: "page down", key: tea.Key{Code: tea.KeyPgDown}},
-		{name: "f", key: tea.Key{Code: 'f', Text: "f"}},
+		{name: "down arrow", key: tea.Key{Code: tea.KeyDown}, wantDelta: 1},
+		{name: "j", key: tea.Key{Code: 'j', Text: "j"}, wantDelta: 1},
+		{name: "page down", key: tea.Key{Code: tea.KeyPgDown}, wantPage: true},
+		{name: "f", key: tea.Key{Code: 'f', Text: "f"}, wantPage: true},
+		{name: "up arrow", key: tea.Key{Code: tea.KeyUp}, startPage: true, wantDelta: -1},
+		{name: "k", key: tea.Key{Code: 'k', Text: "k"}, startPage: true, wantDelta: -1},
+		{name: "page up", key: tea.Key{Code: tea.KeyPgUp}, startPage: true, wantTop: true},
+		{name: "b", key: tea.Key{Code: 'b', Text: "b"}, startPage: true, wantTop: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			model := press(newModel(), test.key)
-			if model.viewport.YOffset() == 0 {
-				t.Fatalf("%s did not scroll the viewport body", test.name)
+			model := newModel()
+			page := model.viewport.Height()
+			start := 0
+			if test.startPage {
+				start = page
+				model.viewport.SetYOffset(start)
 			}
-		})
-	}
-	for _, test := range []struct {
-		name string
-		down tea.Key
-		up   tea.Key
-	}{
-		{name: "up arrow", down: tea.Key{Code: tea.KeyDown}, up: tea.Key{Code: tea.KeyUp}},
-		{name: "k", down: tea.Key{Code: 'j', Text: "j"}, up: tea.Key{Code: 'k', Text: "k"}},
-		{name: "page up", down: tea.Key{Code: tea.KeyPgDown}, up: tea.Key{Code: tea.KeyPgUp}},
-		{name: "b", down: tea.Key{Code: 'f', Text: "f"}, up: tea.Key{Code: 'b', Text: "b"}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			model := press(press(newModel(), test.down), test.up)
-			if !model.viewport.AtTop() {
-				t.Fatalf("%s did not return the viewport to top; offset = %d", test.name, model.viewport.YOffset())
+			want := start + test.wantDelta
+			if test.wantPage {
+				want += page
+			}
+			if test.wantTop {
+				want = 0
+			}
+			model = press(model, test.key)
+			if got := model.viewport.YOffset(); got != want {
+				t.Fatalf("%s offset = %d, want %d (page height %d)", test.name, got, want, page)
 			}
 		})
 	}
@@ -196,9 +201,16 @@ func TestBubbleDashboardMouseWheelScrollsWithoutClickHandling(t *testing.T) {
 	model = updated.(bubbleDashboardModel)
 	updated, _ = model.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
 	model = updated.(bubbleDashboardModel)
-	if model.viewport.YOffset() == 0 {
-		t.Fatal("mouse wheel did not scroll the viewport")
+	if got := model.viewport.YOffset(); got != model.viewport.MouseWheelDelta {
+		t.Fatalf("mouse wheel down offset = %d, want %d", got, model.viewport.MouseWheelDelta)
 	}
+	updated, _ = model.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	model = updated.(bubbleDashboardModel)
+	if !model.viewport.AtTop() {
+		t.Fatalf("mouse wheel up did not return viewport to top; offset = %d", model.viewport.YOffset())
+	}
+	updated, _ = model.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+	model = updated.(bubbleDashboardModel)
 	offset := model.viewport.YOffset()
 	updated, command := model.Update(tea.MouseClickMsg{Button: tea.MouseLeft, X: 1, Y: 1})
 	model = updated.(bubbleDashboardModel)
