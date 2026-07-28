@@ -24,6 +24,7 @@ type Repository struct {
 
 type CompletionOutcome struct {
 	PullRequest    string
+	HeadCommit     string
 	PRFound        bool
 	Merged         bool
 	IssueClosed    bool
@@ -637,6 +638,7 @@ func (c Client) Completion(ctx context.Context, repo string, issue int, branch s
 		AutoMergeRequest json.RawMessage `json:"autoMergeRequest"`
 		IsDraft          *bool           `json:"isDraft"`
 		HeadRefName      string          `json:"headRefName"`
+		HeadRefOID       string          `json:"headRefOid"`
 		HeadOwner        struct {
 			Login string `json:"login"`
 		} `json:"headRepositoryOwner"`
@@ -646,7 +648,7 @@ func (c Client) Completion(ctx context.Context, repo string, issue int, branch s
 	}
 	var pullsJSON json.RawMessage
 	if err := c.jsonCommand(ctx, &pullsJSON, "pr", "list", "--repo", repo, "--state", "all", "--head", branch, "--limit", "1000",
-		"--json", "number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository"); err != nil {
+		"--json", "number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository"); err != nil {
 		return CompletionOutcome{}, fmt.Errorf("find pull request: %w", err)
 	}
 	if len(pullsJSON) == 0 || string(pullsJSON) == "null" || json.Unmarshal(pullsJSON, &pulls) != nil {
@@ -656,7 +658,7 @@ func (c Client) Completion(ctx context.Context, repo string, issue int, branch s
 		return CompletionOutcome{}, errors.New("find pull request: result reached the inspection limit; completeness is unknown")
 	}
 	for _, pull := range pulls {
-		if pull.Number <= 0 || !resourceURLMatches(pull.URL, repo, "pull", pull.Number) || pull.HeadRefName != branch ||
+		if pull.Number <= 0 || !resourceURLMatches(pull.URL, repo, "pull", pull.Number) || pull.HeadRefName != branch || !validCommitOID(pull.HeadRefOID) ||
 			!strings.EqualFold(pull.HeadOwner.Login, parts[0]) || !strings.EqualFold(pull.HeadRepository.NameWithOwner, repo) {
 			return CompletionOutcome{}, errors.New("find pull request: gh returned incomplete or mismatched pull request identity")
 		}
@@ -677,6 +679,7 @@ func (c Client) Completion(ctx context.Context, repo string, issue int, branch s
 		autoMergeArmed, _ := inspectedAutoMergeState(pulls[0].AutoMergeRequest, pulls[0].IsDraft)
 		outcome.PRFound = true
 		outcome.PullRequest = pulls[0].URL
+		outcome.HeadCommit = pulls[0].HeadRefOID
 		outcome.Merged = merged || strings.EqualFold(pulls[0].State, "merged")
 		outcome.AutoMergeArmed = autoMergeArmed
 	}

@@ -3646,6 +3646,184 @@ func TestRunnerRejectsUnsafeSuspendedContinuationAndRetainsLease(t *testing.T) {
 	}
 }
 
+func TestRunnerRefusesChangedOrDeletedShipItCheckpointBeforeReplacementLaunch(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(string) error
+	}{
+		{name: "changed", mutate: func(path string) error { return os.WriteFile(path, []byte("changed\n"), 0o600) }},
+		{name: "deleted", mutate: os.Remove},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			run := resumableRun(t, 101, "checkpoint-101")
+			gitDir := filepath.Join(run.Worktree, ".git")
+			if err := os.Mkdir(gitDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			data := []byte(fmt.Sprintf("# Ship-it checkpoint v1\n\nStatus: active\nStage: normal-review\nCoordinator session: %s\nWorking directory: %s\nBranch: %s\n", run.SessionID, run.Worktree, run.Branch))
+			path := filepath.Join(gitDir, "ship-it-checkpoint-v1.md")
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			path, _ = filepath.EvalSymlinks(path)
+			hash := sha256.Sum256(data)
+			run.Continuation.Workflow, run.Continuation.WorkflowStage = "ship-it", "normal-review"
+			run.Continuation.CheckpointFile, run.Continuation.CheckpointSHA256 = path, hex.EncodeToString(hash[:])
+			run.Continuation.CheckpointStatus = "active"
+			if err := test.mutate(path); err != nil {
+				t.Fatal(err)
+			}
+			workers := newFakeWorkers()
+			store := &memoryStore{value: state.State{Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}}
+			runner := testRunner(&fakeGitHub{}, workers, store, 1)
+			runner.Output = io.Discard
+			current := store.LoadValue()
+			process, err := runner.resume(context.Background(), context.Background(), &current, run)
+			if err != nil || process != nil || workers.wasStarted(run.Issue) || store.LoadValue().Runs[0].Status != scheduler.StatusNeedsHuman {
+				t.Fatalf("unsafe checkpoint Resume = %v, %v, state=%#v", process, err, store.LoadValue())
+			}
+		})
+	}
+}
+
+func TestProviderContinuationRejectsStaleBoundaryFromPriorWorkerGeneration(t *testing.T) {
+	run := resumableRun(t, 102, "stale-102")
+	run.Status = scheduler.StatusFailed
+	run.WorkerGeneration = 2
+	run.Continuation.WorkerGeneration = 1
+	run.Error = "provider exhausted"
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}}
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+	current := store.LoadValue()
+	if err := runner.applyProviderContinuation(&current, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	got := store.LoadValue().Runs[0]
+	if got.Status != scheduler.StatusNeedsHuman || got.FailureClass != scheduler.FailureUnsafeContinuation || got.ProviderContinuationAttempts != 0 {
+		t.Fatalf("stale provider boundary = %#v", got)
+	}
+}
+
+func TestRunnerFreshlyVerifiesRecoveryRepositoryIdentityBeforeStartAndRelease(t *testing.T) {
+	for _, phase := range []string{"start", "release"} {
+		t.Run(phase, func(t *testing.T) {
+			run := resumableRun(t, 103, "identity-103")
+			run.WorkerGeneration = 1
+			run.Continuation.WorkerGeneration = 1
+			run.Continuation.LocalCommit = strings.Repeat("a", 40)
+			run.Continuation.RemoteBranchState = "absent"
+			workers := newFakeWorkers()
+			workers.startupCloseResult.GroupExited = true
+			store := &memoryStore{value: state.State{Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}}
+			runner := testRunner(&fakeGitHub{}, workers, store, 1)
+			runner.Output = io.Discard
+			calls := 0
+			runner.VerifyResumeGit = func(context.Context, scheduler.Run) (string, bool, string, error) {
+				calls++
+				if phase == "start" || calls > 1 {
+					return strings.Repeat("b", 40), false, "", nil
+				}
+				return strings.Repeat("a", 40), false, "", nil
+			}
+			current := store.LoadValue()
+			process, err := runner.resume(context.Background(), context.Background(), &current, run)
+			if err != nil || process != nil || workers.releaseCount() != 0 || store.LoadValue().Runs[0].Status != scheduler.StatusNeedsHuman {
+				t.Fatalf("%s identity drift = %v, %v, state=%#v", phase, process, err, store.LoadValue())
+			}
+			if phase == "start" && workers.wasStarted(run.Issue) {
+				t.Fatal("Worker started before drift refusal")
+			}
+			if phase == "release" && !workers.wasStarted(run.Issue) {
+				t.Fatal("release-gated Worker was not started")
+			}
+		})
+	}
+}
+
+func TestRunnerSettledCheckpointFailurePersistsUnsafeClassificationBeforeProviderPolicy(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		failSave   bool
+		captureErr error
+	}{
+		{name: "capture", captureErr: errors.New("checkpoint unavailable")},
+		{name: "persistence", failSave: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			run := resumableRun(t, 105, "checkpoint-failure-105")
+			workers := newFakeWorkers()
+			store := &memoryStore{value: state.State{Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}}
+			workers.checkpointFunc = func(_ context.Context, _ int, request worker.ContinuationRequest) (worker.Continuation, error) {
+				if test.captureErr != nil {
+					return worker.Continuation{}, test.captureErr
+				}
+				content, err := os.ReadFile(run.Continuation.SessionFile)
+				if err != nil {
+					return worker.Continuation{}, err
+				}
+				hash := sha256.Sum256(content)
+				return worker.Continuation{SessionID: request.SessionID, SessionFile: run.Continuation.SessionFile, Worktree: request.Worktree, LeafID: "leaf", EntryCount: 1, SHA256: hex.EncodeToString(hash[:])}, nil
+			}
+			runner := testRunner(&fakeGitHub{}, workers, store, 1)
+			done := make(chan error, 1)
+			go func() { done <- runner.Run(context.Background()) }()
+			workers.waitForStarts(t, run.Issue)
+			if test.failSave {
+				store.failNext()
+			}
+			workers.complete(run.Issue, worker.Result{ExitCode: 1, Settled: true, ProviderExhausted: true, Err: errors.New("provider unavailable")})
+			assertInterventionRequired(t, <-done, 1)
+			got := store.LoadValue().Runs[0]
+			if got.Status != scheduler.StatusNeedsHuman || got.FailureClass != scheduler.FailureUnsafeContinuation || got.ProviderContinuationAttempts != 0 || got.Continuation != nil || workers.checkpointCount != 1 {
+				t.Fatalf("settled checkpoint failure = %#v, checkpoints=%d", got, workers.checkpointCount)
+			}
+		})
+	}
+}
+
+func TestRunnerProviderExhaustionLifecycleUsesCurrentSettledBoundariesAndStopsAfterSecondAttempt(t *testing.T) {
+	run := resumableRun(t, 104, "provider-lifecycle-104")
+	run.WorkerGeneration = 1
+	run.StoppedWorkerGeneration = 1
+	stopped := time.Now().Add(-time.Minute)
+	run.WorkerStoppedAt = &stopped
+	run.Continuation.WorkerGeneration = 1
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}}
+	base := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	var clock atomic.Int64
+	runner := testRunner(&fakeGitHub{}, workers, store, 1)
+	runner.Now = func() time.Time { return base.Add(time.Duration(clock.Load()) * time.Second) }
+	workers.checkpointFunc = func(_ context.Context, _ int, request worker.ContinuationRequest) (worker.Continuation, error) {
+		content, err := os.ReadFile(run.Continuation.SessionFile)
+		if err != nil {
+			return worker.Continuation{}, err
+		}
+		hash := sha256.Sum256(content)
+		return worker.Continuation{SessionID: request.SessionID, SessionFile: run.Continuation.SessionFile, Worktree: request.Worktree, LeafID: "leaf", EntryCount: 1, SHA256: hex.EncodeToString(hash[:])}, nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, run.Issue)
+	workers.complete(run.Issue, worker.Result{ExitCode: 1, Settled: true, ProviderExhausted: true, Err: errors.New("provider unavailable")})
+	waitForPersistedRun(t, store, run.Issue, func(run scheduler.Run) bool {
+		return run.Status == scheduler.StatusSuspended && run.ProviderContinuationAttempts == 1
+	})
+	clock.Store(31)
+	for deadline := time.Now().Add(2 * time.Second); workers.startCount(run.Issue) < 2 && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+	if workers.startCount(run.Issue) != 2 {
+		t.Fatalf("replacement starts = %d, state=%#v", workers.startCount(run.Issue), store.LoadValue())
+	}
+	workers.complete(run.Issue, worker.Result{ExitCode: 1, Settled: true, ProviderExhausted: true, Err: errors.New("provider unavailable again")})
+	assertInterventionRequired(t, <-done, 1)
+	got := store.LoadValue().Runs[0]
+	if got.Status != scheduler.StatusNeedsHuman || got.ProviderContinuationAttempts != 1 || got.Continuation == nil || got.Continuation.WorkerGeneration != got.WorkerGeneration || workers.checkpointCount != 2 {
+		t.Fatalf("provider lifecycle = %#v, checkpoints=%d", got, workers.checkpointCount)
+	}
+}
+
 func resumeIssueLabels(label string) func(*scheduler.Run, *fakeGitHub, *fakeWorktrees) {
 	return func(_ *scheduler.Run, github *fakeGitHub, _ *fakeWorktrees) {
 		github.issueStateFunc = func(int) (ghadapter.IssueState, error) {
@@ -3818,14 +3996,19 @@ func TestRunnerResumesVerifiedUnarmedExpectedPullRequestFromCheckpointStage(t *t
 	if err := os.Mkdir(gitDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	checkpointData := []byte("# Ship-it checkpoint v1\nStage: watch-hosted-ci\n")
+	checkpointData := []byte(fmt.Sprintf("# Ship-it checkpoint v1\n\nStatus: active\nStage: normal-review\nCoordinator session: %s\nWorking directory: %s\nBranch: %s\n", run.SessionID, run.Worktree, run.Branch))
 	checkpointFile := filepath.Join(gitDir, "ship-it-checkpoint-v1.md")
 	if err := os.WriteFile(checkpointFile, checkpointData, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	checkpointHash := sha256.Sum256(checkpointData)
+	checkpointFile, err := filepath.EvalSymlinks(checkpointFile)
+	if err != nil {
+		t.Fatal(err)
+	}
 	run.Continuation.Workflow = "ship-it"
-	run.Continuation.WorkflowStage = "watch-hosted-ci"
+	run.Continuation.WorkflowStage = "normal-review"
+	run.Continuation.CheckpointStatus = "active"
 	run.Continuation.CheckpointFile = checkpointFile
 	run.Continuation.CheckpointSHA256 = hex.EncodeToString(checkpointHash[:])
 	github := &fakeGitHub{completions: map[int]ghadapter.CompletionOutcome{89: {
@@ -3841,12 +4024,12 @@ func TestRunnerResumesVerifiedUnarmedExpectedPullRequestFromCheckpointStage(t *t
 	current := store.LoadValue()
 	process, err := runner.resume(context.Background(), context.Background(), &current, run)
 	if err != nil || process == nil {
-		t.Fatalf("resume = %v, %v", process, err)
+		t.Fatalf("resume = %v, %v; state = %#v", process, err, store.LoadValue())
 	}
 	workers.mu.Lock()
 	request := workers.requests[0]
 	workers.mu.Unlock()
-	if request.RunID != run.RunID || request.SessionID != run.SessionID || request.ContinuationStage != "watch-hosted-ci" || request.CheckpointFile != run.Continuation.CheckpointFile || request.CheckpointSHA256 != run.Continuation.CheckpointSHA256 {
+	if request.RunID != run.RunID || request.SessionID != run.SessionID || request.ContinuationStage != "normal-review" || request.CheckpointFile != run.Continuation.CheckpointFile || request.CheckpointSHA256 != run.Continuation.CheckpointSHA256 {
 		t.Fatalf("replacement request = %#v", request)
 	}
 	if got := store.LoadValue().Runs[0]; got.Status != scheduler.StatusRunning || got.PullRequest != run.PullRequest {
@@ -5436,6 +5619,16 @@ func (p *fakeProcess) Suspend(ctx context.Context, request worker.ContinuationRe
 		LeafID: "leaf", EntryCount: 1, SHA256: "hash",
 	}, nil
 }
+func (p *fakeProcess) CheckpointSettled(ctx context.Context, request worker.ContinuationRequest) (worker.Continuation, error) {
+	p.owner.mu.Lock()
+	checkpointFunc := p.owner.checkpointFunc
+	p.owner.checkpointCount++
+	p.owner.mu.Unlock()
+	if checkpointFunc != nil {
+		return checkpointFunc(ctx, p.issue, request)
+	}
+	return worker.Continuation{}, errSettledCheckpointUnsupported
+}
 func (p *fakeProcess) Wait() worker.Result {
 	return <-p.done
 }
@@ -5542,6 +5735,8 @@ type fakeWorkers struct {
 	abortErr                error
 	startupCloseResult      worker.Result
 	suspendFunc             func(context.Context, int, worker.ContinuationRequest) (worker.Continuation, error)
+	checkpointFunc          func(context.Context, int, worker.ContinuationRequest) (worker.Continuation, error)
+	checkpointCount         int
 	startChanged            chan struct{}
 	closeContextStarted     chan int
 	settledCloseStarted     chan int

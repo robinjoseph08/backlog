@@ -22,6 +22,7 @@ import (
 	"github.com/robinjoseph08/backlog/internal/resolution"
 	"github.com/robinjoseph08/backlog/internal/retirement"
 	"github.com/robinjoseph08/backlog/internal/runner"
+	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 	"github.com/robinjoseph08/backlog/internal/worker"
 	"github.com/robinjoseph08/backlog/internal/worktree"
@@ -408,6 +409,10 @@ func runCommand(ctx context.Context, options runOptions, stdout io.Writer, signa
 		OnOperationalEvent:             onOperationalEvent,
 		SuppressOperationalEventOutput: dashboard != nil,
 		FinalSummary:                   finalSummary,
+		VerifyResumeGit: func(ctx context.Context, run scheduler.Run) (string, bool, string, error) {
+			identity, err := (recoveryGitVerifier{executable: options.gitExecutable, repositoryRoot: repositoryRoot}).Verify(ctx, run)
+			return identity.LocalCommit, identity.RemotePresent, identity.RemoteCommit, err
+		},
 	}
 	if signals != nil {
 		setupMu.Lock()

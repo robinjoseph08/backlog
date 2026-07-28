@@ -26,38 +26,44 @@ import (
 const promptCommandID = "backlog-afk-prompt"
 
 type Request struct {
-	Issue             int
-	RunID             string
-	Worktree          string
-	SessionName       string
-	SessionID         string
-	SessionDir        string
-	SessionFile       string
-	Resume            bool
-	ContinuationStage string
-	CheckpointFile    string
-	CheckpointSHA256  string
+	Issue                int
+	RunID                string
+	Worktree             string
+	SessionName          string
+	SessionID            string
+	SessionDir           string
+	SessionFile          string
+	Resume               bool
+	ContinuationWorkflow string
+	ContinuationStage    string
+	CheckpointFile       string
+	CheckpointSHA256     string
 }
 
 type ContinuationRequest struct {
+	Issue      int
+	RunID      string
+	Branch     string
 	SessionID  string
 	SessionDir string
 	Worktree   string
 }
 
 type Continuation struct {
-	SessionID        string
-	SessionFile      string
-	Worktree         string
-	LeafID           string
-	EntryCount       int
-	SHA256           string
-	Workflow         string
-	WorkflowStage    string
-	CheckpointFile   string
-	CheckpointSHA256 string
-	LogPath          string
-	StderrPath       string
+	SessionID         string
+	SessionFile       string
+	Worktree          string
+	LeafID            string
+	EntryCount        int
+	SHA256            string
+	Workflow          string
+	WorkflowStage     string
+	CheckpointFile    string
+	CheckpointSHA256  string
+	CheckpointStatus  string
+	CheckpointFailure string
+	LogPath           string
+	StderrPath        string
 }
 
 type Result struct {
@@ -83,31 +89,32 @@ type Supervisor struct {
 }
 
 type Process struct {
-	command            *exec.Cmd
-	logPath            string
-	stderrPath         string
-	gatePath           string
-	stdin              io.WriteCloser
-	stdout             *os.File
-	stderr             *os.File
-	activity           *activity.Writer
-	events             *rpcWriter
-	stdinMu            sync.Mutex
-	terminate          func() error
-	terminationStarted <-chan struct{}
-	terminationDone    <-chan struct{}
-	processGroupGrace  time.Duration
-	releaseOnce        sync.Once
-	releaseErr         error
-	closeInputOnce     sync.Once
-	closeInputErr      error
-	exitDone           chan struct{}
-	resultMu           sync.Mutex
-	result             Result
-	resume             bool
-	continuationStage  string
-	checkpointFile     string
-	checkpointSHA256   string
+	command              *exec.Cmd
+	logPath              string
+	stderrPath           string
+	gatePath             string
+	stdin                io.WriteCloser
+	stdout               *os.File
+	stderr               *os.File
+	activity             *activity.Writer
+	events               *rpcWriter
+	stdinMu              sync.Mutex
+	terminate            func() error
+	terminationStarted   <-chan struct{}
+	terminationDone      <-chan struct{}
+	processGroupGrace    time.Duration
+	releaseOnce          sync.Once
+	releaseErr           error
+	closeInputOnce       sync.Once
+	closeInputErr        error
+	exitDone             chan struct{}
+	resultMu             sync.Mutex
+	result               Result
+	resume               bool
+	continuationWorkflow string
+	continuationStage    string
+	checkpointFile       string
+	checkpointSHA256     string
 }
 
 var safeRunIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
@@ -227,8 +234,9 @@ func (s Supervisor) Start(ctx context.Context, request Request) (*Process, error
 		command: command, logPath: logPath, stderrPath: stderrPath, gatePath: gatePath,
 		stdin: stdin, stdout: stdoutLog, stderr: stderrLog, activity: activityWriter, events: events, terminate: terminate,
 		terminationStarted: terminationStarted, terminationDone: terminationDone, processGroupGrace: grace, exitDone: make(chan struct{}),
-		resume: request.Resume, continuationStage: request.ContinuationStage,
-		checkpointFile: request.CheckpointFile, checkpointSHA256: request.CheckpointSHA256,
+		resume: request.Resume, continuationWorkflow: request.ContinuationWorkflow,
+		continuationStage: request.ContinuationStage, checkpointFile: request.CheckpointFile,
+		checkpointSHA256: request.CheckpointSHA256,
 	}
 	go process.reap()
 	return process, nil
@@ -277,7 +285,11 @@ func (p *Process) Release() error {
 			if stage == "" {
 				stage = "AFK coordinator"
 			}
-			message = fmt.Sprintf("Recover the existing AFK workflow for issue #%d from the verified durable continuation boundary at %s. Reassess the repository and GitHub state before acting. Inspect the remote branch and expected-branch pull request before any push, pull request, merge, issue, or cleanup mutation, and never repeat a mutation whose prior outcome is uncertain.", p.events.issue, stage)
+			workflow := strings.TrimSpace(p.continuationWorkflow)
+			if workflow == "" {
+				workflow = "afk"
+			}
+			message = fmt.Sprintf("Recover the existing %s workflow for issue #%d from the verified durable continuation boundary at exact stage %s. Reassess the repository and GitHub state before acting. Freshly inspect the local repository, remote branch, expected-branch pull request, and issue before any push, pull request, merge, issue, or cleanup mutation. Never perform an external mutation when its prior outcome or current identity is uncertain.", workflow, p.events.issue, stage)
 			if p.checkpointFile != "" {
 				message += fmt.Sprintf(" The verified ship-it checkpoint is %s with SHA-256 %s.", p.checkpointFile, p.checkpointSHA256)
 			}
@@ -397,7 +409,7 @@ func (p *Process) CheckpointSettled(ctx context.Context, expected ContinuationRe
 	if err := p.events.Err(); err != nil {
 		return Continuation{}, fmt.Errorf("confirm final Pi RPC transcript: %w", err)
 	}
-	workflow, stage, checkpointFile, checkpointSHA, err := InspectWorkflowCheckpoint(expected.Worktree)
+	workflow, stage, checkpointFile, checkpointSHA, checkpointStatus, checkpointFailure, err := inspectWorkflowCheckpoint(expected, rpcEntries.Entries)
 	if err != nil {
 		return Continuation{}, err
 	}
@@ -405,6 +417,7 @@ func (p *Process) CheckpointSettled(ctx context.Context, expected ContinuationRe
 		SessionID: expected.SessionID, SessionFile: rpcState.SessionFile, Worktree: expected.Worktree,
 		LeafID: rpcEntries.LeafID, EntryCount: len(rpcEntries.Entries), SHA256: sha,
 		Workflow: workflow, WorkflowStage: stage, CheckpointFile: checkpointFile, CheckpointSHA256: checkpointSHA,
+		CheckpointStatus: checkpointStatus, CheckpointFailure: checkpointFailure,
 		LogPath: p.logPath, StderrPath: p.stderrPath,
 	}, nil
 }
@@ -736,12 +749,12 @@ func VerifyContinuation(expected ContinuationRequest, continuation Continuation)
 		return err
 	}
 	if continuation.Workflow != "" {
-		workflow, stage, checkpointFile, checkpointSHA, err := InspectWorkflowCheckpoint(expected.Worktree)
+		workflow, stage, checkpointFile, checkpointSHA, checkpointStatus, checkpointFailure, err := inspectWorkflowCheckpoint(expected, entries)
 		if err != nil {
 			return err
 		}
-		if workflow != continuation.Workflow || stage != continuation.WorkflowStage || checkpointFile != continuation.CheckpointFile || checkpointSHA != continuation.CheckpointSHA256 {
-			return errors.New("workflow checkpoint identity changed after continuation verification")
+		if workflow != continuation.Workflow || stage != continuation.WorkflowStage || checkpointFile != continuation.CheckpointFile || checkpointSHA != continuation.CheckpointSHA256 || checkpointStatus != continuation.CheckpointStatus || checkpointFailure != continuation.CheckpointFailure {
+			return fmt.Errorf("workflow checkpoint identity changed after continuation verification: got %q/%q/%q/%q/%q/%q", workflow, stage, checkpointFile, checkpointSHA, checkpointStatus, checkpointFailure)
 		}
 	}
 	return nil
@@ -800,12 +813,13 @@ func InspectContinuation(expected ContinuationRequest) (Continuation, error) {
 	if err := VerifyContinuation(expected, continuation); err != nil {
 		return Continuation{}, err
 	}
-	workflow, stage, checkpointFile, checkpointSHA, err := InspectWorkflowCheckpoint(expected.Worktree)
+	workflow, stage, checkpointFile, checkpointSHA, checkpointStatus, checkpointFailure, err := inspectWorkflowCheckpoint(expected, records[1:])
 	if err != nil {
 		return Continuation{}, err
 	}
 	continuation.Workflow, continuation.WorkflowStage = workflow, stage
 	continuation.CheckpointFile, continuation.CheckpointSHA256 = checkpointFile, checkpointSHA
+	continuation.CheckpointStatus, continuation.CheckpointFailure = checkpointStatus, checkpointFailure
 	return continuation, nil
 }
 
@@ -831,79 +845,141 @@ func SyncContinuation(expected ContinuationRequest, continuation Continuation) e
 	return nil
 }
 
-// InspectWorkflowCheckpoint identifies the durable AFK continuation stage. A
-// ship-it checkpoint, when present, is hashed and its exact Stage field is used.
-func InspectWorkflowCheckpoint(worktree string) (workflow, stage, checkpointFile, checkpointSHA string, resultErr error) {
-	gitMarker := filepath.Join(worktree, ".git")
+var supportedShipItStages = map[string]struct{}{
+	"prepare": {}, "preflight-review": {}, "preflight-fix": {}, "normal-review": {},
+	"normal-fix": {}, "final-repair": {}, "publish": {}, "pr": {}, "blocked": {},
+}
+
+func inspectWorkflowCheckpoint(expected ContinuationRequest, entries []json.RawMessage) (workflow, stage, checkpointFile, checkpointSHA, checkpointStatus, checkpointFailure string, resultErr error) {
+	gitMarker := filepath.Join(expected.Worktree, ".git")
 	info, err := os.Lstat(gitMarker)
 	if errors.Is(err, os.ErrNotExist) {
-		// Pi can be exercised against a synthetic worktree in protocol tests. The
-		// absence of ship-it state still has the explicit AFK coordinator boundary.
-		return "afk", "afk-coordinator", "", "", nil
+		if !hasOwnedAFKPrompt(entries, expected.Issue) {
+			return "", "", "", "", "", "", errors.New("missing ship-it checkpoint and durable owned AFK invocation evidence")
+		}
+		return "afk", "afk-coordinator", "", "", "active", "", nil
 	}
 	if err != nil {
-		return "", "", "", "", fmt.Errorf("inspect worktree Git identity: %w", err)
+		return "", "", "", "", "", "", fmt.Errorf("inspect worktree Git identity: %w", err)
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		return "", "", "", "", errors.New("worktree Git identity is a symlink")
+		return "", "", "", "", "", "", errors.New("worktree Git identity is a symlink")
 	}
 	gitDir := gitMarker
 	if info.Mode().IsRegular() {
 		data, err := os.ReadFile(gitMarker)
 		if err != nil {
-			return "", "", "", "", fmt.Errorf("read worktree Git identity: %w", err)
+			return "", "", "", "", "", "", fmt.Errorf("read worktree Git identity: %w", err)
 		}
 		value := strings.TrimSpace(string(data))
 		if !strings.HasPrefix(value, "gitdir: ") {
-			return "", "", "", "", errors.New("worktree Git identity file is malformed")
+			return "", "", "", "", "", "", errors.New("worktree Git identity file is malformed")
 		}
 		gitDir = strings.TrimSpace(strings.TrimPrefix(value, "gitdir: "))
 		if !filepath.IsAbs(gitDir) {
-			gitDir = filepath.Join(worktree, gitDir)
+			gitDir = filepath.Join(expected.Worktree, gitDir)
 		}
 	} else if !info.IsDir() {
-		return "", "", "", "", errors.New("worktree Git identity is not a regular file or directory")
+		return "", "", "", "", "", "", errors.New("worktree Git identity is not a regular file or directory")
 	}
 	gitDir, err = filepath.EvalSymlinks(gitDir)
 	if err != nil {
-		return "", "", "", "", fmt.Errorf("resolve worktree Git directory: %w", err)
+		return "", "", "", "", "", "", fmt.Errorf("resolve worktree Git directory: %w", err)
 	}
 	checkpointFile = filepath.Join(gitDir, "ship-it-checkpoint-v1.md")
-	// #nosec G703 -- gitDir is the resolved Git directory owned by this verified worktree.
+	// #nosec G703 -- checkpointFile is a fixed basename under the resolved worktree Git directory.
 	checkpointInfo, err := os.Lstat(checkpointFile)
 	if errors.Is(err, os.ErrNotExist) {
-		return "afk", "afk-coordinator", "", "", nil
+		if !hasOwnedAFKPrompt(entries, expected.Issue) {
+			return "", "", "", "", "", "", errors.New("missing ship-it checkpoint and durable owned AFK invocation evidence")
+		}
+		return "afk", "afk-coordinator", "", "", "active", "", nil
 	}
 	if err != nil {
-		return "", "", "", "", fmt.Errorf("inspect ship-it checkpoint: %w", err)
+		return "", "", "", "", "", "", fmt.Errorf("inspect ship-it checkpoint: %w", err)
 	}
 	if !checkpointInfo.Mode().IsRegular() || checkpointInfo.Mode()&os.ModeSymlink != 0 {
-		return "", "", "", "", errors.New("ship-it checkpoint is not a regular file")
+		return "", "", "", "", "", "", errors.New("ship-it checkpoint is not a regular file")
 	}
 	if checkpointInfo.Size() > 4*1024*1024 {
-		return "", "", "", "", errors.New("ship-it checkpoint exceeds the supported size")
+		return "", "", "", "", "", "", errors.New("ship-it checkpoint exceeds the supported size")
 	}
 	// #nosec G703 -- checkpointFile is a fixed basename under the resolved worktree Git directory.
 	data, err := os.ReadFile(checkpointFile)
 	if err != nil {
-		return "", "", "", "", fmt.Errorf("read ship-it checkpoint: %w", err)
+		return "", "", "", "", "", "", fmt.Errorf("read ship-it checkpoint: %w", err)
 	}
-	if !strings.HasPrefix(string(data), "# Ship-it checkpoint v1\n") {
-		return "", "", "", "", errors.New("ship-it checkpoint has an unsupported header")
+	if !strings.HasPrefix(string(data), "# Ship-it checkpoint v1\n\n") {
+		return "", "", "", "", "", "", errors.New("ship-it checkpoint has an unsupported header")
 	}
+	fields := make(map[string]string)
 	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "Stage: ") {
-			if stage != "" {
-				return "", "", "", "", errors.New("ship-it checkpoint contains multiple Stage fields")
-			}
-			stage = strings.TrimSpace(strings.TrimPrefix(line, "Stage: "))
+		key, value, found := strings.Cut(line, ": ")
+		if !found || strings.HasPrefix(line, "-") || strings.HasPrefix(line, "#") {
+			continue
 		}
+		if _, duplicate := fields[key]; duplicate {
+			return "", "", "", "", "", "", fmt.Errorf("ship-it checkpoint contains multiple %s fields", key)
+		}
+		fields[key] = strings.TrimSpace(value)
 	}
-	if stage == "" {
-		return "", "", "", "", errors.New("ship-it checkpoint omits its Stage")
+	checkpointStatus, stage = fields["Status"], fields["Stage"]
+	if checkpointStatus != "active" && checkpointStatus != "blocked" {
+		return "", "", "", "", "", "", fmt.Errorf("ship-it checkpoint has unsupported Status %q", checkpointStatus)
+	}
+	if _, supported := supportedShipItStages[stage]; !supported {
+		return "", "", "", "", "", "", fmt.Errorf("ship-it checkpoint has unsupported Stage %q", stage)
+	}
+	if checkpointStatus == "blocked" && stage != "blocked" || checkpointStatus == "active" && stage == "blocked" {
+		return "", "", "", "", "", "", errors.New("ship-it checkpoint Status and Stage are inconsistent")
+	}
+	if fields["Coordinator session"] != expected.SessionID || fields["Working directory"] != expected.Worktree || fields["Branch"] != expected.Branch {
+		return "", "", "", "", "", "", errors.New("ship-it checkpoint session, worktree, or branch ownership does not match the Run")
+	}
+	checkpointFailure = fields["Failure class"]
+	if checkpointFailure == "" {
+		checkpointFailure = fields["Blocker kind"]
+	}
+	if checkpointFailure != "" && checkpointFailure != "provider-exhaustion" && checkpointFailure != "base-advancement" && checkpointFailure != "validation-failure" && checkpointFailure != "repair-budget-exhaustion" && checkpointFailure != "unsafe-continuation-evidence" && checkpointFailure != "none" && checkpointFailure != "<none>" {
+		return "", "", "", "", "", "", fmt.Errorf("ship-it checkpoint has unsupported structured failure class %q", checkpointFailure)
+	}
+	if checkpointFailure == "none" || checkpointFailure == "<none>" {
+		checkpointFailure = ""
 	}
 	hash := sha256.Sum256(data)
-	return "ship-it", stage, checkpointFile, hex.EncodeToString(hash[:]), nil
+	return "ship-it", stage, checkpointFile, hex.EncodeToString(hash[:]), checkpointStatus, checkpointFailure, nil
+}
+
+func hasOwnedAFKPrompt(entries []json.RawMessage, issue int) bool {
+	if issue <= 0 {
+		return false
+	}
+	want := fmt.Sprintf("/skill:afk %d", issue)
+	for _, raw := range entries {
+		var entry struct {
+			Type    string `json:"type"`
+			Message struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			} `json:"message"`
+		}
+		if json.Unmarshal(raw, &entry) != nil || entry.Type != "message" || entry.Message.Role != "user" {
+			continue
+		}
+		var text string
+		if json.Unmarshal(entry.Message.Content, &text) == nil && strings.TrimSpace(text) == want {
+			return true
+		}
+		var content []struct{ Type, Text string }
+		if json.Unmarshal(entry.Message.Content, &content) == nil {
+			for _, item := range content {
+				if item.Type == "text" && strings.TrimSpace(item.Text) == want {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func readSessionRecords(path string) ([]json.RawMessage, string, error) {

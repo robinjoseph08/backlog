@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -32,8 +33,9 @@ type Worktrees interface {
 }
 
 type GitIdentity struct {
-	LocalCommit  string
-	RemoteCommit string
+	LocalCommit   string
+	RemotePresent bool
+	RemoteCommit  string
 }
 
 type GitVerifier interface {
@@ -62,12 +64,15 @@ const (
 
 type Plan struct {
 	Run                scheduler.Run
+	Lease              scheduler.Lease
 	Boundary           scheduler.ContinuationBoundary
 	DerivedOffline     bool
 	Outcome            Outcome
 	PullRequest        string
 	LocalCommit        string
+	RemotePresent      bool
 	RemoteCommit       string
+	PullRequestHead    string
 	OriginalDiagnostic string
 }
 
@@ -92,7 +97,8 @@ func (m *Module) Inspect(ctx context.Context, selector string) (Plan, error) {
 	if err != nil {
 		return Plan{}, err
 	}
-	if !hasLease(current, run) {
+	lease, leased := findLease(current, run)
+	if !leased {
 		return Plan{}, fmt.Errorf("Run %q no longer owns its Lease", run.RunID)
 	}
 	already := run.Status == scheduler.StatusSuspended && run.RecoveryCount > 0
@@ -136,7 +142,11 @@ func (m *Module) Inspect(ctx context.Context, selector string) (Plan, error) {
 		if outcome == OutcomeWaiting && issue.State != "open" {
 			return Plan{}, errors.New("issue closed while expected pull request remains armed; External Resolution takes precedence")
 		}
-		return Plan{Run: run, Outcome: outcome, PullRequest: pullRequest, OriginalDiagnostic: run.Error}, nil
+		pullHead := ""
+		if len(pulls) == 1 {
+			pullHead = pulls[0].Commit
+		}
+		return Plan{Run: run, Lease: lease, Outcome: outcome, PullRequest: pullRequest, PullRequestHead: pullHead, OriginalDiagnostic: run.Error}, nil
 	}
 	if err := verifyIssue(issue); err != nil {
 		return Plan{}, err
@@ -148,8 +158,11 @@ func (m *Module) Inspect(ctx context.Context, selector string) (Plan, error) {
 	if identity.LocalCommit == "" {
 		return Plan{}, errors.New("expected local branch has no commit identity")
 	}
+	if identity.RemotePresent != (identity.RemoteCommit != "") {
+		return Plan{}, errors.New("remote branch presence and commit identity are inconsistent")
+	}
 	if len(pulls) == 1 {
-		if identity.RemoteCommit == "" {
+		if !identity.RemotePresent {
 			return Plan{}, errors.New("expected pull request exists but its remote branch is absent")
 		}
 		if pulls[0].Commit != "" && pulls[0].Commit != identity.RemoteCommit {
@@ -163,7 +176,7 @@ func (m *Module) Inspect(ctx context.Context, selector string) (Plan, error) {
 	var continuation worker.Continuation
 	derived := false
 	if run.Continuation == nil {
-		continuation, err = worker.InspectContinuation(worker.ContinuationRequest{SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree})
+		continuation, err = worker.InspectContinuation(continuationRequest(run))
 		derived = true
 	} else {
 		boundary := run.Continuation
@@ -172,12 +185,10 @@ func (m *Module) Inspect(ctx context.Context, selector string) (Plan, error) {
 			LeafID: boundary.LeafID, EntryCount: boundary.EntryCount, SHA256: boundary.SHA256,
 			Workflow: boundary.Workflow, WorkflowStage: boundary.WorkflowStage,
 			CheckpointFile: boundary.CheckpointFile, CheckpointSHA256: boundary.CheckpointSHA256,
+			CheckpointStatus: boundary.CheckpointStatus, CheckpointFailure: boundary.CheckpointFailure,
 		}
-		if err = worker.VerifyContinuation(worker.ContinuationRequest{SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree}, continuation); err != nil {
+		if err = worker.VerifyContinuation(continuationRequest(run), continuation); err != nil {
 			return Plan{}, fmt.Errorf("verify persisted continuation evidence: %w", err)
-		}
-		if continuation.Workflow == "" {
-			continuation.Workflow, continuation.WorkflowStage, continuation.CheckpointFile, continuation.CheckpointSHA256, err = worker.InspectWorkflowCheckpoint(run.Worktree)
 		}
 	}
 	if err != nil {
@@ -191,14 +202,23 @@ func (m *Module) Inspect(ctx context.Context, selector string) (Plan, error) {
 		LeafID: continuation.LeafID, EntryCount: continuation.EntryCount, SHA256: continuation.SHA256,
 		Workflow: continuation.Workflow, WorkflowStage: continuation.WorkflowStage,
 		CheckpointFile: continuation.CheckpointFile, CheckpointSHA256: continuation.CheckpointSHA256,
-		VerifiedAt: m.config.Now().UTC(),
+		CheckpointStatus: continuation.CheckpointStatus, CheckpointFailure: continuation.CheckpointFailure,
+		WorkerGeneration: run.WorkerGeneration, LocalCommit: identity.LocalCommit,
+		RemoteBranchState: map[bool]string{true: "present", false: "absent"}[identity.RemotePresent], RemoteCommit: identity.RemoteCommit,
+		PullRequest: pullRequest, VerifiedAt: m.config.Now().UTC(),
+	}
+	pullHead := ""
+	if len(pulls) == 1 {
+		pullHead = pulls[0].Commit
+		boundary.PullRequestHead = pullHead
 	}
 	if already {
 		outcome = OutcomeAlready
 	}
 	return Plan{
-		Run: run, Boundary: boundary, DerivedOffline: derived, Outcome: outcome, PullRequest: pullRequest,
-		LocalCommit: identity.LocalCommit, RemoteCommit: identity.RemoteCommit, OriginalDiagnostic: run.Error,
+		Run: run, Lease: lease, Boundary: boundary, DerivedOffline: derived, Outcome: outcome, PullRequest: pullRequest,
+		LocalCommit: identity.LocalCommit, RemotePresent: identity.RemotePresent, RemoteCommit: identity.RemoteCommit,
+		PullRequestHead: pullHead, OriginalDiagnostic: run.Error,
 	}, nil
 }
 
@@ -208,6 +228,9 @@ func (m *Module) Recover(ctx context.Context, expected Plan) (Plan, error) {
 		return Plan{}, err
 	}
 	if !PlansEqual(expected, fresh) {
+		if fresh.Outcome == OutcomeCompletion {
+			return fresh, nil
+		}
 		return Plan{}, errors.New("Recovery Plan changed after confirmation; inspect and confirm the current plan")
 	}
 	if fresh.Outcome == OutcomeAlready {
@@ -219,8 +242,9 @@ func (m *Module) Recover(ctx context.Context, expected Plan) (Plan, error) {
 			LeafID: fresh.Boundary.LeafID, EntryCount: fresh.Boundary.EntryCount, SHA256: fresh.Boundary.SHA256,
 			Workflow: fresh.Boundary.Workflow, WorkflowStage: fresh.Boundary.WorkflowStage,
 			CheckpointFile: fresh.Boundary.CheckpointFile, CheckpointSHA256: fresh.Boundary.CheckpointSHA256,
+			CheckpointStatus: fresh.Boundary.CheckpointStatus, CheckpointFailure: fresh.Boundary.CheckpointFailure,
 		}
-		if err := worker.SyncContinuation(worker.ContinuationRequest{SessionID: fresh.Run.SessionID, SessionDir: fresh.Run.SessionDir, Worktree: fresh.Run.Worktree}, continuation); err != nil {
+		if err := worker.SyncContinuation(continuationRequest(fresh.Run), continuation); err != nil {
 			return Plan{}, fmt.Errorf("synchronize offline continuation evidence: %w", err)
 		}
 	}
@@ -229,7 +253,8 @@ func (m *Module) Recover(ctx context.Context, expected Plan) (Plan, error) {
 		return Plan{}, err
 	}
 	run, err := selectRun(current, fresh.Run.RunID)
-	if err != nil || !hasLease(current, run) {
+	lease, leased := findLease(current, run)
+	if err != nil || !leased || !reflect.DeepEqual(run, fresh.Run) || lease != fresh.Lease {
 		return Plan{}, errors.New("Run or Lease identity changed before Recovery")
 	}
 	now := m.config.Now().UTC()
@@ -261,6 +286,9 @@ func (m *Module) Recover(ctx context.Context, expected Plan) (Plan, error) {
 		run.WorkerLogOpen = false
 		run.Continuation = &fresh.Boundary
 		run.WorkflowStage = fresh.Boundary.WorkflowStage
+		if fresh.Boundary.CheckpointFailure != "" {
+			run.FailureClass = scheduler.FailureClass(fresh.Boundary.CheckpointFailure)
+		}
 		run.ResumeAfter = nil
 		run.SuspendedAt = &now
 		run.RecoveryCount++
@@ -282,7 +310,13 @@ func (m *Module) Recover(ctx context.Context, expected Plan) (Plan, error) {
 }
 
 func (m *Module) verifyAbsent(run scheduler.Run) error {
-	if run.PID == 0 && run.ProcessIdentity == "" {
+	if run.ProcessIdentity == "" {
+		if run.PID != 0 {
+			return errors.New("recorded Worker PID has no checkable process identity")
+		}
+		if run.WorkerGeneration <= 0 || run.StoppedWorkerGeneration != run.WorkerGeneration || run.WorkerStoppedAt == nil || run.WorkerStoppedAt.IsZero() {
+			return errors.New("Run has no durable proof that its last Worker generation stopped")
+		}
 		return nil
 	}
 	identityPIDText, started, found := strings.Cut(run.ProcessIdentity, ":")
@@ -305,6 +339,13 @@ func (m *Module) verifyAbsent(run scheduler.Run) error {
 		return errors.New("recorded Worker process group is still live")
 	}
 	return nil
+}
+
+func continuationRequest(run scheduler.Run) worker.ContinuationRequest {
+	return worker.ContinuationRequest{
+		Issue: run.Issue, RunID: run.RunID, Branch: run.Branch,
+		SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree,
+	}
 }
 
 func verifyIssue(issue ghadapter.OwnedRunIssue) error {
@@ -356,29 +397,21 @@ func selectRun(current state.State, selector string) (scheduler.Run, error) {
 	return selected, nil
 }
 
-func hasLease(current state.State, run scheduler.Run) bool {
+func findLease(current state.State, run scheduler.Run) (scheduler.Lease, bool) {
 	for _, lease := range current.Leases {
 		if lease.RunID == run.RunID && lease.Issue == run.Issue {
-			return true
+			return lease, true
 		}
 	}
-	return false
+	return scheduler.Lease{}, false
 }
 
 // PlansEqual compares every safety-relevant identity while ignoring only the
 // observation timestamp, which is expected to change on each inspection.
 func PlansEqual(left, right Plan) bool {
-	return left.Run.RunID == right.Run.RunID && left.Run.Issue == right.Run.Issue && left.Run.Status == right.Run.Status &&
-		left.Run.Branch == right.Run.Branch && left.Run.Worktree == right.Run.Worktree && left.Run.SessionID == right.Run.SessionID &&
-		left.Run.SessionDir == right.Run.SessionDir && left.Run.LogPath == right.Run.LogPath && left.Run.StderrPath == right.Run.StderrPath &&
-		left.Run.RecoveryCount == right.Run.RecoveryCount && left.DerivedOffline == right.DerivedOffline && left.Outcome == right.Outcome &&
-		left.PullRequest == right.PullRequest && left.LocalCommit == right.LocalCommit && left.RemoteCommit == right.RemoteCommit &&
-		left.OriginalDiagnostic == right.OriginalDiagnostic && left.Boundary.SessionID == right.Boundary.SessionID &&
-		left.Boundary.SessionFile == right.Boundary.SessionFile && left.Boundary.Worktree == right.Boundary.Worktree &&
-		left.Boundary.LeafID == right.Boundary.LeafID && left.Boundary.EntryCount == right.Boundary.EntryCount &&
-		left.Boundary.SHA256 == right.Boundary.SHA256 && left.Boundary.Workflow == right.Boundary.Workflow &&
-		left.Boundary.WorkflowStage == right.Boundary.WorkflowStage && left.Boundary.CheckpointFile == right.Boundary.CheckpointFile &&
-		left.Boundary.CheckpointSHA256 == right.Boundary.CheckpointSHA256
+	left.Boundary.VerifiedAt = time.Time{}
+	right.Boundary.VerifiedAt = time.Time{}
+	return reflect.DeepEqual(left, right)
 }
 
 func replaceRun(current *state.State, replacement scheduler.Run) {

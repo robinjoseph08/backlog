@@ -165,24 +165,7 @@ func recoverCommandWithInput(ctx context.Context, args []string, stdin io.Reader
 		return err
 	}
 	if plan.Outcome == recovery.OutcomeCompletion {
-		retire, err := retirement.New(retirement.Config{
-			Store: fileStore, GitHub: ghadapter.Client{Executable: *ghExecutable, Dir: repositoryRoot},
-			RepositoryRoot: repositoryRoot, CommonDirectory: commonDirectory, StateDirectory: resolvedState, GitExecutable: *gitExecutable,
-		}, resolution.Policy(plan.Run.RunID))
-		if err != nil {
-			return err
-		}
-		completionPlan, err := retire.Inspect(ctx)
-		if err != nil {
-			return err
-		}
-		if err := retire.Validate(completionPlan); err != nil {
-			return err
-		}
-		if err := retire.Retire(ctx, completionPlan); err != nil {
-			return err
-		}
-		return writeResolveOutcome(stdout, fileStore, plan.Run.RunID)
+		return retireRecoveredCompletion(ctx, stdout, fileStore, ghadapter.Client{Executable: *ghExecutable, Dir: repositoryRoot}, repositoryRoot, commonDirectory, resolvedState, *gitExecutable, plan.Run.RunID)
 	}
 	result, err := module.Recover(ctx, plan)
 	if err != nil {
@@ -194,9 +177,30 @@ func recoverCommandWithInput(ctx context.Context, args []string, stdin io.Reader
 	case recovery.OutcomeWaiting:
 		fmt.Fprintf(stdout, "Recovery reconciled Run %s as waiting for merge at %s; no replacement Worker will launch.\n", result.Run.RunID, result.PullRequest)
 	case recovery.OutcomeCompletion:
-		fmt.Fprintf(stdout, "Recovery found merged expected pull request %s and recorded Completion for Run %s.\n", result.PullRequest, result.Run.RunID)
+		return retireRecoveredCompletion(ctx, stdout, fileStore, ghadapter.Client{Executable: *ghExecutable, Dir: repositoryRoot}, repositoryRoot, commonDirectory, resolvedState, *gitExecutable, result.Run.RunID)
 	}
 	return nil
+}
+
+func retireRecoveredCompletion(ctx context.Context, stdout io.Writer, store state.FileStore, github ghadapter.Client, repositoryRoot, commonDirectory, stateDirectory, gitExecutable, runID string) error {
+	retire, err := retirement.New(retirement.Config{
+		Store: store, GitHub: github, RepositoryRoot: repositoryRoot, CommonDirectory: commonDirectory,
+		StateDirectory: stateDirectory, GitExecutable: gitExecutable,
+	}, resolution.Policy(runID))
+	if err != nil {
+		return err
+	}
+	plan, err := retire.Inspect(ctx)
+	if err != nil {
+		return err
+	}
+	if err := retire.Validate(plan); err != nil {
+		return err
+	}
+	if err := retire.Retire(ctx, plan); err != nil {
+		return err
+	}
+	return writeResolveOutcome(stdout, store, runID)
 }
 
 type readOnlyRecoveryStore struct{ store state.FileStore }
@@ -229,6 +233,7 @@ func (v recoveryGitVerifier) Verify(ctx context.Context, run scheduler.Run) (rec
 		if len(fields) != 2 || fields[1] != "refs/heads/"+run.Branch {
 			return recovery.GitIdentity{}, errors.New("remote branch lookup returned malformed or ambiguous identity")
 		}
+		identity.RemotePresent = true
 		identity.RemoteCommit = fields[0]
 	}
 	return identity, nil

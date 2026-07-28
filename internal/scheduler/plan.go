@@ -56,17 +56,25 @@ const (
 )
 
 type ContinuationBoundary struct {
-	SessionID        string    `json:"sessionId"`
-	SessionFile      string    `json:"sessionFile"`
-	Worktree         string    `json:"worktree"`
-	LeafID           string    `json:"leafId"`
-	EntryCount       int       `json:"entryCount"`
-	SHA256           string    `json:"sha256"`
-	Workflow         string    `json:"workflow,omitempty"`
-	WorkflowStage    string    `json:"workflowStage,omitempty"`
-	CheckpointFile   string    `json:"checkpointFile,omitempty"`
-	CheckpointSHA256 string    `json:"checkpointSha256,omitempty"`
-	VerifiedAt       time.Time `json:"verifiedAt"`
+	SessionID         string    `json:"sessionId"`
+	SessionFile       string    `json:"sessionFile"`
+	Worktree          string    `json:"worktree"`
+	LeafID            string    `json:"leafId"`
+	EntryCount        int       `json:"entryCount"`
+	SHA256            string    `json:"sha256"`
+	Workflow          string    `json:"workflow,omitempty"`
+	WorkflowStage     string    `json:"workflowStage,omitempty"`
+	CheckpointFile    string    `json:"checkpointFile,omitempty"`
+	CheckpointSHA256  string    `json:"checkpointSha256,omitempty"`
+	WorkerGeneration  int       `json:"workerGeneration,omitempty"`
+	LocalCommit       string    `json:"localCommit,omitempty"`
+	RemoteBranchState string    `json:"remoteBranchState,omitempty"`
+	RemoteCommit      string    `json:"remoteCommit,omitempty"`
+	PullRequest       string    `json:"pullRequest,omitempty"`
+	PullRequestHead   string    `json:"pullRequestHead,omitempty"`
+	CheckpointStatus  string    `json:"checkpointStatus,omitempty"`
+	CheckpointFailure string    `json:"checkpointFailure,omitempty"`
+	VerifiedAt        time.Time `json:"verifiedAt"`
 }
 
 type Run struct {
@@ -78,6 +86,9 @@ type Run struct {
 	WorkerMode                   WorkerMode            `json:"workerMode"`
 	PID                          int                   `json:"pid,omitempty"`
 	ProcessIdentity              string                `json:"processIdentity,omitempty"`
+	WorkerGeneration             int                   `json:"workerGeneration,omitempty"`
+	StoppedWorkerGeneration      int                   `json:"stoppedWorkerGeneration,omitempty"`
+	WorkerStoppedAt              *time.Time            `json:"workerStoppedAt,omitempty"`
 	Branch                       string                `json:"branch,omitempty"`
 	Worktree                     string                `json:"worktree,omitempty"`
 	SessionName                  string                `json:"sessionName,omitempty"`

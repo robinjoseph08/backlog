@@ -74,6 +74,8 @@ type settledCheckpointer interface {
 	CheckpointSettled(context.Context, worker.ContinuationRequest) (worker.Continuation, error)
 }
 
+var errSettledCheckpointUnsupported = errors.New("Worker does not support settled continuation checkpoints")
+
 // ExternalResolutionReconciler performs the complete non-interactive
 // External Resolution lifecycle for a Run when its issue is closed.
 type ExternalResolutionReconciler interface {
@@ -127,6 +129,7 @@ type Runner struct {
 	PIDAlive               func(pid int) bool
 	ProcessGroupAlive      func(pid int) (bool, error)
 	PIDIdentity            func(context.Context, int) (string, error)
+	VerifyResumeGit        func(context.Context, scheduler.Run) (local string, remotePresent bool, remote string, err error)
 	Lstat                  func(string) (os.FileInfo, error)
 
 	suspensionExit       atomic.Int32
@@ -557,12 +560,20 @@ func (r *Runner) Run(ctx context.Context) error {
 			if closedBeforeReconciliation && workerLogIsClosed(closed) {
 				markWorkerLogClosed(&current, runID)
 				if closed.GroupExited {
-					markWorkerStopped(&current, runID)
+					markWorkerStopped(&current, runID, r.Now().UTC())
 				}
+			}
+			// Provider exhaustion needs its current-generation boundary before the
+			// reconciliation policy decides whether the one automatic continuation is
+			// safe. Other settled Workers are checkpointed after reconciliation only
+			// when their outcome remains incomplete.
+			if completion.result.Settled && completion.result.ProviderExhausted {
+				settledRun := findRun(current.Runs, runID)
+				settledCheckpointErr = r.checkpointSettledWorker(operationCtx, &current, settledRun, process)
 			}
 			startedDraining, issueClosed, err := r.handleWorkerCompletionWhileObservingSignals(operationCtx, &current, completion, signalEvents, len(localWorkers))
 			draining = startedDraining || draining
-			if err == nil && completion.result.Settled {
+			if completion.result.Settled && !completion.result.ProviderExhausted {
 				settledRun := findRun(current.Runs, runID)
 				if settledRun.Status != scheduler.StatusMerged {
 					settledCheckpointErr = r.checkpointSettledWorker(operationCtx, &current, settledRun, process)
@@ -579,8 +590,11 @@ func (r *Runner) Run(ctx context.Context) error {
 			if err == nil && settledCheckpointErr != nil {
 				updated := findRun(current.Runs, runID)
 				if updated.Status == scheduler.StatusFailed || updated.Status == scheduler.StatusNeedsHuman {
+					updated.Continuation = nil
 					updated.FailureClass = scheduler.FailureUnsafeContinuation
-					updated.Error = strings.TrimSpace(updated.Error + "; unsafe continuation evidence: " + settledCheckpointErr.Error())
+					if !strings.Contains(updated.Error, settledCheckpointErr.Error()) {
+						updated.Error = strings.TrimSpace(updated.Error + "; unsafe continuation evidence: " + settledCheckpointErr.Error())
+					}
 					updated.UpdatedAt = r.Now().UTC()
 					replaceRun(&current, updated)
 					err = r.Store.Save(current)
@@ -638,7 +652,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				if workerLogIsClosed(closed) {
 					markWorkerLogClosed(&current, runID)
 					if closed.GroupExited {
-						markWorkerStopped(&current, runID)
+						markWorkerStopped(&current, runID, r.Now().UTC())
 					}
 					if err := r.Store.Save(current); err != nil {
 						markerErr := fmt.Errorf("persist closed Worker log for Run %s: %w", runID, err)
@@ -1093,6 +1107,10 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 	}
 	run = findActiveRun(current, candidate.Number)
 	transitionStatus(&run, scheduler.StatusRunning)
+	run.WorkerGeneration++
+	run.StoppedWorkerGeneration = 0
+	run.WorkerStoppedAt = nil
+	run.Continuation = nil
 	run.PID = process.PID()
 	run.ProcessIdentity = identity
 	run.WorkerStartedAt = r.Now().UTC()
@@ -1156,6 +1174,10 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 	if err := verifyContinuationArtifacts(run); err != nil {
 		return nil, r.rejectResume(current, run.Issue, err.Error())
 	}
+	boundary := *run.Continuation
+	if err := r.verifyRecoveryRepositoryIdentity(operationCtx, run, boundary, outcome); err != nil {
+		return nil, r.rejectResume(current, run.Issue, err.Error())
+	}
 	assignment := worktree.Assignment{Path: run.Worktree, Branch: run.Branch}
 	if err := r.Worktrees.Verify(operationCtx, assignment); err != nil {
 		if operationCtx.Err() != nil {
@@ -1163,7 +1185,6 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 		}
 		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("verify retained branch and worktree before Resume: %v", err))
 	}
-	boundary := run.Continuation
 	run.ResumePending = true
 	run.UpdatedAt = r.Now().UTC()
 	replaceRun(current, run)
@@ -1173,7 +1194,8 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 	process, err := r.Workers.Start(workerCtx, worker.Request{
 		Issue: run.Issue, RunID: run.RunID, Worktree: run.Worktree, SessionName: run.SessionName,
 		SessionID: run.SessionID, SessionDir: run.SessionDir, SessionFile: boundary.SessionFile, Resume: true,
-		ContinuationStage: boundary.WorkflowStage, CheckpointFile: boundary.CheckpointFile, CheckpointSHA256: boundary.CheckpointSHA256,
+		ContinuationWorkflow: boundary.Workflow, ContinuationStage: boundary.WorkflowStage,
+		CheckpointFile: boundary.CheckpointFile, CheckpointSHA256: boundary.CheckpointSHA256,
 	})
 	if err != nil {
 		run = findActiveRun(current, run.Issue)
@@ -1200,6 +1222,8 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 		if !closed.GroupExited {
 			run.PID = process.PID()
 			run.ProcessIdentity = ""
+		} else {
+			markStoppedRun(&run, r.Now().UTC())
 		}
 		replaceRun(current, run)
 		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("record replacement Pi Worker identity: %v; close: %v", err, closed.Err))
@@ -1207,6 +1231,10 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 	now := r.Now().UTC()
 	transitionStatus(&run, scheduler.StatusRunning)
 	run.ResumePending = false
+	run.WorkerGeneration++
+	run.StoppedWorkerGeneration = 0
+	run.WorkerStoppedAt = nil
+	run.Continuation = nil
 	run.ResumeAfter = nil
 	run.PID = process.PID()
 	run.ProcessIdentity = identity
@@ -1220,8 +1248,7 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 		closed := process.Close()
 		run = findActiveRun(current, run.Issue)
 		if closed.GroupExited {
-			run.PID = 0
-			run.ProcessIdentity = ""
+			markStoppedRun(&run, r.Now().UTC())
 			replaceRun(current, run)
 		}
 		failureErr := r.rejectResume(current, run.Issue, fmt.Sprintf("persist replacement Worker identity before release: %v; abort: %v; close: %v", err, abortErr, closed.Err))
@@ -1230,24 +1257,53 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 			failureErr,
 		)
 	}
-	if err := verifyContinuationArtifacts(run); err != nil {
+	if err := verifyBoundaryArtifacts(run, boundary); err != nil {
 		_ = process.Abort()
 		closed := process.Close()
 		run = findActiveRun(current, run.Issue)
 		if closed.GroupExited {
-			run.PID = 0
-			run.ProcessIdentity = ""
+			markStoppedRun(&run, r.Now().UTC())
 			replaceRun(current, run)
 		}
 		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("reverify Pi continuation before replacement Worker release: %v; close: %v", err, closed.Err))
+	}
+	freshOutcome, inspectErr := r.GitHub.Completion(operationCtx, r.Config.Repo, run.Issue, run.Branch)
+	identityErr := inspectErr
+	if identityErr == nil {
+		identityErr = r.verifyRecoveryRepositoryIdentity(operationCtx, run, boundary, freshOutcome)
+	}
+	if identityErr != nil {
+		_ = process.Abort()
+		closed := process.Close()
+		run = findActiveRun(current, run.Issue)
+		if closed.GroupExited {
+			markStoppedRun(&run, r.Now().UTC())
+			replaceRun(current, run)
+		}
+		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("fresh repository identity changed before replacement Worker release: %v; close: %v", identityErr, closed.Err))
+	}
+	if freshOutcome.Merged || freshOutcome.PRFound && freshOutcome.AutoMergeArmed {
+		_ = process.Abort()
+		closed := process.Close()
+		if !closed.GroupExited {
+			return nil, r.rejectResume(current, run.Issue, "Completion appeared before replacement release but gated Worker exit was not verified")
+		}
+		run = findActiveRun(current, run.Issue)
+		markStoppedRun(&run, r.Now().UTC())
+		if err := r.applyOutcome(operationCtx, current, run, freshOutcome, true, true); err != nil {
+			return nil, err
+		}
+		if err := r.Store.Save(*current); err != nil {
+			return nil, fmt.Errorf("persist late Completion before replacement release: %w", err)
+		}
+		return nil, nil
 	}
 	if err := process.Release(); err != nil {
 		_ = process.Abort()
 		closed := process.Close()
 		run = findActiveRun(current, run.Issue)
 		if closed.GroupExited {
-			run.PID = 0
-			run.ProcessIdentity = ""
+			markStoppedRun(&run, r.Now().UTC())
 			replaceRun(current, run)
 		}
 		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("release replacement Pi Worker: %v; close: %v", err, closed.Err))
@@ -1260,12 +1316,27 @@ func (r *Runner) checkpointSettledWorker(ctx context.Context, current *state.Sta
 	original := run
 	checkpointer, ok := process.(settledCheckpointer)
 	if !ok {
-		return errors.New("Worker does not support settled continuation checkpoints")
+		return errSettledCheckpointUnsupported
 	}
 	checkpointCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	boundary, err := checkpointer.CheckpointSettled(checkpointCtx, worker.ContinuationRequest{SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree})
+	boundary, err := checkpointer.CheckpointSettled(checkpointCtx, worker.ContinuationRequest{
+		Issue: run.Issue, RunID: run.RunID, Branch: run.Branch,
+		SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree,
+	})
 	if err != nil {
+		if errors.Is(err, errSettledCheckpointUnsupported) {
+			return err
+		}
+		failed := findRun(current.Runs, run.RunID)
+		failed.Continuation = nil
+		failed.FailureClass = scheduler.FailureUnsafeContinuation
+		failed.Error = strings.TrimSpace(failed.Error + "; unsafe continuation evidence: " + err.Error())
+		failed.UpdatedAt = r.Now().UTC()
+		replaceRun(current, failed)
+		if saveErr := r.Store.Save(*current); saveErr != nil {
+			return errors.Join(err, fmt.Errorf("persist failed settled continuation checkpoint: %w", saveErr))
+		}
 		return err
 	}
 	now := r.Now().UTC()
@@ -1274,7 +1345,9 @@ func (r *Runner) checkpointSettledWorker(ctx context.Context, current *state.Sta
 		SessionID: boundary.SessionID, SessionFile: boundary.SessionFile, Worktree: boundary.Worktree,
 		LeafID: boundary.LeafID, EntryCount: boundary.EntryCount, SHA256: boundary.SHA256,
 		Workflow: boundary.Workflow, WorkflowStage: boundary.WorkflowStage,
-		CheckpointFile: boundary.CheckpointFile, CheckpointSHA256: boundary.CheckpointSHA256, VerifiedAt: now,
+		CheckpointFile: boundary.CheckpointFile, CheckpointSHA256: boundary.CheckpointSHA256,
+		CheckpointStatus: boundary.CheckpointStatus, CheckpointFailure: boundary.CheckpointFailure,
+		WorkerGeneration: run.WorkerGeneration, VerifiedAt: now,
 	}
 	run.WorkflowStage = boundary.WorkflowStage
 	run.UpdatedAt = now
@@ -1295,9 +1368,10 @@ func (r *Runner) applyProviderContinuation(current *state.State, runID string) e
 	if run.PreservedCause == "" {
 		run.PreservedCause = run.Error
 	}
-	if run.Continuation == nil {
+	if run.Continuation == nil || run.Continuation.WorkerGeneration != run.WorkerGeneration {
 		run.Status = scheduler.StatusNeedsHuman
-		run.Error = strings.TrimSpace(run.Error + "; provider retries exhausted without a verified durable continuation boundary")
+		run.FailureClass = scheduler.FailureUnsafeContinuation
+		run.Error = strings.TrimSpace(run.Error + "; provider retries exhausted without a verified durable continuation boundary for the current Worker generation")
 		run.UpdatedAt = r.Now().UTC()
 		replaceRun(current, run)
 		return r.Store.Save(*current)
@@ -1331,17 +1405,51 @@ func verifyContinuationArtifacts(run scheduler.Run) error {
 	if run.SessionID == "" || run.SessionDir == "" || run.Branch == "" || run.Worktree == "" || run.Continuation == nil {
 		return errors.New("continuation artifacts are incomplete before Resume")
 	}
-	boundary := run.Continuation
+	return verifyBoundaryArtifacts(run, *run.Continuation)
+}
+
+func verifyBoundaryArtifacts(run scheduler.Run, boundary scheduler.ContinuationBoundary) error {
 	if boundary.VerifiedAt.IsZero() {
 		return errors.New("continuation verification timestamp is missing before Resume")
 	}
+	if boundary.WorkerGeneration > 0 && boundary.WorkerGeneration != run.WorkerGeneration && boundary.WorkerGeneration != run.WorkerGeneration-1 {
+		return errors.New("continuation boundary does not belong to the replaced Worker generation")
+	}
 	if err := worker.VerifyContinuation(worker.ContinuationRequest{
+		Issue: run.Issue, RunID: run.RunID, Branch: run.Branch,
 		SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree,
 	}, worker.Continuation{
 		SessionID: boundary.SessionID, SessionFile: boundary.SessionFile, Worktree: boundary.Worktree,
 		LeafID: boundary.LeafID, EntryCount: boundary.EntryCount, SHA256: boundary.SHA256,
+		Workflow: boundary.Workflow, WorkflowStage: boundary.WorkflowStage,
+		CheckpointFile: boundary.CheckpointFile, CheckpointSHA256: boundary.CheckpointSHA256,
+		CheckpointStatus: boundary.CheckpointStatus, CheckpointFailure: boundary.CheckpointFailure,
 	}); err != nil {
 		return fmt.Errorf("verify Pi continuation before Resume: %w", err)
+	}
+	return nil
+}
+
+func (r *Runner) verifyRecoveryRepositoryIdentity(ctx context.Context, run scheduler.Run, boundary scheduler.ContinuationBoundary, outcome ghadapter.CompletionOutcome) error {
+	if boundary.LocalCommit == "" && boundary.RemoteBranchState == "" && boundary.PullRequestHead == "" {
+		return nil
+	}
+	if r.VerifyResumeGit == nil {
+		return errors.New("Recovery repository identity verifier is unavailable")
+	}
+	local, remotePresent, remote, err := r.VerifyResumeGit(ctx, run)
+	if err != nil {
+		return fmt.Errorf("freshly verify local and remote branch identities: %w", err)
+	}
+	wantRemotePresent := boundary.RemoteBranchState == "present"
+	if boundary.RemoteBranchState != "present" && boundary.RemoteBranchState != "absent" {
+		return errors.New("persisted Recovery remote branch state is malformed")
+	}
+	if local != boundary.LocalCommit || remotePresent != wantRemotePresent || remote != boundary.RemoteCommit {
+		return errors.New("local or remote branch identity drifted after Recovery")
+	}
+	if outcome.PRFound != (boundary.PullRequest != "") || outcome.PullRequest != boundary.PullRequest || outcome.HeadCommit != boundary.PullRequestHead {
+		return errors.New("expected pull request identity drifted after Recovery")
 	}
 	return nil
 }
@@ -1671,8 +1779,7 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 					changed = true
 					continue
 				}
-				run.PID = 0
-				run.ProcessIdentity = ""
+				markStoppedRun(&run, r.Now().UTC())
 				r.transitionToSuspended(&run)
 				replaceRun(current, run)
 				changed = true
@@ -2083,13 +2190,19 @@ func markWorkerLogClosed(current *state.State, runID string) {
 	replaceRun(current, run)
 }
 
-func markWorkerStopped(current *state.State, runID string) {
+func markStoppedRun(run *scheduler.Run, stoppedAt time.Time) {
+	run.PID = 0
+	run.ProcessIdentity = ""
+	run.StoppedWorkerGeneration = run.WorkerGeneration
+	run.WorkerStoppedAt = &stoppedAt
+}
+
+func markWorkerStopped(current *state.State, runID string, stoppedAt time.Time) {
 	run := findRun(current.Runs, runID)
 	if run.RunID == "" {
 		return
 	}
-	run.PID = 0
-	run.ProcessIdentity = ""
+	markStoppedRun(&run, stoppedAt)
 	replaceRun(current, run)
 }
 
@@ -2245,6 +2358,7 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 				return
 			}
 			boundary, err := process.Suspend(ctx, worker.ContinuationRequest{
+				Issue: run.Issue, RunID: run.RunID, Branch: run.Branch,
 				SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree,
 			})
 			boundaries <- suspensionBoundaryResult{issue: issue, boundary: boundary, err: err}
@@ -2283,7 +2397,9 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 			Worktree: result.boundary.Worktree, LeafID: result.boundary.LeafID,
 			EntryCount: result.boundary.EntryCount, SHA256: result.boundary.SHA256,
 			Workflow: result.boundary.Workflow, WorkflowStage: result.boundary.WorkflowStage,
-			CheckpointFile: result.boundary.CheckpointFile, CheckpointSHA256: result.boundary.CheckpointSHA256, VerifiedAt: now,
+			CheckpointFile: result.boundary.CheckpointFile, CheckpointSHA256: result.boundary.CheckpointSHA256,
+			CheckpointStatus: result.boundary.CheckpointStatus, CheckpointFailure: result.boundary.CheckpointFailure,
+			WorkerGeneration: run.WorkerGeneration, VerifiedAt: now,
 		}
 		if run.LogPath == "" {
 			run.LogPath = result.boundary.LogPath
@@ -2407,8 +2523,7 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 				}
 				run = findRun(current.Runs, run.RunID)
 			}
-			run.PID = 0
-			run.ProcessIdentity = ""
+			markStoppedRun(&run, r.Now().UTC())
 			run.UpdatedAt = r.Now().UTC()
 			if reason := failureReasons[closed.issue]; reason != "" {
 				run.Status = scheduler.StatusNeedsHuman

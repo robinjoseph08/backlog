@@ -52,6 +52,41 @@ func TestFileStoreRoundTripsStateAtomically(t *testing.T) {
 	}
 }
 
+func TestFileStoreRoundTripsCompleteRecoverySafetyMetadata(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	run := scheduler.Run{
+		Issue: 98, IssueTitle: "Recovery", IssueURL: "https://github.com/acme/widgets/issues/98",
+		RunID: "run-98", Status: scheduler.StatusSuspended, WorkerMode: scheduler.WorkerModeRPC,
+		WorkerGeneration: 3, StoppedWorkerGeneration: 3, WorkerStoppedAt: &now,
+		Branch: "agent/issue-98-run-98", Worktree: filepath.Join(root, "worktree"), SessionName: "afk #98",
+		SessionID: "session-98", SessionDir: filepath.Join(root, "sessions"),
+		LogPath: filepath.Join(root, "run.jsonl"), StderrPath: filepath.Join(root, "run.stderr"),
+		PullRequest: "https://github.com/acme/widgets/pull/98", Error: "diagnostic", FailureClass: scheduler.FailureValidation,
+		WorkflowStage: "afk-coordinator", PreservedCause: "provider cause", ProviderContinuationAttempts: 1,
+		RecoveryCount: 1, FirstRecoveredAt: &now, LastRecoveredAt: &now, StartedAt: now.Add(-time.Hour), UpdatedAt: now,
+	}
+	run.Continuation = &scheduler.ContinuationBoundary{
+		SessionID: run.SessionID, SessionFile: filepath.Join(run.SessionDir, "session.jsonl"), Worktree: run.Worktree,
+		LeafID: "leaf", EntryCount: 4, SHA256: strings.Repeat("a", 64), Workflow: "afk", WorkflowStage: "afk-coordinator",
+		WorkerGeneration: 3, LocalCommit: strings.Repeat("b", 40), RemoteBranchState: "present", RemoteCommit: strings.Repeat("c", 40),
+		PullRequest: run.PullRequest, PullRequestHead: strings.Repeat("c", 40), CheckpointStatus: "active", VerifiedAt: now,
+	}
+	lease := scheduler.Lease{LeaseID: "lease-exact-98", Issue: run.Issue, RunID: run.RunID}
+	want := State{Version: CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 2, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{lease}}
+	store := FileStore{Path: filepath.Join(root, "state.json")}
+	if err := store.Save(want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Recovery metadata round trip:\ngot  %#v\nwant %#v", got, want)
+	}
+}
+
 func TestFileStorePreviewDoesNotPersistV1Migration(t *testing.T) {
 	t.Parallel()
 

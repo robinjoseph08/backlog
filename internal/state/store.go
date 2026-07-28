@@ -464,19 +464,25 @@ func validateRun(run scheduler.Run, requireWorkerMode, recoverUnsafeContinuation
 		checkpointHash, checkpointHashErr := hex.DecodeString(boundary.CheckpointSHA256)
 		switch boundary.Workflow {
 		case "":
-			if boundary.WorkflowStage != "" || boundary.CheckpointFile != "" || boundary.CheckpointSHA256 != "" {
+			if boundary.WorkflowStage != "" || boundary.CheckpointFile != "" || boundary.CheckpointSHA256 != "" || boundary.CheckpointStatus != "" || boundary.CheckpointFailure != "" {
 				return fmt.Errorf("state contains Run %q with incomplete continuation workflow identity", run.RunID)
 			}
 		case "afk":
-			if boundary.WorkflowStage == "" || boundary.CheckpointFile != "" || boundary.CheckpointSHA256 != "" {
+			if boundary.WorkflowStage != "afk-coordinator" || boundary.CheckpointFile != "" || boundary.CheckpointSHA256 != "" || boundary.CheckpointStatus != "active" || boundary.CheckpointFailure != "" {
 				return fmt.Errorf("state contains Run %q with invalid AFK continuation identity", run.RunID)
 			}
 		case "ship-it":
-			if boundary.WorkflowStage == "" || boundary.CheckpointFile == "" || len(boundary.CheckpointSHA256) != sha256HexLength || checkpointHashErr != nil || len(checkpointHash) != sha256HexLength/2 {
+			if boundary.WorkflowStage == "" || boundary.CheckpointFile == "" || len(boundary.CheckpointSHA256) != sha256HexLength || checkpointHashErr != nil || len(checkpointHash) != sha256HexLength/2 ||
+				(boundary.CheckpointStatus != "active" && boundary.CheckpointStatus != "blocked") || !knownFailureClass(scheduler.FailureClass(boundary.CheckpointFailure)) {
 				return fmt.Errorf("state contains Run %q with invalid ship-it continuation identity", run.RunID)
 			}
 		default:
 			return fmt.Errorf("state contains Run %q with unsupported continuation workflow %q", run.RunID, boundary.Workflow)
+		}
+		if boundary.WorkerGeneration < 0 || boundary.WorkerGeneration > run.WorkerGeneration || boundary.RemoteBranchState != "" && boundary.RemoteBranchState != "present" && boundary.RemoteBranchState != "absent" ||
+			boundary.RemoteBranchState == "present" && boundary.RemoteCommit == "" || boundary.RemoteBranchState == "absent" && boundary.RemoteCommit != "" ||
+			boundary.PullRequest == "" && boundary.PullRequestHead != "" || boundary.PullRequest != "" && boundary.PullRequestHead == "" {
+			return fmt.Errorf("state contains Run %q with invalid continuation generation or repository identity", run.RunID)
 		}
 		if run.WorkflowStage != "" && run.WorkflowStage != boundary.WorkflowStage {
 			return fmt.Errorf("state contains Run %q with mismatched workflow stage metadata", run.RunID)
@@ -485,6 +491,10 @@ func validateRun(run scheduler.Run, requireWorkerMode, recoverUnsafeContinuation
 		if err != nil || relative == "." || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 			return fmt.Errorf("state contains Run %q with a continuation file outside its session directory", run.RunID)
 		}
+	}
+	if run.WorkerGeneration < 0 || run.StoppedWorkerGeneration < 0 || run.StoppedWorkerGeneration > run.WorkerGeneration ||
+		run.StoppedWorkerGeneration > 0 && (run.WorkerStoppedAt == nil || run.WorkerStoppedAt.IsZero()) || run.WorkerStoppedAt != nil && run.StoppedWorkerGeneration == 0 {
+		return fmt.Errorf("state contains Run %q with invalid Worker generation stop proof", run.RunID)
 	}
 	if run.Status == scheduler.StatusSuspended && !unsafeContinuation {
 		if run.PID != 0 || run.ProcessIdentity != "" || run.Continuation == nil {

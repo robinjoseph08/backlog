@@ -1010,7 +1010,7 @@ func TestProcessSuspendVerifiesAndSyncsContinuationBoundary(t *testing.T) {
 	}
 	header := `{"type":"session","version":3,"id":"backlog-run-50","timestamp":"2026-07-23T00:00:00Z","cwd":` + strconv.Quote(worktree) + `}`
 	entries := []string{
-		`{"type":"message","id":"user","parentId":null,"timestamp":"2026-07-23T00:00:01Z","message":{"role":"user","content":"work"}}`,
+		`{"type":"message","id":"user","parentId":null,"timestamp":"2026-07-23T00:00:01Z","message":{"role":"user","content":"/skill:afk 50"}}`,
 		`{"type":"message","id":"assistant","parentId":"user","timestamp":"2026-07-23T00:00:02Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"tool-1","name":"bash","arguments":{}}],"stopReason":"toolUse"}}`,
 		`{"type":"message","id":"result","parentId":"assistant","timestamp":"2026-07-23T00:00:03Z","message":{"role":"toolResult","toolCallId":"tool-1","toolName":"bash","content":[{"type":"text","text":"done"}],"isError":false}}`,
 	}
@@ -1041,6 +1041,7 @@ while IFS= read -r ignored; do :; done
 	}
 	waitForPath(t, started)
 	boundary, err := process.Suspend(context.Background(), ContinuationRequest{
+		Issue: 50, RunID: "run-50", Branch: "agent/issue-50-run-50",
 		SessionID: "backlog-run-50", SessionDir: sessionDir, Worktree: worktree,
 	})
 	if err != nil {
@@ -1068,7 +1069,7 @@ func TestProcessCheckpointSettledCapturesBoundaryWithoutAbort(t *testing.T) {
 		t.Fatal(err)
 	}
 	header := `{"type":"session","version":3,"id":"backlog-run-settled","cwd":` + strconv.Quote(worktree) + `}`
-	entry := `{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"done"}}`
+	entry := `{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"/skill:afk 54"}}`
 	if err := os.WriteFile(sessionFile, []byte(header+"\n"+entry+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1095,7 +1096,7 @@ while IFS= read -r ignored; do :; done
 	if result := process.Wait(); !result.Settled || result.Err != nil {
 		t.Fatalf("wait = %#v", result)
 	}
-	boundary, err := process.CheckpointSettled(context.Background(), ContinuationRequest{SessionID: "backlog-run-settled", SessionDir: sessionDir, Worktree: worktree})
+	boundary, err := process.CheckpointSettled(context.Background(), ContinuationRequest{Issue: 54, RunID: "run-settled", Branch: "agent/issue-54-run-settled", SessionID: "backlog-run-settled", SessionDir: sessionDir, Worktree: worktree})
 	if err != nil {
 		t.Fatalf("checkpoint settled: %v", err)
 	}
@@ -1111,6 +1112,59 @@ while IFS= read -r ignored; do :; done
 	}
 	if result := process.Close(); !result.GroupExited || result.Err != nil {
 		t.Fatalf("close = %#v", result)
+	}
+}
+
+func TestWorkflowCheckpointRequiresDurableOwnedAFKOrStrictShipItSchema(t *testing.T) {
+	worktree := t.TempDir()
+	request := ContinuationRequest{Issue: 42, RunID: "run-42", Branch: "agent/issue-42-run-42", SessionID: "session-42", Worktree: worktree}
+	unowned := []json.RawMessage{json.RawMessage(`{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"continue"}}`)}
+	if _, _, _, _, _, _, err := inspectWorkflowCheckpoint(request, unowned); err == nil || !strings.Contains(err.Error(), "owned AFK") {
+		t.Fatalf("missing durable workflow evidence = %v", err)
+	}
+	owned := []json.RawMessage{json.RawMessage(`{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"/skill:afk 42"}}`)}
+	workflow, stage, checkpointFile, checkpointSHA, status, failure, err := inspectWorkflowCheckpoint(request, owned)
+	if err != nil || workflow != "afk" || stage != "afk-coordinator" || status != "active" || checkpointFile != "" || checkpointSHA != "" || failure != "" {
+		t.Fatalf("owned AFK evidence = %q/%q/%q/%q/%q/%q, %v", workflow, stage, checkpointFile, checkpointSHA, status, failure, err)
+	}
+	gitDir := filepath.Join(worktree, ".git")
+	if err := os.Mkdir(gitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := filepath.Join(gitDir, "ship-it-checkpoint-v1.md")
+	valid := func(status, stage, session, directory, branch, failure string) []byte {
+		data := fmt.Sprintf("# Ship-it checkpoint v1\n\nStatus: %s\nStage: %s\nCoordinator session: %s\nWorking directory: %s\nBranch: %s\n", status, stage, session, directory, branch)
+		if failure != "" {
+			data += "Failure class: " + failure + "\n"
+		}
+		return []byte(data)
+	}
+	for _, test := range []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{name: "unknown stage", data: valid("active", "anything", request.SessionID, worktree, request.Branch, ""), want: "unsupported Stage"},
+		{name: "missing status", data: []byte("# Ship-it checkpoint v1\n\nStage: prepare\n"), want: "unsupported Status"},
+		{name: "wrong owner", data: valid("active", "prepare", "other", worktree, request.Branch, ""), want: "ownership"},
+		{name: "unknown failure", data: valid("blocked", "blocked", request.SessionID, worktree, request.Branch, "English prose"), want: "structured failure"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(checkpoint, test.data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, _, _, _, _, err := inspectWorkflowCheckpoint(request, owned); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("strict checkpoint error = %v, want %q", err, test.want)
+			}
+		})
+	}
+	data := valid("blocked", "blocked", request.SessionID, worktree, request.Branch, "repair-budget-exhaustion")
+	if err := os.WriteFile(checkpoint, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workflow, stage, checkpointFile, checkpointSHA, status, failure, err = inspectWorkflowCheckpoint(request, owned)
+	if err != nil || workflow != "ship-it" || stage != "blocked" || filepath.Base(checkpointFile) != filepath.Base(checkpoint) || checkpointSHA == "" || status != "blocked" || failure != "repair-budget-exhaustion" {
+		t.Fatalf("structured blocked checkpoint = %q/%q/%q/%q/%q/%q, %v", workflow, stage, checkpointFile, checkpointSHA, status, failure, err)
 	}
 }
 
@@ -1922,6 +1976,10 @@ while IFS= read -r ignored; do :; done
 	request := request(81, "run-81", t.TempDir(), sessionDir)
 	request.SessionFile = sessionFile
 	request.Resume = true
+	request.ContinuationWorkflow = "ship-it"
+	request.ContinuationStage = "normal-review"
+	request.CheckpointFile = "/tmp/ship-it-checkpoint-v1.md"
+	request.CheckpointSHA256 = strings.Repeat("a", 64)
 	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
@@ -1940,8 +1998,10 @@ while IFS= read -r ignored; do :; done
 		t.Fatal(err)
 	}
 	message := string(input)
-	if !strings.Contains(message, "Reassess the repository and GitHub state") || !strings.Contains(message, "existing AFK workflow") {
-		t.Fatalf("replacement prompt = %q", message)
+	for _, want := range []string{"existing ship-it workflow", "exact stage normal-review", "local repository", "remote branch", "expected-branch pull request", "issue", request.CheckpointFile, request.CheckpointSHA256, "Never perform an external mutation"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("replacement prompt omitted %q: %q", want, message)
+		}
 	}
 	args, err := os.ReadFile(argsPath)
 	if err != nil {
@@ -1949,6 +2009,52 @@ while IFS= read -r ignored; do :; done
 	}
 	if !strings.Contains(string(args), "--session "+sessionFile) || strings.Contains(string(args), "--session-id") {
 		t.Fatalf("replacement Worker args = %q, want exact verified session file", args)
+	}
+}
+
+func TestReplacementWorkerPromptNamesExactAFKBoundary(t *testing.T) {
+	root := t.TempDir()
+	inputPath := filepath.Join(root, "input")
+	pi := fakePi(t, `
+IFS= read -r command
+printf '%s\n' "$command" > `+shellQuote(inputPath)+`
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+while IFS= read -r ignored; do :; done
+`)
+	sessionDir := filepath.Join(root, "session")
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sessionFile := filepath.Join(sessionDir, "session.jsonl")
+	if err := os.WriteFile(sessionFile, []byte("session\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request := request(82, "run-82", t.TempDir(), sessionDir)
+	request.SessionFile = sessionFile
+	request.Resume = true
+	request.ContinuationWorkflow = "afk"
+	request.ContinuationStage = "afk-coordinator"
+	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if result := process.Wait(); result.Err != nil {
+		t.Fatal(result.Err)
+	}
+	if result := process.Close(); result.Err != nil {
+		t.Fatal(result.Err)
+	}
+	message, err := os.ReadFile(inputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"existing afk workflow", "exact stage afk-coordinator", "Freshly inspect the local repository", "expected-branch pull request", "Never perform an external mutation"} {
+		if !strings.Contains(string(message), want) {
+			t.Fatalf("AFK replacement prompt omitted %q: %q", want, message)
+		}
 	}
 }
 

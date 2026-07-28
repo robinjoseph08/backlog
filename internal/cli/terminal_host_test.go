@@ -1475,8 +1475,8 @@ case "$*" in
   "issue view 65 --repo acme/widgets --json number,title,body,state,url,createdAt") printf '%s\n' '{"number":65,"title":"Terminal host","body":"","state":"OPEN","url":"https://example.test/issues/65","createdAt":"2026-01-01T00:00:00Z"}' ;;
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/65/comments?per_page=100 --paginate --slurp"|\
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/65/dependencies/blocked_by?per_page=100 --paginate --slurp") printf '%s\n' '[[]]' ;;
-  "pr list --repo acme/widgets --state all --head agent/issue-65-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
-    if test -f `+quote(completedMarker)+`; then head=$8; printf '[{"number":165,"url":"https://github.com/acme/widgets/pull/165","state":"MERGED","mergedAt":"2026-01-02T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"%s","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]\n' "$head"; else printf '%s\n' '[]'; fi ;;
+  "pr list --repo acme/widgets --state all --head agent/issue-65-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    if test -f `+quote(completedMarker)+`; then head=$8; printf '[{"number":165,"url":"https://github.com/acme/widgets/pull/165","state":"MERGED","mergedAt":"2026-01-02T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"%s","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]\n' "$head"; else printf '%s\n' '[]'; fi ;;
   "issue view 65 --repo acme/widgets --json number,state,title,url")
     if test -f `+quote(completedMarker)+`; then printf '%s\n' '{"number":65,"state":"CLOSED","title":"Terminal host","url":"https://github.com/acme/widgets/issues/65"}'; else printf '%s\n' '{"number":65,"state":"OPEN","title":"Terminal host","url":"https://github.com/acme/widgets/issues/65"}'; fi ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
@@ -1517,12 +1517,12 @@ touch ` + quote(filepath.Join(root, "suspension-started")) + `
 while ! test -f ` + quote(filepath.Join(root, "release-worker")) + `; do sleep 0.01; done
 session_file="$session_dir/session.jsonl"
 printf '{"type":"session","version":3,"id":"%s","cwd":"%s"}\n' "$session_id" "$worktree" > "$session_file"
-printf '%s\n' '{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"work"}}' >> "$session_file"
+printf '%s\n' '{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"/skill:afk 65"}}' >> "$session_file"
 printf '%s\n' '{"id":"backlog-suspend-abort","type":"response","command":"abort","success":true}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 IFS= read -r state
 printf '{"id":"backlog-suspend-state","type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":"%s","sessionId":"%s"}}\n' "$session_file" "$session_id"
 IFS= read -r entries
-printf '%s\n' '{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"work"}}],"leafId":"leaf"}}'
+printf '%s\n' '{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"/skill:afk 65"}}],"leafId":"leaf"}}'
 IFS= read -r final_state
 printf '{"id":"backlog-suspend-final-state","type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":"%s","sessionId":"%s"}}\n' "$session_file" "$session_id"
 while IFS= read -r ignored; do :; done
