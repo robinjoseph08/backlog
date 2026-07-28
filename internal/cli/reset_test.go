@@ -825,7 +825,7 @@ func TestResetInspectionDistinguishesAbsentFromUnknownResources(t *testing.T) {
 	if err != nil || branch.Present {
 		t.Fatalf("absent remote branch = %#v, %v", branch, err)
 	}
-	unknownGit := writeExecutable(t, "#!/bin/sh\necho uncertain >&2\nexit 2\n")
+	unknownGit := writeExecutable(t, "#!/bin/sh\necho uncertain >&2\nexit 1\n")
 	if _, err := inspectRemoteBranch(context.Background(), unknownGit, t.TempDir(), run.Branch); err == nil || !strings.Contains(err.Error(), "unknown") {
 		t.Fatalf("unknown remote branch error = %v", err)
 	}
