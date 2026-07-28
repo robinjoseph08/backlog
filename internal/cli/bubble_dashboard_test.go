@@ -43,6 +43,8 @@ func TestBubbleDashboardModelResizesViewportAroundFixedLifecycleChrome(t *testin
 
 func assertBubbleDashboardFits(t *testing.T, model bubbleDashboardModel, width, height, viewportHeight int) {
 	t.Helper()
+	model.refreshViewport(model.currentSelection())
+	frame := model.dashboardFrame()
 	view := model.View()
 	if !view.AltScreen {
 		t.Fatal("dashboard view did not request the alternate screen")
@@ -62,8 +64,14 @@ func assertBubbleDashboardFits(t *testing.T, model bubbleDashboardModel, width, 
 			t.Fatalf("fixed dashboard chrome omitted %q after resize:\n%s", want, plain)
 		}
 	}
-	if model.viewport.Height() != viewportHeight || model.viewport.Width() != width {
-		t.Fatalf("viewport size = %dx%d, want %dx%d", model.viewport.Width(), model.viewport.Height(), width, viewportHeight)
+	if frame.bodyHeight != viewportHeight || model.viewport.Height() != frame.bodyHeight || model.viewport.Width() != width {
+		t.Fatalf("frame body and viewport size = %d and %dx%d, want %d and %dx%d", frame.bodyHeight, model.viewport.Width(), model.viewport.Height(), viewportHeight, width, viewportHeight)
+	}
+	if frame.bodyHeight > 0 {
+		body := strings.Split(ansi.Strip(model.viewport.View()), "\n")
+		if frame.bodyStart >= len(lines) || strings.TrimSpace(lines[frame.bodyStart]) != strings.TrimSpace(body[0]) {
+			t.Fatalf("rendered body does not start at derived line %d:\n%s", frame.bodyStart, plain)
+		}
 	}
 }
 

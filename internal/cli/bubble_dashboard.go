@@ -504,15 +504,9 @@ func dashboardHeaderWithAttention(header string, pending int) string {
 }
 
 func (m *bubbleDashboardModel) resizeViewport() {
-	headerLines := strings.SplitN(m.header, "\n", 3)
-	chrome := dashboardChromeLines(headerLines[1:], strings.Split(m.footer, "\n"), m.width, m.height)
-	chromeHeight := len(chrome.top) + len(chrome.bottom)
-	titleHeight := 0
-	if chromeHeight+1 < m.height {
-		titleHeight = 1
-	}
+	frame := m.dashboardFrame()
 	m.viewport.SetWidth(m.width)
-	m.viewport.SetHeight(max(0, m.height-chromeHeight-titleHeight))
+	m.viewport.SetHeight(frame.bodyHeight)
 }
 
 func (m bubbleDashboardModel) currentSelection() dashboardSelection {
@@ -531,13 +525,7 @@ func (m bubbleDashboardModel) currentSelection() dashboardSelection {
 }
 
 func (m bubbleDashboardModel) dashboardBodyStart() int {
-	headerLines := strings.SplitN(m.header, "\n", 3)
-	chrome := dashboardChromeLines(headerLines[1:], strings.Split(m.footer, "\n"), m.width, m.height)
-	start := len(chrome.top)
-	if len(chrome.top)+len(chrome.bottom)+1 < m.height {
-		start++
-	}
-	return start
+	return m.dashboardFrame().bodyStart
 }
 
 func (m bubbleDashboardModel) anchorVisualLine(identity string) (int, bool) {
@@ -671,25 +659,17 @@ func (m bubbleDashboardModel) View() tea.View {
 	// preceding Bubble Tea message. The program's normal path already refreshes
 	// in Update, so this local copy does not alter navigation state.
 	m.refreshViewport(m.currentSelection())
-	headerLines := strings.SplitN(m.header, "\n", 3)
-	chrome := dashboardChromeLines(headerLines[1:], strings.Split(m.footer, "\n"), m.width, m.height)
-	chromeHeight := len(chrome.top) + len(chrome.bottom)
+	frame := m.dashboardFrame()
 
 	lines := make([]string, 0, m.height)
-	titleHeight := 0
-	if chromeHeight+1 < m.height {
-		lines = append(lines, lipgloss.NewStyle().Bold(true).Render(headerLines[0]))
-		titleHeight = 1
+	if frame.titleHeight > 0 {
+		lines = append(lines, lipgloss.NewStyle().Bold(true).Render(frame.title))
 	}
-	lines = append(lines, chrome.top...)
-	bodyHeight := max(0, m.height-chromeHeight-titleHeight)
-	if bodyHeight > 0 {
-		view := m.viewport
-		view.SetWidth(m.width)
-		view.SetHeight(bodyHeight)
-		lines = append(lines, strings.Split(view.View(), "\n")...)
+	lines = append(lines, frame.chrome.top...)
+	if frame.bodyHeight > 0 {
+		lines = append(lines, strings.Split(m.viewport.View(), "\n")...)
 	}
-	lines = append(lines, chrome.bottom...)
+	lines = append(lines, frame.chrome.bottom...)
 	for index := range lines {
 		lines[index] = fitDashboardLine(lines[index], m.width)
 	}
@@ -697,6 +677,31 @@ func (m bubbleDashboardModel) View() tea.View {
 	view.AltScreen = true
 	view.MouseMode = tea.MouseModeCellMotion
 	return view
+}
+
+type dashboardFrame struct {
+	title       string
+	titleHeight int
+	chrome      dashboardChrome
+	bodyStart   int
+	bodyHeight  int
+}
+
+func (m bubbleDashboardModel) dashboardFrame() dashboardFrame {
+	headerLines := strings.SplitN(m.header, "\n", 3)
+	chrome := dashboardChromeLines(headerLines[1:], strings.Split(m.footer, "\n"), m.width, m.height)
+	chromeHeight := len(chrome.top) + len(chrome.bottom)
+	titleHeight := 0
+	if chromeHeight+1 < m.height {
+		titleHeight = 1
+	}
+	return dashboardFrame{
+		title:       headerLines[0],
+		titleHeight: titleHeight,
+		chrome:      chrome,
+		bodyStart:   titleHeight + len(chrome.top),
+		bodyHeight:  max(0, m.height-chromeHeight-titleHeight),
+	}
 }
 
 type dashboardChrome struct {
