@@ -88,6 +88,18 @@ func TestRunOutputSelectionUsesTerminalCapabilityAndPlainOverride(t *testing.T) 
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			repository := initializeFollowRepository(t)
+			stateDir := t.TempDir()
+			run := scheduler.Run{
+				Issue: 71, IssueTitle: "Linked retained run", IssueURL: "https://github.com/acme/widgets/issues/71",
+				RunID: "retained-71", Status: scheduler.StatusNeedsHuman, WorkerMode: scheduler.WorkerModePrint,
+				PullRequest: "https://github.com/acme/widgets/pull/171",
+			}
+			if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{
+				Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
+				Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+			}); err != nil {
+				t.Fatal(err)
+			}
 			gh := writeExecutable(t, `#!/bin/sh
 set -eu
 case "$*" in
@@ -98,28 +110,32 @@ case "$*" in
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
 `)
-			args := []string{"run", "--repo-dir", repository, "--state-dir", t.TempDir(), "--poll", "5ms", "--gh", gh}
+			args := []string{"run", "--repo-dir", repository, "--state-dir", stateDir, "--poll", "5ms", "--gh", gh}
 			if test.plain {
 				args = append(args, "--plain")
 			}
 			var stdout, stderr bytes.Buffer
 			exit := MainWithSignalsAndTerminal(context.Background(), args, &stdout, &stderr, nil, func(io.Writer) bool { return test.terminal })
-			if exit != 0 {
-				t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+			if exit != 1 {
+				t.Fatalf("exit = %d, want retained-intervention exit 1; stderr = %q", exit, stderr.String())
 			}
-			if strings.Contains(stdout.String(), "\x1b[") != test.wantANSI {
-				t.Fatalf("ANSI presence = %t, want %t: %q", strings.Contains(stdout.String(), "\x1b["), test.wantANSI, stdout.String())
+			output := stdout.String()
+			if strings.Contains(output, "\x1b[") != test.wantANSI {
+				t.Fatalf("ANSI presence = %t, want %t: %q", strings.Contains(output, "\x1b["), test.wantANSI, output)
 			}
-			if !strings.Contains(stdout.String(), test.wantOutput) {
-				t.Fatalf("stdout missing %q: %q", test.wantOutput, stdout.String())
+			for _, want := range []string{test.wantOutput, "#71  Linked retained run", run.IssueURL} {
+				if !strings.Contains(output, want) {
+					t.Fatalf("stdout missing %q: %q", want, output)
+				}
 			}
 			if test.wantANSI {
-				output := stdout.String()
 				restore := strings.Index(output, "\x1b[?1049l")
 				summary := strings.Index(output, "Final aggregate summary")
 				if strings.Count(output, "\x1b[?1049h") != 1 || strings.Count(output, "\x1b[?1049l") != 1 || strings.Count(output, "\x1b[?25l") != 1 || strings.Count(output, "\x1b[?25h") != 1 || restore < 0 || summary < restore {
 					t.Fatalf("Bubble Tea did not restore the screen and cursor before the summary: %q", output)
 				}
+			} else if strings.Contains(output, "\x1b") {
+				t.Fatalf("plain or redirected retained-Run output contains terminal controls: %q", output)
 			}
 		})
 	}
