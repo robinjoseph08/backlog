@@ -1622,6 +1622,63 @@ func TestResetFinalizationPersistsRunAndLeaseTogether(t *testing.T) {
 	}
 }
 
+func TestResetStopsAtStatePersistenceFailuresWithLeaseRetained(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		failStatus   scheduler.Status
+		wantStatus   scheduler.Status
+		wantLabels   string
+		wantAttempts []scheduler.Status
+	}{
+		{
+			name: "progress state", failStatus: scheduler.StatusResetting,
+			wantStatus: scheduler.StatusFailed, wantLabels: "in-progress,spec",
+			wantAttempts: []scheduler.Status{scheduler.StatusResetting},
+		},
+		{
+			name: "final atomic state", failStatus: scheduler.StatusReset,
+			wantStatus: scheduler.StatusResetting, wantLabels: "ready-for-agent,spec",
+			wantAttempts: []scheduler.Status{scheduler.StatusResetting, scheduler.StatusReset},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "spec"})
+			commonDirectory, err := gitCommonDirectory(context.Background(), fixture.git, fixture.repository)
+			if err != nil {
+				t.Fatal(err)
+			}
+			injected := "injected " + test.name + " persistence failure"
+			store := &failingResetStore{
+				resetStateStore: fixture.store, failStatus: test.failStatus, failure: errors.New(injected),
+			}
+			executor := resetExecutor{
+				store: store, github: ghadapter.Client{Executable: fixture.gh, Dir: fixture.repository}, issue: 42,
+				repositoryRoot: fixture.repository, commonDirectory: commonDirectory, stateDirectory: fixture.stateDir, gitExecutable: fixture.git,
+			}
+			approved, err := executor.inspect(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := executor.apply(context.Background(), approved); err == nil || !strings.Contains(err.Error(), injected) {
+				t.Fatalf("persistence error = %v, want %q", err, injected)
+			}
+			current, err := fixture.store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if current.Runs[0].Status != test.wantStatus || len(current.Leases) != 1 {
+				t.Fatalf("persistence failure released ownership: %#v", current)
+			}
+			if labels := strings.Join(fixture.labels(t), ","); labels != test.wantLabels {
+				t.Fatalf("labels after persistence failure = %q, want %q", labels, test.wantLabels)
+			}
+			if !slices.Equal(store.attempts, test.wantAttempts) {
+				t.Fatalf("state persistence attempts = %v, want %v", store.attempts, test.wantAttempts)
+			}
+		})
+	}
+}
+
 func TestResetUsesRevalidatedRepositoryForLabelMutation(t *testing.T) {
 	fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "ready-for-agent", "spec"})
 	commonDirectory, err := gitCommonDirectory(context.Background(), fixture.git, fixture.repository)
@@ -2788,6 +2845,22 @@ func (s *repositoryRaceResetStore) Preview() (state.State, bool, error) {
 		current.Repo = "other/widgets"
 	}
 	return current, exists, err
+}
+
+type failingResetStore struct {
+	resetStateStore
+	failStatus scheduler.Status
+	failure    error
+	attempts   []scheduler.Status
+}
+
+func (s *failingResetStore) Save(current state.State) error {
+	status := current.Runs[0].Status
+	s.attempts = append(s.attempts, status)
+	if status == s.failStatus {
+		return s.failure
+	}
+	return s.resetStateStore.Save(current)
 }
 
 type recordingResetStore struct {

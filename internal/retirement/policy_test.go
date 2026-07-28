@@ -42,6 +42,58 @@ func TestBuildAppliesLifecyclePolicyWithoutOwningLifecycleDecisions(t *testing.T
 	}
 }
 
+func TestServiceAppliesDistinctResumePolicy(t *testing.T) {
+	policy := testPolicy()
+	policy.Operation = "Resume"
+	policy.SelectRun = func(current state.State) (scheduler.Run, scheduler.Lease, error) {
+		return current.Runs[0], current.Leases[0], nil
+	}
+	policy.EligibleStatuses = []scheduler.Status{scheduler.StatusSuspended, scheduler.StatusRunning, scheduler.StatusMerged}
+	policy.Labels = LabelOutcome{Remove: []string{"ready-for-agent"}, Add: []string{"in-progress"}}
+	policy.ProgressStatus = scheduler.StatusRunning
+	policy.TerminalStatus = scheduler.StatusMerged
+
+	run := scheduler.Run{Issue: 42, RunID: "run-42", Status: scheduler.StatusSuspended}
+	lease := scheduler.Lease{LeaseID: "lease-42", Issue: 42, RunID: "run-42"}
+	snapshot := Snapshot{
+		Run: run, Lease: lease,
+		Issue: Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", Open: true, Labels: []string{"ready-for-agent"}},
+	}
+	plan, err := Build(policy, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"mark Run run-42 running while retaining Lease lease-42",
+		"remove issue label ready-for-agent from https://github.com/acme/widgets/issues/42",
+		"add issue label in-progress to https://github.com/acme/widgets/issues/42",
+		"mark Run run-42 merged and release Lease lease-42",
+	}
+	if strings.Join(plan.Actions, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("Resume actions = %q, want %q", plan.Actions, want)
+	}
+	var output bytes.Buffer
+	WritePlan(&output, plan)
+	if !strings.Contains(output.String(), "Resume Plan for issue #42") {
+		t.Fatalf("Resume operation missing from plan output: %q", output.String())
+	}
+
+	store := &policyStateStore{current: state.State{Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{lease}}}
+	module, err := New(Config{
+		Store: store, RepositoryRoot: "/repo", CommonDirectory: "/repo/.git",
+		StateDirectory: "/state", GitExecutable: "git",
+	}, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := module.(*Service).markProgress(); err != nil {
+		t.Fatal(err)
+	}
+	if store.saves != 1 || store.current.Runs[0].Status != scheduler.StatusRunning || store.current.Leases[0] != lease {
+		t.Fatalf("Resume progress persistence = %#v after %d saves", store.current, store.saves)
+	}
+}
+
 func TestPolicyValidationRefusesEveryIncompletePolicyShape(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -100,6 +152,21 @@ var errTestEligibility = &testError{"ineligible"}
 type testError struct{ message string }
 
 func (e *testError) Error() string { return e.message }
+
+type policyStateStore struct {
+	current state.State
+	saves   int
+}
+
+func (s *policyStateStore) Preview() (state.State, bool, error) {
+	return s.current, true, nil
+}
+
+func (s *policyStateStore) Save(current state.State) error {
+	s.current = current
+	s.saves++
+	return nil
+}
 
 func testPolicy() Policy {
 	return Policy{
