@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -2070,6 +2071,254 @@ func TestBubbleDashboardFailureRestoresTerminalBeforeStaticErrorResult(t *testin
 				t.Fatalf("static error result was not printed after restoration: %q", raw)
 			}
 		})
+	}
+}
+
+type ptyPresentationInput struct {
+	*os.File
+	closed chan struct{}
+	once   atomic.Bool
+}
+
+func newPTYPresentationInput(file *os.File) *ptyPresentationInput {
+	return &ptyPresentationInput{File: file, closed: make(chan struct{})}
+}
+
+func (r *ptyPresentationInput) Read([]byte) (int, error) {
+	<-r.closed
+	return 0, io.EOF
+}
+
+func (r *ptyPresentationInput) Close() error {
+	if r.once.CompareAndSwap(false, true) {
+		close(r.closed)
+	}
+	return nil
+}
+
+type ptyPresentationOutput struct {
+	*os.File
+	output                 synchronizedBuffer
+	enteredAlternateScreen chan struct{}
+	entered                atomic.Bool
+	fail                   atomic.Bool
+	failed                 atomic.Bool
+}
+
+func newPTYPresentationOutput(file *os.File) *ptyPresentationOutput {
+	return &ptyPresentationOutput{File: file, enteredAlternateScreen: make(chan struct{})}
+}
+
+func (w *ptyPresentationOutput) Write(content []byte) (int, error) {
+	fail := w.fail.Load()
+	written, err := w.File.Write(content)
+	_, _ = w.output.Write(content[:written])
+	if bytes.Contains(content[:written], []byte("\x1b[?1049h")) && w.entered.CompareAndSwap(false, true) {
+		close(w.enteredAlternateScreen)
+	}
+	if err == nil && written > 0 && fail && w.failed.CompareAndSwap(false, true) {
+		return written, errors.New("terminal output lost")
+	}
+	return written, err
+}
+
+func (w *ptyPresentationOutput) String() string { return w.output.String() }
+
+func TestBubbleDashboardPostStartFailuresRestorePTYStateBeforeStaticErrorResult(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		modelPanic bool
+	}{
+		{name: "output loss"},
+		{name: "model panic", modelPanic: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			primary, terminal, err := pty.Open()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer primary.Close()
+			defer terminal.Close()
+			if err := pty.Setsize(terminal, &pty.Winsize{Rows: 24, Cols: 80}); err != nil {
+				t.Fatal(err)
+			}
+
+			initialState, err := term.GetState(int(terminal.Fd()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			output := newPTYPresentationOutput(terminal)
+			go func() { _, _ = io.Copy(io.Discard, primary) }()
+
+			now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+			var panicEnabled atomic.Bool
+			var panicked atomic.Bool
+			clock := func() time.Time {
+				if panicEnabled.Load() {
+					panicked.Store(true)
+					panic("dashboard model panic")
+				}
+				return now
+			}
+			session := newBubbleDashboardSession(clock)
+			host := runnerHost{terminal: TerminalDependencies{
+				Input: newPTYPresentationInput(terminal), Output: output,
+				Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
+				ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+				Now:          clock,
+			}}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			err = host.run(ctx, func(signals <-chan lifecycleSignal, _ func(runner.OperationalEvent)) error {
+				current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+				session.configure(current, &dashboardTestSource{current: current})
+				if startupErr := session.waitForStartup(ctx); startupErr != nil {
+					return startupErr
+				}
+				select {
+				case <-output.enteredAlternateScreen:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				if test.modelPanic {
+					panicEnabled.Store(true)
+					session.publish(dashboardElapsedMsg(now))
+				} else {
+					output.fail.Store(true)
+					updated := current
+					updated.Repo = "acme/updated-widgets"
+					session.publish(dashboardStateMsg(updated))
+				}
+				select {
+				case event := <-signals:
+					if event.signal != syscall.SIGTERM {
+						t.Errorf("presentation failure signal = %v, want SIGTERM", event.signal)
+					}
+					event.accept()
+					return &runner.SignalExit{Code: 143}
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}, session.presentation)
+			panicEnabled.Store(false)
+
+			var failure *PresentationFailure
+			if !errors.As(err, &failure) {
+				t.Fatalf("post-start presentation result = %v, want presentation failure", err)
+			}
+			if test.modelPanic {
+				if !panicked.Load() || !errors.Is(failure.Err, tea.ErrProgramPanic) {
+					t.Fatalf("model panic result = %v, panicked = %t", err, panicked.Load())
+				}
+			} else if !output.failed.Load() || !strings.Contains(failure.Err.Error(), "terminal output lost") {
+				t.Fatalf("output-loss result = %v, failed = %t", err, output.failed.Load())
+			}
+
+			restoredState, stateErr := term.GetState(int(terminal.Fd()))
+			if stateErr != nil {
+				t.Fatal(stateErr)
+			}
+			if !reflect.DeepEqual(restoredState, initialState) {
+				t.Fatalf("terminal state after %s = %#v, want %#v", test.name, restoredState, initialState)
+			}
+			session.setResult(err)
+			if summaryErr := session.printFinalSummary(output); summaryErr != nil {
+				t.Fatalf("static %s result: %v", test.name, summaryErr)
+			}
+			content := output.String()
+			enter := strings.Index(content, "\x1b[?1049h")
+			hideCursor := strings.Index(content, "\x1b[?25l")
+			restore := strings.LastIndex(content, "\x1b[?1049l")
+			showCursor := strings.LastIndex(content, "\x1b[?25h")
+			summary := strings.Index(content, "Final aggregate summary")
+			if enter < 0 || hideCursor < 0 || restore < enter || showCursor < hideCursor || summary < restore || summary < showCursor || !strings.Contains(content[summary:], "Final outcome: Error: presentation failed:") {
+				t.Fatalf("%s did not restore the normal screen and cursor before static output: %q", test.name, content)
+			}
+		})
+	}
+}
+
+func TestDefaultDashboardThreeExternalSIGINTsDuringSetupPrintForceStopAfterPTYRestoration(t *testing.T) {
+	root := t.TempDir()
+	setupStarted := filepath.Join(root, "git-started")
+	git := writeExecutable(t, `#!/bin/sh
+set -eu
+touch `+quote(setupStarted)+`
+exec sleep 30
+`)
+	primary, terminal, err := pty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer primary.Close()
+	defer terminal.Close()
+	if err := pty.Setsize(terminal, &pty.Winsize{Rows: 24, Cols: 80}); err != nil {
+		t.Fatal(err)
+	}
+	initialState, err := term.GetState(int(terminal.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := newPTYPresentationOutput(terminal)
+	go func() { _, _ = io.Copy(io.Discard, primary) }()
+	externalSignals := make(chan os.Signal)
+	var stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- MainWithTerminal(context.Background(), []string{"run", "--git", git}, TerminalDependencies{
+			Input: newPTYPresentationInput(terminal), Output: output, ErrorOutput: &stderr,
+			IsTerminal: func() bool { return true },
+			Dimensions: func() (TerminalDimensions, error) {
+				return TerminalDimensions{Width: 80, Height: 24}, nil
+			},
+			ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+			Signals:      externalSignals,
+		})
+	}()
+	waitForFile(t, setupStarted)
+	select {
+	case <-output.enteredAlternateScreen:
+	case <-time.After(10 * time.Second):
+		t.Fatal("default dashboard did not enter the alternate screen during blocked setup")
+	}
+	for stage := 1; stage <= 3; stage++ {
+		select {
+		case externalSignals <- os.Interrupt:
+		case exit := <-done:
+			t.Fatalf("default dashboard exited with %d before staged SIGINT %d", exit, stage)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("staged SIGINT %d was not accepted by the signal ingress", stage)
+		}
+	}
+
+	select {
+	case exit := <-done:
+		if exit != 130 {
+			t.Fatalf("setup force-stop exit = %d, want 130; output = %q; stderr = %q", exit, output.String(), stderr.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("default dashboard did not finish setup force stop")
+	}
+	restoredState, stateErr := term.GetState(int(terminal.Fd()))
+	if stateErr != nil {
+		t.Fatal(stateErr)
+	}
+	if !reflect.DeepEqual(restoredState, initialState) {
+		t.Fatalf("terminal state after setup force stop = %#v, want %#v", restoredState, initialState)
+	}
+
+	raw := output.String()
+	restore := strings.LastIndex(raw, "\x1b[?1049l")
+	showCursor := strings.LastIndex(raw, "\x1b[?25h")
+	summary := strings.Index(raw, "Final aggregate summary")
+	if restore < 0 || showCursor < 0 || summary < restore || summary < showCursor {
+		t.Fatalf("setup force-stop summary preceded normal-screen or cursor restoration: %q", raw)
+	}
+	if !strings.Contains(raw[summary:], "Final outcome: Force stop complete\n") || strings.Contains(raw[summary:], "Final outcome: Suspension complete") {
+		t.Fatalf("setup force-stop final outcome was not exact: %q", raw[summary:])
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("setup force stop wrote stderr: %q", stderr.String())
 	}
 }
 

@@ -1087,7 +1087,7 @@ esac
 		t.Fatalf("exit = %d, want unresolved-intervention exit 1; stderr = %q", exit, stderr.String())
 	}
 	finalFrame := lastDashboardFrame(stdout.String())
-	for _, want := range []string{"Final aggregate summary", "Attention Required (1)", "#33  Operator decision", "review retained Worker"} {
+	for _, want := range []string{"Final aggregate summary", "Final outcome: Natural exhaustion with Attention Required", "Attention Required (1)", "#33  Operator decision", "review retained Worker"} {
 		if !strings.Contains(finalFrame, want) {
 			t.Fatalf("terminal final frame missing %q: %q", want, finalFrame)
 		}
