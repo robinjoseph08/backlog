@@ -2485,6 +2485,70 @@ esac
 	}
 }
 
+func newTwoPullRequestResetFixture(t *testing.T) githubArtifactResetFixture {
+	t.Helper()
+	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusFailed, false, false, false)
+	head := strings.TrimSpace(gitOutput(t, fixture.repository, "rev-parse", "origin/"+fixture.branch))
+	encoded := fmt.Sprintf(`{"pulls":[{"number":99,"state":"OPEN","auto":true,"comments":[]},{"number":100,"state":"OPEN","auto":false,"comments":[]}],"head":%q,"labels":["ready-for-agent"],"failClose":100}`, head)
+	if err := os.WriteFile(fixture.githubState, []byte(encoded), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixture.gh = writeExecutable(t, `#!/bin/sh
+set -eu
+state=`+quote(fixture.githubState)+`
+calls=`+quote(fixture.githubCalls)+`
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef")
+    printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    labels=$(jq -c '[.labels[] | {name:.}]' "$state")
+    printf '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":%s}\n' "$labels" ;;
+  "pr list --repo acme/widgets --state all --head `+fixture.branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    jq -c --arg branch `+quote(fixture.branch)+` --arg head "$(jq -r .head "$state")" '[.pulls[] | {number:.number,url:("https://github.com/acme/widgets/pull/" + (.number|tostring)),state:.state,mergedAt:null,autoMergeRequest:(if .auto then {mergeMethod:"SQUASH"} else null end),isDraft:false,headRefName:$branch,headRefOid:$head,headRepositoryOwner:{login:"acme"},headRepository:{nameWithOwner:"acme/widgets"}}]' "$state" ;;
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/99/comments?per_page=100 --paginate --slurp")
+    jq -c '[.pulls[] | select(.number == 99) | .comments | map({body:.})]' "$state" ;;
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/100/comments?per_page=100 --paginate --slurp")
+    jq -c '[.pulls[] | select(.number == 100) | .comments | map({body:.})]' "$state" ;;
+  "pr merge 99 --repo acme/widgets --disable-auto")
+    printf '%s\n' 'disable 99' >> "$calls"
+    temporary="$state.tmp"
+    jq '(.pulls[] | select(.number == 99) | .auto) = false' "$state" > "$temporary"
+    mv "$temporary" "$state" ;;
+  pr\ comment\ 99\ --repo\ acme/widgets\ --body\ *)
+    printf '%s\n' 'comment 99' >> "$calls"
+    body=''; for value in "$@"; do body=$value; done
+    temporary="$state.tmp"
+    jq --arg body "$body" '(.pulls[] | select(.number == 99) | .comments) += [$body]' "$state" > "$temporary"
+    mv "$temporary" "$state" ;;
+  pr\ comment\ 100\ --repo\ acme/widgets\ --body\ *)
+    printf '%s\n' 'comment 100' >> "$calls"
+    body=''; for value in "$@"; do body=$value; done
+    temporary="$state.tmp"
+    jq --arg body "$body" '(.pulls[] | select(.number == 100) | .comments) += [$body]' "$state" > "$temporary"
+    mv "$temporary" "$state" ;;
+  "pr close 99 --repo acme/widgets")
+    printf '%s\n' 'close 99' >> "$calls"
+    temporary="$state.tmp"
+    jq '(.pulls[] | select(.number == 99) | .state) = "CLOSED"' "$state" > "$temporary"
+    mv "$temporary" "$state" ;;
+  "pr close 100 --repo acme/widgets")
+    printf '%s\n' 'close 100' >> "$calls"
+    if [ "$(jq -r .failClose "$state")" = 100 ]; then
+      temporary="$state.tmp"
+      jq '.failClose=0' "$state" > "$temporary"
+      mv "$temporary" "$state"
+      echo 'temporary pull request #100 close failure' >&2
+      exit 1
+    fi
+    temporary="$state.tmp"
+    jq '(.pulls[] | select(.number == 100) | .state) = "CLOSED"' "$state" > "$temporary"
+    mv "$temporary" "$state" ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	return fixture
+}
+
 func (f githubArtifactResetFixture) githubStateValue(t *testing.T) struct {
 	PR       string   `json:"pr"`
 	Merged   bool     `json:"merged"`
@@ -2574,6 +2638,81 @@ func TestResetRerunsOnlyRemainingGitHubArtifactActionsAfterPartialFailure(t *tes
 	}
 	if got := string(calls); strings.Count(got, "disable\n") != 1 || strings.Count(got, "comment\n") != 1 || strings.Count(got, "close\n") != 2 {
 		t.Fatalf("GitHub calls = %q", got)
+	}
+}
+
+func TestResetExecutesTwoPullRequestsInOrderAndRerunsFromPartialProgress(t *testing.T) {
+	fixture := newTwoPullRequestResetFixture(t)
+
+	var stdout, stderr bytes.Buffer
+	if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit == 0 || !strings.Contains(stderr.String(), "temporary pull request #100 close failure") {
+		t.Fatalf("first exit = %d, stderr = %q", exit, stderr.String())
+	}
+	partial, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if partial.Runs[0].Status != scheduler.StatusResetting || len(partial.Leases) != 1 {
+		t.Fatalf("partial failure released ownership: %#v", partial)
+	}
+	var github struct {
+		Pulls []struct {
+			Number   int      `json:"number"`
+			State    string   `json:"state"`
+			Auto     bool     `json:"auto"`
+			Comments []string `json:"comments"`
+		} `json:"pulls"`
+	}
+	data, err := os.ReadFile(fixture.githubState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &github); err != nil {
+		t.Fatal(err)
+	}
+	if len(github.Pulls) != 2 || github.Pulls[0].Number != 99 || github.Pulls[0].State != "CLOSED" || github.Pulls[0].Auto || len(github.Pulls[0].Comments) != 1 ||
+		github.Pulls[1].Number != 100 || github.Pulls[1].State != "OPEN" || github.Pulls[1].Auto || len(github.Pulls[1].Comments) != 1 {
+		t.Fatalf("partial GitHub state = %#v", github.Pulls)
+	}
+	calls, err := os.ReadFile(fixture.githubCalls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const firstCalls = "disable 99\ncomment 99\nclose 99\ncomment 100\nclose 100\n"
+	if string(calls) != firstCalls {
+		t.Fatalf("first GitHub calls = %q, want %q", calls, firstCalls)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit != 0 {
+		t.Fatalf("rerun exit = %d, stderr = %q", exit, stderr.String())
+	}
+	for _, completed := range []string{
+		"disable auto-merge for pull request #99", "explain Reset on pull request #99",
+		"close unmerged pull request #99", "explain Reset on pull request #100",
+	} {
+		if strings.Contains(stdout.String(), completed) {
+			t.Fatalf("rerun planned completed action %q: %q", completed, stdout.String())
+		}
+	}
+	if !strings.Contains(stdout.String(), "close unmerged pull request #100") {
+		t.Fatalf("rerun omitted remaining pull request action: %q", stdout.String())
+	}
+	final, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Runs[0].Status != scheduler.StatusReset || len(final.Leases) != 0 {
+		t.Fatalf("rerun final state = %#v", final)
+	}
+	calls, err = os.ReadFile(fixture.githubCalls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const allCalls = firstCalls + "close 100\n"
+	if string(calls) != allCalls {
+		t.Fatalf("all GitHub calls = %q, want %q", calls, allCalls)
 	}
 }
 

@@ -2,9 +2,14 @@ package retirement
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	ghadapter "github.com/robinjoseph08/backlog/internal/github"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 )
@@ -134,6 +139,98 @@ func TestPolicyValidationRefusesEveryIncompletePolicyShape(t *testing.T) {
 			test.mutate(&policy)
 			if err := policy.validate(); err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("policy error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestExecutablePlansEqualRejectsRenderedEqualPrivateActionIdentity(t *testing.T) {
+	base := Plan{Actions: []Action{{
+		kind: actionRemoveIssueLabel, description: "same rendered action", label: "owned",
+	}}}
+	tests := []struct {
+		name   string
+		mutate func(*Action)
+	}{
+		{name: "kind", mutate: func(action *Action) { action.kind = actionAddIssueLabel }},
+		{name: "pull request", mutate: func(action *Action) { action.pullRequest = 99 }},
+		{name: "label", mutate: func(action *Action) { action.label = "other" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			changed := base
+			changed.Actions = append([]Action(nil), base.Actions...)
+			test.mutate(&changed.Actions[0])
+			if !PlansEqual(base, changed) {
+				t.Fatal("private action identity unexpectedly changed rendered plan")
+			}
+			if executablePlansEqual(base, changed) {
+				t.Fatal("rendered-equal private action identity was executable")
+			}
+		})
+	}
+}
+
+func TestRetireRefusesRenderedEqualPrivateActionIdentityBeforeMutation(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Action)
+	}{
+		{name: "kind", mutate: func(action *Action) { action.kind = actionFinalize }},
+		{name: "pull request", mutate: func(action *Action) { action.pullRequest = 99 }},
+		{name: "label", mutate: func(action *Action) { action.label = "other" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			mutationLog := filepath.Join(root, "mutations")
+			git := writeRetirementExecutable(t, `#!/bin/sh
+case "$*" in
+  *" remote get-url origin") printf '%s\n' 'https://github.com/acme/widgets.git' ;;
+  *) echo "unexpected git: $*" >&2; exit 9 ;;
+esac
+`)
+			gh := writeRetirementExecutable(t, `#!/bin/sh
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef")
+    printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"owned"}]}' ;;
+  issue\ edit\ *) printf '%s\n' "$*" >> `+shellQuote(mutationLog)+` ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+			run := scheduler.Run{Issue: 42, RunID: "run-42", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint}
+			lease := scheduler.Lease{LeaseID: "lease-42", Issue: 42, RunID: "run-42"}
+			store := &policyStateStore{current: state.State{Repo: "acme/widgets", DefaultBranch: "main"}}
+			policy := testPolicy()
+			policy.SelectRun = func(state.State) (scheduler.Run, scheduler.Lease, error) { return run, lease, nil }
+			module, err := New(Config{
+				Store: store, GitHub: ghadapter.Client{Executable: gh, Dir: root}, RepositoryRoot: root,
+				CommonDirectory: root, StateDirectory: root, GitExecutable: git,
+			}, policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			approved, err := module.Inspect(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed := approved
+			changed.Actions = append([]Action(nil), approved.Actions...)
+			test.mutate(&changed.Actions[0])
+			if !PlansEqual(approved, changed) {
+				t.Fatal("private action identity unexpectedly changed rendered plan")
+			}
+			err = module.Retire(context.Background(), changed)
+			if err == nil || !strings.Contains(err.Error(), "Plan changed after confirmation") {
+				t.Fatalf("authorization error = %v", err)
+			}
+			if store.saves != 0 {
+				t.Fatalf("state mutations = %d, want 0", store.saves)
+			}
+			if _, err := os.Stat(mutationLog); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("GitHub mutation occurred before refusal: %v", err)
 			}
 		})
 	}

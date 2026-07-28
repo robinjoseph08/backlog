@@ -1,9 +1,11 @@
 package reset
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
+	"github.com/robinjoseph08/backlog/internal/retirement"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
 
@@ -17,14 +19,15 @@ func planActionDescriptions(plan Plan) []string {
 
 func TestBuildTailorsOrderedResetActions(t *testing.T) {
 	plan, err := Build(Snapshot{
-		Run:          scheduler.Run{Issue: 42, RunID: "run-42", Status: scheduler.StatusSuspended, Branch: "agent/issue-42-run-42", Worktree: "/state/worktrees/issue-42-run-42", SessionID: "backlog-run-42", SessionDir: "/state/sessions/run-42", PullRequest: "https://github.com/acme/widgets/pull/7"},
-		Lease:        scheduler.Lease{LeaseID: "lease-42", Issue: 42, RunID: "run-42"},
-		Issue:        Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", Open: true, Labels: []string{"in-progress", "spec"}},
-		PullRequests: []PullRequest{{Number: 7, URL: "https://github.com/acme/widgets/pull/7", Branch: "agent/issue-42-run-42", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", State: PullRequestOpen, AutoMergeArmed: true}},
-		RemoteBranch: Branch{Name: "agent/issue-42-run-42", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Present: true},
-		LocalBranch:  Branch{Name: "agent/issue-42-run-42", Commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Present: true},
-		Worktree:     Worktree{Path: "/state/worktrees/issue-42-run-42", Branch: "agent/issue-42-run-42", Commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Present: true},
-		Session:      Session{ID: "backlog-run-42", Dir: "/state/sessions/run-42", ArchiveDir: "/state/history/sessions/run-42", Present: true},
+		Run:           scheduler.Run{Issue: 42, RunID: "run-42", Status: scheduler.StatusSuspended, Branch: "agent/issue-42-run-42", Worktree: "/state/worktrees/issue-42-run-42", SessionID: "backlog-run-42", SessionDir: "/state/sessions/run-42", PullRequest: "https://github.com/acme/widgets/pull/7"},
+		Lease:         scheduler.Lease{LeaseID: "lease-42", Issue: 42, RunID: "run-42"},
+		Issue:         Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", Open: true, Labels: []string{"in-progress", "spec"}},
+		PullRequests:  []PullRequest{{Number: 7, URL: "https://github.com/acme/widgets/pull/7", Branch: "agent/issue-42-run-42", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", State: PullRequestOpen, AutoMergeArmed: true}},
+		RemoteBranch:  Branch{Name: "agent/issue-42-run-42", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Present: true},
+		LocalBranch:   Branch{Name: "agent/issue-42-run-42", Commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Present: true},
+		Worktree:      Worktree{Path: "/state/worktrees/issue-42-run-42", Branch: "agent/issue-42-run-42", Commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Present: true},
+		Session:       Session{ID: "backlog-run-42", Dir: "/state/sessions/run-42", ArchiveDir: "/state/history/sessions/run-42", Present: true},
+		WorkerSummary: "absent (recorded PID and process group 4242)",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -44,6 +47,34 @@ func TestBuildTailorsOrderedResetActions(t *testing.T) {
 	}
 	if strings.Join(planActionDescriptions(plan), "\n") != strings.Join(want, "\n") {
 		t.Fatalf("actions =\n%s\nwant =\n%s", strings.Join(planActionDescriptions(plan), "\n"), strings.Join(want, "\n"))
+	}
+	var rendered bytes.Buffer
+	retirement.WritePlan(&rendered, plan)
+	const wantPlan = `Reset Plan for issue #42
+Run: run-42 (suspended)
+Lease: lease-42
+Issue: https://github.com/acme/widgets/issues/42 (open; labels: in-progress, spec)
+Worker: absent (recorded PID and process group 4242)
+Remote branch: agent/issue-42-run-42 at aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Local branch: agent/issue-42-run-42 at bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+Local worktree: /state/worktrees/issue-42-run-42 (agent/issue-42-run-42 at bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)
+Pi session: backlog-run-42 in /state/sessions/run-42 (active; archive: /state/history/sessions/run-42)
+Pull request: #7 https://github.com/acme/widgets/pull/7 (open; agent/issue-42-run-42 at aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; auto-merge armed)
+Required actions:
+  1. mark Run run-42 resetting while retaining Lease lease-42
+  2. disable auto-merge for pull request #7 (https://github.com/acme/widgets/pull/7)
+  3. explain Reset on pull request #7 (https://github.com/acme/widgets/pull/7)
+  4. close unmerged pull request #7 (https://github.com/acme/widgets/pull/7)
+  5. delete remote branch agent/issue-42-run-42 at aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  6. remove local worktree /state/worktrees/issue-42-run-42 for agent/issue-42-run-42 at bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  7. delete local branch agent/issue-42-run-42 at bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  8. archive Pi session backlog-run-42 from /state/sessions/run-42 to /state/history/sessions/run-42
+  9. remove issue label in-progress from https://github.com/acme/widgets/issues/42
+  10. add issue label ready-for-agent to https://github.com/acme/widgets/issues/42
+  11. mark Run run-42 reset and release Lease lease-42
+`
+	if rendered.String() != wantPlan {
+		t.Fatalf("rendered Reset Plan =\n%q\nwant =\n%q", rendered.String(), wantPlan)
 	}
 }
 
@@ -142,12 +173,31 @@ func TestBuildAlreadyResetRequiresNoLeaseOrFinalAction(t *testing.T) {
 	snapshot := minimalSnapshot([]string{"ready-for-agent"})
 	snapshot.Run.Status = scheduler.StatusReset
 	snapshot.Lease = scheduler.Lease{}
+	snapshot.WorkerSummary = "absent (no recorded PID)"
 	plan, err := Build(snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(plan.Actions) != 0 {
 		t.Fatalf("already reset actions = %q", plan.Actions)
+	}
+	var rendered bytes.Buffer
+	retirement.WritePlan(&rendered, plan)
+	const wantPlan = `Reset Plan for issue #42
+Run: run-42 (reset)
+Lease: absent (Run already reset)
+Issue: https://github.com/acme/widgets/issues/42 (open; labels: ready-for-agent, spec)
+Worker: absent (no recorded PID)
+Remote branch: absent (not assigned)
+Local branch: absent (not assigned)
+Local worktree: absent (not assigned)
+Pi session: absent (not assigned)
+Pull requests: absent (no Run branch assigned)
+Required actions:
+  None.
+`
+	if rendered.String() != wantPlan {
+		t.Fatalf("already-reset Plan =\n%q\nwant =\n%q", rendered.String(), wantPlan)
 	}
 
 	snapshot.Lease = scheduler.Lease{LeaseID: "old", Issue: 42, RunID: "run-42"}
