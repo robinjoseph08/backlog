@@ -186,18 +186,7 @@ func confirmResolve(ctx context.Context, reader *bufio.Reader, output io.Writer)
 	if _, err := fmt.Fprint(output, "Proceed with External Resolution? [y/N] "); err != nil {
 		return false, err
 	}
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	line, err := reader.ReadString('\n')
-	if errors.Is(err, io.EOF) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("read External Resolution confirmation: %w", err)
-	}
-	answer := strings.ToLower(strings.TrimSpace(line))
-	return answer == "y" || answer == "yes", nil
+	return readConfirmation(ctx, reader, "External Resolution")
 }
 
 func splitResolveArguments(args []string) (string, []string, error) {

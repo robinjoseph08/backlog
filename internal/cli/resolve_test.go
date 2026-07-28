@@ -1,9 +1,12 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -140,12 +143,46 @@ func TestCompiledResolveDryRunAndInteractiveCancellation(t *testing.T) {
 	}
 }
 
-func TestResolveRequiresYesNonInteractivelyAndRefusesRunnerLock(t *testing.T) {
+func TestResolveConfirmationStopsWaitingWhenContextIsCancelled(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	prompted := make(chan struct{})
+	stdout := writerFunc(func(data []byte) (int, error) {
+		select {
+		case <-prompted:
+		default:
+			close(prompted)
+		}
+		return len(data), nil
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, err := confirmResolve(ctx, bufio.NewReader(reader), stdout)
+		done <- err
+	}()
+	<-prompted
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("confirmation error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Resolve confirmation did not stop waiting after cancellation")
+	}
+}
+
+func TestResolveRequiresYesNonInteractivelyAndCompiledExecutableRefusesRunnerLock(t *testing.T) {
 	fixture := newResolveFixture(t, []string{"spec"}, "COMPLETED")
 	var stdout, stderr bytes.Buffer
 	if err := resolveCommandWithInput(context.Background(), fixture.args("42"), strings.NewReader(""), false, &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "requires --yes") {
 		t.Fatalf("non-interactive error = %v", err)
 	}
+	binary := buildExecutable(t, t.TempDir())
+	beforeState := fileDigest(t, fixture.store.Path)
+	beforeGitHub := fileDigest(t, fixture.githubState)
 	common, err := gitCommonDirectory(context.Background(), fixture.git, fixture.repository)
 	if err != nil {
 		t.Fatal(err)
@@ -155,8 +192,13 @@ func TestResolveRequiresYesNonInteractivelyAndRefusesRunnerLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lock.Release()
-	if err := resolveCommandWithInput(context.Background(), fixture.args("42", "--yes"), strings.NewReader(""), false, &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "Runner owns repository coordination") {
-		t.Fatalf("lock error = %v", err)
+	command := exec.Command(binary, append([]string{"resolve"}, fixture.args("42", "--yes")...)...)
+	output, err := command.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "Runner owns repository coordination") {
+		t.Fatalf("compiled lock error = %v\n%s", err, output)
+	}
+	if fileDigest(t, fixture.store.Path) != beforeState || fileDigest(t, fixture.githubState) != beforeGitHub {
+		t.Fatal("compiled lock refusal changed state")
 	}
 }
 
@@ -209,7 +251,7 @@ func TestResolveExactRunIDPrecedesNumericIssueAndIssueSelectsLease(t *testing.T)
 	}
 }
 
-func TestResolvedRunStatusAndFollowExposeMetadataAndMissingLogWarning(t *testing.T) {
+func TestCompiledResolveMigratesV3AndStatusAndFollowExposeResolution(t *testing.T) {
 	fixture := newResolveFixture(t, []string{"spec"}, "COMPLETED")
 	current, _, _ := fixture.store.Preview()
 	current.Runs[1].LogPath = filepath.Join(fixture.stateDir, "missing.jsonl")
@@ -217,34 +259,61 @@ func TestResolvedRunStatusAndFollowExposeMetadataAndMissingLogWarning(t *testing
 	if err := fixture.store.Save(current); err != nil {
 		t.Fatal(err)
 	}
-	var stdout, stderr bytes.Buffer
-	if err := resolveCommandWithInput(context.Background(), fixture.args("run-42", "--yes"), strings.NewReader(""), false, &stdout, &stderr); err != nil {
+	encoded, err := os.ReadFile(fixture.store.Path)
+	if err != nil {
 		t.Fatal(err)
 	}
-	stdout.Reset()
-	stderr.Reset()
-	if exit := Main(context.Background(), []string{"status", "--repo-dir", fixture.repository, "--state-dir", fixture.stateDir, "--git", fixture.git}, &stdout, &stderr); exit != 0 {
-		t.Fatal(stderr.String())
+	encoded = bytes.Replace(encoded, []byte(`"version": 4`), []byte(`"version": 3`), 1)
+	if err := os.WriteFile(fixture.store.Path, encoded, 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if strings.Contains(stdout.String(), "run-42") || strings.Contains(stdout.String(), "External Resolution") {
-		t.Fatalf("default status exposed handled External Resolution: %s", stdout.String())
+
+	binary := buildExecutable(t, t.TempDir())
+	resolve := exec.Command(binary, append([]string{"resolve"}, fixture.args("run-42", "--yes")...)...)
+	if output, err := resolve.CombinedOutput(); err != nil {
+		t.Fatalf("compiled resolve: %v\n%s", err, output)
 	}
-	stdout.Reset()
-	stderr.Reset()
-	if exit := Main(context.Background(), []string{"status", "--all", "--repo-dir", fixture.repository, "--state-dir", fixture.stateDir, "--git", fixture.git}, &stdout, &stderr); exit != 0 {
-		t.Fatal(stderr.String())
+	persisted, err := os.ReadFile(fixture.store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(persisted, []byte(`"version": 4`)) {
+		t.Fatalf("compiled resolve did not persist v3 migration:\n%s", persisted)
+	}
+	migrated, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if migrated.Version != state.CurrentVersion || len(migrated.Runs) != 2 || migrated.Runs[0].Error != "older history" || migrated.Runs[1].Status != scheduler.StatusResolvedExternally {
+		t.Fatalf("compiled v3 migration changed existing state: %#v", migrated)
+	}
+
+	status := exec.Command(binary, "status", "--repo-dir", fixture.repository, "--state-dir", fixture.stateDir, "--git", fixture.git)
+	statusOutput, err := status.CombinedOutput()
+	if err != nil {
+		t.Fatalf("compiled default status: %v\n%s", err, statusOutput)
+	}
+	if strings.Contains(string(statusOutput), "run-42") || strings.Contains(string(statusOutput), "External Resolution") {
+		t.Fatalf("default status exposed handled External Resolution: %s", statusOutput)
+	}
+
+	status = exec.Command(binary, "status", "--all", "--repo-dir", fixture.repository, "--state-dir", fixture.stateDir, "--git", fixture.git)
+	statusOutput, err = status.CombinedOutput()
+	if err != nil {
+		t.Fatalf("compiled full status: %v\n%s", err, statusOutput)
 	}
 	for _, want := range []string{"resolved-externally", "GitHub closure reason: completed", "retained diagnostic", "Diagnostic warning:"} {
-		if !strings.Contains(stdout.String(), want) {
-			t.Fatalf("full status missing %q: %s", want, stdout.String())
+		if !strings.Contains(string(statusOutput), want) {
+			t.Fatalf("compiled full status missing %q: %s", want, statusOutput)
 		}
 	}
-	stdout.Reset()
-	stderr.Reset()
-	if exit := Main(context.Background(), []string{"follow", "run-42", "--repo-dir", fixture.repository, "--state-dir", fixture.stateDir, "--git", fixture.git}, &stdout, &stderr); exit != 0 {
-		t.Fatal(stderr.String())
+
+	follow := exec.Command(binary, "follow", "run-42", "--repo-dir", fixture.repository, "--state-dir", fixture.stateDir, "--git", fixture.git)
+	followOutput, err := follow.CombinedOutput()
+	if err != nil {
+		t.Fatalf("compiled Follow: %v\n%s", err, followOutput)
 	}
-	if !strings.Contains(stdout.String(), "External Resolution:") || !strings.Contains(stdout.String(), "Diagnostic warning:") {
-		t.Fatalf("follow = %s", stdout.String())
+	if !strings.Contains(string(followOutput), "External Resolution:") || !strings.Contains(string(followOutput), "Diagnostic warning:") {
+		t.Fatalf("compiled Follow = %s", followOutput)
 	}
 }
