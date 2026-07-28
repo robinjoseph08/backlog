@@ -230,9 +230,49 @@ func presentationEventIsTerminal(event runner.OperationalEvent) bool {
 }
 
 func (q *presentationEventQueue) remove(index int) {
+	preservePresentationFailureOccurrences(q.events, index)
 	copy(q.events[index:], q.events[index+1:])
 	q.events[len(q.events)-1] = nil
 	q.events = q.events[:len(q.events)-1]
+}
+
+func preservePresentationFailureOccurrences(events []runner.OperationalEvent, index int) {
+	evicted, ok := events[index].(runner.CandidateDiscoveryFailed)
+	if !ok {
+		return
+	}
+	key := presentationFailureKey(evicted)
+	for later := index + 1; later < len(events); later++ {
+		switch event := events[later].(type) {
+		case runner.CandidateDiscoveryRecovered:
+			return
+		case runner.CandidateDiscoveryFailed:
+			if presentationFailureKey(event) != key {
+				continue
+			}
+			event.Occurrences = presentationFailureOccurrences(event) + presentationFailureOccurrences(evicted)
+			if event.FirstFailureAt.IsZero() || (!evicted.FirstFailureAt.IsZero() && evicted.FirstFailureAt.Before(event.FirstFailureAt)) {
+				event.FirstFailureAt = evicted.FirstFailureAt
+			}
+			events[later] = event
+			return
+		}
+	}
+}
+
+func presentationFailureOccurrences(failure runner.CandidateDiscoveryFailed) int {
+	if failure.Occurrences > 0 {
+		return failure.Occurrences
+	}
+	return 1
+}
+
+func presentationFailureKey(failure runner.CandidateDiscoveryFailed) string {
+	cause := normalizedDashboardMessage(failure.Cause)
+	if cause == "" && failure.Err != nil {
+		cause = normalizedDashboardMessage(failure.Err.Error())
+	}
+	return string(failure.Operation) + "\x00" + cause
 }
 
 func (q *presentationEventQueue) pop() runner.OperationalEvent {

@@ -27,8 +27,9 @@ const (
 // one Candidate. Err presents the original discovery error through the
 // invocation's bounded Diagnostics retention. Cause is a concise terminal
 // cause supplied independently of the retry policy. FirstFailureAt preserves
-// the start of the current degradation episode if delivery is coalesced by a
-// bounded presentation queue.
+// the start of the current degradation episode. Occurrences counts equivalent
+// failures represented by this event when bounded delivery queues coalesce
+// occurrences; zero means one occurrence.
 type CandidateDiscoveryFailed struct {
 	Operation           CandidateDiscoveryOperation
 	Issue               *int
@@ -38,6 +39,7 @@ type CandidateDiscoveryFailed struct {
 	OccurredAt          time.Time
 	RetryAt             time.Time
 	ConsecutiveFailures int
+	Occurrences         int
 }
 
 func (CandidateDiscoveryFailed) operationalEvent() {}

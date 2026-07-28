@@ -391,7 +391,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				r.emitWhileAdmissionActive(admission, CandidateDiscoveryFailed{
 					Operation: operation, Issue: issue, Err: err, Cause: cause,
 					FirstFailureAt: candidateDiscoveryFirstFailure, OccurredAt: occurredAt, RetryAt: occurredAt.Add(r.Config.PollInterval),
-					ConsecutiveFailures: candidateDiscoveryFailures,
+					ConsecutiveFailures: candidateDiscoveryFailures, Occurrences: 1,
 				})
 			} else {
 				if candidateDiscoveryFailures > 0 {
@@ -2252,9 +2252,49 @@ func oldestOperationalAdmissionFailure(events []OperationalEvent) int {
 }
 
 func removeOperationalEvent(events []OperationalEvent, index int) []OperationalEvent {
+	preserveOperationalFailureOccurrences(events, index)
 	copy(events[index:], events[index+1:])
 	events[len(events)-1] = nil
 	return events[:len(events)-1]
+}
+
+func preserveOperationalFailureOccurrences(events []OperationalEvent, index int) {
+	evicted, ok := events[index].(CandidateDiscoveryFailed)
+	if !ok {
+		return
+	}
+	key := candidateDiscoveryFailureKey(evicted)
+	for later := index + 1; later < len(events); later++ {
+		switch event := events[later].(type) {
+		case CandidateDiscoveryRecovered:
+			return
+		case CandidateDiscoveryFailed:
+			if candidateDiscoveryFailureKey(event) != key {
+				continue
+			}
+			event.Occurrences = candidateDiscoveryFailureOccurrences(event) + candidateDiscoveryFailureOccurrences(evicted)
+			if event.FirstFailureAt.IsZero() || (!evicted.FirstFailureAt.IsZero() && evicted.FirstFailureAt.Before(event.FirstFailureAt)) {
+				event.FirstFailureAt = evicted.FirstFailureAt
+			}
+			events[later] = event
+			return
+		}
+	}
+}
+
+func candidateDiscoveryFailureOccurrences(failure CandidateDiscoveryFailed) int {
+	if failure.Occurrences > 0 {
+		return failure.Occurrences
+	}
+	return 1
+}
+
+func candidateDiscoveryFailureKey(failure CandidateDiscoveryFailed) string {
+	cause := failure.Cause
+	if cause == "" && failure.Err != nil {
+		cause = conciseDiscoveryCause(failure.Err)
+	}
+	return string(failure.Operation) + "\x00" + cause
 }
 
 func (r *Runner) deliverOperationalEvents(deliver func(OperationalEvent)) {

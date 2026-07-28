@@ -82,14 +82,16 @@ type dashboardAdmission struct {
 	issue               *int
 	cause               string
 	equivalentFailures  map[string]int
+	equivalentOrder     []string
 	failures            []runner.CandidateDiscoveryFailed
 	recoveredAt         time.Time
 	recoveredFailures   int
 }
 
 const (
-	dashboardDiagnosticLimit = 20
-	admissionRecoveryNotice  = 10 * time.Second
+	dashboardDiagnosticLimit     = 20
+	dashboardAggregationKeyLimit = 20
+	admissionRecoveryNotice      = 10 * time.Second
 )
 
 type fileSignature struct {
@@ -329,6 +331,7 @@ func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
 		d.admission.degraded = false
 		d.admission.consecutiveFailures = 0
 		d.admission.equivalentFailures = nil
+		d.admission.equivalentOrder = nil
 		d.admission.recoveredAt = event.OccurredAt
 		d.admission.recoveredFailures = event.Failures
 		d.mu.Unlock()
@@ -398,6 +401,7 @@ func (d *liveDashboard) recordAdmissionFailureLocked(failure runner.CandidateDis
 			d.admission.firstFailure = failure.OccurredAt
 		}
 		d.admission.equivalentFailures = make(map[string]int)
+		d.admission.equivalentOrder = nil
 	}
 	d.admission.degraded = true
 	d.admission.consecutiveFailures = failure.ConsecutiveFailures
@@ -409,11 +413,30 @@ func (d *liveDashboard) recordAdmissionFailureLocked(failure runner.CandidateDis
 	d.admission.recoveredAt = time.Time{}
 	d.admission.recoveredFailures = 0
 	key := string(failure.Operation) + "\x00" + cause
-	d.admission.equivalentFailures[key]++
+	d.recordEquivalentFailureLocked(key, presentationFailureOccurrences(failure))
 	d.admission.failures = append(d.admission.failures, failure)
 	if len(d.admission.failures) > dashboardDiagnosticLimit {
 		d.admission.failures = append([]runner.CandidateDiscoveryFailed(nil), d.admission.failures[len(d.admission.failures)-dashboardDiagnosticLimit:]...)
 	}
+}
+
+func (d *liveDashboard) recordEquivalentFailureLocked(key string, occurrences int) {
+	for index, existing := range d.admission.equivalentOrder {
+		if existing != key {
+			continue
+		}
+		copy(d.admission.equivalentOrder[index:], d.admission.equivalentOrder[index+1:])
+		d.admission.equivalentOrder = d.admission.equivalentOrder[:len(d.admission.equivalentOrder)-1]
+		break
+	}
+	d.admission.equivalentOrder = append(d.admission.equivalentOrder, key)
+	d.admission.equivalentFailures[key] += occurrences
+	if len(d.admission.equivalentOrder) <= dashboardAggregationKeyLimit {
+		return
+	}
+	oldest := d.admission.equivalentOrder[0]
+	delete(d.admission.equivalentFailures, oldest)
+	d.admission.equivalentOrder = d.admission.equivalentOrder[1:]
 }
 
 func cloneIssue(issue *int) *int {
@@ -563,6 +586,7 @@ func (d *liveDashboard) renderPartsFor(current state.State, messages []string, s
 func cloneDashboardAdmission(admission dashboardAdmission) dashboardAdmission {
 	admission.issue = cloneIssue(admission.issue)
 	admission.failures = append([]runner.CandidateDiscoveryFailed(nil), admission.failures...)
+	admission.equivalentOrder = append([]string(nil), admission.equivalentOrder...)
 	if admission.equivalentFailures != nil {
 		groups := make(map[string]int, len(admission.equivalentFailures))
 		for key, count := range admission.equivalentFailures {

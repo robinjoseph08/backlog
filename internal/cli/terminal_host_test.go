@@ -92,6 +92,17 @@ func TestPresentationEventQueueBoundsIgnoredConsumer(t *testing.T) {
 	if !ok || latest.ConsecutiveFailures != presentationEventLimit*100 {
 		t.Fatalf("latest retained Admission event = %#v", queue.events[len(queue.events)-1])
 	}
+	totalOccurrences := 0
+	for _, event := range queue.events {
+		failure, ok := event.(runner.CandidateDiscoveryFailed)
+		if !ok {
+			t.Fatalf("retained event = %T, want CandidateDiscoveryFailed", event)
+		}
+		totalOccurrences += presentationFailureOccurrences(failure)
+	}
+	if totalOccurrences != presentationEventLimit*100 {
+		t.Fatalf("retained equivalent occurrences = %d, want %d", totalOccurrences, presentationEventLimit*100)
+	}
 }
 
 func TestPresentationEventQueuePreservesOrderedShutdownAndTerminalDeliveryForSlowConsumer(t *testing.T) {

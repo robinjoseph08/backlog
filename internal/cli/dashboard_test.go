@@ -94,6 +94,52 @@ esac
 	}
 }
 
+func TestPlainRunEmitsCompleteCandidateDiscoveryEvidenceForEveryRetry(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	attemptsPath := filepath.Join(t.TempDir(), "attempts")
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef")
+    printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
+    attempts=0
+    if [ -f `+quote(attemptsPath)+` ]; then attempts=$(cat `+quote(attemptsPath)+`); fi
+    attempts=$((attempts + 1))
+    printf '%s\n' "$attempts" > `+quote(attemptsPath)+`
+    if [ "$attempts" -le 2 ]; then
+      printf '%s\n' "TLS handshake timeout" "complete stderr evidence for retry $attempts" >&2
+      exit 1
+    fi
+    printf '%s\n' '[]' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	var stdout, stderr bytes.Buffer
+	exit := MainWithSignalsAndTerminal(context.Background(), []string{
+		"run", "--plain", "--repo-dir", repository, "--state-dir", t.TempDir(), "--poll", "5ms", "--gh", gh,
+	}, &stdout, &stderr, nil, func(io.Writer) bool { return true })
+	if exit != 0 {
+		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+	}
+	output := stdout.String()
+	command := "gh issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url"
+	if count := strings.Count(output, "candidate discovery failed; admission paused"); count != 2 {
+		t.Fatalf("plain failure rows = %d, want 2:\n%s", count, output)
+	}
+	if count := strings.Count(output, command); count != 2 {
+		t.Fatalf("full command occurrences = %d, want one for each retry:\n%s", count, output)
+	}
+	for _, evidence := range []string{"TLS handshake timeout", "complete stderr evidence for retry 1", "complete stderr evidence for retry 2", "candidate discovery recovered; admission resumed after 2 failures"} {
+		if !strings.Contains(output, evidence) {
+			t.Fatalf("plain retry output omitted %q:\n%s", evidence, output)
+		}
+	}
+	if stderr.Len() != 0 || strings.Contains(output, "Backlog Run Dashboard") || strings.Contains(output, "\x1b[") {
+		t.Fatalf("plain output compatibility changed: stdout=%q stderr=%q", output, stderr.String())
+	}
+}
+
 func TestAutomaticBubbleDashboardRawCtrlCCompletesDrainThroughTerminalInput(t *testing.T) {
 	repository := initializeFollowRepository(t)
 	discovered := filepath.Join(t.TempDir(), "discovered")
@@ -281,6 +327,74 @@ func TestDashboardAggregatesAdmissionFailuresAndBoundsDiagnostics(t *testing.T) 
 		!strings.Contains(body, "full gh command 4") || !strings.Contains(body, "full gh command 23") ||
 		strings.Contains(body, "full gh command 3") {
 		t.Fatalf("Diagnostics did not contain exactly the latest 20 full failures:\n%s", body)
+	}
+}
+
+func TestPresentationQueuePreservesAdmissionAggregateThroughDashboard(t *testing.T) {
+	firstFailure := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	queue := newPresentationEventQueue()
+	for failure := 1; failure <= 25; failure++ {
+		failureFirst := time.Time{}
+		if failure == 1 {
+			failureFirst = firstFailure
+		}
+		queue.publish(runner.CandidateDiscoveryFailed{
+			Operation: runner.CandidateDiscoveryList,
+			Err:       fmt.Errorf("full gh command %d", failure), Cause: "TLS handshake timeout",
+			FirstFailureAt: failureFirst, OccurredAt: firstFailure.Add(time.Duration(failure-1) * time.Second),
+			RetryAt: firstFailure.Add(time.Minute), ConsecutiveFailures: failure, Occurrences: 1,
+		})
+	}
+
+	dashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, time.Now)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for {
+		event, err := queue.next(ctx)
+		if errors.Is(err, context.Canceled) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read presentation queue: %v", err)
+		}
+		dashboard.operationalEvent(event)
+		queue.complete()
+	}
+
+	now := firstFailure.Add(24 * time.Second)
+	_, body, _ := dashboard.renderParts(now)
+	for _, want := range []string{
+		"25 consecutive failures", "First failure: 2026-07-28T12:00:00Z", "Latest failure: 2026-07-28T12:00:24Z",
+		"Equivalent failures: 25", "Diagnostics: closed (d to open; 20 recent)",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("queue-to-dashboard aggregate missing %q:\n%s", want, body)
+		}
+	}
+	dashboard.toggleDiagnostics()
+	_, body, _ = dashboard.renderParts(now)
+	if !strings.Contains(body, "full gh command 6") || !strings.Contains(body, "full gh command 25") || strings.Contains(body, "full gh command 5") {
+		t.Fatalf("queue-to-dashboard Diagnostics did not retain exactly the latest twenty failures:\n%s", body)
+	}
+}
+
+func TestDashboardBoundsAdmissionAggregationKeys(t *testing.T) {
+	dashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, time.Now)
+	for failure := 1; failure <= dashboardAggregationKeyLimit*10; failure++ {
+		dashboard.operationalEvent(runner.CandidateDiscoveryFailed{
+			Operation: runner.CandidateDiscoveryList, Cause: fmt.Sprintf("varying cause %d", failure),
+			OccurredAt: time.Unix(int64(failure), 0), ConsecutiveFailures: failure, Occurrences: 1,
+		})
+	}
+	if count := len(dashboard.admission.equivalentFailures); count != dashboardAggregationKeyLimit {
+		t.Fatalf("retained aggregation keys = %d, want bounded %d", count, dashboardAggregationKeyLimit)
+	}
+	if count := len(dashboard.admission.equivalentOrder); count != dashboardAggregationKeyLimit {
+		t.Fatalf("aggregation-key order = %d, want bounded %d", count, dashboardAggregationKeyLimit)
+	}
+	latestKey := string(runner.CandidateDiscoveryList) + "\x00" + fmt.Sprintf("varying cause %d", dashboardAggregationKeyLimit*10)
+	if dashboard.admission.equivalentFailures[latestKey] != 1 {
+		t.Fatalf("latest aggregation key was not retained: %#v", dashboard.admission.equivalentFailures)
 	}
 }
 
