@@ -108,14 +108,15 @@ type Runner struct {
 	suspensionCancel     context.CancelFunc
 	suspensionEventReady chan struct{}
 
-	operationalEventOnce     sync.Once
-	operationalEventMu       sync.Mutex
-	operationalEventWake     chan struct{}
-	operationalEventStop     chan struct{}
-	operationalEventDone     chan struct{}
-	operationalEventStopping bool
-	operationalEvents        []OperationalEvent
-	candidateDiagnostics     candidateDiscoveryDiagnostics
+	operationalEventOnce            sync.Once
+	operationalEventMu              sync.Mutex
+	operationalEventWake            chan struct{}
+	operationalEventStop            chan struct{}
+	operationalEventDone            chan struct{}
+	operationalEventStopping        bool
+	operationalEvents               []OperationalEvent
+	operationalEvictedFailureCounts map[string]int
+	candidateDiagnostics            candidateDiscoveryDiagnostics
 }
 
 const operationalAdmissionFailureLimit = 20
@@ -2221,9 +2222,20 @@ func (r *Runner) enqueueOperationalEvent(event OperationalEvent) {
 	})
 	event = r.retainCandidateDiagnostic(event)
 	r.operationalEventMu.Lock()
+	switch typed := event.(type) {
+	case CandidateDiscoveryFailed:
+		key := candidateDiscoveryFailureKey(typed)
+		if occurrences := r.operationalEvictedFailureCounts[key]; occurrences > 0 {
+			typed.Occurrences = candidateDiscoveryFailureOccurrences(typed) + occurrences
+			delete(r.operationalEvictedFailureCounts, key)
+			event = typed
+		}
+	case CandidateDiscoveryRecovered:
+		clear(r.operationalEvictedFailureCounts)
+	}
 	r.operationalEvents = append(r.operationalEvents, event)
 	for operationalAdmissionFailureCount(r.operationalEvents) > operationalAdmissionFailureLimit {
-		r.operationalEvents = removeOperationalEvent(r.operationalEvents, oldestOperationalAdmissionFailure(r.operationalEvents))
+		r.removeOperationalEvent(oldestOperationalAdmissionFailure(r.operationalEvents))
 	}
 	r.operationalEventMu.Unlock()
 	select {
@@ -2251,21 +2263,21 @@ func oldestOperationalAdmissionFailure(events []OperationalEvent) int {
 	return 0
 }
 
-func removeOperationalEvent(events []OperationalEvent, index int) []OperationalEvent {
-	preserveOperationalFailureOccurrences(events, index)
-	copy(events[index:], events[index+1:])
-	events[len(events)-1] = nil
-	return events[:len(events)-1]
+func (r *Runner) removeOperationalEvent(index int) {
+	r.preserveOperationalFailureOccurrences(index)
+	copy(r.operationalEvents[index:], r.operationalEvents[index+1:])
+	r.operationalEvents[len(r.operationalEvents)-1] = nil
+	r.operationalEvents = r.operationalEvents[:len(r.operationalEvents)-1]
 }
 
-func preserveOperationalFailureOccurrences(events []OperationalEvent, index int) {
-	evicted, ok := events[index].(CandidateDiscoveryFailed)
+func (r *Runner) preserveOperationalFailureOccurrences(index int) {
+	evicted, ok := r.operationalEvents[index].(CandidateDiscoveryFailed)
 	if !ok {
 		return
 	}
 	key := candidateDiscoveryFailureKey(evicted)
-	for later := index + 1; later < len(events); later++ {
-		switch event := events[later].(type) {
+	for later := index + 1; later < len(r.operationalEvents); later++ {
+		switch event := r.operationalEvents[later].(type) {
 		case CandidateDiscoveryRecovered:
 			return
 		case CandidateDiscoveryFailed:
@@ -2276,10 +2288,14 @@ func preserveOperationalFailureOccurrences(events []OperationalEvent, index int)
 			if event.FirstFailureAt.IsZero() || (!evicted.FirstFailureAt.IsZero() && evicted.FirstFailureAt.Before(event.FirstFailureAt)) {
 				event.FirstFailureAt = evicted.FirstFailureAt
 			}
-			events[later] = event
+			r.operationalEvents[later] = event
 			return
 		}
 	}
+	if r.operationalEvictedFailureCounts == nil {
+		r.operationalEvictedFailureCounts = make(map[string]int)
+	}
+	r.operationalEvictedFailureCounts[key] += candidateDiscoveryFailureOccurrences(evicted)
 }
 
 func candidateDiscoveryFailureOccurrences(failure CandidateDiscoveryFailed) int {

@@ -197,6 +197,94 @@ func TestRunnerRetainsAtMostTwentyFullAdmissionDiagnostics(t *testing.T) {
 	}
 }
 
+func TestRunnerPreservesAdmissionOccurrencesAcrossSlowDeliveryAndClearsOnRecovery(t *testing.T) {
+	runner := &Runner{}
+	deliveryStarted := make(chan struct{})
+	releaseDelivery := make(chan struct{})
+	var startOnce sync.Once
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseDelivery) })
+	recorder := &operationalEventRecorder{}
+	runner.OnOperationalEvent = func(event OperationalEvent) {
+		startOnce.Do(func() { close(deliveryStarted) })
+		<-releaseDelivery
+		recorder.record(event)
+	}
+
+	runner.enqueueOperationalEvent(ShutdownEvent{Stage: ShutdownStageDraining})
+	<-deliveryStarted
+
+	episodeStarted := time.Date(2026, 7, 2, 3, 4, 5, 0, time.UTC)
+	enqueueFailure := func(cause string, consecutive int, firstFailureAt time.Time) {
+		runner.enqueueOperationalEvent(CandidateDiscoveryFailed{
+			Operation: CandidateDiscoveryList, Err: fmt.Errorf("full diagnostic for %s", cause), Cause: cause,
+			FirstFailureAt: firstFailureAt, OccurredAt: episodeStarted.Add(time.Duration(consecutive) * time.Second),
+			ConsecutiveFailures: consecutive, Occurrences: 1,
+		})
+	}
+
+	enqueueFailure("recurring cause", 1, episodeStarted)
+	for failure := 2; failure <= operationalAdmissionFailureLimit+2; failure++ {
+		enqueueFailure(fmt.Sprintf("distinct cause %d", failure), failure, episodeStarted)
+	}
+	enqueueFailure("recurring cause", operationalAdmissionFailureLimit+3, episodeStarted)
+
+	runner.operationalEventMu.Lock()
+	if len(runner.operationalEvictedFailureCounts) == 0 {
+		runner.operationalEventMu.Unlock()
+		t.Fatal("slow delivery did not retain lightweight counts for evicted failure identities")
+	}
+	runner.operationalEventMu.Unlock()
+
+	runner.enqueueOperationalEvent(CandidateDiscoveryRecovered{
+		OccurredAt: episodeStarted.Add(time.Minute), Failures: operationalAdmissionFailureLimit + 3,
+	})
+	enqueueFailure("recurring cause", 1, episodeStarted.Add(2*time.Minute))
+
+	runner.operationalEventMu.Lock()
+	queuedFailures := operationalAdmissionFailureCount(runner.operationalEvents)
+	retainedCounts := len(runner.operationalEvictedFailureCounts)
+	runner.operationalEventMu.Unlock()
+	if queuedFailures != operationalAdmissionFailureLimit {
+		t.Fatalf("queued full failure records = %d, want %d", queuedFailures, operationalAdmissionFailureLimit)
+	}
+	if retainedCounts != 0 {
+		t.Fatalf("recovery retained episode-wide failure counts: %d", retainedCounts)
+	}
+	if diagnostics := runner.candidateDiagnostics.count(); diagnostics != candidateDiscoveryDiagnosticLimit {
+		t.Fatalf("retained full diagnostics = %d, want %d", diagnostics, candidateDiscoveryDiagnosticLimit)
+	}
+
+	runner.stopOperationalEventDelivery()
+	releaseOnce.Do(func() { close(releaseDelivery) })
+	runner.WaitForOperationalEventDelivery()
+
+	recovered := false
+	beforeRecoveryOccurrences := 0
+	afterRecoveryOccurrences := 0
+	for _, event := range recorder.snapshot() {
+		switch event := event.(type) {
+		case CandidateDiscoveryRecovered:
+			recovered = true
+		case CandidateDiscoveryFailed:
+			if event.Cause != "recurring cause" {
+				continue
+			}
+			if recovered {
+				afterRecoveryOccurrences += candidateDiscoveryFailureOccurrences(event)
+			} else {
+				beforeRecoveryOccurrences += candidateDiscoveryFailureOccurrences(event)
+			}
+		}
+	}
+	if beforeRecoveryOccurrences != 2 {
+		t.Fatalf("recurring failure occurrences before recovery = %d, want 2", beforeRecoveryOccurrences)
+	}
+	if afterRecoveryOccurrences != 1 {
+		t.Fatalf("recurring failure occurrences after recovery = %d, want 1", afterRecoveryOccurrences)
+	}
+}
+
 func TestRunnerDoesNotReportAdmissionRecoveryAfterDrainIsAccepted(t *testing.T) {
 	calls := 0
 	retryStarted := make(chan struct{})
