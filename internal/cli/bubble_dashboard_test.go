@@ -146,7 +146,7 @@ func TestBubbleDashboardTogglesAdmissionDiagnosticsWithDWithoutScrolling(t *test
 	}
 	updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}))
 	model = updated.(bubbleDashboardModel)
-	if view := ansi.Strip(model.View().Content); !strings.Contains(view, "Diagnostics (8 recent Candidate discovery failures; d to close)") || !strings.Contains(model.viewport.GetContent(), "gh issue list") {
+	if view := ansi.Strip(model.View().Content); !strings.Contains(view, "Diagnostics (8 recent Candidate discovery failure records; d to close)") || !strings.Contains(model.viewport.GetContent(), "gh issue list") {
 		t.Fatalf("d did not open Diagnostics:\n%s", view)
 	}
 	if !model.viewport.AtTop() {

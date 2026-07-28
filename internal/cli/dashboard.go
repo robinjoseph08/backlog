@@ -835,12 +835,12 @@ func renderAdmissionDiagnostics(output *strings.Builder, failures []runner.Candi
 }
 
 func renderAdmissionDiagnosticsStyled(output *strings.Builder, failures []runner.CandidateDiscoveryFailed, styler dashboardStyler) {
-	noun := "failures"
+	noun := "records"
 	if len(failures) == 1 {
-		noun = "failure"
+		noun = "record"
 	}
 	output.WriteByte('\n')
-	writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, fmt.Sprintf("Diagnostics (%d recent Candidate discovery %s; d to close)", len(failures), noun))
+	writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, fmt.Sprintf("Diagnostics (%d recent Candidate discovery failure %s; d to close)", len(failures), noun))
 	if len(failures) == 0 {
 		writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, "  none")
 		return

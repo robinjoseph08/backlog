@@ -474,7 +474,7 @@ func TestDashboardAggregatesAdmissionFailuresAndBoundsDiagnostics(t *testing.T) 
 
 	dashboard.toggleDiagnostics()
 	_, body, _ = dashboard.renderParts(now)
-	if !strings.Contains(body, "Diagnostics (20 recent Candidate discovery failures; d to close)") ||
+	if !strings.Contains(body, "Diagnostics (20 recent Candidate discovery failure records; d to close)") ||
 		!strings.Contains(body, "full gh command 4") || !strings.Contains(body, "full gh command 23") ||
 		strings.Contains(body, "full gh command 3") {
 		t.Fatalf("Diagnostics did not contain exactly the latest 20 full failures:\n%s", body)
@@ -576,8 +576,9 @@ func TestPresentationQueuePreservesAdmissionAggregateThroughDashboard(t *testing
 	}
 	dashboard.toggleDiagnostics()
 	_, body, _ = dashboard.renderParts(now)
-	if !strings.Contains(body, "full gh command 6") || !strings.Contains(body, "full gh command 25") || strings.Contains(body, "full gh command 5") {
-		t.Fatalf("queue-to-dashboard Diagnostics did not retain exactly the latest twenty failures:\n%s", body)
+	if !strings.Contains(body, "Diagnostics (20 recent Candidate discovery failure records; d to close)") ||
+		!strings.Contains(body, "full gh command 6") || !strings.Contains(body, "full gh command 25") || strings.Contains(body, "full gh command 5") {
+		t.Fatalf("queue-to-dashboard Diagnostics did not truthfully label the latest twenty records representing 25 failures:\n%s", body)
 	}
 }
 
