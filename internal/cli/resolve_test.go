@@ -644,7 +644,7 @@ func TestCompiledRunWatchUsesCompleteExternalResolutionDuringPolling(t *testing.
 	}
 }
 
-func TestCompiledRunResolvesIssueClosedWhileWorkerIsActiveAfterSettlement(t *testing.T) {
+func TestCompiledRunResolvesIssueClosedWhileOwnedWorkerIsActiveAfterSettlement(t *testing.T) {
 	root := t.TempDir()
 	repository := filepath.Join(root, "repo")
 	runGit(t, root, "init", "-b", "main", repository)
@@ -663,6 +663,7 @@ func TestCompiledRunResolvesIssueClosedWhileWorkerIsActiveAfterSettlement(t *tes
 	statePath := filepath.Join(stateDir, "state.json")
 	workerStarted := filepath.Join(root, "worker-started")
 	issueClosed := filepath.Join(root, "issue-closed")
+	closedIssuePolled := filepath.Join(root, "closed-issue-polled")
 	settleWorker := filepath.Join(root, "settle-worker")
 	workerExited := filepath.Join(root, "worker-exited")
 	removedReady := filepath.Join(root, "removed-ready")
@@ -674,7 +675,7 @@ case "$*" in
   "repo view --json nameWithOwner,defaultBranchRef")
     printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
   "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
-    if test -f `+quote(issueClosed)+`; then printf '%s\n' '[]'; else printf '%s\n' '[{"number":84,"title":"Settlement closure","createdAt":"2026-07-28T00:00:00Z","url":"https://github.com/acme/widgets/issues/84"}]'; fi ;;
+    if test -f `+quote(issueClosed)+`; then touch `+quote(closedIssuePolled)+`; printf '%s\n' '[]'; else printf '%s\n' '[{"number":84,"title":"Settlement closure","createdAt":"2026-07-28T00:00:00Z","url":"https://github.com/acme/widgets/issues/84"}]'; fi ;;
   "issue view 84 --repo acme/widgets --json number,title,body,state,url,createdAt")
     printf '%s\n' '{"number":84,"title":"Settlement closure","body":"","state":"OPEN","url":"https://github.com/acme/widgets/issues/84","createdAt":"2026-07-28T00:00:00Z"}' ;;
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/84/comments?per_page=100 --paginate --slurp"|\
@@ -738,12 +739,12 @@ touch `+quote(workerExited)+`
 	if err := os.WriteFile(issueClosed, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(30 * time.Millisecond)
+	waitForFile(t, closedIssuePolled)
 	active, err := (state.FileStore{Path: statePath}).Load()
 	if err != nil || len(active.Runs) != 1 || active.Runs[0].Status != scheduler.StatusRunning || len(active.Leases) != 1 {
 		_ = command.Process.Kill()
 		_ = command.Wait()
-		t.Fatalf("issue closure controlled active Worker: state=%#v err=%v output=%s", active, err, output.String())
+		t.Fatalf("issue closure controlled Owned Worker: state=%#v err=%v output=%s", active, err, output.String())
 	}
 	if _, err := os.Stat(workerExited); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Worker exited before normal settlement: %v", err)

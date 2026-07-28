@@ -552,7 +552,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			if closedBeforeReconciliation && workerLogIsClosed(closed) {
 				markWorkerLogClosed(&current, runID)
 			}
-			startedDraining, err := r.handleWorkerCompletionWhileObservingSignals(operationCtx, &current, completion, signalEvents, len(localWorkers))
+			startedDraining, issueClosed, err := r.handleWorkerCompletionWhileObservingSignals(operationCtx, &current, completion, signalEvents, len(localWorkers))
 			draining = startedDraining || draining
 			if err != nil && operationCtx.Err() != nil && r.suspensionExit.Load() != 0 {
 				persisted, reloadErr := r.Store.Load()
@@ -712,7 +712,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				return errors.Join(err, shutdownErr)
 			}
 			if completion.result.Settled && closed.GroupExited && workerLogIsClosed(closed) {
-				if err := r.reconcileAfterWorkerSettlementWithinLifecycle(ctx, &current, runID); err != nil {
+				if err := r.reconcileAfterWorkerSettlementWithinLifecycle(ctx, &current, runID, issueClosed); err != nil {
 					if r.suspensionExit.Load() != 0 {
 						r.suspensionFailed.Store(true)
 						r.suspensionProgressEvent("stopping post-settlement reconciliation at the shared deadline", len(localWorkers), "Suspension: post-settlement reconciliation stopped at the shared deadline: %v", err)
@@ -1258,14 +1258,21 @@ func (r *Runner) rejectResume(current *state.State, issue int, message string) e
 	return nil
 }
 
-func (r *Runner) handleWorkerCompletionWhileObservingSignals(ctx context.Context, current *state.State, completion workerCompletion, signalEvents <-chan signalEvent, workers int) (bool, error) {
-	result := make(chan error, 1)
-	go func() { result <- r.handleWorkerCompletion(ctx, current, completion) }()
+func (r *Runner) handleWorkerCompletionWhileObservingSignals(ctx context.Context, current *state.State, completion workerCompletion, signalEvents <-chan signalEvent, workers int) (bool, bool, error) {
+	type reconciliationResult struct {
+		issueClosed bool
+		err         error
+	}
+	result := make(chan reconciliationResult, 1)
+	go func() {
+		issueClosed, err := r.handleWorkerCompletion(ctx, current, completion)
+		result <- reconciliationResult{issueClosed: issueClosed, err: err}
+	}()
 	draining := false
 	for {
 		select {
-		case err := <-result:
-			return draining, err
+		case reconciled := <-result:
+			return draining, reconciled.issueClosed, reconciled.err
 		case event := <-signalEvents:
 			draining = r.handleSignal(event, workers) || draining
 		}
@@ -1354,15 +1361,15 @@ func (r *Runner) authorizeSettledKill(runID string, process WorkerProcess) func(
 	}
 }
 
-func (r *Runner) handleWorkerCompletion(ctx context.Context, current *state.State, completion workerCompletion) error {
+func (r *Runner) handleWorkerCompletion(ctx context.Context, current *state.State, completion workerCompletion) (bool, error) {
 	run := findActiveRun(current, completion.issue)
 	if run.Issue == 0 {
-		return fmt.Errorf("worker completed for unleased issue #%d", completion.issue)
+		return false, fmt.Errorf("worker completed for unleased issue #%d", completion.issue)
 	}
 	outcome, err := r.GitHub.Completion(ctx, r.Config.Repo, run.Issue, run.Branch)
 	if err != nil {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return false, ctx.Err()
 		}
 		r.needsHuman(current, run.Issue, fmt.Sprintf("verify worker outcome: %v", err))
 	} else {
@@ -1373,7 +1380,7 @@ func (r *Runner) handleWorkerCompletion(ctx context.Context, current *state.Stat
 			replaceRun(current, updated)
 		} else {
 			if err := r.applyOutcome(ctx, current, run, outcome, completion.result.ExitCode == 0 && completion.result.Err == nil, false); err != nil {
-				return err
+				return false, err
 			}
 		}
 		if updated := findActiveRun(current, run.Issue); updated.Status == scheduler.StatusFailed && completion.result.Err != nil {
@@ -1391,9 +1398,9 @@ func (r *Runner) handleWorkerCompletion(ctx context.Context, current *state.Stat
 	}
 	replaceRun(current, resultRun)
 	if err := r.Store.Save(*current); err != nil {
-		return fmt.Errorf("persist completion for issue #%d: %w", run.Issue, err)
+		return false, fmt.Errorf("persist completion for issue #%d: %w", run.Issue, err)
 	}
-	return nil
+	return err == nil && outcome.IssueClosed, nil
 }
 
 func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[int]WorkerProcess) error {
@@ -1581,18 +1588,18 @@ func (r *Runner) reconcileExternalResolutions(ctx context.Context, current *stat
 	return nil
 }
 
-func (r *Runner) reconcileAfterWorkerSettlementWithinLifecycle(ctx context.Context, current *state.State, runID string) error {
+func (r *Runner) reconcileAfterWorkerSettlementWithinLifecycle(ctx context.Context, current *state.State, runID string, issueClosed bool) error {
 	reconciliationCtx, cancel := r.suspensionAwareCleanupContext(ctx)
 	defer cancel()
-	return r.reconcileAfterWorkerSettlement(reconciliationCtx, current, runID)
+	return r.reconcileAfterWorkerSettlement(reconciliationCtx, current, runID, issueClosed)
 }
 
 // reconcileAfterWorkerSettlement runs only after normal Worker settlement,
-// process-group exit, and durable log closure. It gives the expected branch one
-// final Completion check before complete External Resolution may release the
-// Run's Lease.
-func (r *Runner) reconcileAfterWorkerSettlement(ctx context.Context, current *state.State, runID string) error {
-	if r.ExternalResolution == nil {
+// process-group exit, durable log closure, and an initial outcome that verified
+// issue closure. It gives the expected branch one final Completion check before
+// complete External Resolution may release the Run's Lease.
+func (r *Runner) reconcileAfterWorkerSettlement(ctx context.Context, current *state.State, runID string, issueClosed bool) error {
+	if !issueClosed || r.ExternalResolution == nil {
 		return nil
 	}
 	run := findRun(current.Runs, runID)
@@ -1622,6 +1629,9 @@ func (r *Runner) reconcileAfterWorkerSettlement(ctx context.Context, current *st
 		if err := r.Store.Save(*current); err != nil {
 			return fmt.Errorf("persist post-settlement Completion for issue #%d: %w", run.Issue, err)
 		}
+		return nil
+	}
+	if !outcome.IssueClosed {
 		return nil
 	}
 	return r.reconcileExternalResolution(ctx, current, run)

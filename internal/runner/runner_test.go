@@ -2387,9 +2387,13 @@ func TestRunnerRecordsLateCompletionAfterWorkerExitBeforeExternalResolution(t *t
 }
 
 func TestRunnerPostSettlementReopeningRetainsLease(t *testing.T) {
-	github := &fakeGitHub{
-		candidates:  []scheduler.Candidate{{Number: 7, CreatedAt: time.Now()}},
-		completions: map[int]ghadapter.CompletionOutcome{7: {IssueClosed: true}},
+	var completionCalls atomic.Int32
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 7, CreatedAt: time.Now()}}}
+	github.completionFunc = func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
+		if completionCalls.Add(1) == 1 {
+			return ghadapter.CompletionOutcome{IssueClosed: true}, nil
+		}
+		return ghadapter.CompletionOutcome{}, nil
 	}
 	workers := newFakeWorkers()
 	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
@@ -2397,7 +2401,7 @@ func TestRunnerPostSettlementReopeningRetainsLease(t *testing.T) {
 	var resolutionCalls atomic.Int32
 	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
 		resolutionCalls.Add(1)
-		return false, nil // The issue reopened during the fresh closure check.
+		return true, errors.New("External Resolution must not start after reopening")
 	})
 
 	done := make(chan error, 1)
@@ -2406,8 +2410,8 @@ func TestRunnerPostSettlementReopeningRetainsLease(t *testing.T) {
 	workers.complete(7, worker.Result{ExitCode: 0})
 	assertInterventionRequired(t, <-done, 1)
 	got := store.LoadValue()
-	if resolutionCalls.Load() != 1 || got.Runs[0].Status != scheduler.StatusFailed || got.Runs[0].WorkerLogOpen || len(got.Leases) != 1 {
-		t.Fatalf("reopened post-settlement state = %#v, calls=%d", got, resolutionCalls.Load())
+	if completionCalls.Load() != 2 || resolutionCalls.Load() != 0 || got.Runs[0].Status != scheduler.StatusFailed || got.Runs[0].WorkerLogOpen || len(got.Leases) != 1 {
+		t.Fatalf("reopened post-settlement state = %#v, completion calls=%d resolution calls=%d", got, completionCalls.Load(), resolutionCalls.Load())
 	}
 }
 
@@ -2510,6 +2514,28 @@ func TestRunnerPostSettlementPreconditionsAndPersistenceFailClosed(t *testing.T)
 		Leases: []scheduler.Lease{{LeaseID: "run-11", Issue: 11, RunID: "run-11"}},
 	}
 
+	t.Run("open issue skips redundant Completion recheck", func(t *testing.T) {
+		current := cloneState(base)
+		current.Runs[0].Status = scheduler.StatusWaitingForMerge
+		var completionCalls atomic.Int32
+		github := &fakeGitHub{completionFunc: func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
+			completionCalls.Add(1)
+			return ghadapter.CompletionOutcome{}, errors.New("redundant Completion lookup")
+		}}
+		runner := testRunner(github, newFakeWorkers(), &memoryStore{value: cloneState(current)}, 1)
+		var resolutionCalls atomic.Int32
+		runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+			resolutionCalls.Add(1)
+			return true, errors.New("must not inspect an open issue")
+		})
+		if err := runner.reconcileAfterWorkerSettlement(context.Background(), &current, "run-11", false); err != nil {
+			t.Fatalf("open issue post-settlement reconciliation: %v", err)
+		}
+		if completionCalls.Load() != 0 || resolutionCalls.Load() != 0 || current.Runs[0].Status != scheduler.StatusWaitingForMerge || len(current.Leases) != 1 {
+			t.Fatalf("open issue post-settlement state = %#v, completion calls=%d resolution calls=%d", current, completionCalls.Load(), resolutionCalls.Load())
+		}
+	})
+
 	t.Run("durable log closure", func(t *testing.T) {
 		current := cloneState(base)
 		current.Runs[0].WorkerLogOpen = true
@@ -2517,7 +2543,7 @@ func TestRunnerPostSettlementPreconditionsAndPersistenceFailClosed(t *testing.T)
 		runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
 			return true, errors.New("must not inspect before log closure")
 		})
-		if err := runner.reconcileAfterWorkerSettlement(context.Background(), &current, "run-11"); err == nil || !strings.Contains(err.Error(), "before durable Worker log closure") {
+		if err := runner.reconcileAfterWorkerSettlement(context.Background(), &current, "run-11", true); err == nil || !strings.Contains(err.Error(), "before durable Worker log closure") {
 			t.Fatalf("open-log post-settlement error = %v", err)
 		}
 	})
@@ -2531,7 +2557,7 @@ func TestRunnerPostSettlementPreconditionsAndPersistenceFailClosed(t *testing.T)
 		runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
 			return true, errors.New("must not replace Completion")
 		})
-		if err := runner.reconcileAfterWorkerSettlement(context.Background(), &current, "run-11"); err == nil || !strings.Contains(err.Error(), "persist post-settlement Completion") {
+		if err := runner.reconcileAfterWorkerSettlement(context.Background(), &current, "run-11", true); err == nil || !strings.Contains(err.Error(), "persist post-settlement Completion") {
 			t.Fatalf("Completion persistence error = %v", err)
 		}
 		if got := store.LoadValue(); len(got.Leases) != 1 || got.Runs[0].Status != scheduler.StatusFailed {
