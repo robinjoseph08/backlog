@@ -214,23 +214,45 @@ func TestBubbleDashboardKeyboardNavigationSelectsCollapsedSectionWhenContentFits
 		Runs:   []scheduler.Run{active, completion},
 		Leases: []scheduler.Lease{{LeaseID: active.RunID, Issue: active.Issue, RunID: active.RunID}},
 	}
-	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 23})
-	updated, _ := model.Update(dashboardConfiguredMsg{initial: current, source: &dashboardTestSource{current: current}})
-	model = updated.(bubbleDashboardModel)
-	if model.viewport.YOffset() != 0 || !model.viewport.AtBottom() {
-		t.Fatalf("test dashboard content did not fit at offset zero: offset=%d bottom=%t", model.viewport.YOffset(), model.viewport.AtBottom())
+	newModel := func() bubbleDashboardModel {
+		model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 23})
+		updated, _ := model.Update(dashboardConfiguredMsg{initial: current, source: &dashboardTestSource{current: current}})
+		model = updated.(bubbleDashboardModel)
+		if model.viewport.YOffset() != 0 || !model.viewport.AtBottom() {
+			t.Fatalf("test dashboard content did not fit at offset zero: offset=%d bottom=%t", model.viewport.YOffset(), model.viewport.AtBottom())
+		}
+		return model
 	}
 
-	updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
-	model = updated.(bubbleDashboardModel)
-	if want := dashboardSectionAnchor("Attention Required"); model.selectedAnchor != want {
-		t.Fatalf("Down selected %q, want next anchor %q", model.selectedAnchor, want)
-	}
-	if model.viewport.YOffset() != 0 {
-		t.Fatalf("Down scrolled fitting content to offset %d", model.viewport.YOffset())
+	for _, test := range []struct {
+		name string
+		key  tea.Key
+		want string
+	}{
+		{name: "Down", key: tea.Key{Code: tea.KeyDown}, want: dashboardSectionAnchor("Attention Required")},
+		{name: "j", key: tea.Key{Code: 'j', Text: "j"}, want: dashboardSectionAnchor("Attention Required")},
+		{name: "Up", key: tea.Key{Code: tea.KeyUp}, want: dashboardSectionAnchor("Active Runs")},
+		{name: "k", key: tea.Key{Code: 'k', Text: "k"}, want: dashboardSectionAnchor("Active Runs")},
+		{name: "Page Down", key: tea.Key{Code: tea.KeyPgDown}, want: dashboardSectionAnchor("Recent Completions")},
+		{name: "f", key: tea.Key{Code: 'f', Text: "f"}, want: dashboardSectionAnchor("Recent Completions")},
+		{name: "Page Up", key: tea.Key{Code: tea.KeyPgUp}, want: dashboardSectionAnchor("Active Runs")},
+		{name: "b", key: tea.Key{Code: 'b', Text: "b"}, want: dashboardSectionAnchor("Active Runs")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			model := newModel()
+			updated, _ := model.Update(tea.KeyPressMsg(test.key))
+			model = updated.(bubbleDashboardModel)
+			if model.selectedAnchor != test.want {
+				t.Fatalf("selected %q, want %q", model.selectedAnchor, test.want)
+			}
+			if model.viewport.YOffset() != 0 {
+				t.Fatalf("fitting content scrolled to offset %d", model.viewport.YOffset())
+			}
+		})
 	}
 
-	updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnd}))
+	model := newModel()
+	updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnd}))
 	model = updated.(bubbleDashboardModel)
 	section := dashboardSectionAnchor("Recent Completions")
 	if model.selectedAnchor != section {
@@ -336,6 +358,115 @@ func TestBubbleDashboardPreservesSelectedRunAcrossLiveProjectionChanges(t *testi
 	current.Leases = current.Leases[1:]
 	source.current = current
 	assertStable("Completion", dashboardStateMsg(current))
+}
+
+func TestBubbleDashboardKeepsSelectedRunWhenItBecomesACompletion(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	active := scheduler.Run{Issue: 69, IssueTitle: "Selected completion", RunID: "selected", Status: scheduler.StatusRunning, StartedAt: now.Add(-time.Hour)}
+	other := scheduler.Run{Issue: 70, IssueTitle: "Unrelated active Run", RunID: "other", Status: scheduler.StatusClaimed, StartedAt: now.Add(-30 * time.Minute)}
+	current := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 2,
+		Runs: []scheduler.Run{active, other},
+		Leases: []scheduler.Lease{
+			{LeaseID: active.RunID, Issue: active.Issue, RunID: active.RunID},
+			{LeaseID: other.RunID, Issue: other.Issue, RunID: other.RunID},
+		},
+	}
+	source := &dashboardTestSource{current: current}
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 23})
+	updated, _ := model.Update(dashboardConfiguredMsg{initial: current, source: source})
+	model = updated.(bubbleDashboardModel)
+	selected := dashboardRunAnchor(active.RunID)
+	model.selectedAnchor = selected
+	model.refreshViewport(dashboardSelection{identity: selected, relative: model.dashboardBodyStart() + 1, valid: true})
+
+	completedAt := now
+	current.Runs[0].Status = scheduler.StatusMerged
+	current.Runs[0].CompletedAt = &completedAt
+	current.Runs[0].UpdatedAt = completedAt
+	current.Leases = current.Leases[1:]
+	source.current = current
+	updated, _ = model.Update(dashboardStateMsg(current))
+	model = updated.(bubbleDashboardModel)
+
+	if model.selectedAnchor != selected {
+		t.Fatalf("completed selected Run changed selection to %q, want %q", model.selectedAnchor, selected)
+	}
+	completionSection := dashboardSectionAnchor("Recent Completions")
+	if !model.expansionOverrides[completionSection] {
+		t.Fatal("default-collapsed Recent Completions was not expanded to reveal the selected Run")
+	}
+	line, exists := model.anchorVisualLine(selected)
+	if !exists || !model.visualLineVisible(line) {
+		t.Fatalf("selected Completion was not visible after its section changed:\n%s", ansi.Strip(model.View().Content))
+	}
+}
+
+func TestBubbleDashboardPreservesExplicitRunExpansionAcrossLiveUpdatesAndDensityChanges(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name          string
+		initialHeight int
+		resizedHeight int
+		expanded      bool
+	}{
+		{name: "expanded", initialHeight: 23, resizedHeight: 24, expanded: true},
+		{name: "collapsed", initialHeight: 24, resizedHeight: 23, expanded: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			current := navigationTestState(now, 12)
+			logPath := t.TempDir() + "/selected.jsonl"
+			if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			current.Runs[6].LogPath = logPath
+			writeActivityEntries(t, activity.PathForLog(logPath), activity.Entry{
+				Version: activity.CurrentVersion, ObservedAt: now.Add(-time.Second), Kind: "turn",
+				Description: "Worker turn completed", TurnDelta: 1,
+			})
+			source := &dashboardTestSource{current: current}
+			model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: test.initialHeight})
+			updated, _ := model.Update(dashboardConfiguredMsg{initial: current, source: source})
+			model = updated.(bubbleDashboardModel)
+			selected := dashboardRunAnchor(current.Runs[6].RunID)
+			model.selectedAnchor = selected
+			model.refreshViewport(dashboardSelection{identity: selected, relative: model.dashboardBodyStart() + 2, valid: true})
+			updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+			model = updated.(bubbleDashboardModel)
+			wantSelection := model.currentSelection()
+			wantScreenLine := dashboardVisibleLine(t, model.View().Content, "> #7")
+
+			assertStable := func(name string, msg tea.Msg) {
+				t.Helper()
+				updated, _ := model.Update(msg)
+				model = updated.(bubbleDashboardModel)
+				selection := model.currentSelection()
+				if !selection.valid || selection.identity != selected || selection.relative != wantSelection.relative {
+					t.Fatalf("%s selection = %#v, want identity %q at relative line %d", name, selection, selected, wantSelection.relative)
+				}
+				if got := dashboardVisibleLine(t, model.View().Content, "> #7"); got != wantScreenLine {
+					t.Fatalf("%s moved selected Run from screen line %d to %d", name, wantScreenLine, got)
+				}
+				if got := strings.Contains(model.viewport.GetContent(), "Run: "+current.Runs[6].RunID); got != test.expanded {
+					t.Fatalf("%s expanded details visible = %t, want %t", name, got, test.expanded)
+				}
+				if got, exists := model.expansionOverrides[selected]; !exists || got != test.expanded {
+					t.Fatalf("%s expansion override = %t (present %t), want %t", name, got, exists, test.expanded)
+				}
+			}
+
+			writeActivityEntries(t, activity.PathForLog(logPath), activity.Entry{
+				Version: activity.CurrentVersion, ObservedAt: now, Kind: "tool", Description: "Tool edit started",
+				Operation: "edit", OperationChanged: true,
+			})
+			assertStable("Activity update", dashboardActivityMsg(now))
+			current.Runs[6].UpdatedAt = now
+			source.current = current
+			assertStable("state update", dashboardStateMsg(current))
+			assertStable("density transition", tea.WindowSizeMsg{Width: 80, Height: test.resizedHeight})
+			assertStable("density return", tea.WindowSizeMsg{Width: 80, Height: test.initialHeight})
+		})
+	}
 }
 
 func TestBubbleDashboardPreservesSelectedSectionAcrossLiveProjectionChanges(t *testing.T) {

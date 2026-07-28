@@ -510,9 +510,13 @@ type dashboardSelection struct {
 
 func (m *bubbleDashboardModel) refreshViewport(selection dashboardSelection) {
 	density := dashboardDensityForHeight(m.height)
-	projection, layout, stage := m.dashboard.renderResponsiveParts(m.dashboard.now(), responsiveDashboardOptions{
+	options := responsiveDashboardOptions{
 		density: density, width: m.width, selected: m.selectedAnchor, expansionOverrides: m.expansionOverrides, styler: m.styler,
-	})
+	}
+	projection, layout, stage := m.dashboard.renderResponsiveParts(m.dashboard.now(), options)
+	if m.revealSelectedCompletion(selection, projection, layout) {
+		projection, layout, stage = m.dashboard.renderResponsiveParts(m.dashboard.now(), options)
+	}
 	if density == dashboardDensityMinimal {
 		m.header = minimalDashboardHeader(projection.metadata, len(layout.attention), 0)
 		m.footer = minimalDashboardFooter(projection.footer + "\n" + dashboardNavigationHelp)
@@ -532,6 +536,29 @@ func (m *bubbleDashboardModel) refreshViewport(selection dashboardSelection) {
 		}
 	}
 	m.selectViewportAnchor()
+}
+
+func (m *bubbleDashboardModel) revealSelectedCompletion(selection dashboardSelection, projection dashboardProjection, layout dashboardBodyLayout) bool {
+	if !selection.valid || !strings.HasPrefix(selection.identity, "run:") {
+		return false
+	}
+	for _, anchor := range layout.anchors {
+		if anchor.identity == selection.identity {
+			return false
+		}
+	}
+	section := dashboardSectionAnchor("Recent Completions")
+	if _, explicitlySet := m.expansionOverrides[section]; explicitlySet {
+		return false
+	}
+	selectedRunID := strings.TrimPrefix(selection.identity, "run:")
+	for _, observed := range projection.sections[statusCompletions] {
+		if observed.run.RunID == selectedRunID {
+			m.expansionOverrides[section] = true
+			return true
+		}
+	}
+	return false
 }
 
 func (m *bubbleDashboardModel) ensureRunSelection() {
