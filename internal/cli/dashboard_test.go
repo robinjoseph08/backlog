@@ -542,23 +542,38 @@ func TestPresentationQueuePreservesAdmissionAggregateThroughDashboard(t *testing
 	}
 }
 
-func TestDashboardBoundsAdmissionAggregationKeys(t *testing.T) {
+func TestDashboardAggregatesRecurringAdmissionFailureAfterManyDistinctCauses(t *testing.T) {
 	dashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, time.Now)
-	for failure := 1; failure <= dashboardAggregationKeyLimit*10; failure++ {
+	firstCause := "recurring cause"
+	dashboard.operationalEvent(runner.CandidateDiscoveryFailed{
+		Operation: runner.CandidateDiscoveryList, Cause: firstCause,
+		OccurredAt: time.Unix(1, 0), ConsecutiveFailures: 1, Occurrences: 1,
+	})
+	for failure := 2; failure <= 201; failure++ {
 		dashboard.operationalEvent(runner.CandidateDiscoveryFailed{
 			Operation: runner.CandidateDiscoveryList, Cause: fmt.Sprintf("varying cause %d", failure),
 			OccurredAt: time.Unix(int64(failure), 0), ConsecutiveFailures: failure, Occurrences: 1,
 		})
 	}
-	if count := len(dashboard.admission.equivalentFailures); count != dashboardAggregationKeyLimit {
-		t.Fatalf("retained aggregation keys = %d, want bounded %d", count, dashboardAggregationKeyLimit)
+	dashboard.operationalEvent(runner.CandidateDiscoveryFailed{
+		Operation: runner.CandidateDiscoveryList, Cause: firstCause,
+		OccurredAt: time.Unix(202, 0), ConsecutiveFailures: 202, Occurrences: 1,
+	})
+
+	header, body, footer := dashboard.renderParts(time.Unix(202, 0))
+	if !strings.Contains(header, "Backlog Run Dashboard") || !strings.Contains(footer, "Runner stage: Running") {
+		t.Fatalf("dashboard chrome = header %q, footer %q", header, footer)
 	}
-	if count := len(dashboard.admission.equivalentOrder); count != dashboardAggregationKeyLimit {
-		t.Fatalf("aggregation-key order = %d, want bounded %d", count, dashboardAggregationKeyLimit)
+	if !strings.Contains(body, "Cause: recurring cause | Equivalent failures: 2") {
+		t.Fatalf("recurring failure lost its episode-wide aggregate:\n%s", body)
 	}
-	latestKey := string(runner.CandidateDiscoveryList) + "\x00" + fmt.Sprintf("varying cause %d", dashboardAggregationKeyLimit*10)
-	if dashboard.admission.equivalentFailures[latestKey] != 1 {
-		t.Fatalf("latest aggregation key was not retained: %#v", dashboard.admission.equivalentFailures)
+	if count := len(dashboard.admission.equivalentFailures); count != 201 {
+		t.Fatalf("lightweight aggregation counts = %d, want one for every episode identity", count)
+	}
+
+	dashboard.operationalEvent(runner.CandidateDiscoveryRecovered{OccurredAt: time.Unix(203, 0), Failures: 202})
+	if dashboard.admission.equivalentFailures != nil {
+		t.Fatalf("recovery retained episode aggregation counts: %#v", dashboard.admission.equivalentFailures)
 	}
 }
 
