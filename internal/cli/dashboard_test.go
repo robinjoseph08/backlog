@@ -249,9 +249,17 @@ esac
 		t.Fatalf("return to Admission after retries: %v", err)
 	}
 	waitForDashboardScreen(t, &stdout, "2 consecutive failures")
+	if visible := terminalScreenText(stdout.String(), 100, 12); !strings.Contains(visible, "Admission health") || !strings.Contains(visible, "DEGRADED") {
+		t.Fatalf("automatic dashboard did not render degraded Admission health:\n%s", visible)
+	}
+	if _, err := writeInput.Write([]byte("j")); err != nil {
+		t.Fatalf("reveal closed Diagnostics below Admission details: %v", err)
+	}
+	waitForDashboardScreen(t, &stdout, "Diagnostics: closed")
 	closedOutput := stdout.String()
-	if !strings.Contains(closedOutput, "Admission health") || !strings.Contains(closedOutput, "DEGRADED") || !strings.Contains(closedOutput, "Diagnostics: closed") {
-		t.Fatalf("automatic dashboard did not render closed Admission health: %q", closedOutput)
+	closedVisible := terminalScreenText(closedOutput, 100, 12)
+	if !strings.Contains(closedVisible, "DEGRADED") || !strings.Contains(closedVisible, "Diagnostics: closed") {
+		t.Fatalf("automatic dashboard did not render closed Admission Diagnostics:\n%s", closedVisible)
 	}
 	if strings.Contains(closedOutput, "retained stderr evidence") || strings.Contains(closedOutput, "Operational messages") || strings.Contains(closedOutput, "candidate discovery failed; admission paused") {
 		t.Fatalf("closed automatic dashboard exposed full evidence or duplicated Admission as operational rows: %q", closedOutput)
