@@ -202,12 +202,14 @@ esac
 	}
 	waitForDashboardOutputAfter(t, &stdout, diagnosticsOffset, "retained stderr evidence")
 
-	sectionsOffset := len(stdout.String())
-	if _, err := writeInput.Write([]byte(strings.Repeat("j", 80))); err != nil {
-		t.Fatalf("scroll to existing dashboard sections: %v", err)
+	if _, err := writeInput.Write([]byte("G")); err != nil {
+		t.Fatalf("jump to bottom of existing dashboard sections: %v", err)
 	}
-	waitForDashboardOutputAfter(t, &stdout, sectionsOffset, "Outcomes to Acknowledge")
-	waitForDashboardOutputAfter(t, &stdout, sectionsOffset, "Diagnostic: retained outcome evidence")
+	waitForDashboardScreen(t, &stdout, 100, 12, "Diagnostic: retained outcome evidence")
+	if _, err := writeInput.Write([]byte("b")); err != nil {
+		t.Fatalf("page to existing outcome section: %v", err)
+	}
+	waitForDashboardScreen(t, &stdout, 100, 12, "Outcomes to Acknowledge")
 
 	if _, err := writeInput.Write([]byte(strings.Repeat("k", 100))); err != nil {
 		t.Fatalf("return to Admission: %v", err)
@@ -244,6 +246,19 @@ func waitForDashboardOutputAfter(t *testing.T, output *synchronizedBuffer, offse
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("dashboard output after byte %d never contained %q: %q", offset, want, output.String())
+}
+
+func waitForDashboardScreen(t *testing.T, output *synchronizedBuffer, width, height int, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if visible := terminalScreenText(output.String(), width, height); strings.Contains(visible, want) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	visible := terminalScreenText(output.String(), width, height)
+	t.Fatalf("dashboard screen never contained %q:\n%s\nraw output: %q", want, visible, output.String())
 }
 
 func TestAutomaticBubbleDashboardRawCtrlCCompletesDrainThroughTerminalInput(t *testing.T) {
@@ -313,7 +328,7 @@ func TestTerminalDashboardPreservesDrainAndSuspensionMessages(t *testing.T) {
 		},
 		{
 			name: "suspension", signal: syscall.SIGTERM, wantExit: 143,
-			wantOutput: []string{"Suspension complete", "no effect"},
+			wantOutput: []string{"Suspension finished", "no effect"},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
