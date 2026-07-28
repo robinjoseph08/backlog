@@ -97,6 +97,28 @@ func (f resolveFixture) args(selector string, extra ...string) []string {
 	return append(args, extra...)
 }
 
+func resolveGitHubWithLabelChangeAfterFirstInspection(t *testing.T, fixture resolveFixture) string {
+	t.Helper()
+	root := t.TempDir()
+	viewed := filepath.Join(root, "viewed")
+	changed := filepath.Join(root, "changed")
+	return writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    if [ ! -f `+quote(viewed)+` ]; then
+      touch `+quote(viewed)+`
+    elif [ ! -f `+quote(changed)+` ]; then
+      temporary=`+quote(fixture.githubState)+`.tmp
+      jq '.labels += ["ready-for-agent"]' `+quote(fixture.githubState)+` > "$temporary"
+      mv "$temporary" `+quote(fixture.githubState)+`
+      touch `+quote(changed)+`
+    fi ;;
+esac
+exec `+quote(fixture.gh)+` "$@"
+`)
+}
+
 func assertResolveStateBindingsAbsent(t *testing.T, repository string) {
 	t.Helper()
 	for _, name := range []string{stateDirectoryBindingFile, legacyStateDirectoryBindingFile} {
@@ -275,6 +297,43 @@ func TestResolveInteractiveYesFinalizesExternalResolution(t *testing.T) {
 	}
 	if strings.Join(github.Labels, ",") != "spec" {
 		t.Fatalf("interactive Resolve labels = %v", github.Labels)
+	}
+}
+
+func TestResolveChangedInteractivePlanRequiresConfirmationAgain(t *testing.T) {
+	fixture := newResolveFixture(t, []string{"in-progress", "spec"}, "COMPLETED")
+	fixture.gh = resolveGitHubWithLabelChangeAfterFirstInspection(t, fixture)
+	before := fileDigest(t, fixture.store.Path)
+
+	var stdout, stderr bytes.Buffer
+	if err := resolveCommandWithInput(context.Background(), fixture.args("run-42"), strings.NewReader("yes\nno\n"), true, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(stdout.String(), "External Resolution Plan for issue #42") != 2 || !strings.Contains(stdout.String(), "confirm the current plan again") || !strings.Contains(stdout.String(), "remove issue label ready-for-agent") {
+		t.Fatalf("changed-plan output = %q", stdout.String())
+	}
+	if fileDigest(t, fixture.store.Path) != before {
+		t.Fatal("second confirmation refusal changed Run state")
+	}
+}
+
+func TestResolveYesPrintsChangedCurrentPlanAndContinues(t *testing.T) {
+	fixture := newResolveFixture(t, []string{"in-progress", "spec"}, "COMPLETED")
+	fixture.gh = resolveGitHubWithLabelChangeAfterFirstInspection(t, fixture)
+
+	var stdout, stderr bytes.Buffer
+	if err := resolveCommandWithInput(context.Background(), fixture.args("run-42", "--yes"), strings.NewReader(""), false, &stdout, &stderr); err != nil {
+		t.Fatalf("Resolve with changed plan: %v, stderr=%q", err, stderr.String())
+	}
+	if strings.Count(stdout.String(), "External Resolution Plan for issue #42") != 2 || !strings.Contains(stdout.String(), "using the current plan") || !strings.Contains(stdout.String(), "remove issue label ready-for-agent") {
+		t.Fatalf("changed-plan output = %q", stdout.String())
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[1].Status != scheduler.StatusResolvedExternally || len(current.Leases) != 0 {
+		t.Fatalf("changed-plan Resolution state = %#v", current)
 	}
 }
 
@@ -987,6 +1046,52 @@ esac
 	}
 }
 
+func TestCompiledResolveRetiresEveryOwnedUnmergedPullRequest(t *testing.T) {
+	fixture := newTwoPullRequestResetFixture(t)
+	fixture.updateGitHubState(t, `.failClose=0`)
+	gh := githubArtifactResolveGitHub(t, fixture)
+	binary := buildExecutable(t, t.TempDir())
+
+	command := exec.Command(binary, githubArtifactResolveArgs(fixture, fixture.git, gh, "--yes")...)
+	output, err := command.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "External Resolution complete for Run run-github") {
+		t.Fatalf("compiled multiple pull request retirement: %v\n%s", err, output)
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusResolvedExternally || len(current.Leases) != 0 {
+		t.Fatalf("multiple pull request retirement state = %#v", current)
+	}
+	var github struct {
+		Pulls []struct {
+			Number   int      `json:"number"`
+			State    string   `json:"state"`
+			Comments []string `json:"comments"`
+		} `json:"pulls"`
+	}
+	data, err := os.ReadFile(fixture.githubState)
+	if err != nil || json.Unmarshal(data, &github) != nil {
+		t.Fatalf("read multiple pull request state: %v", err)
+	}
+	if len(github.Pulls) != 2 {
+		t.Fatalf("retired pull requests = %#v", github.Pulls)
+	}
+	for _, pull := range github.Pulls {
+		if pull.State != "CLOSED" || len(pull.Comments) != 1 || !strings.Contains(pull.Comments[0], resolution.CommentMarker("run-github")) {
+			t.Fatalf("pull request #%d was not completely retired: %#v", pull.Number, pull)
+		}
+	}
+	calls, err := os.ReadFile(fixture.githubCalls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(calls) != "disable 99\ncomment 99\nclose 99\ncomment 100\nclose 100\n" {
+		t.Fatalf("multiple pull request mutation order = %q", calls)
+	}
+}
+
 func TestCompiledResolveExplainsClosedUnmergedPullRequestWithoutReclosing(t *testing.T) {
 	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusFailed, false, false, false)
 	fixture.updateGitHubState(t, `.pr="CLOSED" | .auto=false | .comments=[]`)
@@ -1345,7 +1450,7 @@ esac
 				t.Fatal(err)
 			}
 			run := persisted.Runs[1]
-			if run.Status != scheduler.StatusMerged || run.PullRequest != pullRequest || run.CompletedAt == nil || run.WorkerLogOpen || run.ResolvedExternallyAt != nil || run.ClosureReason != "" || len(persisted.Leases) != 0 {
+			if run.Status != scheduler.StatusMerged || run.PullRequest != pullRequest || run.CompletedAt == nil || run.WorkerLogOpen || run.ResolvedExternallyAt != nil || run.ClosureReason != "" || run.Error != "retained diagnostic" || len(persisted.Leases) != 0 {
 				t.Fatalf("Completion fallback state = %#v", persisted)
 			}
 			if !run.UpdatedAt.Equal(*run.CompletedAt) {

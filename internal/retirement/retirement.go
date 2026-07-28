@@ -886,7 +886,6 @@ func (e Service) finalizeCompletion(ctx context.Context, verified Plan, pullNumb
 			current.Runs[index].ProcessIdentity = ""
 			current.Runs[index].WorkerLogOpen = false
 			current.Runs[index].CleanupPending = fresh.Snapshot.Worktree.Present || fresh.Snapshot.LocalBranch.Present
-			current.Runs[index].Error = ""
 			break
 		}
 	}
