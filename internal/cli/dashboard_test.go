@@ -92,7 +92,6 @@ func TestRunOutputSelectionUsesTerminalCapabilityAndPlainOverride(t *testing.T) 
 			run := scheduler.Run{
 				Issue: 71, IssueTitle: "Linked retained run", IssueURL: "https://github.com/acme/widgets/issues/71",
 				RunID: "retained-71", Status: scheduler.StatusNeedsHuman, WorkerMode: scheduler.WorkerModePrint,
-				PullRequest: "https://github.com/acme/widgets/pull/171",
 			}
 			if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{
 				Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,

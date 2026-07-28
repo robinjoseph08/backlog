@@ -129,6 +129,43 @@ func TestStatusPresentsOperationalSectionsWithSharedRunObservation(t *testing.T)
 	}
 }
 
+func TestRedirectedStatusKeepsCanonicalIssueAndPullRequestMetadataPlain(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	completedAt := time.Now().UTC().Add(-time.Minute)
+	waiting := scheduler.Run{
+		Issue: 71, IssueTitle: "Waiting with resources", IssueURL: "https://github.com/acme/widgets/issues/71",
+		RunID: "waiting-resources", Status: scheduler.StatusWaitingForMerge, WorkerMode: scheduler.WorkerModePrint,
+		PullRequest: "https://github.com/acme/widgets/pull/171",
+	}
+	merged := scheduler.Run{
+		Issue: 72, IssueTitle: "Merged with resources", IssueURL: "https://github.com/acme/widgets/issues/72",
+		RunID: "merged-resources", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint,
+		PullRequest: "https://github.com/acme/widgets/pull/172", CompletedAt: &completedAt,
+	}
+	if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", Runs: []scheduler.Run{waiting, merged},
+		Leases: []scheduler.Lease{{LeaseID: waiting.RunID, Issue: waiting.Issue, RunID: waiting.RunID}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	output := runStatusCommand(t, repository, stateDir)
+	for _, want := range []string{
+		"Issue: " + waiting.IssueURL,
+		"Pull request: " + waiting.PullRequest,
+		"Issue: " + merged.IssueURL,
+		"Pull request: " + merged.PullRequest,
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("redirected status omitted plain resource metadata %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "\x1b") {
+		t.Fatalf("redirected status emitted OSC or other terminal controls for canonical resources: %q", output)
+	}
+}
+
 func TestStatusConciseProjectionAndFullHistoryAreCompleteOrderedAndExplicit(t *testing.T) {
 	repository := initializeFollowRepository(t)
 	stateDir := t.TempDir()
