@@ -12,8 +12,8 @@ import (
 	"github.com/robinjoseph08/backlog/internal/state"
 )
 
-// Policy recognizes a GitHub-verified closure without attributing Completion
-// to the incomplete Run.
+// Policy recognizes a GitHub-verified closure as External Resolution unless
+// the recorded expected pull request establishes Completion.
 func Policy(selector string) retirement.Policy {
 	return retirement.Policy{
 		Operation:        "External Resolution",
