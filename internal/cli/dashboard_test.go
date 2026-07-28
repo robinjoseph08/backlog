@@ -891,6 +891,50 @@ func TestDashboardCloseShowsThatRunnerStopped(t *testing.T) {
 	}
 }
 
+func TestDashboardWorkerExpectationFollowsRunLifecycle(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []scheduler.Status{
+		scheduler.StatusClaimed,
+		scheduler.StatusWorktreeReady,
+		scheduler.StatusRunning,
+		scheduler.StatusWaitingForMerge,
+		scheduler.StatusSuspended,
+		scheduler.StatusResetting,
+		scheduler.StatusReset,
+		scheduler.StatusMerged,
+		scheduler.StatusFailed,
+		scheduler.StatusNeedsHuman,
+	} {
+		status := status
+		t.Run(string(status), func(t *testing.T) {
+			t.Parallel()
+
+			run := scheduler.Run{Status: status, PID: 42, ProcessIdentity: "42:retained"}
+			observed := statusRun{run: run, observation: runObservation{process: followObservation{
+				supervision:         "UNSUPERVISED",
+				workerLiveness:      "dead",
+				workerLivenessState: workerLivenessDead,
+			}}}
+			wantExpected := status == scheduler.StatusRunning
+			if got := dashboardRunExpectsWorker(run); got != wantExpected {
+				t.Fatalf("Worker expectation = %t, want %t", got, wantExpected)
+			}
+			promotions := dashboardLivenessPromotions(observed)
+			healthy, anomalous := dashboardWorkerHealth([]statusRun{observed})
+			if wantExpected {
+				if len(promotions) == 0 || healthy != 0 || anomalous != 1 {
+					t.Fatalf("running Worker promotions = %q, health = %d healthy and %d anomalous", promotions, healthy, anomalous)
+				}
+				return
+			}
+			if len(promotions) != 0 || healthy != 0 || anomalous != 0 {
+				t.Fatalf("Run without an expected Worker promotions = %q, health = %d healthy and %d anomalous", promotions, healthy, anomalous)
+			}
+		})
+	}
+}
+
 func TestDashboardActiveLivenessAnomalyUsesVerifiedState(t *testing.T) {
 	t.Parallel()
 

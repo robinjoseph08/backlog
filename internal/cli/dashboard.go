@@ -760,7 +760,7 @@ func dashboardPullRequestIdentity(value string) string {
 }
 
 func dashboardRunExpectsWorker(run scheduler.Run) bool {
-	return run.Status == scheduler.StatusRunning || run.PID > 0 || run.ProcessIdentity != ""
+	return run.Status == scheduler.StatusRunning
 }
 
 func dashboardWorkerHealth(groups ...[]statusRun) (healthy, anomalous int) {
