@@ -57,8 +57,9 @@ const (
 	ShutdownStageSuspensionIncomplete ShutdownStage = "suspension-incomplete"
 )
 
-// ShutdownResult identifies whether a terminal shutdown outcome preserves a
-// successful Runner result or accompanies a fatal result.
+// ShutdownResult supplies an explicit success or failure semantic when a
+// shutdown event needs outcome-specific presentation. None leaves presentation
+// to ShutdownStage.
 type ShutdownResult string
 
 const (

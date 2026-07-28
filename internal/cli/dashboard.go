@@ -780,7 +780,7 @@ func dashboardStagePresentationFor(stage dashboardStage) dashboardStagePresentat
 		}
 	case dashboardSuspensionIncomplete:
 		return dashboardStagePresentation{
-			summary:       "Suspension incomplete: one or more Runs lack a continuation boundary; no further interrupt has an effect before exit.",
+			summary:       "Suspension incomplete: one or more shutdown steps failed; review operational messages and Run diagnostics; no further interrupt has an effect before exit.",
 			stage:         "Suspension incomplete",
 			nextInterrupt: "no effect",
 		}
