@@ -119,7 +119,10 @@ func (e *PresentationFailure) Unwrap() []error {
 	return []error{e.Err, e.RunnerErr}
 }
 
-const presentationEventLimit = 32
+const (
+	presentationEventLimit            = 32
+	presentationAdmissionFailureLimit = 20
+)
 
 type presentationEventQueue struct {
 	mu       sync.Mutex
@@ -135,6 +138,9 @@ func newPresentationEventQueue() *presentationEventQueue {
 func (q *presentationEventQueue) publish(event runner.OperationalEvent) {
 	q.mu.Lock()
 	q.events = append(q.events, event)
+	for presentationAdmissionFailureCount(q.events) > presentationAdmissionFailureLimit {
+		q.remove(oldestPresentationAdmissionFailure(q.events))
+	}
 	for len(q.events) > presentationEventLimit {
 		q.remove(presentationEventEvictionIndex(q.events))
 	}
@@ -143,6 +149,25 @@ func (q *presentationEventQueue) publish(event runner.OperationalEvent) {
 	case q.wake <- struct{}{}:
 	default:
 	}
+}
+
+func presentationAdmissionFailureCount(events []runner.OperationalEvent) int {
+	count := 0
+	for _, event := range events {
+		if _, ok := event.(runner.CandidateDiscoveryFailed); ok {
+			count++
+		}
+	}
+	return count
+}
+
+func oldestPresentationAdmissionFailure(events []runner.OperationalEvent) int {
+	for index, event := range events {
+		if _, ok := event.(runner.CandidateDiscoveryFailed); ok {
+			return index
+		}
+	}
+	return 0
 }
 
 // presentationEventEvictionIndex prefers obsolete progress, then the oldest

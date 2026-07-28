@@ -72,6 +72,9 @@ type CandidateDiscoveryError struct {
 	Operation CandidateDiscoveryOperation
 	Issue     int
 	Err       error
+	// Cause is a concise terminal cause suitable for presentation grouping.
+	// Err retains the complete command and wrapping context for Diagnostics.
+	Cause string
 }
 
 func (e *CandidateDiscoveryError) Error() string {
@@ -110,14 +113,14 @@ func (c Client) Candidates(ctx context.Context, repo string) ([]scheduler.Candid
 		"issue", "list", "--repo", repo, "--state", "open", "--label", "ready-for-agent",
 		"--limit", "1000", "--json", "number,title,createdAt,url",
 	); err != nil {
-		return nil, &CandidateDiscoveryError{Operation: CandidateDiscoveryList, Err: err}
+		return nil, newCandidateDiscoveryError(CandidateDiscoveryList, 0, err)
 	}
 
 	candidates := make([]scheduler.Candidate, 0, len(listed))
 	for _, item := range listed {
 		candidate, err := c.candidate(ctx, repo, item.Number)
 		if err != nil {
-			return nil, &CandidateDiscoveryError{Operation: CandidateDiscoveryInspect, Issue: item.Number, Err: err}
+			return nil, newCandidateDiscoveryError(CandidateDiscoveryInspect, item.Number, err)
 		}
 		candidates = append(candidates, candidate)
 	}
@@ -619,6 +622,45 @@ func (c Client) command(ctx context.Context, args ...string) error {
 	return fmt.Errorf("gh %s: %w", strings.Join(args, " "), err)
 }
 
+type commandError struct {
+	command string
+	detail  string
+	err     error
+}
+
+func (e *commandError) Error() string {
+	if e.detail != "" {
+		return fmt.Sprintf("gh %s: %s", e.command, e.detail)
+	}
+	return fmt.Sprintf("gh %s: %v", e.command, e.err)
+}
+
+func (e *commandError) Unwrap() error { return e.err }
+
+func newCandidateDiscoveryError(operation CandidateDiscoveryOperation, issue int, err error) *CandidateDiscoveryError {
+	return &CandidateDiscoveryError{Operation: operation, Issue: issue, Err: err, Cause: conciseCandidateDiscoveryCause(err)}
+}
+
+func conciseCandidateDiscoveryCause(err error) string {
+	var command *commandError
+	if errors.As(err, &command) {
+		if command.detail != "" {
+			return command.detail
+		}
+		if command.err != nil {
+			return command.err.Error()
+		}
+	}
+	cause := err
+	for errors.Unwrap(cause) != nil {
+		cause = errors.Unwrap(cause)
+	}
+	if cause == nil {
+		return "unknown error"
+	}
+	return cause.Error()
+}
+
 func (c Client) jsonCommand(ctx context.Context, target any, args ...string) error {
 	executable := c.Executable
 	if executable == "" {
@@ -631,10 +673,10 @@ func (c Client) jsonCommand(ctx context.Context, target any, args ...string) err
 		if exitError, ok := err.(*exec.ExitError); ok {
 			message := strings.TrimSpace(string(exitError.Stderr))
 			if message != "" {
-				return fmt.Errorf("gh %s: %s", strings.Join(args, " "), message)
+				return &commandError{command: strings.Join(args, " "), detail: message, err: err}
 			}
 		}
-		return fmt.Errorf("gh %s: %w", strings.Join(args, " "), err)
+		return &commandError{command: strings.Join(args, " "), err: err}
 	}
 	if err := rejectDuplicateJSONFields(output); err != nil {
 		return fmt.Errorf("decode gh %s output: %w", strings.Join(args, " "), err)

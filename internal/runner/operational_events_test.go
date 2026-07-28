@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -113,11 +114,11 @@ func TestRunnerReportsCandidateDiscoveryFailuresAndResetsCountAfterRecovery(t *t
 		t.Fatalf("first event = %T, want CandidateDiscoveryFailed", events[0])
 	}
 	occurredAt := time.Date(2026, 7, 2, 3, 4, 5, 0, time.UTC)
-	if listing.Operation != CandidateDiscoveryList || listing.Issue != nil || !errors.Is(listing.Err, listErr) || !listing.OccurredAt.Equal(occurredAt) || !listing.RetryAt.Equal(occurredAt.Add(20*time.Millisecond)) || listing.ConsecutiveFailures != 1 {
+	if listing.Operation != CandidateDiscoveryList || listing.Issue != nil || !errors.Is(listing.Err, listErr) || listing.Cause != "i/o timeout" || !listing.FirstFailureAt.Equal(occurredAt) || !listing.OccurredAt.Equal(occurredAt) || !listing.RetryAt.Equal(occurredAt.Add(20*time.Millisecond)) || listing.ConsecutiveFailures != 1 {
 		t.Fatalf("Candidate listing failure = %#v", listing)
 	}
 	inspection, ok := events[1].(CandidateDiscoveryFailed)
-	if !ok || inspection.Operation != CandidateDiscoveryInspect || inspection.Issue == nil || *inspection.Issue != 17 || !errors.Is(inspection.Err, inspectErr) || inspection.ConsecutiveFailures != 2 {
+	if !ok || inspection.Operation != CandidateDiscoveryInspect || inspection.Issue == nil || *inspection.Issue != 17 || !errors.Is(inspection.Err, inspectErr) || !inspection.FirstFailureAt.Equal(occurredAt) || inspection.ConsecutiveFailures != 2 {
 		t.Fatalf("Candidate inspection failure = %#v", events[1])
 	}
 	fallback, ok := events[2].(CandidateDiscoveryFailed)
@@ -147,6 +148,48 @@ func TestRunnerReportsCandidateDiscoveryFailuresAndResetsCountAfterRecovery(t *t
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("plain output omitted %q: %q", want, output.String())
 		}
+	}
+}
+
+func TestRunnerStructuredPresentationCanSuppressCompatibleAdmissionOutput(t *testing.T) {
+	github := &fakeGitHub{
+		candidateResults: []candidateResult{{err: errors.New("temporary failure")}, {}},
+		candidateChanged: make(chan struct{}, 2),
+	}
+	runner := testRunner(github, newFakeWorkers(), &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+	runner.Config.PollInterval = time.Millisecond
+	runner.SuppressOperationalEventOutput = true
+	var output bytes.Buffer
+	runner.Output = &output
+	recorder := &operationalEventRecorder{}
+	runner.OnOperationalEvent = recorder.record
+
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	runner.WaitForOperationalEventDelivery()
+	if events := recorder.snapshot(); len(events) != 2 {
+		t.Fatalf("structured events = %#v, want failure and recovery", events)
+	}
+	if strings.Contains(output.String(), "candidate discovery") {
+		t.Fatalf("structured presentation received compatible Admission rows: %q", output.String())
+	}
+}
+
+func TestOperationalEventQueueRetainsAtMostTwentyAdmissionFailures(t *testing.T) {
+	events := make([]OperationalEvent, 0, operationalAdmissionFailureLimit+5)
+	for failure := 1; failure <= operationalAdmissionFailureLimit+5; failure++ {
+		events = append(events, CandidateDiscoveryFailed{ConsecutiveFailures: failure, Err: fmt.Errorf("failure %d", failure)})
+		for operationalAdmissionFailureCount(events) > operationalAdmissionFailureLimit {
+			events = removeOperationalEvent(events, oldestOperationalAdmissionFailure(events))
+		}
+	}
+	if len(events) != operationalAdmissionFailureLimit {
+		t.Fatalf("retained failures = %d, want %d", len(events), operationalAdmissionFailureLimit)
+	}
+	first := events[0].(CandidateDiscoveryFailed)
+	if first.ConsecutiveFailures != 6 {
+		t.Fatalf("oldest retained failure = %d, want 6", first.ConsecutiveFailures)
 	}
 }
 

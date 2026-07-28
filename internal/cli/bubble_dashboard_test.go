@@ -110,6 +110,28 @@ func TestBubbleDashboardElapsedTickAdvancesAndReschedulesWithoutExternalUpdates(
 	}
 }
 
+func TestBubbleDashboardTogglesAdmissionDiagnosticsWithD(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 100, Height: 30})
+	model.dashboard.operationalEvent(runner.CandidateDiscoveryFailed{
+		Operation: runner.CandidateDiscoveryList, Err: errors.New("gh issue list --repo acme/widgets: connection refused"), Cause: "connection refused",
+		OccurredAt: now, RetryAt: now.Add(30 * time.Second), ConsecutiveFailures: 1,
+	})
+	if view := ansi.Strip(model.View().Content); strings.Contains(view, "gh issue list") {
+		t.Fatalf("closed Diagnostics exposed full command:\n%s", view)
+	}
+	updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}))
+	model = updated.(bubbleDashboardModel)
+	if view := ansi.Strip(model.View().Content); !strings.Contains(view, "Diagnostics (1 recent Candidate discovery failure; d to close)") || !strings.Contains(view, "gh issue list") {
+		t.Fatalf("d did not open Diagnostics:\n%s", view)
+	}
+	updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}))
+	model = updated.(bubbleDashboardModel)
+	if view := ansi.Strip(model.View().Content); strings.Contains(view, "gh issue list") {
+		t.Fatalf("second d did not close Diagnostics:\n%s", view)
+	}
+}
+
 func TestBubbleDashboardViewportSupportsKeyboardScrolling(t *testing.T) {
 	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: time.Now}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 60, Height: 9})
 	for range 30 {
@@ -186,10 +208,15 @@ func TestBubbleDashboardSessionSafelyDeliversStateOutputAndOperationalEvents(t *
 	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
 	session.configure(current, &dashboardTestSource{current: current})
 	session.stateSaved(current)
-	if _, err := io.WriteString(session, "candidate discovery failed\n"); err != nil {
+	if _, err := io.WriteString(session, "persist runner state failed\n"); err != nil {
 		t.Fatal(err)
 	}
 	events := newPresentationEventQueue()
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	events.publish(runner.CandidateDiscoveryFailed{
+		Operation: runner.CandidateDiscoveryList, Err: errors.New("gh issue list: unavailable"), Cause: "unavailable",
+		OccurredAt: now, RetryAt: now.Add(30 * time.Second), ConsecutiveFailures: 1,
+	})
 	events.publish(runner.ShutdownEvent{Stage: runner.ShutdownStageDraining, Message: "Drain accepted"})
 	control := PresentationControl{Terminal: PresentationTerminal{Now: time.Now}, operationalEvents: events}
 	model := newBubbleDashboardModel(context.Background(), control, session, TerminalDimensions{Width: 80, Height: 20})
@@ -201,16 +228,22 @@ func TestBubbleDashboardSessionSafelyDeliversStateOutputAndOperationalEvents(t *
 		updated, _ := model.Update(msg)
 		model = updated.(bubbleDashboardModel)
 	}
-	operational := model.waitForOperationalEvent()()
+	admission := model.waitForOperationalEvent()()
 	updated, _ := model.Update(dashboardFlushMsg{acknowledged: make(chan struct{})})
 	model = updated.(bubbleDashboardModel)
 	if len(model.pendingFlushes) != 1 {
 		t.Fatal("final render flush did not wait for the in-flight operational event")
 	}
-	updated, _ = model.Update(operational)
+	updated, _ = model.Update(admission)
+	model = updated.(bubbleDashboardModel)
+	if len(model.pendingFlushes) != 1 {
+		t.Fatal("final render flush resumed before the queued shutdown event")
+	}
+	shutdown := model.waitForOperationalEvent()()
+	updated, _ = model.Update(shutdown)
 	model = updated.(bubbleDashboardModel)
 	if len(model.pendingFlushes) != 0 || !events.idle() {
-		t.Fatal("final render flush did not resume after the operational event was applied")
+		t.Fatal("final render flush did not resume after all operational events were applied")
 	}
 	view := ansi.Strip(model.View().Content)
 	for _, want := range []string{"Repository: acme/widgets", "Runner stage: Draining", "Next Ctrl-C: suspend"} {
@@ -218,8 +251,8 @@ func TestBubbleDashboardSessionSafelyDeliversStateOutputAndOperationalEvents(t *
 			t.Fatalf("Bubble Tea Update did not receive %q:\n%s", want, view)
 		}
 	}
-	if body := model.viewport.GetContent(); !strings.Contains(body, "candidate discovery failed") || !strings.Contains(body, "Drain accepted") {
-		t.Fatalf("scrollable body did not receive output and typed event: %q", body)
+	if body := model.viewport.GetContent(); !strings.Contains(body, "Admission: DEGRADED") || !strings.Contains(body, "persist runner state failed") || !strings.Contains(body, "Drain accepted") || strings.Contains(body, "gh issue list") {
+		t.Fatalf("primary body did not separate health, operational output, and closed Diagnostics: %q", body)
 	}
 }
 

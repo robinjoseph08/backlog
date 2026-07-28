@@ -84,6 +84,10 @@ type Runner struct {
 	// presentation cannot block Runner control paths or compatible plain output.
 	OnOperationalEvent func(OperationalEvent)
 
+	// SuppressOperationalEventOutput lets a structured presentation avoid the
+	// compatible line-oriented copies. Plain mode leaves this false.
+	SuppressOperationalEventOutput bool
+
 	// FinalSummary presents the aggregate state immediately before natural
 	// one-shot exhaustion. Signal shutdown and watch mode do not call it.
 	FinalSummary func(state.State) error
@@ -112,6 +116,8 @@ type Runner struct {
 	operationalEventStopping bool
 	operationalEvents        []OperationalEvent
 }
+
+const operationalAdmissionFailureLimit = 20
 
 type workerCompletion struct {
 	issue  int
@@ -273,6 +279,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	var candidateRetryTimer *time.Timer
 	var candidateRetry <-chan time.Time
 	candidateDiscoveryFailures := 0
+	var candidateDiscoveryFirstFailure time.Time
 	defer func() {
 		if candidateRetryTimer != nil {
 			candidateRetryTimer.Stop()
@@ -358,10 +365,17 @@ func (r *Runner) Run(ctx context.Context) error {
 				}
 				candidateRetry = candidateRetryTimer.C
 				occurredAt := r.Now().UTC()
+				if candidateDiscoveryFailures == 1 {
+					candidateDiscoveryFirstFailure = occurredAt
+				}
 				operation := CandidateDiscoverySnapshot
+				cause := conciseDiscoveryCause(err)
 				var issue *int
 				var discoveryErr *ghadapter.CandidateDiscoveryError
 				if errors.As(err, &discoveryErr) {
+					if discoveryErr.Cause != "" {
+						cause = discoveryErr.Cause
+					}
 					switch discoveryErr.Operation {
 					case ghadapter.CandidateDiscoveryList:
 						operation = CandidateDiscoveryList
@@ -374,8 +388,8 @@ func (r *Runner) Run(ctx context.Context) error {
 					}
 				}
 				r.emitWhileAdmissionActive(admission, CandidateDiscoveryFailed{
-					Operation: operation, Issue: issue, Err: err,
-					OccurredAt: occurredAt, RetryAt: occurredAt.Add(r.Config.PollInterval),
+					Operation: operation, Issue: issue, Err: err, Cause: cause,
+					FirstFailureAt: candidateDiscoveryFirstFailure, OccurredAt: occurredAt, RetryAt: occurredAt.Add(r.Config.PollInterval),
 					ConsecutiveFailures: candidateDiscoveryFailures,
 				})
 			} else {
@@ -385,6 +399,7 @@ func (r *Runner) Run(ctx context.Context) error {
 						continue
 					}
 					candidateDiscoveryFailures = 0
+					candidateDiscoveryFirstFailure = time.Time{}
 				}
 				plan := scheduler.Plan(scheduler.Snapshot{Candidates: candidates, Runs: current.Runs, Leases: current.Leases}, r.Config.MaxConcurrentIssues)
 				startedWorker := false
@@ -2152,9 +2167,23 @@ func (r *Runner) emitWhileAdmissionActive(admission *admissionGate, event Operat
 }
 
 func (r *Runner) writeOperationalEvent(event OperationalEvent) {
+	if r.SuppressOperationalEventOutput {
+		return
+	}
 	if message := FormatOperationalEvent(event); message != "" {
 		r.logf("%s", message)
 	}
+}
+
+func conciseDiscoveryCause(err error) string {
+	cause := err
+	for errors.Unwrap(cause) != nil {
+		cause = errors.Unwrap(cause)
+	}
+	if cause == nil {
+		return "unknown error"
+	}
+	return cause.Error()
 }
 
 func (r *Runner) enqueueOperationalEvent(event OperationalEvent) {
@@ -2166,11 +2195,39 @@ func (r *Runner) enqueueOperationalEvent(event OperationalEvent) {
 	})
 	r.operationalEventMu.Lock()
 	r.operationalEvents = append(r.operationalEvents, event)
+	for operationalAdmissionFailureCount(r.operationalEvents) > operationalAdmissionFailureLimit {
+		r.operationalEvents = removeOperationalEvent(r.operationalEvents, oldestOperationalAdmissionFailure(r.operationalEvents))
+	}
 	r.operationalEventMu.Unlock()
 	select {
 	case r.operationalEventWake <- struct{}{}:
 	default:
 	}
+}
+
+func operationalAdmissionFailureCount(events []OperationalEvent) int {
+	count := 0
+	for _, event := range events {
+		if _, ok := event.(CandidateDiscoveryFailed); ok {
+			count++
+		}
+	}
+	return count
+}
+
+func oldestOperationalAdmissionFailure(events []OperationalEvent) int {
+	for index, event := range events {
+		if _, ok := event.(CandidateDiscoveryFailed); ok {
+			return index
+		}
+	}
+	return 0
+}
+
+func removeOperationalEvent(events []OperationalEvent, index int) []OperationalEvent {
+	copy(events[index:], events[index+1:])
+	events[len(events)-1] = nil
+	return events[:len(events)-1]
 }
 
 func (r *Runner) deliverOperationalEvents(deliver func(OperationalEvent)) {

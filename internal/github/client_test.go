@@ -87,6 +87,30 @@ esac`)
 	if !errors.As(err, &discovery) || discovery.Operation != CandidateDiscoveryList || discovery.Issue != 0 {
 		t.Fatalf("Candidate discovery context = %#v", discovery)
 	}
+	if discovery.Cause != "invalid character 'o' in literal null (expecting 'u')" {
+		t.Fatalf("Candidate discovery concise cause = %q", discovery.Cause)
+	}
+}
+
+func TestClientSeparatesCandidateDiscoveryCauseFromFullCommand(t *testing.T) {
+	t.Parallel()
+
+	gh := fakeGH(t, `
+case "$*" in
+  "issue list "*) echo "TLS handshake timeout" >&2; exit 1 ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+	_, err := (Client{Executable: gh}).Candidates(context.Background(), "acme/widgets")
+	var discovery *CandidateDiscoveryError
+	if !errors.As(err, &discovery) {
+		t.Fatalf("Candidate discovery error = %v", err)
+	}
+	if discovery.Cause != "TLS handshake timeout" {
+		t.Fatalf("concise cause = %q", discovery.Cause)
+	}
+	if !strings.Contains(discovery.Error(), "gh issue list --repo acme/widgets") || !strings.Contains(discovery.Error(), discovery.Cause) {
+		t.Fatalf("full error lost command evidence: %q", discovery.Error())
+	}
 }
 
 func TestClientRejectsIncompleteCandidateSnapshots(t *testing.T) {

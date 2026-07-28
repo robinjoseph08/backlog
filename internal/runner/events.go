@@ -23,11 +23,16 @@ const (
 
 // CandidateDiscoveryFailed reports that Admission cannot use an incomplete
 // Candidate snapshot. Issue is nil when the failed operation was not scoped to
-// one Candidate. Err is the original discovery error.
+// one Candidate. Err is the original discovery error. Cause is a concise
+// terminal cause supplied independently of the retry policy. FirstFailureAt
+// preserves the start of the current degradation episode if delivery is
+// coalesced by a bounded presentation queue.
 type CandidateDiscoveryFailed struct {
 	Operation           CandidateDiscoveryOperation
 	Issue               *int
 	Err                 error
+	Cause               string
+	FirstFailureAt      time.Time
 	OccurredAt          time.Time
 	RetryAt             time.Time
 	ConsecutiveFailures int

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -235,6 +236,71 @@ func TestDashboardReceivesShutdownStageWithoutParsingFormattedMessages(t *testin
 	}
 	if strings.Contains(frame, "Force stop: this is diagnostic text") {
 		t.Fatalf("formatted prefix received shutdown retention without a typed event:\n%s", output.String())
+	}
+}
+
+func TestDashboardAggregatesAdmissionFailuresAndBoundsDiagnostics(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 30, 0, time.UTC)
+	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+	dashboard := newLiveDashboard(io.Discard, &dashboardTestSource{current: current}, current, func() time.Time { return now })
+	issue := 70
+	for failure := 1; failure <= 23; failure++ {
+		operation := runner.CandidateDiscoveryList
+		cause := "TLS handshake timeout"
+		if failure == 2 {
+			operation = runner.CandidateDiscoveryInspect
+			cause = "i/o timeout"
+		}
+		dashboard.operationalEvent(runner.CandidateDiscoveryFailed{
+			Operation: operation, Issue: &issue, Err: fmt.Errorf("full gh command %d: %s", failure, cause), Cause: cause,
+			OccurredAt: now.Add(time.Duration(failure-23) * time.Second), RetryAt: now.Add(30 * time.Second),
+			ConsecutiveFailures: failure,
+		})
+	}
+
+	_, body, _ := dashboard.renderParts(now)
+	for _, want := range []string{
+		"Admission: DEGRADED", "23 consecutive failures", "First failure: 2026-07-28T12:00:08Z",
+		"Latest failure: 2026-07-28T12:00:30Z", "Next retry: 30s", "Operation: list candidates",
+		"Issue: #70", "Cause: TLS handshake timeout", "Equivalent failures: 22", "Diagnostics: closed (d to open; 20 recent)",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("Admission banner missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "full gh command") {
+		t.Fatalf("closed Diagnostics exposed full errors:\n%s", body)
+	}
+	if len(dashboard.admission.failures) != 20 {
+		t.Fatalf("retained full failures = %d, want 20", len(dashboard.admission.failures))
+	}
+
+	dashboard.toggleDiagnostics()
+	_, body, _ = dashboard.renderParts(now)
+	if !strings.Contains(body, "Diagnostics (20 recent Candidate discovery failures; d to close)") ||
+		!strings.Contains(body, "full gh command 4") || !strings.Contains(body, "full gh command 23") ||
+		strings.Contains(body, "full gh command 3") {
+		t.Fatalf("Diagnostics did not contain exactly the latest 20 full failures:\n%s", body)
+	}
+}
+
+func TestDashboardAdmissionRecoveryNoticeExpiresAfterTenSeconds(t *testing.T) {
+	recoveredAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+	dashboard := newLiveDashboard(io.Discard, &dashboardTestSource{current: current}, current, time.Now)
+	dashboard.operationalEvent(runner.CandidateDiscoveryFailed{
+		Operation: runner.CandidateDiscoveryList, Err: errors.New("gh command: unavailable"), Cause: "unavailable",
+		OccurredAt: recoveredAt.Add(-time.Second), RetryAt: recoveredAt.Add(time.Minute), ConsecutiveFailures: 1,
+	})
+	dashboard.operationalEvent(runner.CandidateDiscoveryRecovered{OccurredAt: recoveredAt, Failures: 1})
+
+	_, body, _ := dashboard.renderParts(recoveredAt.Add(9 * time.Second))
+	if !strings.Contains(body, "Admission: healthy | Recovered 9s ago after 1 failure") || strings.Contains(body, "DEGRADED") {
+		t.Fatalf("active recovery notice = %q", body)
+	}
+	_, body, _ = dashboard.renderParts(recoveredAt.Add(10 * time.Second))
+	if !strings.Contains(body, "Admission: healthy") || strings.Contains(body, "Recovered") {
+		t.Fatalf("expired recovery notice = %q", body)
 	}
 }
 

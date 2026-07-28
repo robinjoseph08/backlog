@@ -85,8 +85,8 @@ func TestPresentationEventQueueBoundsIgnoredConsumer(t *testing.T) {
 
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
-	if len(queue.events) != presentationEventLimit {
-		t.Fatalf("ignored-consumer queue length = %d, want hard limit %d", len(queue.events), presentationEventLimit)
+	if len(queue.events) != presentationAdmissionFailureLimit {
+		t.Fatalf("ignored-consumer queue length = %d, want Admission failure limit %d", len(queue.events), presentationAdmissionFailureLimit)
 	}
 	latest, ok := queue.events[len(queue.events)-1].(runner.CandidateDiscoveryFailed)
 	if !ok || latest.ConsecutiveFailures != presentationEventLimit*100 {
@@ -121,8 +121,9 @@ func TestPresentationEventQueuePreservesOrderedShutdownAndTerminalDeliveryForSlo
 		}
 		events = append(events, event)
 	}
-	if len(events) != presentationEventLimit {
-		t.Fatalf("slow-consumer delivery count = %d, want bounded %d", len(events), presentationEventLimit)
+	wantEvents := presentationAdmissionFailureLimit + 4
+	if len(events) != wantEvents {
+		t.Fatalf("slow-consumer delivery count = %d, want bounded %d", len(events), wantEvents)
 	}
 	previousFailure := 0
 	for _, event := range events[:len(events)-4] {
@@ -465,6 +466,15 @@ esac
 	}
 	if strings.Contains(stdout.String(), "Backlog Run Dashboard") || strings.Contains(stdout.String(), "\x1b[") || stderr.Len() != 0 {
 		t.Fatalf("selected presentation output compatibility changed: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	persisted, err := os.ReadFile(filepath.Join(root, "state", "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, transient := range []string{"GitHub temporarily unavailable", "candidate discovery", "Admission", "Diagnostics"} {
+		if strings.Contains(string(persisted), transient) {
+			t.Fatalf("transient presentation state %q was persisted: %s", transient, persisted)
+		}
 	}
 }
 

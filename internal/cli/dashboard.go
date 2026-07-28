@@ -53,6 +53,8 @@ type liveDashboard struct {
 	shutdownOccurrences map[string]int
 	occurrenceOrder     []string
 	stage               dashboardStage
+	admission           dashboardAdmission
+	diagnosticsOpen     bool
 	lastActivity        map[string]fileSignature
 	observations        map[string]dashboardActivityObservation
 	pendingOutput       bytes.Buffer
@@ -69,6 +71,26 @@ type dashboardMessage struct {
 	shutdown     bool
 	plainMatched bool
 }
+
+type dashboardAdmission struct {
+	degraded            bool
+	consecutiveFailures int
+	firstFailure        time.Time
+	latestFailure       time.Time
+	retryAt             time.Time
+	operation           runner.CandidateDiscoveryOperation
+	issue               *int
+	cause               string
+	equivalentFailures  map[string]int
+	failures            []runner.CandidateDiscoveryFailed
+	recoveredAt         time.Time
+	recoveredFailures   int
+}
+
+const (
+	dashboardDiagnosticLimit = 20
+	admissionRecoveryNotice  = 10 * time.Second
+)
 
 type fileSignature struct {
 	path    string
@@ -166,9 +188,9 @@ func (d *liveDashboard) requestRedraw() {
 	}
 }
 
-// Write receives append-only Runner lifecycle messages. In dashboard mode the
-// messages are retained in the dashboard instead of being lost on the next
-// redraw. Plain mode never uses this writer.
+// Write receives append-only Runner operational lines that do not have a
+// structured dashboard surface. They remain visible instead of being lost on
+// the next redraw. Plain mode never uses this writer.
 func (d *liveDashboard) Write(content []byte) (int, error) {
 	d.mu.Lock()
 	if d.err != nil {
@@ -292,9 +314,28 @@ func dashboardMessageTexts(messages []dashboardMessage) []string {
 }
 
 // operationalEvent receives lifecycle state directly from the Runner. Message
-// formatting remains independent, so presentation never infers shutdown stage
-// from append-only prose.
+// formatting remains independent, so presentation never infers Admission or
+// shutdown state from append-only prose.
 func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
+	switch event := event.(type) {
+	case runner.CandidateDiscoveryFailed:
+		d.mu.Lock()
+		d.recordAdmissionFailureLocked(event)
+		d.mu.Unlock()
+		d.requestRedraw()
+		return
+	case runner.CandidateDiscoveryRecovered:
+		d.mu.Lock()
+		d.admission.degraded = false
+		d.admission.consecutiveFailures = 0
+		d.admission.equivalentFailures = nil
+		d.admission.recoveredAt = event.OccurredAt
+		d.admission.recoveredFailures = event.Failures
+		d.mu.Unlock()
+		d.requestRedraw()
+		return
+	}
+
 	shutdown, ok := event.(runner.ShutdownEvent)
 	if !ok {
 		return
@@ -339,6 +380,53 @@ func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
 	if next > d.stage {
 		d.stage = next
 	}
+	d.mu.Unlock()
+	d.requestRedraw()
+}
+
+func (d *liveDashboard) recordAdmissionFailureLocked(failure runner.CandidateDiscoveryFailed) {
+	cause := normalizedDashboardMessage(failure.Cause)
+	if cause == "" && failure.Err != nil {
+		cause = normalizedDashboardMessage(failure.Err.Error())
+	}
+	if cause == "" {
+		cause = "unknown error"
+	}
+	if !d.admission.degraded {
+		d.admission.firstFailure = failure.FirstFailureAt
+		if d.admission.firstFailure.IsZero() {
+			d.admission.firstFailure = failure.OccurredAt
+		}
+		d.admission.equivalentFailures = make(map[string]int)
+	}
+	d.admission.degraded = true
+	d.admission.consecutiveFailures = failure.ConsecutiveFailures
+	d.admission.latestFailure = failure.OccurredAt
+	d.admission.retryAt = failure.RetryAt
+	d.admission.operation = failure.Operation
+	d.admission.issue = cloneIssue(failure.Issue)
+	d.admission.cause = cause
+	d.admission.recoveredAt = time.Time{}
+	d.admission.recoveredFailures = 0
+	key := string(failure.Operation) + "\x00" + cause
+	d.admission.equivalentFailures[key]++
+	d.admission.failures = append(d.admission.failures, failure)
+	if len(d.admission.failures) > dashboardDiagnosticLimit {
+		d.admission.failures = append([]runner.CandidateDiscoveryFailed(nil), d.admission.failures[len(d.admission.failures)-dashboardDiagnosticLimit:]...)
+	}
+}
+
+func cloneIssue(issue *int) *int {
+	if issue == nil {
+		return nil
+	}
+	value := *issue
+	return &value
+}
+
+func (d *liveDashboard) toggleDiagnostics() {
+	d.mu.Lock()
+	d.diagnosticsOpen = !d.diagnosticsOpen
 	d.mu.Unlock()
 	d.requestRedraw()
 }
@@ -435,6 +523,11 @@ func (d *liveDashboard) renderPartsFor(current state.State, messages []string, s
 	header := fmt.Sprintf("Backlog Run Dashboard\nRepository: %s\n%s",
 		valueOr(plainStatusValue(current.Repo), "not initialized"), capacity)
 	var body strings.Builder
+	d.mu.Lock()
+	admission := cloneDashboardAdmission(d.admission)
+	diagnosticsOpen := d.diagnosticsOpen
+	d.mu.Unlock()
+	renderAdmissionHealth(&body, admission, diagnosticsOpen, now)
 	renderDashboardSection(&body, "Active Runs", sections[statusActive], now)
 	renderDashboardSection(&body, "Attention Required", sections[statusAttention], now)
 	renderDashboardSection(&body, "Outcomes to Acknowledge", sections[statusOutcomes], now)
@@ -446,6 +539,97 @@ func (d *liveDashboard) renderPartsFor(current state.State, messages []string, s
 		}
 	}
 	return header, strings.TrimPrefix(body.String(), "\n"), dashboardFooterParts(stage)
+}
+
+func cloneDashboardAdmission(admission dashboardAdmission) dashboardAdmission {
+	admission.issue = cloneIssue(admission.issue)
+	admission.failures = append([]runner.CandidateDiscoveryFailed(nil), admission.failures...)
+	if admission.equivalentFailures != nil {
+		groups := make(map[string]int, len(admission.equivalentFailures))
+		for key, count := range admission.equivalentFailures {
+			groups[key] = count
+		}
+		admission.equivalentFailures = groups
+	}
+	return admission
+}
+
+func renderAdmissionHealth(output *strings.Builder, admission dashboardAdmission, diagnosticsOpen bool, now time.Time) {
+	output.WriteString("\nAdmission health\n")
+	if admission.degraded {
+		noun := "failures"
+		if admission.consecutiveFailures == 1 {
+			noun = "failure"
+		}
+		fmt.Fprintf(output, "  Admission: DEGRADED | %d consecutive %s\n", admission.consecutiveFailures, noun)
+		fmt.Fprintf(output, "    First failure: %s | Latest failure: %s | Next retry: %s\n",
+			formatAdmissionTime(admission.firstFailure), formatAdmissionTime(admission.latestFailure), admissionRetryCountdown(admission.retryAt, now))
+		fmt.Fprintf(output, "    Operation: %s", plainStatusValue(string(admission.operation)))
+		if admission.issue != nil {
+			fmt.Fprintf(output, " | Issue: #%d", *admission.issue)
+		}
+		output.WriteByte('\n')
+		fmt.Fprintf(output, "    Cause: %s", plainStatusValue(admission.cause))
+		key := string(admission.operation) + "\x00" + admission.cause
+		if equivalent := admission.equivalentFailures[key]; equivalent > 1 {
+			fmt.Fprintf(output, " | Equivalent failures: %d", equivalent)
+		}
+		output.WriteByte('\n')
+	} else {
+		output.WriteString("  Admission: healthy")
+		if !admission.recoveredAt.IsZero() {
+			age := now.Sub(admission.recoveredAt)
+			if age < 0 {
+				age = 0
+			}
+			if age < admissionRecoveryNotice {
+				noun := "failures"
+				if admission.recoveredFailures == 1 {
+					noun = "failure"
+				}
+				fmt.Fprintf(output, " | Recovered %s ago after %d %s", displayDuration(age), admission.recoveredFailures, noun)
+			}
+		}
+		output.WriteByte('\n')
+	}
+	if diagnosticsOpen {
+		renderAdmissionDiagnostics(output, admission.failures)
+	} else {
+		fmt.Fprintf(output, "  Diagnostics: closed (d to open; %d recent)\n", len(admission.failures))
+	}
+}
+
+func renderAdmissionDiagnostics(output *strings.Builder, failures []runner.CandidateDiscoveryFailed) {
+	noun := "failures"
+	if len(failures) == 1 {
+		noun = "failure"
+	}
+	fmt.Fprintf(output, "\nDiagnostics (%d recent Candidate discovery %s; d to close)\n", len(failures), noun)
+	if len(failures) == 0 {
+		output.WriteString("  none\n")
+		return
+	}
+	for _, failure := range failures {
+		fmt.Fprintf(output, "  [%s] Full error/command: %s\n", formatAdmissionTime(failure.OccurredAt), normalizedDashboardMessage(runner.FormatOperationalEvent(failure)))
+	}
+}
+
+func formatAdmissionTime(value time.Time) string {
+	if value.IsZero() {
+		return "n/a"
+	}
+	return value.UTC().Format(time.RFC3339)
+}
+
+func admissionRetryCountdown(retryAt, now time.Time) string {
+	if retryAt.IsZero() {
+		return "n/a"
+	}
+	remaining := retryAt.Sub(now)
+	if remaining < 0 {
+		remaining = 0
+	}
+	return displayDuration(remaining)
 }
 
 // observeSections applies the shared status ownership and history projection.

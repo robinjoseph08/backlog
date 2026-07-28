@@ -358,12 +358,15 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = max(1, msg.Width), max(1, msg.Height)
 	case tea.KeyPressMsg:
-		if msg.String() == "ctrl+c" {
+		switch msg.String() {
+		case "ctrl+c":
 			m.interruptsWaiting++
 			if m.interruptsWaiting == 1 {
 				commands = append(commands, m.interrupt())
 			}
 			return m, tea.Batch(commands...)
+		case "d":
+			m.dashboard.toggleDiagnostics()
 		}
 	case dashboardInterruptResultMsg:
 		if m.interruptsWaiting > 0 {
