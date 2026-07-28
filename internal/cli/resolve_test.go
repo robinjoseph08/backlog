@@ -412,7 +412,7 @@ func TestResolveRequiresYesNonInteractivelyAndCompiledExecutableRefusesRunnerLoc
 		t.Run(mode.name, func(t *testing.T) {
 			command := exec.Command(binary, append([]string{"resolve"}, mode.args...)...)
 			output, commandErr := command.CombinedOutput()
-			if commandErr == nil || !strings.Contains(string(output), "Runner owns repository coordination") || !strings.Contains(string(output), "supervising Runner will reconcile the closed issue automatically") {
+			if commandErr == nil || !strings.Contains(string(output), "Runner owns repository coordination") || !strings.Contains(string(output), "supervising Runner handles automatic reconciliation at startup and during watch polling once the Run has no Owned Worker") {
 				t.Fatalf("compiled lock error = %v\n%s", commandErr, output)
 			}
 		})

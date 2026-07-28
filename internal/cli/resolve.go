@@ -79,7 +79,7 @@ func resolveCommandWithInput(ctx context.Context, args []string, stdin io.Reader
 	}
 	lock, err := acquireResetReadLock(commonDirectory)
 	if err != nil {
-		return fmt.Errorf("External Resolution refused while Runner owns repository coordination; the supervising Runner will reconcile the closed issue automatically: %w", err)
+		return fmt.Errorf("External Resolution refused while Runner owns repository coordination; the supervising Runner handles automatic reconciliation at startup and during watch polling once the Run has no Owned Worker: %w", err)
 	}
 	defer func() { _ = lock.Release() }()
 	if !*dryRun && !*yes && !interactive {

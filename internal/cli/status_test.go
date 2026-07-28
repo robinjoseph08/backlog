@@ -529,7 +529,7 @@ func TestStatusGuidesInterruptedExternalResolutionRecovery(t *testing.T) {
 	if printer.err != nil {
 		t.Fatal(printer.err)
 	}
-	want := "External Resolution is incomplete; close the issue if needed and rerun backlog resolve, or Reset the Run with backlog reset"
+	want := "External Resolution is incomplete; close the issue if needed and rerun backlog resolve, or Reset the Run with backlog reset; a supervising Runner will retry at startup or during watch polling while no Owned Worker is present"
 	if !strings.Contains(output.String(), want) {
 		t.Fatalf("interrupted External Resolution status missing %q:\n%s", want, output.String())
 	}
