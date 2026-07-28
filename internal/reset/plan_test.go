@@ -157,6 +157,7 @@ func TestBuildPlansEverySafeRunStatus(t *testing.T) {
 		scheduler.StatusNeedsHuman,
 		scheduler.StatusSuspended,
 		scheduler.StatusResetting,
+		scheduler.StatusResolvingExternally,
 	}
 	for _, status := range statuses {
 		t.Run(string(status), func(t *testing.T) {

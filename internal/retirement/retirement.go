@@ -126,10 +126,16 @@ func (e Service) inspect(ctx context.Context) (Plan, error) {
 		return Plan{}, err
 	}
 	if e.policy.RequireClosureReason {
-		issueResource.ClosureReason, err = e.github.IssueClosureReason(ctx, repository.Slug, run.Issue)
-		if err != nil {
-			return Plan{}, err
+		closure, closureErr := e.github.IssueClosure(ctx, repository.Slug, run.Issue)
+		if closureErr != nil {
+			return Plan{}, closureErr
 		}
+		if closure.Open {
+			issueResource.State = "open"
+		} else {
+			issueResource.State = "closed"
+		}
+		issueResource.ClosureReason = closure.Reason
 	}
 	remoteBranch, err := inspectRemoteBranch(ctx, e.gitExecutable, e.repositoryRoot, run.Branch)
 	if err != nil {

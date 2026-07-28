@@ -118,6 +118,8 @@ func TestRunStateTransitionsAreExplicit(t *testing.T) {
 		{StatusFailed, StatusResolvingExternally},
 		{StatusNeedsHuman, StatusResolvingExternally},
 		{StatusResetting, StatusResolvingExternally},
+		{StatusResolvingExternally, StatusResetting},
+		{StatusResolvingExternally, StatusReset},
 		{StatusResolvingExternally, StatusResolvedExternally},
 		{StatusResolvingExternally, StatusMerged},
 		{StatusFailed, StatusMerged},

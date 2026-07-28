@@ -45,7 +45,8 @@ func Policy(issue int) retirement.Policy {
 		EligibleStatuses: []scheduler.Status{
 			scheduler.StatusClaimed, scheduler.StatusWorktreeReady, scheduler.StatusRunning,
 			scheduler.StatusWaitingForMerge, scheduler.StatusFailed, scheduler.StatusSuspended,
-			scheduler.StatusNeedsHuman, scheduler.StatusResetting, scheduler.StatusReset,
+			scheduler.StatusNeedsHuman, scheduler.StatusResetting, scheduler.StatusResolvingExternally,
+			scheduler.StatusReset,
 		},
 		CanTransition:     scheduler.CanTransition,
 		Explanation:       Explanation,

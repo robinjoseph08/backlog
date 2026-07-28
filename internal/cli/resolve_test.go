@@ -121,7 +121,7 @@ func TestResolveClosureInspectionFailureDoesNotMutateStateOrLabels(t *testing.T)
 
 	var stdout, stderr bytes.Buffer
 	err := resolveCommandWithInput(context.Background(), fixture.args("run-42", "--yes"), strings.NewReader(""), false, &stdout, &stderr)
-	if err == nil || !strings.Contains(err.Error(), `unsupported closure reason "FUTURE"`) {
+	if err == nil || !strings.Contains(err.Error(), `unsupported or unavailable GitHub closure reason "FUTURE"`) {
 		t.Fatalf("Resolve closure inspection error = %v, stderr=%q, stdout=%q", err, stderr.String(), stdout.String())
 	}
 	if fileDigest(t, fixture.store.Path) != beforeState || fileDigest(t, fixture.githubState) != beforeGitHub {
@@ -258,28 +258,33 @@ func TestCompiledResolveFinalizesAndRerunsIdempotently(t *testing.T) {
 }
 
 func TestResolveRecordsAndReportsCompletionFromMergedExpectedPullRequest(t *testing.T) {
-	fixture := newResolveFixture(t, []string{"in-progress", "spec"}, "COMPLETED")
-	current, err := fixture.store.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	branch := "agent/issue-42-run-42"
-	pullRequest := "https://github.com/acme/widgets/pull/9"
-	logPath := filepath.Join(fixture.stateDir, "run-42.jsonl")
-	if err := os.WriteFile(logPath, []byte("worker history\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	current.Runs[1].Status = scheduler.StatusWaitingForMerge
-	current.Runs[1].Branch = branch
-	current.Runs[1].Worktree = filepath.Join(fixture.stateDir, "worktrees", "issue-42-run-42")
-	current.Runs[1].PullRequest = pullRequest
-	current.Runs[1].LogPath = logPath
-	current.Runs[1].WorkerLogOpen = true
-	if err := fixture.store.Save(current); err != nil {
-		t.Fatal(err)
-	}
-	commit := strings.Repeat("a", 40)
-	fixture.git = writeExecutable(t, `#!/bin/sh
+	for _, test := range []struct{ name, reasonJSON string }{
+		{name: "missing closure reason", reasonJSON: "null"},
+		{name: "future closure reason", reasonJSON: `"FUTURE"`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newResolveFixture(t, []string{"in-progress", "spec"}, "COMPLETED")
+			current, err := fixture.store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			branch := "agent/issue-42-run-42"
+			pullRequest := "https://github.com/acme/widgets/pull/9"
+			logPath := filepath.Join(fixture.stateDir, "run-42.jsonl")
+			if err := os.WriteFile(logPath, []byte("worker history\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			current.Runs[1].Status = scheduler.StatusWaitingForMerge
+			current.Runs[1].Branch = branch
+			current.Runs[1].Worktree = filepath.Join(fixture.stateDir, "worktrees", "issue-42-run-42")
+			current.Runs[1].PullRequest = pullRequest
+			current.Runs[1].LogPath = logPath
+			current.Runs[1].WorkerLogOpen = true
+			if err := fixture.store.Save(current); err != nil {
+				t.Fatal(err)
+			}
+			commit := strings.Repeat("a", 40)
+			fixture.git = writeExecutable(t, `#!/bin/sh
 set -eu
 case "$*" in
   *" remote get-url origin") printf '%s\n' 'git@github.com:acme/widgets.git' ;;
@@ -289,7 +294,7 @@ case "$*" in
   *) exec git "$@" ;;
 esac
 `)
-	fixture.gh = writeExecutable(t, `#!/bin/sh
+			fixture.gh = writeExecutable(t, `#!/bin/sh
 set -eu
 case "$*" in
   "repo view --json nameWithOwner,defaultBranchRef")
@@ -297,30 +302,32 @@ case "$*" in
   "issue view 42 --repo acme/widgets --json number,url,state,labels")
     printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","labels":[{"name":"in-progress"},{"name":"spec"}]}' ;;
   "issue view 42 --repo acme/widgets --json number,url,state,stateReason")
-    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","stateReason":"COMPLETED"}' ;;
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","stateReason":`+test.reasonJSON+`}' ;;
   "pr list --repo acme/widgets --state all --head `+branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
     printf '%s\n' '[{"number":9,"url":"`+pullRequest+`","state":"MERGED","mergedAt":"2026-07-28T01:01:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"`+branch+`","headRefOid":"`+commit+`","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
 `)
 
-	var stdout, stderr bytes.Buffer
-	if err := resolveCommandWithInput(context.Background(), fixture.args("run-42", "--yes"), strings.NewReader(""), false, &stdout, &stderr); err != nil {
-		t.Fatalf("resolve Completion fallback: %v, stderr=%q, stdout=%q", err, stderr.String(), stdout.String())
-	}
-	if !strings.Contains(stdout.String(), "Completion recorded for Run run-42 from merged expected pull request "+pullRequest) || strings.Contains(stdout.String(), "External Resolution complete") {
-		t.Fatalf("Completion fallback output = %q", stdout.String())
-	}
-	persisted, err := fixture.store.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	run := persisted.Runs[1]
-	if run.Status != scheduler.StatusMerged || run.PullRequest != pullRequest || run.CompletedAt == nil || run.WorkerLogOpen || run.ResolvedExternallyAt != nil || run.ClosureReason != "" || len(persisted.Leases) != 0 {
-		t.Fatalf("Completion fallback state = %#v", persisted)
-	}
-	if !run.UpdatedAt.Equal(*run.CompletedAt) {
-		t.Fatalf("Completion timestamps = updated %s, completed %s", run.UpdatedAt, run.CompletedAt)
+			var stdout, stderr bytes.Buffer
+			if err := resolveCommandWithInput(context.Background(), fixture.args("run-42", "--yes"), strings.NewReader(""), false, &stdout, &stderr); err != nil {
+				t.Fatalf("resolve Completion fallback: %v, stderr=%q, stdout=%q", err, stderr.String(), stdout.String())
+			}
+			if !strings.Contains(stdout.String(), "Completion recorded for Run run-42 from merged expected pull request "+pullRequest) || strings.Contains(stdout.String(), "External Resolution complete") {
+				t.Fatalf("Completion fallback output = %q", stdout.String())
+			}
+			persisted, err := fixture.store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			run := persisted.Runs[1]
+			if run.Status != scheduler.StatusMerged || run.PullRequest != pullRequest || run.CompletedAt == nil || run.WorkerLogOpen || run.ResolvedExternallyAt != nil || run.ClosureReason != "" || len(persisted.Leases) != 0 {
+				t.Fatalf("Completion fallback state = %#v", persisted)
+			}
+			if !run.UpdatedAt.Equal(*run.CompletedAt) {
+				t.Fatalf("Completion timestamps = updated %s, completed %s", run.UpdatedAt, run.CompletedAt)
+			}
+		})
 	}
 }
 

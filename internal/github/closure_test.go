@@ -74,6 +74,37 @@ esac`)
 	}
 }
 
+func TestClientIssueClosureSeparatesVerifiedStateFromReasonSupport(t *testing.T) {
+	for _, test := range []struct {
+		name, response, wantReason, wantError string
+		wantOpen                              bool
+	}{
+		{name: "missing reason", response: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","stateReason":null}`},
+		{name: "future reason", response: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","stateReason":"FUTURE"}`, wantReason: "FUTURE"},
+		{name: "open", response: `{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","stateReason":null}`, wantOpen: true},
+		{name: "mismatched identity", response: `{"number":41,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","stateReason":null}`, wantError: "incomplete or mismatched issue identity/state"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			gh := fakeGH(t, `
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,stateReason") printf '%s\n' '`+test.response+`' ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+
+			got, err := (Client{Executable: gh}).IssueClosure(context.Background(), "acme/widgets", 42)
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("IssueClosure() = %#v, %v, want error containing %q", got, err, test.wantError)
+				}
+				return
+			}
+			if err != nil || got.Open != test.wantOpen || got.Reason != test.wantReason {
+				t.Fatalf("IssueClosure() = %#v, %v, want open=%t reason=%q", got, err, test.wantOpen, test.wantReason)
+			}
+		})
+	}
+}
+
 func TestInspectedClosureReasonSupportsGitHubReasons(t *testing.T) {
 	for _, test := range []struct {
 		state, raw, want string

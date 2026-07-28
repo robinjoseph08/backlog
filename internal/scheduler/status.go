@@ -61,7 +61,7 @@ func CanTransition(from, to Status) bool {
 	case StatusResetting:
 		return to == StatusReset || to == StatusResolvingExternally || to == StatusMerged
 	case StatusResolvingExternally:
-		return to == StatusResolvedExternally || to == StatusMerged
+		return to == StatusResetting || to == StatusReset || to == StatusResolvedExternally || to == StatusMerged
 	default:
 		return false
 	}

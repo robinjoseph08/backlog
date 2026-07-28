@@ -436,28 +436,72 @@ func (c Client) ownedPullRequestComments(ctx context.Context, repo string, numbe
 	return comments, nil
 }
 
+// IssueClosureState is a verified GitHub issue closure snapshot. Reason is
+// normalized when supported and otherwise retains a string value when one was
+// available. Callers decide whether closure-reason support is required for the
+// outcome they are planning.
+type IssueClosureState struct {
+	Open   bool
+	Reason string
+}
+
+type issueClosureResponse struct {
+	Number      int             `json:"number"`
+	URL         string          `json:"url"`
+	State       string          `json:"state"`
+	StateReason json.RawMessage `json:"stateReason"`
+}
+
+// IssueClosure verifies exact issue identity and open/closed state without
+// making closure-reason support a prerequisite for observing that state.
+func (c Client) IssueClosure(ctx context.Context, repo string, issueNumber int) (IssueClosureState, error) {
+	issue, err := c.inspectIssueClosure(ctx, repo, issueNumber)
+	if err != nil {
+		return IssueClosureState{}, err
+	}
+	if strings.EqualFold(issue.State, "open") {
+		if _, err := inspectedClosureReason(issue.State, issue.StateReason); err != nil {
+			return IssueClosureState{}, fmt.Errorf("inspect issue closure: %w", err)
+		}
+		return IssueClosureState{Open: true}, nil
+	}
+	var reason string
+	if json.Unmarshal(issue.StateReason, &reason) == nil {
+		switch strings.ToUpper(reason) {
+		case "COMPLETED":
+			reason = "completed"
+		case "NOT_PLANNED":
+			reason = "not-planned"
+		}
+	}
+	return IssueClosureState{Reason: reason}, nil
+}
+
 // IssueClosureReason verifies a closed issue and returns one of GitHub's
 // supported closure reasons. Open, unavailable, and unknown state fail closed.
 func (c Client) IssueClosureReason(ctx context.Context, repo string, issueNumber int) (string, error) {
-	var issue struct {
-		Number      int             `json:"number"`
-		URL         string          `json:"url"`
-		State       string          `json:"state"`
-		StateReason json.RawMessage `json:"stateReason"`
-	}
-	if err := c.jsonCommand(ctx, &issue, "issue", "view", fmt.Sprint(issueNumber), "--repo", repo,
-		"--json", "number,url,state,stateReason"); err != nil {
-		return "", fmt.Errorf("inspect issue closure: %w", err)
-	}
-	if issue.Number != issueNumber || !resourceURLMatches(issue.URL, repo, "issues", issueNumber) ||
-		(!strings.EqualFold(issue.State, "open") && !strings.EqualFold(issue.State, "closed")) {
-		return "", errors.New("inspect issue closure: gh returned incomplete or mismatched issue identity/state")
+	issue, err := c.inspectIssueClosure(ctx, repo, issueNumber)
+	if err != nil {
+		return "", err
 	}
 	reason, err := inspectedClosureReason(issue.State, issue.StateReason)
 	if err != nil {
 		return "", fmt.Errorf("inspect issue closure: %w", err)
 	}
 	return reason, nil
+}
+
+func (c Client) inspectIssueClosure(ctx context.Context, repo string, issueNumber int) (issueClosureResponse, error) {
+	var issue issueClosureResponse
+	if err := c.jsonCommand(ctx, &issue, "issue", "view", fmt.Sprint(issueNumber), "--repo", repo,
+		"--json", "number,url,state,stateReason"); err != nil {
+		return issue, fmt.Errorf("inspect issue closure: %w", err)
+	}
+	if issue.Number != issueNumber || !resourceURLMatches(issue.URL, repo, "issues", issueNumber) ||
+		(!strings.EqualFold(issue.State, "open") && !strings.EqualFold(issue.State, "closed")) {
+		return issue, errors.New("inspect issue closure: gh returned incomplete or mismatched issue identity/state")
+	}
+	return issue, nil
 }
 
 func inspectedClosureReason(issueState string, raw json.RawMessage) (string, error) {

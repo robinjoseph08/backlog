@@ -101,19 +101,35 @@ func TestPolicyRefusesArtifactRichRunsWithoutPlanningDestructiveActions(t *testi
 	}
 }
 
-func TestMergedExpectedPullRequestPlansCompletion(t *testing.T) {
+func TestMergedExpectedPullRequestPlansCompletionBeforeClosureReasonEligibility(t *testing.T) {
+	for _, test := range []struct{ name, reason string }{{"missing", ""}, {"future", "future"}} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := retirement.Snapshot{
+				Run:          scheduler.Run{Issue: 42, RunID: "run", Status: scheduler.StatusWaitingForMerge, PullRequest: "https://github.com/acme/widgets/pull/9", Branch: "agent/run"},
+				Lease:        scheduler.Lease{LeaseID: "lease", Issue: 42, RunID: "run"},
+				Issue:        retirement.Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", ClosureReason: test.reason},
+				PullRequests: []retirement.PullRequest{{Number: 9, URL: "https://github.com/acme/widgets/pull/9", Branch: "agent/run", Commit: strings.Repeat("a", 40), State: retirement.PullRequestMerged}},
+			}
+			plan, err := retirement.Build(Policy("run"), snapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if plan.TerminalState != scheduler.StatusMerged || len(plan.Actions) != 1 || !strings.Contains(plan.Actions[0].String(), "record Completion") {
+				t.Fatalf("Completion plan = %#v", plan)
+			}
+		})
+	}
+}
+
+func TestMergedExpectedPullRequestStillRequiresClosedIssue(t *testing.T) {
 	snapshot := retirement.Snapshot{
 		Run:          scheduler.Run{Issue: 42, RunID: "run", Status: scheduler.StatusWaitingForMerge, PullRequest: "https://github.com/acme/widgets/pull/9", Branch: "agent/run"},
 		Lease:        scheduler.Lease{LeaseID: "lease", Issue: 42, RunID: "run"},
-		Issue:        retirement.Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", ClosureReason: "completed"},
+		Issue:        retirement.Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", Open: true},
 		PullRequests: []retirement.PullRequest{{Number: 9, URL: "https://github.com/acme/widgets/pull/9", Branch: "agent/run", Commit: strings.Repeat("a", 40), State: retirement.PullRequestMerged}},
 	}
-	plan, err := retirement.Build(Policy("run"), snapshot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if plan.TerminalState != scheduler.StatusMerged || len(plan.Actions) != 1 || !strings.Contains(plan.Actions[0].String(), "record Completion") {
-		t.Fatalf("Completion plan = %#v", plan)
+	if _, err := retirement.Build(Policy("run"), snapshot); err == nil || !strings.Contains(err.Error(), "Completion requires a verified GitHub closure") {
+		t.Fatalf("open issue Completion error = %v", err)
 	}
 }
 
