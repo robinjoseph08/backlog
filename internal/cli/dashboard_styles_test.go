@@ -66,6 +66,54 @@ func TestDashboardStylingUsesTypedRunSemanticsWithoutChangingLabels(t *testing.T
 	}
 }
 
+func TestDashboardAdmissionStylingUsesHealthSemanticsWithoutChangingLabels(t *testing.T) {
+	styler := newDashboardStyler(TerminalColorTrueColor, true)
+	now := time.Date(2026, 7, 28, 1, 0, 0, 0, time.UTC)
+	degraded := dashboardAdmission{
+		degraded: true, consecutiveFailures: 2,
+		firstFailure: now.Add(-time.Minute), latestFailure: now, retryAt: now.Add(30 * time.Second),
+		operation: runner.CandidateDiscoveryList, cause: "connection refused",
+		equivalentFailures: map[string]int{string(runner.CandidateDiscoveryList) + "\x00connection refused": 2},
+	}
+
+	var styled, plain strings.Builder
+	renderAdmissionHealth(&styled, degraded, false, dashboardRunning, now, styler)
+	renderAdmissionHealth(&plain, degraded, false, dashboardRunning, now, dashboardStyler{})
+	if stripped := ansi.Strip(styled.String()); stripped != plain.String() {
+		t.Fatalf("Admission styling changed semantic labels:\n%s", stripped)
+	}
+	for _, want := range []string{
+		styler.warning.Render("Admission health"),
+		styler.warning.Render("  Admission: DEGRADED | 2 consecutive failures"),
+		styler.warning.Render("    Cause: connection refused | Equivalent failures: 2"),
+		styler.metadata.Render("    First failure: 2026-07-28T00:59:00Z | Latest failure: 2026-07-28T01:00:00Z | Next retry: 30s"),
+		styler.metadata.Render("  Diagnostics: closed (d to open; 0 recent)"),
+	} {
+		if !strings.Contains(styled.String(), want) {
+			t.Fatalf("styled degraded Admission omitted semantic span %q: %q", ansi.Strip(want), styled.String())
+		}
+	}
+
+	var checking strings.Builder
+	renderAdmissionHealth(&checking, dashboardAdmission{}, false, dashboardRunning, now, styler)
+	for _, want := range []string{styler.metadata.Render("Admission health"), styler.metadata.Render("  Admission: checking | Candidate snapshot not yet complete")} {
+		if !strings.Contains(checking.String(), want) {
+			t.Fatalf("styled checking Admission omitted metadata span %q: %q", ansi.Strip(want), checking.String())
+		}
+	}
+	if strings.Contains(ansi.Strip(checking.String()), "Admission: healthy") {
+		t.Fatalf("styled checking Admission claimed unverified health: %q", checking.String())
+	}
+
+	var healthy strings.Builder
+	renderAdmissionHealth(&healthy, dashboardAdmission{snapshotComplete: true}, false, dashboardRunning, now, styler)
+	for _, want := range []string{styler.active.Render("Admission health"), styler.active.Render("  Admission: healthy")} {
+		if !strings.Contains(healthy.String(), want) {
+			t.Fatalf("styled healthy Admission omitted active span %q: %q", ansi.Strip(want), healthy.String())
+		}
+	}
+}
+
 func TestResponsiveDashboardSectionKeepsTypedSemanticWhenHeadingChanges(t *testing.T) {
 	styler := newDashboardStyler(TerminalColorTrueColor, true)
 	body := dashboardBodyBuilder{}
@@ -272,6 +320,7 @@ func TestDashboardOperationalMessagesUseTypedEventSemantics(t *testing.T) {
 		style    lipgloss.Style
 	}{
 		{event: runner.CandidateDiscoveryFailed{}, semantic: dashboardSemanticWarning, style: styler.warning},
+		{event: runner.CandidateSnapshotCompleted{}, semantic: dashboardSemanticActive, style: styler.active},
 		{event: runner.CandidateDiscoveryRecovered{}, semantic: dashboardSemanticActive, style: styler.active},
 		{event: runner.RunLifecycleEvent{Stage: runner.RunLifecycleClaimed}, semantic: dashboardSemanticActive, style: styler.active},
 		{event: runner.RunLifecycleEvent{Stage: runner.RunLifecycleStarted}, semantic: dashboardSemanticActive, style: styler.active},

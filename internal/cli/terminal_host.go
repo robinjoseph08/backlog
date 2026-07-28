@@ -119,13 +119,17 @@ func (e *PresentationFailure) Unwrap() []error {
 	return []error{e.Err, e.RunnerErr}
 }
 
-const presentationEventLimit = 32
+const (
+	presentationEventLimit            = 32
+	presentationAdmissionFailureLimit = 20
+)
 
 type presentationEventQueue struct {
-	mu       sync.Mutex
-	events   []runner.OperationalEvent
-	inFlight int
-	wake     chan struct{}
+	mu                        sync.Mutex
+	events                    []runner.OperationalEvent
+	inFlight                  int
+	evictedFailureOccurrences map[string]int
+	wake                      chan struct{}
 }
 
 func newPresentationEventQueue() *presentationEventQueue {
@@ -134,7 +138,20 @@ func newPresentationEventQueue() *presentationEventQueue {
 
 func (q *presentationEventQueue) publish(event runner.OperationalEvent) {
 	q.mu.Lock()
+	switch typed := event.(type) {
+	case runner.CandidateDiscoveryFailed:
+		key := presentationFailureKey(typed)
+		if occurrences := takeAdmissionOccurrences(q.evictedFailureOccurrences, key); occurrences > 0 {
+			typed.Occurrences = presentationFailureOccurrences(typed) + occurrences
+			event = typed
+		}
+	case runner.CandidateSnapshotCompleted, runner.CandidateDiscoveryRecovered:
+		clear(q.evictedFailureOccurrences)
+	}
 	q.events = append(q.events, event)
+	for presentationAdmissionFailureCount(q.events) > presentationAdmissionFailureLimit {
+		q.remove(oldestPresentationAdmissionFailure(q.events))
+	}
 	for len(q.events) > presentationEventLimit {
 		q.remove(presentationEventEvictionIndex(q.events))
 	}
@@ -145,12 +162,31 @@ func (q *presentationEventQueue) publish(event runner.OperationalEvent) {
 	}
 }
 
+func presentationAdmissionFailureCount(events []runner.OperationalEvent) int {
+	count := 0
+	for _, event := range events {
+		if _, ok := event.(runner.CandidateDiscoveryFailed); ok {
+			count++
+		}
+	}
+	return count
+}
+
+func oldestPresentationAdmissionFailure(events []runner.OperationalEvent) int {
+	for index, event := range events {
+		if _, ok := event.(runner.CandidateDiscoveryFailed); ok {
+			return index
+		}
+	}
+	return 0
+}
+
 // presentationEventEvictionIndex prefers obsolete progress, then the oldest
 // nonterminal state. This retains a recent ordered lifecycle window and never
 // trades a terminal shutdown result for optional progress.
 func presentationEventEvictionIndex(events []runner.OperationalEvent) int {
 	for index, event := range events {
-		if presentationEventIsTerminal(event) {
+		if presentationEventIsTerminal(event) || presentationEventIsLatestAdmissionTransition(events, index) {
 			continue
 		}
 		if presentationEventIsSuperseded(events, index) {
@@ -158,11 +194,31 @@ func presentationEventEvictionIndex(events []runner.OperationalEvent) int {
 		}
 	}
 	for index, event := range events {
-		if !presentationEventIsTerminal(event) {
+		if !presentationEventIsTerminal(event) && !presentationEventIsLatestAdmissionTransition(events, index) {
+			return index
+		}
+	}
+	for index := range events {
+		if !presentationEventIsLatestAdmissionTransition(events, index) {
 			return index
 		}
 	}
 	return 0
+}
+
+func presentationEventIsLatestAdmissionTransition(events []runner.OperationalEvent, index int) bool {
+	switch events[index].(type) {
+	case runner.CandidateSnapshotCompleted, runner.CandidateDiscoveryFailed, runner.CandidateDiscoveryRecovered:
+	default:
+		return false
+	}
+	for _, later := range events[index+1:] {
+		switch later.(type) {
+		case runner.CandidateSnapshotCompleted, runner.CandidateDiscoveryFailed, runner.CandidateDiscoveryRecovered:
+			return false
+		}
+	}
+	return true
 }
 
 func presentationEventIsSuperseded(events []runner.OperationalEvent, index int) bool {
@@ -172,7 +228,7 @@ func presentationEventIsSuperseded(events []runner.OperationalEvent, index int) 
 			switch later.(type) {
 			case runner.CandidateDiscoveryFailed:
 				return true
-			case runner.CandidateDiscoveryRecovered:
+			case runner.CandidateSnapshotCompleted, runner.CandidateDiscoveryRecovered:
 				return false
 			}
 		}
@@ -205,9 +261,54 @@ func presentationEventIsTerminal(event runner.OperationalEvent) bool {
 }
 
 func (q *presentationEventQueue) remove(index int) {
+	q.preserveFailureOccurrences(index)
 	copy(q.events[index:], q.events[index+1:])
 	q.events[len(q.events)-1] = nil
 	q.events = q.events[:len(q.events)-1]
+}
+
+func (q *presentationEventQueue) preserveFailureOccurrences(index int) {
+	evicted, ok := q.events[index].(runner.CandidateDiscoveryFailed)
+	if !ok {
+		return
+	}
+	key := presentationFailureKey(evicted)
+	for later := index + 1; later < len(q.events); later++ {
+		switch event := q.events[later].(type) {
+		case runner.CandidateSnapshotCompleted, runner.CandidateDiscoveryRecovered:
+			return
+		case runner.CandidateDiscoveryFailed:
+			if presentationFailureKey(event) != key {
+				continue
+			}
+			event.Occurrences = presentationFailureOccurrences(event) + presentationFailureOccurrences(evicted)
+			if event.FirstFailureAt.IsZero() || (!evicted.FirstFailureAt.IsZero() && evicted.FirstFailureAt.Before(event.FirstFailureAt)) {
+				event.FirstFailureAt = evicted.FirstFailureAt
+			}
+			q.events[later] = event
+			return
+		}
+	}
+	q.evictedFailureOccurrences = retainAdmissionOccurrences(
+		q.evictedFailureOccurrences,
+		key,
+		presentationFailureOccurrences(evicted),
+	)
+}
+
+func presentationFailureOccurrences(failure runner.CandidateDiscoveryFailed) int {
+	if failure.Occurrences > 0 {
+		return failure.Occurrences
+	}
+	return 1
+}
+
+func presentationFailureKey(failure runner.CandidateDiscoveryFailed) string {
+	cause := normalizedDashboardMessage(failure.Cause)
+	if cause == "" && failure.Err != nil {
+		cause = normalizedDashboardMessage(failure.Err.Error())
+	}
+	return string(failure.Operation) + "\x00" + cause
 }
 
 func (q *presentationEventQueue) pop() runner.OperationalEvent {

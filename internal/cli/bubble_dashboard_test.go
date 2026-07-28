@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -67,6 +68,7 @@ func assertBubbleDashboardFits(t *testing.T, model bubbleDashboardModel, width, 
 		{name: "Worker capacity", variants: []string{"Worker capacity:", "W:"}},
 		{name: "Runner stage", variants: []string{"Runner stage: Running", "S:Running"}},
 		{name: "next Ctrl-C", variants: []string{"Next Ctrl-C: start Drain", "^C:start Drain"}},
+		{name: "Diagnostics help", variants: []string{"d:Diagnostics", "a d Ent"}},
 	} {
 		found := false
 		for _, variant := range expected.variants {
@@ -87,18 +89,31 @@ func assertBubbleDashboardFits(t *testing.T, model bubbleDashboardModel, width, 
 	}
 }
 
-func TestBubbleDashboardInitialFrameShowsCapacityPendingUntilConfigured(t *testing.T) {
+func TestBubbleDashboardShowsAdmissionCheckingThroughSetupUntilSnapshotCompletes(t *testing.T) {
 	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: time.Now}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 12})
 	initial := ansi.Strip(model.View().Content)
 	if !strings.Contains(initial, "Worker capacity: pending configuration") || strings.Contains(initial, "Worker capacity: 0 used | 0 available | 0 total") {
 		t.Fatalf("initial capacity was not pending configuration:\n%s", initial)
 	}
+	if !strings.Contains(initial, "Admission: checking | Candidate snapshot not yet complete") || strings.Contains(initial, "Admission: healthy") {
+		t.Fatalf("startup Admission claimed health before a Candidate snapshot completed:\n%s", initial)
+	}
 
 	configured := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 3}
 	updated, _ := model.Update(dashboardConfiguredMsg{initial: configured, source: &dashboardTestSource{current: configured}})
-	configuredView := ansi.Strip(updated.(bubbleDashboardModel).View().Content)
+	model = updated.(bubbleDashboardModel)
+	configuredView := ansi.Strip(model.View().Content)
 	if !strings.Contains(configuredView, "Worker capacity: 0 used | 3 available | 3 total") || strings.Contains(configuredView, "pending configuration") {
 		t.Fatalf("configured capacity was not rendered:\n%s", configuredView)
+	}
+	if !strings.Contains(configuredView, "Admission: checking | Candidate snapshot not yet complete") || strings.Contains(configuredView, "Admission: healthy") {
+		t.Fatalf("setup configuration falsely established Admission health:\n%s", configuredView)
+	}
+
+	updated, _ = model.Update(dashboardOperationalMsg{event: runner.CandidateSnapshotCompleted{OccurredAt: time.Now()}})
+	completedView := ansi.Strip(updated.(bubbleDashboardModel).View().Content)
+	if !strings.Contains(completedView, "Admission: healthy") || strings.Contains(completedView, "Admission: checking") || strings.Contains(completedView, "Recovered") {
+		t.Fatalf("first complete Candidate snapshot did not establish immediate health:\n%s", completedView)
 	}
 }
 
@@ -113,6 +128,7 @@ func TestBubbleDashboardElapsedTickAdvancesAndReschedulesWithoutExternalUpdates(
 	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return clock }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 16})
 	model.dashboard.source = &dashboardTestSource{current: current}
 	model.dashboard.update(current)
+	model.refreshViewport(model.currentSelection())
 	if initial := ansi.Strip(model.View().Content); !strings.Contains(initial, "Elapsed: 5s") {
 		t.Fatalf("initial Bubble Tea elapsed value missing:\n%s", initial)
 	}
@@ -128,6 +144,33 @@ func TestBubbleDashboardElapsedTickAdvancesAndReschedulesWithoutExternalUpdates(
 	}
 	if _, ok := command().(dashboardElapsedMsg); !ok {
 		t.Fatal("elapsed tick successor did not emit dashboardElapsedMsg")
+	}
+}
+
+func TestBubbleDashboardTogglesAdmissionDiagnosticsWithDWithoutScrolling(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 100, Height: 14})
+	for failure := 1; failure <= 8; failure++ {
+		model.dashboard.operationalEvent(runner.CandidateDiscoveryFailed{
+			Operation: runner.CandidateDiscoveryList, Err: fmt.Errorf("gh issue list --repo acme/widgets: connection refused %d", failure), Cause: "connection refused",
+			OccurredAt: now, RetryAt: now.Add(30 * time.Second), ConsecutiveFailures: failure,
+		})
+	}
+	if view := ansi.Strip(model.View().Content); strings.Contains(view, "gh issue list") {
+		t.Fatalf("closed Diagnostics exposed full command:\n%s", view)
+	}
+	updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}))
+	model = updated.(bubbleDashboardModel)
+	if view := ansi.Strip(model.View().Content); !strings.Contains(view, "Diagnostics (8 recent Candidate discovery failure records; d to close)") || !strings.Contains(model.viewport.GetContent(), "gh issue list") {
+		t.Fatalf("d did not open Diagnostics:\n%s", view)
+	}
+	if !model.viewport.AtTop() {
+		t.Fatalf("d also scrolled the viewport to offset %d", model.viewport.YOffset())
+	}
+	updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}))
+	model = updated.(bubbleDashboardModel)
+	if view := ansi.Strip(model.View().Content); strings.Contains(view, "gh issue list") {
+		t.Fatalf("second d did not close Diagnostics:\n%s", view)
 	}
 }
 
@@ -235,8 +278,8 @@ func TestBubbleDashboardKeyboardNavigationSelectsCollapsedSectionWhenContentFits
 		{name: "k", key: tea.Key{Code: 'k', Text: "k"}, want: dashboardSectionAnchor("Active Runs")},
 		{name: "Page Down", key: tea.Key{Code: tea.KeyPgDown}, want: dashboardSectionAnchor("Recent Completions")},
 		{name: "f", key: tea.Key{Code: 'f', Text: "f"}, want: dashboardSectionAnchor("Recent Completions")},
-		{name: "Page Up", key: tea.Key{Code: tea.KeyPgUp}, want: dashboardSectionAnchor("Active Runs")},
-		{name: "b", key: tea.Key{Code: 'b', Text: "b"}, want: dashboardSectionAnchor("Active Runs")},
+		{name: "Page Up", key: tea.Key{Code: tea.KeyPgUp}, want: dashboardSectionAnchor("Admission health")},
+		{name: "b", key: tea.Key{Code: 'b', Text: "b"}, want: dashboardSectionAnchor("Admission health")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			model := newModel()
@@ -358,6 +401,196 @@ func TestBubbleDashboardPreservesSelectedRunAcrossLiveProjectionChanges(t *testi
 	current.Leases = current.Leases[1:]
 	source.current = current
 	assertStable("Completion", dashboardStateMsg(current))
+}
+
+func TestBubbleDashboardPreservesSelectedRunAcrossAdmissionChanges(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	current := navigationTestState(now, 7)
+	model := configuredNavigationTestModel(t, now, current, &dashboardTestSource{current: current})
+	selected := dashboardRunAnchor("run-4")
+	model.selectedAnchor = selected
+	model.refreshViewport(dashboardSelection{identity: selected, relative: model.dashboardBodyStart() + 1, valid: true})
+	wantSelection := model.currentSelection()
+	if !wantSelection.valid || wantSelection.identity != selected {
+		t.Fatalf("selected anchor = %#v, want %q", wantSelection, selected)
+	}
+
+	assertStable := func(name string, msg tea.Msg, bodyText string) {
+		t.Helper()
+		updated, _ := model.Update(msg)
+		model = updated.(bubbleDashboardModel)
+		if selection := model.currentSelection(); selection != wantSelection {
+			t.Fatalf("%s selection = %#v, want %#v", name, selection, wantSelection)
+		}
+		if body := model.viewport.GetContent(); !strings.Contains(body, bodyText) {
+			t.Fatalf("%s did not update Admission content with %q:\n%s", name, bodyText, body)
+		}
+	}
+
+	failure := runner.CandidateDiscoveryFailed{
+		Operation: runner.CandidateDiscoveryList,
+		Err:       errors.New("gh issue list: connection refused"), Cause: "connection refused",
+		FirstFailureAt: now, OccurredAt: now, RetryAt: now.Add(30 * time.Second), ConsecutiveFailures: 1,
+	}
+	assertStable("failure", dashboardOperationalMsg{event: failure}, "Admission: DEGRADED")
+	assertStable("Diagnostics toggle", tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}), "Full error/command (page 1/1): candidate discovery failed")
+	assertStable("recovery", dashboardOperationalMsg{event: runner.CandidateDiscoveryRecovered{OccurredAt: now.Add(time.Second), Failures: 1}}, "Admission: healthy | Recovered")
+}
+
+func TestBubbleDashboardPagesFullDiagnosticsWithBoundedTickAndResizeWork(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	model := newBubbleDashboardModel(
+		context.Background(),
+		PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}},
+		newBubbleDashboardSession(time.Now),
+		TerminalDimensions{Width: 80, Height: 24},
+	)
+	for failure := 1; failure <= dashboardDiagnosticLimit; failure++ {
+		tail := fmt.Sprintf("complete multibyte diagnostic tail 界%02d", failure)
+		evidence := strings.Repeat(fmt.Sprintf("oversized evidence %02d ", failure), (64<<10)/22) + tail
+		updated, _ := model.Update(dashboardOperationalMsg{event: runner.CandidateDiscoveryFailed{
+			Operation: runner.CandidateDiscoveryList, Err: errors.New(evidence), Cause: "oversized evidence",
+			OccurredAt: now.Add(time.Duration(failure) * time.Second), RetryAt: now.Add(time.Minute),
+			ConsecutiveFailures: failure, Occurrences: 1,
+		}})
+		model = updated.(bubbleDashboardModel)
+	}
+	updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}))
+	model = updated.(bubbleDashboardModel)
+
+	content := ansi.Strip(model.viewport.GetContent())
+	if len(content) > dashboardDiagnosticPageByteLimit+(12<<10) {
+		t.Fatalf("open Diagnostics viewport bytes = %d, want one bounded evidence page plus dashboard chrome", len(content))
+	}
+	if strings.Contains(content, "complete multibyte diagnostic tail 界20") {
+		t.Fatal("first bounded evidence page unexpectedly contained the oversized record tail")
+	}
+	diagnostic := model.dashboard.admission.failures[dashboardDiagnosticLimit-1]
+	pages := len(diagnostic.pageStarts)
+	var complete strings.Builder
+	for page := range pages {
+		chunk := diagnostic.page(page)
+		if len(chunk) > dashboardDiagnosticPageByteLimit+3 || !utf8.ValidString(chunk) {
+			t.Fatalf("evidence page %d is invalid or %d bytes, want bounded valid UTF-8", page+1, len(chunk))
+		}
+		complete.WriteString(chunk)
+	}
+	if complete.String() != diagnostic.evidence {
+		t.Fatal("paged retrieval lost or duplicated full diagnostic evidence")
+	}
+	for page := 1; page < pages; page++ {
+		updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: '.', Text: "."}))
+		model = updated.(bubbleDashboardModel)
+	}
+	if content = ansi.Strip(model.viewport.GetContent()); !utf8.ValidString(content) || !strings.Contains(content, "complete multibyte diagnostic tail 界20") || !strings.Contains(content, fmt.Sprintf("Evidence page %d/%d", pages, pages)) {
+		t.Fatalf("paged Diagnostics did not retrieve the complete oversized evidence tail:\n%s", content)
+	}
+
+	activityAllocs := testing.AllocsPerRun(20, func() {
+		updated, _ := model.Update(dashboardActivityMsg(now))
+		model = updated.(bubbleDashboardModel)
+		_ = model.View()
+	})
+	if activityAllocs > 1500 {
+		t.Fatalf("unchanged activity Update+View allocations = %.0f, want at most 1500", activityAllocs)
+	}
+	width := 79
+	resizeAllocs := testing.AllocsPerRun(10, func() {
+		updated, _ := model.Update(tea.WindowSizeMsg{Width: width, Height: 24})
+		model = updated.(bubbleDashboardModel)
+		_ = model.View()
+		width = 159 - width
+	})
+	if resizeAllocs > 2500 {
+		t.Fatalf("Diagnostics resize Update+View allocations = %.0f, want at most 2500", resizeAllocs)
+	}
+	shutdownAllocs := testing.AllocsPerRun(5, func() {
+		updated, _ := model.Update(dashboardOperationalMsg{event: runner.ShutdownEvent{Stage: runner.ShutdownStageDraining}})
+		model = updated.(bubbleDashboardModel)
+		_ = model.View()
+	})
+	if shutdownAllocs > 2500 {
+		t.Fatalf("Diagnostics shutdown Update+View allocations = %.0f, want at most 2500", shutdownAllocs)
+	}
+	if content = ansi.Strip(model.viewport.GetContent()); len(content) > dashboardDiagnosticPageByteLimit+(12<<10) || !strings.Contains(content, "Retry: stopped") {
+		t.Fatalf("shutdown lost bounded Diagnostics or stopped retry state: bytes=%d\n%s", len(content), content)
+	}
+}
+
+func TestBubbleDashboardPreservesDownstreamSelectionAcrossStyledDiagnosticsChanges(t *testing.T) {
+	profiles := []struct {
+		name    string
+		profile TerminalColorProfile
+	}{
+		{name: "no color", profile: TerminalColorNone},
+		{name: "ANSI", profile: TerminalColorANSI},
+		{name: "ANSI 256", profile: TerminalColorANSI256},
+		{name: "true color", profile: TerminalColorTrueColor},
+	}
+	for _, test := range profiles {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+			current := navigationTestState(now, 10)
+			model := configuredNavigationTestModel(t, now, current, &dashboardTestSource{current: current})
+			model.styler = newDashboardStyler(test.profile, true)
+			for failure := 1; failure <= dashboardDiagnosticLimit; failure++ {
+				updated, _ := model.Update(dashboardOperationalMsg{event: runner.CandidateDiscoveryFailed{
+					Operation: runner.CandidateDiscoveryList,
+					Err:       fmt.Errorf("gh issue list: long diagnostic %02d %s", failure, strings.Repeat("wrapped evidence ", 8)),
+					Cause:     "connection refused", FirstFailureAt: now,
+					OccurredAt: now.Add(time.Duration(failure) * time.Second), RetryAt: now.Add(time.Minute),
+					ConsecutiveFailures: failure, Occurrences: 1,
+				}})
+				model = updated.(bubbleDashboardModel)
+			}
+			updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}))
+			model = updated.(bubbleDashboardModel)
+
+			selected := dashboardRunAnchor("run-5")
+			line, exists := model.anchorVisualLine(selected)
+			if !exists {
+				t.Fatalf("selected downstream Run anchor %q missing", selected)
+			}
+			model.viewport.SetYOffset(line)
+			model.selectViewportAnchor()
+			wantSelection := model.currentSelection()
+			if !wantSelection.valid || wantSelection.identity != selected {
+				t.Fatalf("selected anchor = %#v, want %q", wantSelection, selected)
+			}
+			model.refreshViewport(wantSelection)
+
+			assertStable := func(name string, msg tea.Msg) {
+				t.Helper()
+				beforeLine := dashboardVisibleLine(t, model.View().Content, "> #6")
+				updated, _ := model.Update(msg)
+				model = updated.(bubbleDashboardModel)
+				selection := model.currentSelection()
+				if !selection.valid || selection.identity != selected {
+					t.Fatalf("%s selection = %#v, want identity %q", name, selection, selected)
+				}
+				wantLine := max(beforeLine, model.dashboardBodyStart())
+				if got := dashboardVisibleLine(t, model.View().Content, "> #6"); got != wantLine {
+					t.Fatalf("%s moved selected downstream Run from screen line %d to %d, want %d", name, beforeLine, got, wantLine)
+				}
+			}
+
+			assertStable("narrow resize", tea.WindowSizeMsg{Width: 44, Height: 24})
+			assertStable("wide resize", tea.WindowSizeMsg{Width: 120, Height: 24})
+			assertStable("new failure", dashboardOperationalMsg{event: runner.CandidateDiscoveryFailed{
+				Operation: runner.CandidateDiscoveryList,
+				Err:       errors.New("gh issue list: latest diagnostic after navigation"), Cause: "connection refused",
+				FirstFailureAt: now, OccurredAt: now.Add(21 * time.Second), RetryAt: now.Add(time.Minute),
+				ConsecutiveFailures: 21, Occurrences: 1,
+			}})
+			if body := ansi.Strip(model.viewport.GetContent()); !strings.Contains(body, "latest diagnostic after navigation") || strings.Contains(body, "long diagnostic 01") {
+				t.Fatalf("bounded Diagnostics did not retain the latest twenty entries:\n%s", body)
+			}
+			assertStable("drawer close", tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}))
+			if body := ansi.Strip(model.viewport.GetContent()); strings.Contains(body, "latest diagnostic after navigation") || !strings.Contains(body, "Diagnostics: closed") {
+				t.Fatalf("closed Diagnostics retained full evidence:\n%s", body)
+			}
+		})
+	}
 }
 
 func TestBubbleDashboardKeepsSelectedRunWhenItBecomesACompletion(t *testing.T) {
@@ -540,7 +773,7 @@ func TestBubbleDashboardMarksAndJumpsToNewOffscreenAttention(t *testing.T) {
 	if want := model.styler.attention.Render("NEW ATTENTION (1): press a"); !strings.Contains(rendered, want) {
 		t.Fatalf("offscreen Attention marker did not use Attention styling: %q", rendered)
 	}
-	for _, want := range []string{"Next Ctrl-C:", "Nav:", "a:Attention"} {
+	for _, want := range []string{"Next Ctrl-C:", "Nav:", "d:Diagnostics", "a:Attention"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("fixed footer omitted %q:\n%s", want, view)
 		}
@@ -603,6 +836,10 @@ func TestBubbleDashboardClearsPendingAttentionWhenRefreshRevealsRun(t *testing.T
 			current := navigationTestState(now, 8)
 			source := &dashboardTestSource{current: current}
 			model := configuredNavigationTestModel(t, now, current, source)
+			if refresh == "state update" {
+				updated, _ := model.Update(tea.WindowSizeMsg{Width: 64, Height: 17})
+				model = updated.(bubbleDashboardModel)
+			}
 			attention := scheduler.Run{Issue: 100, IssueTitle: "Operator decision", RunID: "attention-new", Status: scheduler.StatusNeedsHuman, StartedAt: now, UpdatedAt: now, Error: "inspect outcome"}
 			current.Runs = append(current.Runs, attention)
 			current.Leases = append(current.Leases, scheduler.Lease{LeaseID: attention.RunID, Issue: attention.Issue, RunID: attention.RunID})
@@ -733,10 +970,15 @@ func TestBubbleDashboardSessionSafelyDeliversStateOutputAndOperationalEvents(t *
 	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
 	session.configure(current, &dashboardTestSource{current: current})
 	session.stateSaved(current)
-	if _, err := io.WriteString(session, "candidate discovery failed\n"); err != nil {
+	if _, err := io.WriteString(session, "persist runner state failed\n"); err != nil {
 		t.Fatal(err)
 	}
 	events := newPresentationEventQueue()
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	events.publish(runner.CandidateDiscoveryFailed{
+		Operation: runner.CandidateDiscoveryList, Err: errors.New("gh issue list: unavailable"), Cause: "unavailable",
+		OccurredAt: now, RetryAt: now.Add(30 * time.Second), ConsecutiveFailures: 1,
+	})
 	events.publish(runner.ShutdownEvent{Stage: runner.ShutdownStageDraining, Message: "Drain accepted"})
 	control := PresentationControl{Terminal: PresentationTerminal{Now: time.Now}, operationalEvents: events}
 	model := newBubbleDashboardModel(context.Background(), control, session, TerminalDimensions{Width: 80, Height: 20})
@@ -748,16 +990,22 @@ func TestBubbleDashboardSessionSafelyDeliversStateOutputAndOperationalEvents(t *
 		updated, _ := model.Update(msg)
 		model = updated.(bubbleDashboardModel)
 	}
-	operational := model.waitForOperationalEvent()()
+	admission := model.waitForOperationalEvent()()
 	updated, _ := model.Update(dashboardFlushMsg{acknowledged: make(chan struct{})})
 	model = updated.(bubbleDashboardModel)
 	if len(model.pendingFlushes) != 1 {
 		t.Fatal("final render flush did not wait for the in-flight operational event")
 	}
-	updated, _ = model.Update(operational)
+	updated, _ = model.Update(admission)
+	model = updated.(bubbleDashboardModel)
+	if len(model.pendingFlushes) != 1 {
+		t.Fatal("final render flush resumed before the queued shutdown event")
+	}
+	shutdown := model.waitForOperationalEvent()()
+	updated, _ = model.Update(shutdown)
 	model = updated.(bubbleDashboardModel)
 	if len(model.pendingFlushes) != 0 || !events.idle() {
-		t.Fatal("final render flush did not resume after the operational event was applied")
+		t.Fatal("final render flush did not resume after all operational events were applied")
 	}
 	view := ansi.Strip(model.View().Content)
 	for _, want := range []string{"Repository: acme/widgets", "Runner stage: Draining", "Next Ctrl-C: suspend"} {
@@ -765,8 +1013,8 @@ func TestBubbleDashboardSessionSafelyDeliversStateOutputAndOperationalEvents(t *
 			t.Fatalf("Bubble Tea Update did not receive %q:\n%s", want, view)
 		}
 	}
-	if body := model.viewport.GetContent(); !strings.Contains(body, "candidate discovery failed") || !strings.Contains(body, "Drain accepted") {
-		t.Fatalf("scrollable body did not receive output and typed event: %q", body)
+	if body := model.viewport.GetContent(); !strings.Contains(body, "Admission: DEGRADED") || !strings.Contains(body, "persist runner state failed") || !strings.Contains(body, "Drain accepted") || strings.Contains(body, "gh issue list") {
+		t.Fatalf("primary body did not separate health, operational output, and closed Diagnostics: %q", body)
 	}
 }
 
@@ -825,6 +1073,79 @@ func TestBubbleDashboardQueueBoundsOnlyOptionalOutput(t *testing.T) {
 	}
 	if len(outputs) != dashboardOutputUpdateLimit || outputs[0] != "output 6" {
 		t.Fatalf("bounded output = %d messages starting at %q", len(outputs), outputs[0])
+	}
+}
+
+func TestBubbleDashboardAdmissionExpansionRemainsUsefulAndResponsive(t *testing.T) {
+	now := time.Date(2026, 7, 28, 14, 0, 30, 0, time.UTC)
+	model := newBubbleDashboardModel(
+		context.Background(),
+		PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}},
+		newBubbleDashboardSession(time.Now),
+		TerminalDimensions{Width: 180, Height: 18},
+	)
+	issue := 70
+	model.dashboard.operationalEvent(runner.CandidateDiscoveryFailed{
+		Operation:  runner.CandidateDiscoveryInspect,
+		Issue:      &issue,
+		Err:        errors.New("gh issue view 70: retained diagnostic evidence"),
+		Cause:      "upstream API temporarily unavailable",
+		OccurredAt: now.Add(-30 * time.Second), RetryAt: now.Add(30 * time.Second),
+		ConsecutiveFailures: 3,
+	})
+	admission := dashboardSectionAnchor("Admission health")
+	model.selectedAnchor = admission
+	model.refreshViewport(dashboardSelection{identity: admission, relative: model.dashboardBodyStart(), valid: true})
+
+	expanded := model.viewport.GetContent()
+	for _, want := range []string{"> Admission health", "First failure:", "Operation: inspect candidate", "Cause: upstream API temporarily unavailable"} {
+		if !strings.Contains(expanded, want) {
+			t.Fatalf("expanded selected Admission omitted %q:\n%s", want, expanded)
+		}
+	}
+
+	updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	model = updated.(bubbleDashboardModel)
+	collapsed := model.viewport.GetContent()
+	for _, want := range []string{"> Admission health [collapsed]", "Admission: DEGRADED | 3 consecutive failures", "inspect candidate #70", "Cause: upstream API temporarily unavailable", "Diagnostics: closed"} {
+		if !strings.Contains(collapsed, want) {
+			t.Fatalf("collapsed selected Admission omitted %q:\n%s", want, collapsed)
+		}
+	}
+	for _, hidden := range []string{"First failure:", "Latest failure:", "    Operation:"} {
+		if strings.Contains(collapsed, hidden) {
+			t.Fatalf("collapsed Admission retained expanded field %q:\n%s", hidden, collapsed)
+		}
+	}
+
+	updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}))
+	model = updated.(bubbleDashboardModel)
+	if body := model.viewport.GetContent(); !strings.Contains(body, "> Admission health [collapsed]") || !strings.Contains(body, "retained diagnostic evidence") {
+		t.Fatalf("collapsed Admission made Diagnostics inaccessible:\n%s", body)
+	}
+	updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}))
+	model = updated.(bubbleDashboardModel)
+
+	updated, _ = model.Update(tea.WindowSizeMsg{Width: 32, Height: 11})
+	model = updated.(bubbleDashboardModel)
+	narrow := model.viewport.GetContent()
+	for _, line := range []string{
+		dashboardContentLine(t, narrow, "Admission health"),
+		dashboardContentLine(t, narrow, "Admission: DEGRADED"),
+		dashboardContentLine(t, narrow, "Diagnostics:"),
+	} {
+		if width := ansi.StringWidth(line); width > 32 {
+			t.Fatalf("collapsed Admission line width = %d, want at most 32: %q", width, line)
+		}
+	}
+	if !strings.Contains(narrow, "> Admission health [collapsed]") || !strings.Contains(narrow, "Admission: DEGRADED") {
+		t.Fatalf("narrow collapsed Admission lost its selected degraded summary:\n%s", narrow)
+	}
+
+	updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	model = updated.(bubbleDashboardModel)
+	if body := model.viewport.GetContent(); !strings.Contains(body, "> Admission health") || strings.Contains(body, "Admission health [collapsed]") || !strings.Contains(body, "upstream API temporarily unavailable") {
+		t.Fatalf("narrow Admission did not restore complete expanded details for wrapping:\n%s", body)
 	}
 }
 
@@ -904,7 +1225,7 @@ func TestBubbleDashboardResponsiveDensityAndSelectedDetails(t *testing.T) {
 
 	minimal := newModel(11)
 	minimalView := ansi.Strip(minimal.View().Content)
-	for _, want := range []string{"acme/widgets", "Health:1 healthy, 0 anomalous", "Attention:1", "#69", "N:jk", "Enter"} {
+	for _, want := range []string{"acme/widgets", "Health:1 healthy, 0 anomalous", "Attention:1", "#69", "N:jk/fb", "a d Ent"} {
 		if !strings.Contains(minimalView, want) {
 			t.Fatalf("sub-12-row layout omitted %q:\n%s", want, minimalView)
 		}
@@ -1220,6 +1541,7 @@ func TestBubbleDashboardConstrainedChromeKeepsRequiredLifecycleInformation(t *te
 	} {
 		model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: time.Now}}, newBubbleDashboardSession(time.Now), dimensions)
 		model.dashboard.update(current)
+		model.refreshViewport(model.currentSelection())
 		plain := ansi.Strip(model.View().Content)
 		for _, expected := range []struct {
 			name     string
@@ -1230,6 +1552,7 @@ func TestBubbleDashboardConstrainedChromeKeepsRequiredLifecycleInformation(t *te
 			{name: "Runner stage", variants: []string{"Runner stage:", "S:"}},
 			{name: "next Ctrl-C", variants: []string{"Next Ctrl-C:", "^C:"}},
 			{name: "navigation", variants: []string{"Nav:", "N:"}},
+			{name: "Diagnostics", variants: []string{"d:Diagnostics", "a d Ent"}},
 			{name: "f/b shortcuts", variants: []string{"f/b", "fb"}},
 		} {
 			found := false
@@ -1315,8 +1638,8 @@ func TestBubbleDashboardAdaptiveNavigationIncludesEnterGuidance(t *testing.T) {
 		7,
 	)
 	fixedFooter := strings.Join(chrome.bottom, "\n")
-	if !strings.Contains(fixedFooter, "N:jk/fb Pg H/E gG a Enter") {
-		t.Fatalf("adaptive navigation omitted Enter guidance: %#v", chrome)
+	if !strings.Contains(fixedFooter, dashboardCompactNavigationHelp) {
+		t.Fatalf("adaptive navigation omitted compact Diagnostics and Enter guidance: %#v", chrome)
 	}
 }
 
@@ -1339,7 +1662,7 @@ func TestBubbleDashboardConstrainedFallbackKeepsGuidanceInFixedFooter(t *testing
 		t.Fatal("constrained dashboard moved fixed-footer guidance above the body")
 	}
 	fixedFooter := strings.Join(chrome.bottom, "\n")
-	for _, want := range []string{"^C:start Drain and stop Admission", "N:jk/fb Pg H/E gG a Enter"} {
+	for _, want := range []string{"^C:start Drain and stop Admission", dashboardCompactNavigationHelp} {
 		if !strings.Contains(fixedFooter, want) {
 			t.Fatalf("constrained fixed footer omitted %q: %#v", want, chrome)
 		}
@@ -1365,6 +1688,145 @@ func TestBubbleDashboardPresentationRejectsDimensionFailureBeforeRunnerStartup(t
 				t.Fatalf("Runner startup error = %v, want %v", startupErr, err)
 			}
 		})
+	}
+}
+
+func TestBubbleDashboardFinalFlushWaitsForRecoveryNoticeBeforeAcknowledgingNaturalExit(t *testing.T) {
+	recoveredAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	now := recoveredAt.Add(2 * time.Second)
+	control := PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}
+	session := newBubbleDashboardSession(time.Now)
+	if err := session.captureFinalSummary(state.State{Version: state.CurrentVersion}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	flushDone := make(chan error, 1)
+	go func() { flushDone <- session.flush(ctx) }()
+	msg, err := session.next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flush, ok := msg.(dashboardFlushMsg)
+	if !ok || !flush.naturalExit {
+		t.Fatalf("post-Runner flush = %#v, want natural-exit marker", msg)
+	}
+
+	requestedDelay := make(chan time.Duration, 1)
+	clockFired := make(chan time.Time, 1)
+	model := newBubbleDashboardModel(context.Background(), control, session, TerminalDimensions{Width: 140, Height: 20})
+	model.flushAfter = func(delay time.Duration) <-chan time.Time {
+		requestedDelay <- delay
+		return clockFired
+	}
+	model.dashboard.operationalEvent(runner.CandidateDiscoveryRecovered{OccurredAt: recoveredAt, Failures: 3})
+	updated, command := model.Update(flush)
+	model = updated.(bubbleDashboardModel)
+	batch, ok := command().(tea.BatchMsg)
+	if !ok || len(batch) < 1 {
+		t.Fatalf("natural-exit Update command = %T, want a delayed render batch", command())
+	}
+	rendered := make(chan tea.Msg, 1)
+	go func() { rendered <- batch[0]() }()
+	if delay := <-requestedDelay; delay != 8*time.Second {
+		t.Fatalf("controllable clock delay = %s, want remaining 8s", delay)
+	}
+
+	view := ansi.Strip(model.View().Content)
+	for _, want := range []string{
+		"Admission: stopped | Last Candidate snapshot completed successfully | Recovered 2s ago after 3 failures",
+		"Runner stage: Complete; the Runner has exited",
+		"Next Ctrl-C: no effect",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("natural-exit recovery hold omitted %q:\n%s", want, view)
+		}
+	}
+	select {
+	case <-flush.acknowledged:
+		t.Fatal("natural-exit flush acknowledged before the remaining recovery notice duration")
+	default:
+	}
+
+	clockFired <- recoveredAt.Add(admissionRecoveryNotice)
+	renderedMsg := <-rendered
+	select {
+	case <-flush.acknowledged:
+		t.Fatal("natural-exit flush acknowledged before the delayed render message was applied")
+	default:
+	}
+	updated, _ = model.Update(renderedMsg)
+	model = updated.(bubbleDashboardModel)
+	if err := <-flushDone; err != nil {
+		t.Fatalf("delayed natural-exit acknowledgment: %v", err)
+	}
+	view = ansi.Strip(model.View().Content)
+	for _, want := range []string{"Admission: stopped | Last Candidate snapshot completed successfully | Recovered", "Runner stage: Complete; the Runner has exited", "Next Ctrl-C: no effect"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("acknowledged natural-exit frame omitted %q:\n%s", want, view)
+		}
+	}
+	for _, stale := range []string{"Runner stage: Running", "Next Ctrl-C: start Drain and stop Admission"} {
+		if strings.Contains(view, stale) {
+			t.Fatalf("natural-exit recovery hold retained stale lifecycle guidance %q:\n%s", stale, view)
+		}
+	}
+
+	shutdownDashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, func() time.Time { return now })
+	shutdownDashboard.operationalEvent(runner.ShutdownEvent{Stage: runner.ShutdownStageDraining})
+	shutdownDashboard.markNaturalExit()
+	_, _, footer := shutdownDashboard.renderParts(now)
+	if !strings.Contains(footer, "Runner stage: Draining") || strings.Contains(footer, "Complete; the Runner has exited") {
+		t.Fatalf("natural-exit marker replaced an established shutdown stage: %q", footer)
+	}
+}
+
+func TestBubbleDashboardPromptShutdownFlushUsesOneRenderFrameDuringRecoveryNotice(t *testing.T) {
+	recoveredAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	now := recoveredAt.Add(2 * time.Second)
+	session := newBubbleDashboardSession(time.Now)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	flushDone := make(chan error, 1)
+	go func() { flushDone <- session.flush(ctx) }()
+	msg, err := session.next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flush, ok := msg.(dashboardFlushMsg)
+	if !ok || flush.naturalExit {
+		t.Fatalf("prompt shutdown flush = %#v, want non-natural flush", msg)
+	}
+
+	requestedDelay := make(chan time.Duration, 1)
+	clockFired := make(chan time.Time, 1)
+	model := newBubbleDashboardModel(
+		context.Background(),
+		PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}},
+		session,
+		TerminalDimensions{Width: 100, Height: 20},
+	)
+	model.flushAfter = func(delay time.Duration) <-chan time.Time {
+		requestedDelay <- delay
+		return clockFired
+	}
+	model.dashboard.operationalEvent(runner.CandidateDiscoveryRecovered{OccurredAt: recoveredAt, Failures: 3})
+	updated, command := model.Update(flush)
+	model = updated.(bubbleDashboardModel)
+	batch, ok := command().(tea.BatchMsg)
+	if !ok || len(batch) < 1 {
+		t.Fatalf("prompt shutdown Update command = %T, want a render batch", command)
+	}
+	rendered := make(chan tea.Msg, 1)
+	go func() { rendered <- batch[0]() }()
+	if delay := <-requestedDelay; delay != time.Second/30 {
+		t.Fatalf("prompt shutdown flush delay = %s, want one render frame %s", delay, time.Second/30)
+	}
+	clockFired <- now.Add(time.Second / 30)
+	updated, _ = model.Update(<-rendered)
+	_ = updated.(bubbleDashboardModel)
+	if err := <-flushDone; err != nil {
+		t.Fatalf("prompt shutdown terminal restoration: %v", err)
 	}
 }
 

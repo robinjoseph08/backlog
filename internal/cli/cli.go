@@ -363,14 +363,15 @@ func runCommand(ctx context.Context, options runOptions, stdout io.Writer, signa
 			MaxConcurrentIssues: options.maxWorkers, PollInterval: options.poll, MaxWorkerAge: options.maxWorkerAge, Watch: options.watch,
 			SessionsDir: filepath.Join(resolvedStateDir, "sessions"),
 		},
-		GitHub:             github,
-		Store:              runnerStore,
-		Worktrees:          worktrees,
-		Workers:            workerAdapter{supervisor: supervisor},
-		Output:             runnerOutput,
-		Signals:            runnerSignals,
-		OnOperationalEvent: onOperationalEvent,
-		FinalSummary:       finalSummary,
+		GitHub:                         github,
+		Store:                          runnerStore,
+		Worktrees:                      worktrees,
+		Workers:                        workerAdapter{supervisor: supervisor},
+		Output:                         runnerOutput,
+		Signals:                        runnerSignals,
+		OnOperationalEvent:             onOperationalEvent,
+		SuppressOperationalEventOutput: dashboard != nil,
+		FinalSummary:                   finalSummary,
 	}
 	if signals != nil {
 		setupMu.Lock()

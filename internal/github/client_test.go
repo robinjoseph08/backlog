@@ -1,6 +1,7 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 )
 
 func TestClientDiscoversRepository(t *testing.T) {
@@ -28,6 +31,78 @@ esac`)
 	}
 	if got.Slug != "acme/widgets" || got.DefaultBranch != "trunk" {
 		t.Fatalf("got %#v", got)
+	}
+}
+
+func TestClientCommandsPreferContextCancellationOverSubprocessErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		run     func(context.Context, Client) error
+	}{
+		{
+			name: "command", command: "gh issue list --repo acme/widgets",
+			run: func(ctx context.Context, client Client) error {
+				return client.command(ctx, "issue", "list", "--repo", "acme/widgets")
+			},
+		},
+		{
+			name: "JSON command", command: "gh repo view --json nameWithOwner",
+			run: func(ctx context.Context, client Client) error {
+				var result struct {
+					Name string `json:"nameWithOwner"`
+				}
+				return client.jsonCommand(ctx, &result, "repo", "view", "--json", "nameWithOwner")
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			started := filepath.Join(dir, "started")
+			gh := filepath.Join(dir, "gh")
+			script := fmt.Sprintf(`#!/bin/sh
+set -eu
+printf 'subprocess stderr must not win cancellation\n' >&2
+: > %q
+exec sleep 30
+`, started)
+			if err := os.WriteFile(gh, []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- test.run(ctx, Client{Executable: gh}) }()
+
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				if _, err := os.Stat(started); err == nil {
+					break
+				} else if !errors.Is(err, os.ErrNotExist) {
+					t.Fatal(err)
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("blocking fake gh did not start %s", test.name)
+				}
+				time.Sleep(time.Millisecond)
+			}
+			cancel()
+
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("cancellation error = %v, want context.Canceled", err)
+				}
+				if !strings.Contains(err.Error(), test.command) {
+					t.Fatalf("cancellation error lost command identity %q: %v", test.command, err)
+				}
+				if strings.Contains(err.Error(), "subprocess stderr must not win") {
+					t.Fatalf("subprocess stderr took precedence over cancellation: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("%s did not return after context cancellation", test.name)
+			}
+		})
 	}
 }
 
@@ -86,6 +161,76 @@ esac`)
 	var discovery *CandidateDiscoveryError
 	if !errors.As(err, &discovery) || discovery.Operation != CandidateDiscoveryList || discovery.Issue != 0 {
 		t.Fatalf("Candidate discovery context = %#v", discovery)
+	}
+	if discovery.Cause != "invalid character 'o' in literal null (expecting 'u')" {
+		t.Fatalf("Candidate discovery concise cause = %q", discovery.Cause)
+	}
+}
+
+func TestClientSeparatesCandidateDiscoveryCauseFromFullCommand(t *testing.T) {
+	t.Parallel()
+
+	gh := fakeGH(t, `
+case "$*" in
+  "issue list "*) printf '%s\n' "TLS handshake timeout" "complete verbose stderr detail" >&2; exit 1 ;;
+  *) echo "unexpected: $*" >&2; exit 9 ;;
+esac`)
+	_, err := (Client{Executable: gh}).Candidates(context.Background(), "acme/widgets")
+	var discovery *CandidateDiscoveryError
+	if !errors.As(err, &discovery) {
+		t.Fatalf("Candidate discovery error = %v", err)
+	}
+	if discovery.Cause != "TLS handshake timeout" {
+		t.Fatalf("concise cause = %q", discovery.Cause)
+	}
+	if !strings.Contains(discovery.Error(), "gh issue list --repo acme/widgets") || !strings.Contains(discovery.Error(), discovery.Cause) || !strings.Contains(discovery.Error(), "complete verbose stderr detail") {
+		t.Fatalf("full error lost command or stderr evidence: %q", discovery.Error())
+	}
+}
+
+func TestTwentyCommandErrorsRetainFullOversizedStderrOnce(t *testing.T) {
+	const recordLimit = 20
+	records := make([]*CandidateDiscoveryError, 0, recordLimit)
+	for record := 1; record <= recordLimit; record++ {
+		tail := fmt.Sprintf("complete oversized stderr tail 界%d", record)
+		stderr := append(bytes.Repeat([]byte(fmt.Sprintf("oversized stderr evidence 界%d ", record)), 4096), tail...)
+		exitError := &exec.ExitError{Stderr: stderr}
+		command := fmt.Sprintf("issue view %d --repo acme/widgets", record)
+		failure := newCommandError(command, exitError)
+
+		if len(failure.detail) != len(stderr) || !bytes.HasSuffix(failure.detail, []byte(tail)) {
+			t.Fatalf("record %d did not retain all %d stderr bytes", record, len(stderr))
+		}
+		if &failure.detail[0] != &stderr[0] {
+			t.Fatalf("record %d copied stderr instead of taking ownership", record)
+		}
+		var retainedExit *exec.ExitError
+		if !errors.As(failure, &retainedExit) {
+			t.Fatalf("record %d lost exit-error semantics: %v", record, failure)
+		}
+		if len(retainedExit.Stderr) != 0 || len(exitError.Stderr) != 0 {
+			t.Fatalf("record %d retained duplicate ExitError stderr bytes", record)
+		}
+		records = append(records, newCandidateDiscoveryError(CandidateDiscoveryInspect, record, failure))
+	}
+
+	for record, discovery := range records {
+		text := discovery.Error()
+		command := fmt.Sprintf("gh issue view %d --repo acme/widgets", record+1)
+		tail := fmt.Sprintf("complete oversized stderr tail 界%d", record+1)
+		if !utf8.ValidString(text) || !strings.Contains(text, command) || !strings.Contains(text, "oversized stderr evidence") || !strings.Contains(text, tail) || strings.Contains(text, "truncated") {
+			t.Fatalf("record %d lost or corrupted full multibyte command stderr evidence", record+1)
+		}
+		if len([]rune(discovery.Cause)) > 200 {
+			t.Fatalf("record %d concise cause has %d runes, want at most 200", record+1, len([]rune(discovery.Cause)))
+		}
+	}
+}
+
+func TestCandidateDiscoveryCauseIsBounded(t *testing.T) {
+	cause := boundedCandidateDiscoveryCause(strings.Repeat("x", 250))
+	if len([]rune(cause)) != 200 || !strings.HasSuffix(cause, "...") {
+		t.Fatalf("bounded cause length = %d, cause = %q", len([]rune(cause)), cause)
 	}
 }
 

@@ -4,18 +4,24 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
+	ghadapter "github.com/robinjoseph08/backlog/internal/github"
 	"github.com/robinjoseph08/backlog/internal/runner"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
+	"github.com/robinjoseph08/backlog/internal/worker"
+	"github.com/robinjoseph08/backlog/internal/worktree"
 )
 
 func TestRunnerHostOrdersExternalAndPresentationSignalsThroughOneIngress(t *testing.T) {
@@ -85,13 +91,455 @@ func TestPresentationEventQueueBoundsIgnoredConsumer(t *testing.T) {
 
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
-	if len(queue.events) != presentationEventLimit {
-		t.Fatalf("ignored-consumer queue length = %d, want hard limit %d", len(queue.events), presentationEventLimit)
+	if len(queue.events) != presentationAdmissionFailureLimit {
+		t.Fatalf("ignored-consumer queue length = %d, want Admission failure limit %d", len(queue.events), presentationAdmissionFailureLimit)
 	}
 	latest, ok := queue.events[len(queue.events)-1].(runner.CandidateDiscoveryFailed)
 	if !ok || latest.ConsecutiveFailures != presentationEventLimit*100 {
 		t.Fatalf("latest retained Admission event = %#v", queue.events[len(queue.events)-1])
 	}
+	totalOccurrences := 0
+	for _, event := range queue.events {
+		failure, ok := event.(runner.CandidateDiscoveryFailed)
+		if !ok {
+			t.Fatalf("retained event = %T, want CandidateDiscoveryFailed", event)
+		}
+		totalOccurrences += presentationFailureOccurrences(failure)
+	}
+	if totalOccurrences != presentationEventLimit*100 {
+		t.Fatalf("retained equivalent occurrences = %d, want %d", totalOccurrences, presentationEventLimit*100)
+	}
+}
+
+func TestPresentationEventQueueRetainsExactCountsBeyondOneThousandIdentities(t *testing.T) {
+	const distinctIdentities = 1024
+	queue := newPresentationEventQueue()
+	queue.publish(runner.CandidateDiscoveryFailed{
+		Operation: runner.CandidateDiscoveryList, Cause: "recurring cause", Occurrences: 1,
+	})
+	for identity := 1; identity <= distinctIdentities; identity++ {
+		queue.publish(runner.CandidateDiscoveryFailed{
+			Operation: runner.CandidateDiscoveryList, Cause: fmt.Sprintf("distinct cause %d", identity), Occurrences: 1,
+		})
+	}
+	queue.publish(runner.CandidateDiscoveryFailed{
+		Operation: runner.CandidateDiscoveryList, Cause: "recurring cause", Occurrences: 1,
+	})
+
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	if identities := len(queue.evictedFailureOccurrences); identities != distinctIdentities-presentationAdmissionFailureLimit+1 {
+		t.Fatalf("lightweight presentation identities = %d, want %d retained episode identities", identities, distinctIdentities-presentationAdmissionFailureLimit+1)
+	}
+	if failures := presentationAdmissionFailureCount(queue.events); failures != presentationAdmissionFailureLimit {
+		t.Fatalf("queued failure records = %d, want %d", failures, presentationAdmissionFailureLimit)
+	}
+	latest := queue.events[len(queue.events)-1].(runner.CandidateDiscoveryFailed)
+	if occurrences := presentationFailureOccurrences(latest); occurrences != 2 {
+		t.Fatalf("recurring cause after %d identities = %d occurrences, want 2", distinctIdentities, occurrences)
+	}
+}
+
+type composedBackpressureGitHub struct {
+	failures          []error
+	firstWave         int
+	continueAfterWave <-chan struct{}
+	firstWaveReady    chan<- struct{}
+	freshQueued       chan<- struct{}
+	deliveryProgress  *atomic.Int64
+	deliveryBaseline  int64
+	calls             atomic.Int64
+	clockUnix         *atomic.Int64
+}
+
+func (g *composedBackpressureGitHub) Candidates(ctx context.Context, _ string) ([]scheduler.Candidate, error) {
+	call := int(g.calls.Add(1)) - 1
+	g.clockUnix.Store(int64(call + 1))
+	if call == g.firstWave {
+		close(g.firstWaveReady)
+		select {
+		case <-g.continueAfterWave:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if call > g.firstWave && call <= len(g.failures) {
+		target := g.deliveryBaseline + int64(call-g.firstWave)
+		for g.deliveryProgress.Load() < target {
+			select {
+			case <-time.After(50 * time.Microsecond):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+	}
+	if call < len(g.failures) {
+		return nil, g.failures[call]
+	}
+	if call == len(g.failures) {
+		return nil, nil
+	}
+	if call == len(g.failures)+1 {
+		return nil, &ghadapter.CandidateDiscoveryError{
+			Operation: ghadapter.CandidateDiscoveryList,
+			Cause:     "recurring cause",
+			Err:       errors.New("fresh recurring diagnostic"),
+		}
+	}
+	close(g.freshQueued)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (*composedBackpressureGitHub) Completion(context.Context, string, int, string) (ghadapter.CompletionOutcome, error) {
+	return ghadapter.CompletionOutcome{}, nil
+}
+
+func (*composedBackpressureGitHub) IssueState(context.Context, string, int) (ghadapter.IssueState, error) {
+	return ghadapter.IssueState{}, nil
+}
+
+type composedBackpressureStore struct{ current state.State }
+
+func (s *composedBackpressureStore) Load() (state.State, error) { return s.current, nil }
+func (s *composedBackpressureStore) Save(current state.State) error {
+	s.current = current
+	return nil
+}
+
+type composedBackpressureWorktrees struct{}
+
+func (composedBackpressureWorktrees) Plan(int, string) (worktree.Assignment, error) {
+	return worktree.Assignment{}, errors.New("unexpected worktree plan")
+}
+func (composedBackpressureWorktrees) Prepare(context.Context, worktree.Assignment) error {
+	return errors.New("unexpected worktree preparation")
+}
+func (composedBackpressureWorktrees) Verify(context.Context, worktree.Assignment) error {
+	return errors.New("unexpected worktree verification")
+}
+func (composedBackpressureWorktrees) Cleanup(context.Context, worktree.Assignment) error {
+	return errors.New("unexpected worktree cleanup")
+}
+func (composedBackpressureWorktrees) Exists(worktree.Assignment) bool { return false }
+
+type composedBackpressureWorkers struct{}
+
+func (composedBackpressureWorkers) Start(context.Context, worker.Request) (runner.WorkerProcess, error) {
+	return nil, errors.New("unexpected Worker start")
+}
+func (composedBackpressureWorkers) Release(string) error { return nil }
+
+type composedOversizedGitHub struct {
+	failures []error
+	calls    atomic.Int64
+	blocked  chan struct{}
+}
+
+func (g *composedOversizedGitHub) Candidates(ctx context.Context, _ string) ([]scheduler.Candidate, error) {
+	call := int(g.calls.Add(1)) - 1
+	if call < len(g.failures) {
+		return nil, g.failures[call]
+	}
+	if call == len(g.failures) {
+		return nil, nil
+	}
+	close(g.blocked)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (*composedOversizedGitHub) Completion(context.Context, string, int, string) (ghadapter.CompletionOutcome, error) {
+	return ghadapter.CompletionOutcome{}, nil
+}
+
+func (*composedOversizedGitHub) IssueState(context.Context, string, int) (ghadapter.IssueState, error) {
+	return ghadapter.IssueState{}, nil
+}
+
+func TestOversizedAdmissionFailuresRemainCompleteInPlainOutputAndLatestTwentyDiagnostics(t *testing.T) {
+	const failures = 25
+	failureErrors := make([]error, 0, failures)
+	for failure := 1; failure <= failures; failure++ {
+		tail := fmt.Sprintf("complete oversized tail %02d", failure)
+		evidence := strings.Repeat(fmt.Sprintf("oversized failure %02d evidence ", failure), 300) + tail
+		failureErrors = append(failureErrors, &ghadapter.CandidateDiscoveryError{
+			Operation: ghadapter.CandidateDiscoveryList, Cause: "oversized failure",
+			Err: errors.New(evidence),
+		})
+	}
+	github := &composedOversizedGitHub{failures: failureErrors, blocked: make(chan struct{})}
+	queue := newPresentationEventQueue()
+	var plain bytes.Buffer
+	candidateRunner := &runner.Runner{
+		Config: runner.Config{
+			Repo: "acme/widgets", DefaultBranch: "master", MaxConcurrentIssues: 1,
+			PollInterval: 10 * time.Microsecond, Watch: true, SessionsDir: t.TempDir(),
+		},
+		GitHub: github, Store: &composedBackpressureStore{current: state.State{Version: state.CurrentVersion}},
+		Worktrees: composedBackpressureWorktrees{}, Workers: composedBackpressureWorkers{},
+		Output: &plain, OnOperationalEvent: queue.publish,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- candidateRunner.Run(ctx) }()
+	select {
+	case <-github.blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Runner did not emit the oversized failure sequence")
+	}
+	cancel()
+	if err := <-runDone; err != nil {
+		t.Fatalf("Runner oversized failure sequence: %v", err)
+	}
+	candidateRunner.WaitForOperationalEventDelivery()
+
+	output := plain.String()
+	if count := strings.Count(output, "candidate discovery failed; admission paused"); count != failures {
+		t.Fatalf("plain oversized failure rows = %d, want %d", count, failures)
+	}
+	for failure := 1; failure <= failures; failure++ {
+		if tail := fmt.Sprintf("complete oversized tail %02d", failure); !strings.Contains(output, tail) {
+			t.Fatalf("plain output omitted complete diagnostic %q", tail)
+		}
+	}
+	if strings.Contains(output, runner.ErrCandidateDiscoveryDiagnosticExpired.Error()) || strings.Contains(output, "truncated") {
+		t.Fatal("plain output replaced complete evidence with an expiry or truncation marker")
+	}
+
+	dashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, time.Now)
+	drainCtx, stopDrain := context.WithCancel(context.Background())
+	stopDrain()
+	for {
+		event, err := queue.next(drainCtx)
+		if errors.Is(err, context.Canceled) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		dashboard.operationalEvent(event)
+		queue.complete()
+	}
+	if got := len(dashboard.admission.failures); got != dashboardDiagnosticLimit {
+		t.Fatalf("dashboard oversized Diagnostics = %d, want latest %d", got, dashboardDiagnosticLimit)
+	}
+	first, latest := dashboard.admission.failures[0], dashboard.admission.failures[dashboardDiagnosticLimit-1]
+	if first.unavailable || latest.unavailable || !strings.Contains(first.evidence, "complete oversized tail 06") || !strings.Contains(latest.evidence, "complete oversized tail 25") {
+		t.Fatalf("dashboard did not retain complete latest-twenty oversized evidence")
+	}
+}
+
+func TestAdmissionBackpressureComposesRunnerPresentationAndDashboardBounds(t *testing.T) {
+	const (
+		firstDistinct  = 600
+		secondDistinct = 600
+	)
+	failures := make([]error, 0, firstDistinct+secondDistinct+3)
+	failure := func(cause string) error {
+		return &ghadapter.CandidateDiscoveryError{
+			Operation: ghadapter.CandidateDiscoveryList,
+			Cause:     cause,
+			Err:       fmt.Errorf("full diagnostic for %s", cause),
+		}
+	}
+	failures = append(failures, failure("recurring cause"))
+	for identity := 1; identity <= firstDistinct; identity++ {
+		failures = append(failures, failure(fmt.Sprintf("first distinct cause %d", identity)))
+	}
+	failures = append(failures, failure("recurring cause"))
+	firstWave := len(failures)
+	for identity := 1; identity <= secondDistinct; identity++ {
+		failures = append(failures, failure(fmt.Sprintf("second distinct cause %d", identity)))
+	}
+	failures = append(failures, failure("recurring cause"))
+
+	base := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	var clockUnix atomic.Int64
+	firstWaveReady := make(chan struct{})
+	continueAfterWave := make(chan struct{})
+	freshQueued := make(chan struct{})
+	var delivered atomic.Int64
+	deliveryBaseline := int64(1 + presentationAdmissionFailureLimit)
+	github := &composedBackpressureGitHub{
+		failures: failures, firstWave: firstWave, continueAfterWave: continueAfterWave,
+		firstWaveReady: firstWaveReady, freshQueued: freshQueued, deliveryProgress: &delivered,
+		deliveryBaseline: deliveryBaseline, clockUnix: &clockUnix,
+	}
+	queue := newPresentationEventQueue()
+	firstDeliveryStarted := make(chan struct{})
+	releaseFirstDelivery := make(chan struct{})
+	recoveryDeliveryStarted := make(chan struct{})
+	releaseRecovery := make(chan struct{})
+	var first atomic.Bool
+	candidateRunner := &runner.Runner{
+		Config: runner.Config{
+			Repo: "acme/widgets", DefaultBranch: "master", MaxConcurrentIssues: 1,
+			PollInterval: 10 * time.Microsecond, Watch: true, SessionsDir: t.TempDir(),
+		},
+		GitHub: github, Store: &composedBackpressureStore{current: state.State{Version: state.CurrentVersion}},
+		Worktrees: composedBackpressureWorktrees{}, Workers: composedBackpressureWorkers{},
+		Output: io.Discard, SuppressOperationalEventOutput: true,
+		Now: func() time.Time { return base.Add(time.Duration(clockUnix.Load()) * time.Second) },
+		OnOperationalEvent: func(event runner.OperationalEvent) {
+			if first.CompareAndSwap(false, true) {
+				close(firstDeliveryStarted)
+				<-releaseFirstDelivery
+			}
+			if _, recovered := event.(runner.CandidateDiscoveryRecovered); recovered {
+				close(recoveryDeliveryStarted)
+				<-releaseRecovery
+			}
+			queue.publish(event)
+			delivered.Add(1)
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- candidateRunner.Run(ctx) }()
+	<-firstDeliveryStarted
+	<-firstWaveReady
+	close(releaseFirstDelivery)
+
+	waitFor := func(description string, condition func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for !condition() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s", description)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	waitFor("bounded first Runner wave delivery", func() bool { return delivered.Load() >= deliveryBaseline })
+	if got := delivered.Load(); got != deliveryBaseline {
+		t.Fatalf("Runner deliveries from blocked first wave = %d, want one in-flight plus twenty bounded records", got)
+	}
+	close(continueAfterWave)
+	<-recoveryDeliveryStarted
+	if got := delivered.Load(); got <= firstDistinct {
+		t.Fatalf("presentation deliveries before recovery = %d, want pressure beyond %d identities", got, firstDistinct)
+	}
+
+	queue.mu.Lock()
+	queuedFailures := presentationAdmissionFailureCount(queue.events)
+	presentationIdentities := len(queue.evictedFailureOccurrences)
+	queueRecurring := 0
+	var queueRecurringFirst time.Time
+	for _, event := range queue.events {
+		failure, ok := event.(runner.CandidateDiscoveryFailed)
+		if !ok || failure.Cause != "recurring cause" {
+			continue
+		}
+		queueRecurring += presentationFailureOccurrences(failure)
+		if queueRecurringFirst.IsZero() || failure.FirstFailureAt.Before(queueRecurringFirst) {
+			queueRecurringFirst = failure.FirstFailureAt
+		}
+	}
+	queue.mu.Unlock()
+	if queuedFailures != presentationAdmissionFailureLimit {
+		t.Fatalf("presentation failure records = %d, want bounded %d", queuedFailures, presentationAdmissionFailureLimit)
+	}
+	if presentationIdentities <= 256 {
+		t.Fatalf("presentation lightweight identities = %d, want exact episode state well beyond 256 under pressure", presentationIdentities)
+	}
+	if queueRecurring != 3 || !queueRecurringFirst.Equal(base.Add(time.Second)) {
+		t.Fatalf("presentation recurring failures = %d from %s, want 3 from %s", queueRecurring, queueRecurringFirst, base.Add(time.Second))
+	}
+
+	close(releaseRecovery)
+	<-freshQueued
+	waitFor("fresh episode presentation delivery", func() bool {
+		queue.mu.Lock()
+		defer queue.mu.Unlock()
+		for _, event := range queue.events {
+			failure, ok := event.(runner.CandidateDiscoveryFailed)
+			if ok && failure.ConsecutiveFailures == 1 && failure.OccurredAt.Equal(base.Add(time.Duration(len(failures)+2)*time.Second)) {
+				return true
+			}
+		}
+		return false
+	})
+	cancel()
+	if err := <-runDone; err != nil {
+		t.Fatalf("Runner under composed backpressure: %v", err)
+	}
+	candidateRunner.WaitForOperationalEventDelivery()
+
+	queue.mu.Lock()
+	if identities := len(queue.evictedFailureOccurrences); identities != 0 {
+		queue.mu.Unlock()
+		t.Fatalf("presentation recovery retained %d old episode identities", identities)
+	}
+	queue.mu.Unlock()
+
+	dashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, func() time.Time { return base })
+	drainCtx, stopDrain := context.WithCancel(context.Background())
+	stopDrain()
+	sawRecovery := false
+	for {
+		event, err := queue.next(drainCtx)
+		if errors.Is(err, context.Canceled) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, recovered := event.(runner.CandidateDiscoveryRecovered); recovered {
+			dashboard.mu.Lock()
+			key := string(runner.CandidateDiscoveryList) + "\x00recurring cause"
+			if dashboard.admission.consecutiveFailures != len(failures) ||
+				dashboard.admission.equivalentFailures[key] != 3 ||
+				!dashboard.admission.firstFailure.Equal(base.Add(time.Second)) ||
+				!dashboard.admission.latestFailure.Equal(base.Add(time.Duration(len(failures))*time.Second)) {
+				dashboard.mu.Unlock()
+				t.Fatalf("dashboard old episode lost or doubled count/time: %#v", dashboard.admission)
+			}
+			dashboard.mu.Unlock()
+			sawRecovery = true
+		}
+		dashboard.operationalEvent(event)
+		queue.complete()
+		if sawRecovery {
+			dashboard.mu.Lock()
+			if _, recovered := event.(runner.CandidateDiscoveryRecovered); recovered &&
+				(dashboard.admission.degraded || !dashboard.admission.snapshotComplete || dashboard.admission.equivalentFailures != nil) {
+				dashboard.mu.Unlock()
+				t.Fatalf("dashboard recovery did not reset episode state: %#v", dashboard.admission)
+			}
+			dashboard.mu.Unlock()
+		}
+	}
+	if !sawRecovery {
+		t.Fatal("bounded composed delivery lost recovery transition")
+	}
+
+	dashboard.mu.Lock()
+	key := string(runner.CandidateDiscoveryList) + "\x00recurring cause"
+	freshAt := base.Add(time.Duration(len(failures)+2) * time.Second)
+	if !dashboard.admission.degraded || dashboard.admission.consecutiveFailures != 1 ||
+		dashboard.admission.equivalentFailures[key] != 1 ||
+		!dashboard.admission.firstFailure.Equal(freshAt) || !dashboard.admission.latestFailure.Equal(freshAt) {
+		dashboard.mu.Unlock()
+		t.Fatalf("fresh dashboard episode inherited old count/time: %#v", dashboard.admission)
+	}
+	if diagnostics := len(dashboard.admission.failures); diagnostics != dashboardDiagnosticLimit {
+		dashboard.mu.Unlock()
+		t.Fatalf("dashboard diagnostics = %d, want bounded latest %d", diagnostics, dashboardDiagnosticLimit)
+	}
+	for _, diagnostic := range dashboard.admission.failures {
+		if diagnostic.unavailable {
+			dashboard.mu.Unlock()
+			t.Fatal("bounded composed delivery retained an expired latest diagnostic")
+		}
+	}
+	if identities := len(dashboard.admission.equivalentFailures); identities != 1 {
+		dashboard.mu.Unlock()
+		t.Fatalf("fresh dashboard identities = %d, want one fresh episode identity", identities)
+	}
+	dashboard.mu.Unlock()
 }
 
 func TestPresentationEventQueuePreservesOrderedShutdownAndTerminalDeliveryForSlowConsumer(t *testing.T) {
@@ -121,8 +569,9 @@ func TestPresentationEventQueuePreservesOrderedShutdownAndTerminalDeliveryForSlo
 		}
 		events = append(events, event)
 	}
-	if len(events) != presentationEventLimit {
-		t.Fatalf("slow-consumer delivery count = %d, want bounded %d", len(events), presentationEventLimit)
+	wantEvents := presentationAdmissionFailureLimit + 4
+	if len(events) != wantEvents {
+		t.Fatalf("slow-consumer delivery count = %d, want bounded %d", len(events), wantEvents)
 	}
 	previousFailure := 0
 	for _, event := range events[:len(events)-4] {
@@ -142,6 +591,75 @@ func TestPresentationEventQueuePreservesOrderedShutdownAndTerminalDeliveryForSlo
 		if !ok || shutdown.Stage != stage {
 			t.Fatalf("shutdown delivery %d = %#v, want stage %s", index, events[len(events)-4+index], stage)
 		}
+	}
+}
+
+func TestPresentationEventQueuePreservesLatestAdmissionTransitionUnderLifecyclePressure(t *testing.T) {
+	firstFailure := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	queue := newPresentationEventQueue()
+	dashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, time.Now)
+	queue.publish(runner.CandidateDiscoveryFailed{
+		Operation: runner.CandidateDiscoveryList, Cause: "recurring cause", Err: errors.New("old full diagnostic"),
+		FirstFailureAt: firstFailure, OccurredAt: firstFailure, ConsecutiveFailures: 1, Occurrences: 1,
+	})
+	event, err := queue.next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dashboard.operationalEvent(event)
+	queue.complete()
+
+	recoveredAt := firstFailure.Add(time.Minute)
+	queue.publish(runner.CandidateDiscoveryRecovered{OccurredAt: recoveredAt, Failures: 1})
+	for lifecycle := 0; lifecycle < presentationEventLimit+8; lifecycle++ {
+		queue.publish(runner.RunLifecycleEvent{Stage: runner.RunLifecycleClaimed, Message: fmt.Sprintf("Run %d claimed", lifecycle)})
+	}
+	queue.mu.Lock()
+	recoveryRetained := false
+	for _, queued := range queue.events {
+		if _, ok := queued.(runner.CandidateDiscoveryRecovered); ok {
+			recoveryRetained = true
+			break
+		}
+	}
+	queue.mu.Unlock()
+	if !recoveryRetained {
+		t.Fatal("latest Admission recovery was evicted by lifecycle pressure")
+	}
+
+	freshFailure := recoveredAt.Add(time.Minute)
+	queue.publish(runner.CandidateDiscoveryFailed{
+		Operation: runner.CandidateDiscoveryList, Cause: "recurring cause", Err: errors.New("fresh full diagnostic"),
+		FirstFailureAt: freshFailure, OccurredAt: freshFailure, RetryAt: freshFailure.Add(time.Minute),
+		ConsecutiveFailures: 1, Occurrences: 1,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for {
+		event, err := queue.next(ctx)
+		if errors.Is(err, context.Canceled) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		dashboard.operationalEvent(event)
+		queue.complete()
+	}
+
+	_, body, _ := dashboard.renderParts(freshFailure)
+	for _, want := range []string{
+		"Admission: DEGRADED | 1 consecutive failure",
+		"First failure: 2026-07-28T12:02:00Z",
+		"Latest failure: 2026-07-28T12:02:00Z",
+		"Cause: recurring cause",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("fresh Admission episode missing %q after queue pressure:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "Equivalent failures:") {
+		t.Fatalf("fresh Admission episode joined stale equivalent counts:\n%s", body)
 	}
 }
 
@@ -465,6 +983,15 @@ esac
 	}
 	if strings.Contains(stdout.String(), "Backlog Run Dashboard") || strings.Contains(stdout.String(), "\x1b[") || stderr.Len() != 0 {
 		t.Fatalf("selected presentation output compatibility changed: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	persisted, err := os.ReadFile(filepath.Join(root, "state", "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, transient := range []string{"GitHub temporarily unavailable", "candidate discovery", "Admission", "Diagnostics"} {
+		if strings.Contains(string(persisted), transient) {
+			t.Fatalf("transient presentation state %q was persisted: %s", transient, persisted)
+		}
 	}
 }
 

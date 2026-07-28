@@ -73,6 +73,9 @@ type CandidateDiscoveryError struct {
 	Operation CandidateDiscoveryOperation
 	Issue     int
 	Err       error
+	// Cause is a concise terminal cause suitable for presentation grouping.
+	// Err retains the complete command and wrapping context for Diagnostics.
+	Cause string
 }
 
 func (e *CandidateDiscoveryError) Error() string {
@@ -111,14 +114,14 @@ func (c Client) Candidates(ctx context.Context, repo string) ([]scheduler.Candid
 		"issue", "list", "--repo", repo, "--state", "open", "--label", "ready-for-agent",
 		"--limit", "1000", "--json", "number,title,createdAt,url",
 	); err != nil {
-		return nil, &CandidateDiscoveryError{Operation: CandidateDiscoveryList, Err: err}
+		return nil, newCandidateDiscoveryError(CandidateDiscoveryList, 0, err)
 	}
 
 	candidates := make([]scheduler.Candidate, 0, len(listed))
 	for _, item := range listed {
 		candidate, err := c.candidate(ctx, repo, item.Number)
 		if err != nil {
-			return nil, &CandidateDiscoveryError{Operation: CandidateDiscoveryInspect, Issue: item.Number, Err: err}
+			return nil, newCandidateDiscoveryError(CandidateDiscoveryInspect, item.Number, err)
 		}
 		candidates = append(candidates, candidate)
 	}
@@ -715,6 +718,76 @@ func (c Client) command(ctx context.Context, args ...string) error {
 	return fmt.Errorf("gh %s: %w", strings.Join(args, " "), err)
 }
 
+type commandError struct {
+	command string
+	detail  []byte
+	err     error
+}
+
+func (e *commandError) Error() string {
+	if len(e.detail) > 0 {
+		return fmt.Sprintf("gh %s: %s", e.command, e.detail)
+	}
+	return fmt.Sprintf("gh %s: %v", e.command, e.err)
+}
+
+func (e *commandError) Unwrap() error { return e.err }
+
+func newCommandError(command string, err error) *commandError {
+	failure := &commandError{command: command, err: err}
+	exitError, ok := err.(*exec.ExitError)
+	if !ok || len(exitError.Stderr) == 0 {
+		return failure
+	}
+	// Transfer the command-owned stderr allocation into the diagnostic. Clearing
+	// ExitError.Stderr preserves exit-status semantics without retaining the same
+	// evidence a second time. The full evidence remains invocation-local and is
+	// released when its bounded Runner diagnostic record is evicted.
+	failure.detail = bytes.TrimSpace(exitError.Stderr)
+	exitError.Stderr = nil
+	return failure
+}
+
+func newCandidateDiscoveryError(operation CandidateDiscoveryOperation, issue int, err error) *CandidateDiscoveryError {
+	return &CandidateDiscoveryError{Operation: operation, Issue: issue, Err: err, Cause: conciseCandidateDiscoveryCause(err)}
+}
+
+func conciseCandidateDiscoveryCause(err error) string {
+	var command *commandError
+	if errors.As(err, &command) {
+		if len(command.detail) > 0 {
+			return boundedCandidateDiscoveryCause(string(command.detail))
+		}
+		if command.err != nil {
+			return boundedCandidateDiscoveryCause(command.err.Error())
+		}
+	}
+	cause := err
+	for errors.Unwrap(cause) != nil {
+		cause = errors.Unwrap(cause)
+	}
+	if cause == nil {
+		return "unknown error"
+	}
+	return boundedCandidateDiscoveryCause(cause.Error())
+}
+
+func boundedCandidateDiscoveryCause(cause string) string {
+	cause = strings.TrimSpace(cause)
+	if line, _, found := strings.Cut(cause, "\n"); found {
+		cause = strings.TrimSpace(line)
+	}
+	const limit = 200
+	runes := []rune(cause)
+	if len(runes) > limit {
+		cause = string(runes[:limit-3]) + "..."
+	}
+	if cause == "" {
+		return "unknown error"
+	}
+	return cause
+}
+
 func (c Client) jsonCommand(ctx context.Context, target any, args ...string) error {
 	executable := c.Executable
 	if executable == "" {
@@ -727,13 +800,7 @@ func (c Client) jsonCommand(ctx context.Context, target any, args ...string) err
 		if contextErr := ctx.Err(); contextErr != nil {
 			return fmt.Errorf("gh %s: %w", strings.Join(args, " "), contextErr)
 		}
-		if exitError, ok := err.(*exec.ExitError); ok {
-			message := strings.TrimSpace(string(exitError.Stderr))
-			if message != "" {
-				return fmt.Errorf("gh %s: %s", strings.Join(args, " "), message)
-			}
-		}
-		return fmt.Errorf("gh %s: %w", strings.Join(args, " "), err)
+		return newCommandError(strings.Join(args, " "), err)
 	}
 	if err := rejectDuplicateJSONFields(output); err != nil {
 		return fmt.Errorf("decode gh %s output: %w", strings.Join(args, " "), err)

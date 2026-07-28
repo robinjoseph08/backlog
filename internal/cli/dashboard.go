@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -57,6 +58,8 @@ type liveDashboard struct {
 	shutdownOccurrences map[string]int
 	occurrenceOrder     []string
 	stage               dashboardStage
+	admission           dashboardAdmission
+	diagnosticsOpen     bool
 	lastActivity        map[string]fileSignature
 	observations        map[string]dashboardActivityObservation
 	pendingOutput       bytes.Buffer
@@ -75,6 +78,37 @@ type dashboardMessage struct {
 	shutdownPriority bool
 	plainMatched     bool
 }
+
+type dashboardAdmission struct {
+	snapshotComplete    bool
+	degraded            bool
+	consecutiveFailures int
+	firstFailure        time.Time
+	latestFailure       time.Time
+	retryAt             time.Time
+	operation           runner.CandidateDiscoveryOperation
+	issue               *int
+	cause               string
+	equivalentFailures  map[string]int
+	failures            []dashboardDiagnostic
+	diagnosticRecord    int
+	diagnosticPage      int
+	recoveredAt         time.Time
+	recoveredFailures   int
+}
+
+type dashboardDiagnostic struct {
+	occurredAt  time.Time
+	evidence    string
+	pageStarts  []int
+	unavailable bool
+}
+
+const (
+	dashboardDiagnosticLimit         = 20
+	dashboardDiagnosticPageByteLimit = 4 << 10
+	admissionRecoveryNotice          = 10 * time.Second
+)
 
 type fileSignature struct {
 	path    string
@@ -176,9 +210,9 @@ func (d *liveDashboard) requestRedraw() {
 	}
 }
 
-// Write receives append-only Runner lifecycle messages. In dashboard mode the
-// messages are retained in the dashboard instead of being lost on the next
-// redraw. Plain mode never uses this writer.
+// Write receives append-only Runner operational lines that do not have a
+// structured dashboard surface. They remain visible instead of being lost on
+// the next redraw. Plain mode never uses this writer.
 func (d *liveDashboard) Write(content []byte) (int, error) {
 	d.mu.Lock()
 	if d.err != nil {
@@ -293,14 +327,50 @@ func normalizedDashboardMessage(message string) string {
 	return plainStatusValue(strings.TrimSpace(message))
 }
 
+func normalizedDashboardDiagnostic(message string) string {
+	message = strings.ReplaceAll(message, "\r", "\n")
+	state := terminalText
+	filtered := filterTerminalControls([]byte(message), &state, true)
+	return strings.Join(strings.Fields(string(filtered)), " ")
+}
+
 func cloneDashboardMessages(messages []dashboardMessage) []dashboardMessage {
 	return append([]dashboardMessage(nil), messages...)
 }
 
 // operationalEvent receives lifecycle state directly from the Runner. Message
-// formatting remains independent, so presentation never infers semantics from
-// append-only prose.
+// formatting remains independent, so presentation never infers Admission or
+// other operational semantics from append-only prose.
 func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
+	switch event := event.(type) {
+	case runner.CandidateSnapshotCompleted:
+		d.mu.Lock()
+		d.admission.snapshotComplete = true
+		d.admission.degraded = false
+		d.admission.recoveredAt = time.Time{}
+		d.admission.recoveredFailures = 0
+		d.mu.Unlock()
+		d.requestRedraw()
+		return
+	case runner.CandidateDiscoveryFailed:
+		d.mu.Lock()
+		d.recordAdmissionFailureLocked(event)
+		d.mu.Unlock()
+		d.requestRedraw()
+		return
+	case runner.CandidateDiscoveryRecovered:
+		d.mu.Lock()
+		d.admission.snapshotComplete = true
+		d.admission.degraded = false
+		d.admission.consecutiveFailures = 0
+		d.admission.equivalentFailures = nil
+		d.admission.recoveredAt = event.OccurredAt
+		d.admission.recoveredFailures = event.Failures
+		d.mu.Unlock()
+		d.requestRedraw()
+		return
+	}
+
 	message := normalizedDashboardMessage(runner.FormatOperationalEvent(event))
 	semantic := dashboardOperationalEventSemantic(event)
 	_, shutdownPriority := event.(runner.ShutdownEvent)
@@ -338,11 +408,188 @@ func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
 	d.requestRedraw()
 }
 
+func (d *liveDashboard) recordAdmissionFailureLocked(failure runner.CandidateDiscoveryFailed) {
+	cause := normalizedDashboardMessage(failure.Cause)
+	if cause == "" && failure.Err != nil {
+		cause = normalizedDashboardMessage(failure.Err.Error())
+	}
+	if cause == "" {
+		cause = "unknown error"
+	}
+	newEpisode := !d.admission.degraded
+	if d.admission.degraded && !failure.FirstFailureAt.IsZero() && !d.admission.firstFailure.IsZero() && !failure.FirstFailureAt.Equal(d.admission.firstFailure) {
+		newEpisode = true
+	}
+	if d.admission.degraded && failure.ConsecutiveFailures > 0 && d.admission.consecutiveFailures > 0 && failure.ConsecutiveFailures < d.admission.consecutiveFailures {
+		newEpisode = true
+	}
+	if newEpisode {
+		d.admission.firstFailure = failure.FirstFailureAt
+		if d.admission.firstFailure.IsZero() {
+			d.admission.firstFailure = failure.OccurredAt
+		}
+		d.admission.equivalentFailures = make(map[string]int)
+	}
+	d.admission.snapshotComplete = false
+	d.admission.degraded = true
+	d.admission.consecutiveFailures = failure.ConsecutiveFailures
+	d.admission.latestFailure = failure.OccurredAt
+	d.admission.retryAt = failure.RetryAt
+	d.admission.operation = failure.Operation
+	d.admission.issue = cloneIssue(failure.Issue)
+	d.admission.cause = cause
+	d.admission.recoveredAt = time.Time{}
+	d.admission.recoveredFailures = 0
+	key := string(failure.Operation) + "\x00" + cause
+	d.admission.equivalentFailures = retainAdmissionOccurrences(d.admission.equivalentFailures, key, presentationFailureOccurrences(failure))
+	d.admission.failures = append(d.admission.failures, newDashboardDiagnostic(failure))
+	if len(d.admission.failures) > dashboardDiagnosticLimit {
+		d.admission.failures = append([]dashboardDiagnostic(nil), d.admission.failures[len(d.admission.failures)-dashboardDiagnosticLimit:]...)
+	}
+	// New failures keep an open drawer on the latest complete record. Evidence
+	// is sanitized once above and only the selected bounded page is rendered.
+	d.admission.diagnosticRecord = len(d.admission.failures) - 1
+	d.admission.diagnosticPage = 0
+}
+
+func newDashboardDiagnostic(failure runner.CandidateDiscoveryFailed) dashboardDiagnostic {
+	failure.Err = runner.SnapshotCandidateDiscoveryDiagnostic(failure.Err)
+	if errors.Is(failure.Err, runner.ErrCandidateDiscoveryDiagnosticExpired) {
+		return dashboardDiagnostic{
+			occurredAt: failure.OccurredAt, evidence: runner.ErrCandidateDiscoveryDiagnosticExpired.Error(),
+			pageStarts: []int{0}, unavailable: true,
+		}
+	}
+	evidence := normalizedDashboardDiagnostic(runner.FormatOperationalEvent(failure))
+	return dashboardDiagnostic{occurredAt: failure.OccurredAt, evidence: evidence, pageStarts: dashboardDiagnosticPages(evidence)}
+}
+
+func dashboardDiagnosticPages(evidence string) []int {
+	starts := []int{0}
+	pageStart := 0
+	for offset := range evidence {
+		if offset-pageStart < dashboardDiagnosticPageByteLimit {
+			continue
+		}
+		starts = append(starts, offset)
+		pageStart = offset
+	}
+	return starts
+}
+
+func (d dashboardDiagnostic) page(index int) string {
+	if len(d.pageStarts) == 0 {
+		return ""
+	}
+	index = max(0, min(index, len(d.pageStarts)-1))
+	end := len(d.evidence)
+	if index+1 < len(d.pageStarts) {
+		end = d.pageStarts[index+1]
+	}
+	return d.evidence[d.pageStarts[index]:end]
+}
+
+// Admission occurrence counts are lightweight degradation-episode state. They
+// retain every operation/cause identity for exact aggregation until recovery;
+// full diagnostic records remain independently bounded.
+func retainAdmissionOccurrences(counts map[string]int, key string, occurrences int) map[string]int {
+	if counts == nil {
+		counts = make(map[string]int)
+	}
+	counts[key] += occurrences
+	return counts
+}
+
+func takeAdmissionOccurrences(counts map[string]int, key string) int {
+	occurrences := counts[key]
+	delete(counts, key)
+	return occurrences
+}
+
+func cloneIssue(issue *int) *int {
+	if issue == nil {
+		return nil
+	}
+	value := *issue
+	return &value
+}
+
+func (d *liveDashboard) toggleDiagnostics() {
+	d.mu.Lock()
+	d.diagnosticsOpen = !d.diagnosticsOpen
+	if d.diagnosticsOpen && len(d.admission.failures) > 0 {
+		d.admission.diagnosticRecord = len(d.admission.failures) - 1
+		d.admission.diagnosticPage = 0
+	}
+	d.mu.Unlock()
+	d.requestRedraw()
+}
+
+func (d *liveDashboard) moveDiagnosticRecord(delta int) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.diagnosticsOpen || len(d.admission.failures) == 0 {
+		return false
+	}
+	next := max(0, min(d.admission.diagnosticRecord+delta, len(d.admission.failures)-1))
+	if next == d.admission.diagnosticRecord {
+		return false
+	}
+	d.admission.diagnosticRecord = next
+	d.admission.diagnosticPage = 0
+	d.requestRedraw()
+	return true
+}
+
+func (d *liveDashboard) moveDiagnosticPage(delta int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.diagnosticsOpen || len(d.admission.failures) == 0 {
+		return
+	}
+	record := max(0, min(d.admission.diagnosticRecord, len(d.admission.failures)-1))
+	pages := len(d.admission.failures[record].pageStarts)
+	next := max(0, min(d.admission.diagnosticPage+delta, pages-1))
+	if next == d.admission.diagnosticPage {
+		return
+	}
+	d.admission.diagnosticPage = next
+	d.requestRedraw()
+}
+
+func (d *liveDashboard) markNaturalExit() {
+	d.mu.Lock()
+	if d.stage == dashboardRunning {
+		d.stage = dashboardFinished
+	}
+	d.mu.Unlock()
+	d.requestRedraw()
+}
+
+func (d *liveDashboard) recoveryNoticeRemaining(now time.Time) time.Duration {
+	d.mu.Lock()
+	degraded := d.admission.degraded
+	recoveredAt := d.admission.recoveredAt
+	d.mu.Unlock()
+	if degraded || recoveredAt.IsZero() {
+		return 0
+	}
+	elapsed := now.Sub(recoveredAt)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	remaining := admissionRecoveryNotice - elapsed
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
 func dashboardOperationalEventSemantic(event runner.OperationalEvent) dashboardSemantic {
 	switch event := event.(type) {
 	case runner.CandidateDiscoveryFailed:
 		return dashboardSemanticWarning
-	case runner.CandidateDiscoveryRecovered:
+	case runner.CandidateSnapshotCompleted, runner.CandidateDiscoveryRecovered:
 		return dashboardSemanticActive
 	case runner.RunLifecycleEvent:
 		switch event.Stage {
@@ -607,10 +854,13 @@ func (d *liveDashboard) renderResponsiveParts(now time.Time, options responsiveD
 	current := cloneDashboardState(d.current)
 	messages := cloneDashboardMessages(d.messages)
 	stage := d.stage
+	admission := cloneDashboardAdmission(d.admission)
+	diagnosticsOpen := d.diagnosticsOpen
 	d.mu.Unlock()
 
 	projection := d.project(current, stage, now)
 	body := dashboardBodyBuilder{}
+	body.renderResponsiveAdmission(admission, diagnosticsOpen, stage, now, options)
 	body.renderResponsiveSection(statusActive, "Active Runs", projection.sections[statusActive], now, options, false)
 	body.renderResponsiveSection(statusAttention, "Attention Required", projection.sections[statusAttention], now, options, false)
 	body.renderResponsiveSection(statusOutcomes, "Outcomes to Acknowledge", projection.sections[statusOutcomes], now, options, false)
@@ -619,6 +869,32 @@ func (d *liveDashboard) renderResponsiveParts(now time.Time, options responsiveD
 		body.renderResponsiveMessages(messages, options)
 	}
 	return projection, dashboardBodyLayout{text: body.body.String(), anchors: body.anchors, attention: projection.attention}, stage
+}
+
+func (b *dashboardBodyBuilder) renderResponsiveAdmission(admission dashboardAdmission, diagnosticsOpen bool, stage dashboardStage, now time.Time, options responsiveDashboardOptions) {
+	b.separate()
+	identity := dashboardSectionAnchor("Admission health")
+	b.anchor(identity)
+	marker := "  "
+	if options.selected == identity {
+		marker = "> "
+	}
+	expanded := options.expanded(identity, true)
+	heading := marker + "Admission health"
+	if !expanded {
+		heading += " [collapsed]"
+	}
+	semantic := dashboardAdmissionSemantic(admission)
+	b.write(options.styler.render(semantic, truncateDashboardContent(heading, options.width)) + "\n")
+
+	var content strings.Builder
+	if expanded {
+		renderAdmissionDetails(&content, admission, diagnosticsOpen, stage, now, options.styler)
+	} else {
+		renderCompactAdmissionStatus(&content, admission, stage, now, options)
+		renderAdmissionDiagnosticsState(&content, admission, diagnosticsOpen, options.styler, options.width)
+	}
+	b.write(content.String())
 }
 
 func (b *dashboardBodyBuilder) renderResponsiveSection(section statusSection, name string, runs []statusRun, now time.Time, options responsiveDashboardOptions, completions bool) {
@@ -857,6 +1133,21 @@ func truncateDashboardContent(content string, width int) string {
 	return ansi.Truncate(content, width, "")
 }
 
+func (d *liveDashboard) renderPartsWithLayout(now time.Time, styler dashboardStyler) (string, dashboardBodyLayout, string, dashboardStage) {
+	d.mu.Lock()
+	current := cloneDashboardState(d.current)
+	messages := cloneDashboardMessages(d.messages)
+	stage := d.stage
+	d.mu.Unlock()
+	header, layout, footer := d.renderPartsForWithLayout(current, messages, stage, now, styler)
+	return header, layout, footer, stage
+}
+
+func (d *liveDashboard) renderParts(now time.Time) (string, string, string) {
+	header, layout, footer, _ := d.renderPartsWithLayout(now, dashboardStyler{})
+	return header, layout.text, footer
+}
+
 func (d *liveDashboard) renderPartsFor(current state.State, messages []dashboardMessage, stage dashboardStage, now time.Time, styler dashboardStyler) (string, string, string) {
 	header, layout, footer := d.renderPartsForWithLayout(current, messages, stage, now, styler)
 	return header, layout.text, footer
@@ -865,6 +1156,11 @@ func (d *liveDashboard) renderPartsFor(current state.State, messages []dashboard
 func (d *liveDashboard) renderPartsForWithLayout(current state.State, messages []dashboardMessage, stage dashboardStage, now time.Time, styler dashboardStyler) (string, dashboardBodyLayout, string) {
 	projection := d.project(current, stage, now)
 	body := dashboardBodyBuilder{}
+	d.mu.Lock()
+	admission := cloneDashboardAdmission(d.admission)
+	diagnosticsOpen := d.diagnosticsOpen
+	d.mu.Unlock()
+	body.renderAdmission(admission, diagnosticsOpen, stage, now, styler)
 	body.renderSection(statusActive, "Active Runs", projection.sections[statusActive], now, styler)
 	body.renderSection(statusAttention, "Attention Required", projection.sections[statusAttention], now, styler)
 	body.renderSection(statusOutcomes, "Outcomes to Acknowledge", projection.sections[statusOutcomes], now, styler)
@@ -878,6 +1174,206 @@ func (d *liveDashboard) renderPartsForWithLayout(current state.State, messages [
 		}
 	}
 	return projection.header, dashboardBodyLayout{text: body.body.String(), anchors: body.anchors, attention: projection.attention}, projection.footer
+}
+
+func (b *dashboardBodyBuilder) renderAdmission(admission dashboardAdmission, diagnosticsOpen bool, stage dashboardStage, now time.Time, styler dashboardStyler) {
+	b.separate()
+	b.anchor(dashboardSectionAnchor("Admission health"))
+	var admissionBody strings.Builder
+	renderAdmissionHealth(&admissionBody, admission, diagnosticsOpen, stage, now, styler)
+	b.write(strings.TrimPrefix(admissionBody.String(), "\n"))
+}
+
+func cloneDashboardAdmission(admission dashboardAdmission) dashboardAdmission {
+	admission.issue = cloneIssue(admission.issue)
+	admission.failures = append([]dashboardDiagnostic(nil), admission.failures...)
+	if admission.equivalentFailures != nil {
+		groups := make(map[string]int, len(admission.equivalentFailures))
+		for key, count := range admission.equivalentFailures {
+			groups[key] = count
+		}
+		admission.equivalentFailures = groups
+	}
+	return admission
+}
+
+func renderAdmissionHealth(output *strings.Builder, admission dashboardAdmission, diagnosticsOpen bool, stage dashboardStage, now time.Time, styler dashboardStyler) {
+	output.WriteByte('\n')
+	writeDashboardStyledLine(output, styler, dashboardAdmissionSemantic(admission), "Admission health")
+	renderAdmissionDetails(output, admission, diagnosticsOpen, stage, now, styler)
+}
+
+func dashboardAdmissionSemantic(admission dashboardAdmission) dashboardSemantic {
+	if admission.degraded {
+		return dashboardSemanticWarning
+	}
+	if admission.snapshotComplete {
+		return dashboardSemanticActive
+	}
+	return dashboardSemanticMetadata
+}
+
+func renderAdmissionDetails(output *strings.Builder, admission dashboardAdmission, diagnosticsOpen bool, stage dashboardStage, now time.Time, styler dashboardStyler) {
+	if admission.degraded {
+		noun := "failures"
+		if admission.consecutiveFailures == 1 {
+			noun = "failure"
+		}
+		writeDashboardStyledLine(output, styler, dashboardSemanticWarning, fmt.Sprintf("  Admission: DEGRADED | %d consecutive %s", admission.consecutiveFailures, noun))
+		failureTimes := fmt.Sprintf("    First failure: %s | Latest failure: %s", formatAdmissionTime(admission.firstFailure), formatAdmissionTime(admission.latestFailure))
+		if stage == dashboardRunning {
+			failureTimes += " | Next retry: " + admissionRetryCountdown(admission.retryAt, now)
+		} else {
+			failureTimes += " | Retry: stopped"
+		}
+		writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, failureTimes)
+		operation := "    Operation: " + plainStatusValue(string(admission.operation))
+		if admission.issue != nil {
+			operation += fmt.Sprintf(" | Issue: #%d", *admission.issue)
+		}
+		writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, operation)
+		cause := "    Cause: " + plainStatusValue(admission.cause)
+		key := string(admission.operation) + "\x00" + admission.cause
+		if equivalent := admission.equivalentFailures[key]; equivalent > 1 {
+			cause += fmt.Sprintf(" | Equivalent failures: %d", equivalent)
+		}
+		writeDashboardStyledLine(output, styler, dashboardSemanticWarning, cause)
+	} else if !admission.snapshotComplete {
+		writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, incompleteAdmissionStatus(stage))
+	} else {
+		health := "  Admission: " + completedAdmissionStatus(admission, stage, now)
+		writeDashboardStyledLine(output, styler, dashboardSemanticActive, health)
+	}
+	renderAdmissionDiagnosticsState(output, admission, diagnosticsOpen, styler, 0)
+}
+
+func renderCompactAdmissionStatus(output *strings.Builder, admission dashboardAdmission, stage dashboardStage, now time.Time, options responsiveDashboardOptions) {
+	semantic := dashboardAdmissionSemantic(admission)
+	line := incompleteAdmissionStatus(stage)
+	if admission.degraded {
+		noun := "failures"
+		if admission.consecutiveFailures == 1 {
+			noun = "failure"
+		}
+		line = fmt.Sprintf("  Admission: DEGRADED | %d consecutive %s", admission.consecutiveFailures, noun)
+		if operation := plainStatusValue(string(admission.operation)); operation != "" {
+			line += " | " + operation
+			if admission.issue != nil {
+				line += fmt.Sprintf(" #%d", *admission.issue)
+			}
+		}
+		if cause := plainStatusValue(admission.cause); cause != "" {
+			line += " | Cause: " + cause
+		}
+		if stage == dashboardRunning {
+			line += " | Next retry: " + admissionRetryCountdown(admission.retryAt, now)
+		} else {
+			line += " | Retry: stopped"
+		}
+	} else if admission.snapshotComplete {
+		line = "  Admission: " + completedAdmissionStatus(admission, stage, now)
+	}
+	writeDashboardStyledLine(output, options.styler, semantic, truncateDashboardContent(line, options.width))
+}
+
+func completedAdmissionStatus(admission dashboardAdmission, stage dashboardStage, now time.Time) string {
+	if stage == dashboardRunning {
+		return "healthy" + admissionRecoverySummary(admission, now)
+	}
+	return "stopped | Last Candidate snapshot completed successfully" + admissionRecoverySummary(admission, now)
+}
+
+func incompleteAdmissionStatus(stage dashboardStage) string {
+	if stage == dashboardRunning {
+		return "  Admission: checking | Candidate snapshot not yet complete"
+	}
+	return "  Admission: stopped | Candidate snapshot not completed"
+}
+
+func admissionRecoverySummary(admission dashboardAdmission, now time.Time) string {
+	if admission.recoveredAt.IsZero() {
+		return ""
+	}
+	age := now.Sub(admission.recoveredAt)
+	if age < 0 {
+		age = 0
+	}
+	if age >= admissionRecoveryNotice {
+		return ""
+	}
+	noun := "failures"
+	if admission.recoveredFailures == 1 {
+		noun = "failure"
+	}
+	return fmt.Sprintf(" | Recovered %s ago after %d %s", displayDuration(age), admission.recoveredFailures, noun)
+}
+
+func renderAdmissionDiagnosticsState(output *strings.Builder, admission dashboardAdmission, diagnosticsOpen bool, styler dashboardStyler, width int) {
+	if diagnosticsOpen {
+		renderAdmissionDiagnosticsStyled(output, admission.failures, admission.diagnosticRecord, admission.diagnosticPage, styler)
+		return
+	}
+	line := fmt.Sprintf("  Diagnostics: closed (d to open; %d recent)", len(admission.failures))
+	if width > 0 {
+		line = truncateDashboardContent(line, width)
+	}
+	writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, line)
+}
+
+func writeDashboardStyledLine(output *strings.Builder, styler dashboardStyler, semantic dashboardSemantic, line string) {
+	output.WriteString(styler.render(semantic, line))
+	output.WriteByte('\n')
+}
+
+func renderAdmissionDiagnostics(output *strings.Builder, failures []runner.CandidateDiscoveryFailed) {
+	diagnostics := make([]dashboardDiagnostic, 0, len(failures))
+	for _, failure := range failures {
+		diagnostics = append(diagnostics, newDashboardDiagnostic(failure))
+	}
+	renderAdmissionDiagnosticsStyled(output, diagnostics, len(diagnostics)-1, 0, dashboardStyler{})
+}
+
+func renderAdmissionDiagnosticsStyled(output *strings.Builder, failures []dashboardDiagnostic, recordIndex, pageIndex int, styler dashboardStyler) {
+	noun := "records"
+	if len(failures) == 1 {
+		noun = "record"
+	}
+	output.WriteByte('\n')
+	writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, fmt.Sprintf("Diagnostics (%d recent Candidate discovery failure %s; d to close)", len(failures), noun))
+	if len(failures) == 0 {
+		writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, "  none")
+		return
+	}
+	recordIndex = max(0, min(recordIndex, len(failures)-1))
+	diagnostic := failures[recordIndex]
+	pageIndex = max(0, min(pageIndex, len(diagnostic.pageStarts)-1))
+	writeDashboardStyledLine(output, styler, dashboardSemanticMetadata,
+		fmt.Sprintf("  Record %d/%d ([ previous, ] next) | Evidence page %d/%d (, previous, . next)",
+			recordIndex+1, len(failures), pageIndex+1, len(diagnostic.pageStarts)))
+	label := fmt.Sprintf("Full error/command (page %d/%d)", pageIndex+1, len(diagnostic.pageStarts))
+	if diagnostic.unavailable {
+		label = "Diagnostic unavailable"
+	}
+	line := fmt.Sprintf("  [%s] %s: %s", formatAdmissionTime(diagnostic.occurredAt), label, diagnostic.page(pageIndex))
+	writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, line)
+}
+
+func formatAdmissionTime(value time.Time) string {
+	if value.IsZero() {
+		return "n/a"
+	}
+	return value.UTC().Format(time.RFC3339)
+}
+
+func admissionRetryCountdown(retryAt, now time.Time) string {
+	if retryAt.IsZero() {
+		return "n/a"
+	}
+	remaining := retryAt.Sub(now)
+	if remaining < 0 {
+		remaining = 0
+	}
+	return displayDuration(remaining)
 }
 
 // observeSections applies the shared status ownership and history projection.

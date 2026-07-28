@@ -70,6 +70,24 @@ type Workers interface {
 	Release(runID string) error
 }
 
+type candidateRetryTimer interface {
+	channel() <-chan time.Time
+	reset(time.Duration)
+	stop()
+}
+
+type systemCandidateRetryTimer struct {
+	timer *time.Timer
+}
+
+func newSystemCandidateRetryTimer(delay time.Duration) candidateRetryTimer {
+	return &systemCandidateRetryTimer{timer: time.NewTimer(delay)}
+}
+
+func (t *systemCandidateRetryTimer) channel() <-chan time.Time { return t.timer.C }
+func (t *systemCandidateRetryTimer) reset(delay time.Duration) { t.timer.Reset(delay) }
+func (t *systemCandidateRetryTimer) stop()                     { t.timer.Stop() }
+
 type Runner struct {
 	Config    Config
 	GitHub    GitHub
@@ -84,16 +102,21 @@ type Runner struct {
 	// presentation cannot block Runner control paths or compatible plain output.
 	OnOperationalEvent func(OperationalEvent)
 
+	// SuppressOperationalEventOutput lets a structured presentation avoid the
+	// compatible line-oriented copies. Plain mode leaves this false.
+	SuppressOperationalEventOutput bool
+
 	// FinalSummary presents the aggregate state immediately before natural
 	// one-shot exhaustion. Signal shutdown and watch mode do not call it.
 	FinalSummary func(state.State) error
 
-	Now               func() time.Time
-	NewRunID          func(issue int) string
-	PIDAlive          func(pid int) bool
-	ProcessGroupAlive func(pid int) (bool, error)
-	PIDIdentity       func(context.Context, int) (string, error)
-	Lstat             func(string) (os.FileInfo, error)
+	Now                    func() time.Time
+	newCandidateRetryTimer func(time.Duration) candidateRetryTimer
+	NewRunID               func(issue int) string
+	PIDAlive               func(pid int) bool
+	ProcessGroupAlive      func(pid int) (bool, error)
+	PIDIdentity            func(context.Context, int) (string, error)
+	Lstat                  func(string) (os.FileInfo, error)
 
 	suspensionExit       atomic.Int32
 	suspensionFailed     atomic.Bool
@@ -104,14 +127,18 @@ type Runner struct {
 	suspensionCancel     context.CancelFunc
 	suspensionEventReady chan struct{}
 
-	operationalEventOnce     sync.Once
-	operationalEventMu       sync.Mutex
-	operationalEventWake     chan struct{}
-	operationalEventStop     chan struct{}
-	operationalEventDone     chan struct{}
-	operationalEventStopping bool
-	operationalEvents        []OperationalEvent
+	operationalEventOnce            sync.Once
+	operationalEventMu              sync.Mutex
+	operationalEventWake            chan struct{}
+	operationalEventStop            chan struct{}
+	operationalEventDone            chan struct{}
+	operationalEventStopping        bool
+	operationalEvents               []OperationalEvent
+	operationalEvictedFailureCounts map[string]int
+	candidateDiagnostics            candidateDiscoveryDiagnostics
 }
+
+const operationalAdmissionFailureLimit = 20
 
 type workerCompletion struct {
 	issue  int
@@ -270,12 +297,18 @@ func (r *Runner) Run(ctx context.Context) error {
 	localWorkers := make(map[int]WorkerProcess)
 	poll := time.NewTicker(r.Config.PollInterval)
 	defer poll.Stop()
-	var candidateRetryTimer *time.Timer
+	newCandidateRetryTimer := r.newCandidateRetryTimer
+	if newCandidateRetryTimer == nil {
+		newCandidateRetryTimer = newSystemCandidateRetryTimer
+	}
+	var candidateRetryTimer candidateRetryTimer
 	var candidateRetry <-chan time.Time
 	candidateDiscoveryFailures := 0
+	candidateSnapshotCompleted := false
+	var candidateDiscoveryFirstFailure time.Time
 	defer func() {
 		if candidateRetryTimer != nil {
-			candidateRetryTimer.Stop()
+			candidateRetryTimer.stop()
 		}
 	}()
 
@@ -351,17 +384,26 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 			if err != nil {
 				candidateDiscoveryFailures++
-				if candidateRetryTimer == nil {
-					candidateRetryTimer = time.NewTimer(r.Config.PollInterval)
-				} else {
-					candidateRetryTimer.Reset(r.Config.PollInterval)
-				}
-				candidateRetry = candidateRetryTimer.C
 				occurredAt := r.Now().UTC()
+				retryAt := occurredAt.Add(r.Config.PollInterval)
+				retryDelay := retryAt.Sub(occurredAt)
+				if candidateRetryTimer == nil {
+					candidateRetryTimer = newCandidateRetryTimer(retryDelay)
+				} else {
+					candidateRetryTimer.reset(retryDelay)
+				}
+				candidateRetry = candidateRetryTimer.channel()
+				if candidateDiscoveryFailures == 1 {
+					candidateDiscoveryFirstFailure = occurredAt
+				}
 				operation := CandidateDiscoverySnapshot
+				cause := conciseDiscoveryCause(err)
 				var issue *int
 				var discoveryErr *ghadapter.CandidateDiscoveryError
 				if errors.As(err, &discoveryErr) {
+					if discoveryErr.Cause != "" {
+						cause = boundedDiscoveryCause(discoveryErr.Cause)
+					}
 					switch discoveryErr.Operation {
 					case ghadapter.CandidateDiscoveryList:
 						operation = CandidateDiscoveryList
@@ -374,9 +416,9 @@ func (r *Runner) Run(ctx context.Context) error {
 					}
 				}
 				r.emitWhileAdmissionActive(admission, CandidateDiscoveryFailed{
-					Operation: operation, Issue: issue, Err: err,
-					OccurredAt: occurredAt, RetryAt: occurredAt.Add(r.Config.PollInterval),
-					ConsecutiveFailures: candidateDiscoveryFailures,
+					Operation: operation, Issue: issue, Err: err, Cause: cause,
+					FirstFailureAt: candidateDiscoveryFirstFailure, OccurredAt: occurredAt, RetryAt: retryAt,
+					ConsecutiveFailures: candidateDiscoveryFailures, Occurrences: 1,
 				})
 			} else {
 				if candidateDiscoveryFailures > 0 {
@@ -385,6 +427,13 @@ func (r *Runner) Run(ctx context.Context) error {
 						continue
 					}
 					candidateDiscoveryFailures = 0
+					candidateDiscoveryFirstFailure = time.Time{}
+					candidateSnapshotCompleted = true
+				} else if !candidateSnapshotCompleted {
+					if !r.emitWhileAdmissionActive(admission, CandidateSnapshotCompleted{OccurredAt: r.Now().UTC()}) {
+						continue
+					}
+					candidateSnapshotCompleted = true
 				}
 				plan := scheduler.Plan(scheduler.Snapshot{Candidates: candidates, Runs: current.Runs, Leases: current.Leases}, r.Config.MaxConcurrentIssues)
 				startedWorker := false
@@ -2153,9 +2202,48 @@ func (r *Runner) emitWhileAdmissionActive(admission *admissionGate, event Operat
 }
 
 func (r *Runner) writeOperationalEvent(event OperationalEvent) {
+	if r.SuppressOperationalEventOutput {
+		return
+	}
 	if message := FormatOperationalEvent(event); message != "" {
 		r.logf("%s", message)
 	}
+}
+
+func conciseDiscoveryCause(err error) string {
+	cause := err
+	for errors.Unwrap(cause) != nil {
+		cause = errors.Unwrap(cause)
+	}
+	if cause == nil {
+		return "unknown error"
+	}
+	return boundedDiscoveryCause(cause.Error())
+}
+
+func boundedDiscoveryCause(cause string) string {
+	cause = strings.TrimSpace(cause)
+	if line, _, found := strings.Cut(cause, "\n"); found {
+		cause = strings.TrimSpace(line)
+	}
+	const limit = 200
+	runes := []rune(cause)
+	if len(runes) > limit {
+		cause = string(runes[:limit-3]) + "..."
+	}
+	if cause == "" {
+		return "unknown error"
+	}
+	return cause
+}
+
+func (r *Runner) retainCandidateDiagnostic(event OperationalEvent) OperationalEvent {
+	failure, ok := event.(CandidateDiscoveryFailed)
+	if !ok || failure.Err == nil {
+		return event
+	}
+	failure.Err = r.candidateDiagnostics.retain(failure.Err)
+	return failure
 }
 
 func (r *Runner) enqueueOperationalEvent(event OperationalEvent) {
@@ -2165,13 +2253,114 @@ func (r *Runner) enqueueOperationalEvent(event OperationalEvent) {
 		r.operationalEventDone = make(chan struct{})
 		go r.deliverOperationalEvents(r.OnOperationalEvent)
 	})
+	event = r.retainCandidateDiagnostic(event)
 	r.operationalEventMu.Lock()
+	switch typed := event.(type) {
+	case CandidateDiscoveryFailed:
+		key := candidateDiscoveryFailureKey(typed)
+		if occurrences := takeOperationalFailureOccurrences(r.operationalEvictedFailureCounts, key); occurrences > 0 {
+			typed.Occurrences = candidateDiscoveryFailureOccurrences(typed) + occurrences
+			event = typed
+		}
+	case CandidateSnapshotCompleted, CandidateDiscoveryRecovered:
+		clear(r.operationalEvictedFailureCounts)
+	}
 	r.operationalEvents = append(r.operationalEvents, event)
+	for operationalAdmissionFailureCount(r.operationalEvents) > operationalAdmissionFailureLimit {
+		r.removeOperationalEvent(oldestOperationalAdmissionFailure(r.operationalEvents))
+	}
 	r.operationalEventMu.Unlock()
 	select {
 	case r.operationalEventWake <- struct{}{}:
 	default:
 	}
+}
+
+func operationalAdmissionFailureCount(events []OperationalEvent) int {
+	count := 0
+	for _, event := range events {
+		if _, ok := event.(CandidateDiscoveryFailed); ok {
+			count++
+		}
+	}
+	return count
+}
+
+func oldestOperationalAdmissionFailure(events []OperationalEvent) int {
+	for index, event := range events {
+		if _, ok := event.(CandidateDiscoveryFailed); ok {
+			return index
+		}
+	}
+	return 0
+}
+
+func (r *Runner) removeOperationalEvent(index int) {
+	r.preserveOperationalFailureOccurrences(index)
+	copy(r.operationalEvents[index:], r.operationalEvents[index+1:])
+	r.operationalEvents[len(r.operationalEvents)-1] = nil
+	r.operationalEvents = r.operationalEvents[:len(r.operationalEvents)-1]
+}
+
+func (r *Runner) preserveOperationalFailureOccurrences(index int) {
+	evicted, ok := r.operationalEvents[index].(CandidateDiscoveryFailed)
+	if !ok {
+		return
+	}
+	key := candidateDiscoveryFailureKey(evicted)
+	for later := index + 1; later < len(r.operationalEvents); later++ {
+		switch event := r.operationalEvents[later].(type) {
+		case CandidateSnapshotCompleted, CandidateDiscoveryRecovered:
+			return
+		case CandidateDiscoveryFailed:
+			if candidateDiscoveryFailureKey(event) != key {
+				continue
+			}
+			event.Occurrences = candidateDiscoveryFailureOccurrences(event) + candidateDiscoveryFailureOccurrences(evicted)
+			if event.FirstFailureAt.IsZero() || (!evicted.FirstFailureAt.IsZero() && evicted.FirstFailureAt.Before(event.FirstFailureAt)) {
+				event.FirstFailureAt = evicted.FirstFailureAt
+			}
+			r.operationalEvents[later] = event
+			return
+		}
+	}
+	r.operationalEvictedFailureCounts = retainOperationalFailureOccurrences(
+		r.operationalEvictedFailureCounts,
+		key,
+		candidateDiscoveryFailureOccurrences(evicted),
+	)
+}
+
+// operationalEvictedFailureCounts is lightweight, invocation-local episode
+// state. It retains one operation/cause counter per identity so aggregation is
+// exact; recovery clears it, while full diagnostic evidence remains bounded.
+func retainOperationalFailureOccurrences(counts map[string]int, key string, occurrences int) map[string]int {
+	if counts == nil {
+		counts = make(map[string]int)
+	}
+	counts[key] += occurrences
+	return counts
+}
+
+func takeOperationalFailureOccurrences(counts map[string]int, key string) int {
+	occurrences := counts[key]
+	delete(counts, key)
+	return occurrences
+}
+
+func candidateDiscoveryFailureOccurrences(failure CandidateDiscoveryFailed) int {
+	if failure.Occurrences > 0 {
+		return failure.Occurrences
+	}
+	return 1
+}
+
+func candidateDiscoveryFailureKey(failure CandidateDiscoveryFailed) string {
+	cause := failure.Cause
+	if cause == "" && failure.Err != nil {
+		cause = conciseDiscoveryCause(failure.Err)
+	}
+	return string(failure.Operation) + "\x00" + cause
 }
 
 func (r *Runner) deliverOperationalEvents(deliver func(OperationalEvent)) {

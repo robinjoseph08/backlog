@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -26,6 +27,25 @@ type blockingOperationalOutput struct {
 	started chan struct{}
 	release chan struct{}
 	once    sync.Once
+}
+
+type controlledCandidateRetryTimer struct {
+	ticks       chan time.Time
+	resetDelays chan time.Duration
+	stopped     chan struct{}
+	stopOnce    sync.Once
+}
+
+func newControlledCandidateRetryTimer() *controlledCandidateRetryTimer {
+	return &controlledCandidateRetryTimer{
+		ticks: make(chan time.Time, 1), resetDelays: make(chan time.Duration, 1), stopped: make(chan struct{}),
+	}
+}
+
+func (t *controlledCandidateRetryTimer) channel() <-chan time.Time { return t.ticks }
+func (t *controlledCandidateRetryTimer) reset(delay time.Duration) { t.resetDelays <- delay }
+func (t *controlledCandidateRetryTimer) stop() {
+	t.stopOnce.Do(func() { close(t.stopped) })
 }
 
 func (w *blockingOperationalOutput) Write(content []byte) (int, error) {
@@ -122,6 +142,40 @@ func TestRunnerReportsClaimStartAndMergeLifecycleEvents(t *testing.T) {
 	}
 }
 
+func TestRunnerReportsInitialCandidateSnapshotCompletionWithoutRecovery(t *testing.T) {
+	t.Parallel()
+
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+	var output bytes.Buffer
+	runner.Output = &output
+	recorder := &operationalEventRecorder{}
+	runner.OnOperationalEvent = recorder.record
+
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	runner.WaitForOperationalEventDelivery()
+	events := recorder.snapshot()
+	completed := 0
+	for _, event := range events {
+		switch event := event.(type) {
+		case CandidateSnapshotCompleted:
+			completed++
+			if event.OccurredAt.IsZero() {
+				t.Fatal("initial Candidate snapshot completion omitted its occurrence time")
+			}
+		case CandidateDiscoveryRecovered:
+			t.Fatalf("initial success was reported as a recovery: %#v", event)
+		}
+	}
+	if completed != 1 {
+		t.Fatalf("initial Candidate snapshot completion events = %d, want 1 in %#v", completed, events)
+	}
+	if strings.Contains(output.String(), "candidate discovery recovered") {
+		t.Fatalf("initial success emitted compatible recovery output: %q", output.String())
+	}
+}
+
 func TestRunnerReportsCandidateDiscoveryFailuresAndResetsCountAfterRecovery(t *testing.T) {
 	t.Parallel()
 
@@ -165,11 +219,11 @@ func TestRunnerReportsCandidateDiscoveryFailuresAndResetsCountAfterRecovery(t *t
 		t.Fatalf("first event = %T, want CandidateDiscoveryFailed", events[0])
 	}
 	occurredAt := time.Date(2026, 7, 2, 3, 4, 5, 0, time.UTC)
-	if listing.Operation != CandidateDiscoveryList || listing.Issue != nil || !errors.Is(listing.Err, listErr) || !listing.OccurredAt.Equal(occurredAt) || !listing.RetryAt.Equal(occurredAt.Add(20*time.Millisecond)) || listing.ConsecutiveFailures != 1 {
+	if listing.Operation != CandidateDiscoveryList || listing.Issue != nil || !errors.Is(listing.Err, listErr) || listing.Cause != "i/o timeout" || !listing.FirstFailureAt.Equal(occurredAt) || !listing.OccurredAt.Equal(occurredAt) || !listing.RetryAt.Equal(occurredAt.Add(20*time.Millisecond)) || listing.ConsecutiveFailures != 1 {
 		t.Fatalf("Candidate listing failure = %#v", listing)
 	}
 	inspection, ok := events[1].(CandidateDiscoveryFailed)
-	if !ok || inspection.Operation != CandidateDiscoveryInspect || inspection.Issue == nil || *inspection.Issue != 17 || !errors.Is(inspection.Err, inspectErr) || inspection.ConsecutiveFailures != 2 {
+	if !ok || inspection.Operation != CandidateDiscoveryInspect || inspection.Issue == nil || *inspection.Issue != 17 || !errors.Is(inspection.Err, inspectErr) || !inspection.FirstFailureAt.Equal(occurredAt) || inspection.ConsecutiveFailures != 2 {
 		t.Fatalf("Candidate inspection failure = %#v", events[1])
 	}
 	fallback, ok := events[2].(CandidateDiscoveryFailed)
@@ -199,6 +253,269 @@ func TestRunnerReportsCandidateDiscoveryFailuresAndResetsCountAfterRecovery(t *t
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("plain output omitted %q: %q", want, output.String())
 		}
+	}
+}
+
+func TestRunnerDerivesCandidateRetryTimerAndEventFromOneReferenceTime(t *testing.T) {
+	base := time.Date(2026, 7, 2, 3, 4, 5, 0, time.UTC)
+	const retryDelay = 30 * time.Second
+	github := &fakeGitHub{
+		candidateResults: []candidateResult{{err: errors.New("temporary failure")}, {}},
+		candidateChanged: make(chan struct{}, 2),
+	}
+	runner := testRunner(github, newFakeWorkers(), &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+	runner.Config.PollInterval = retryDelay
+	referenceCaptured := false
+	runner.Now = func() time.Time {
+		referenceCaptured = true
+		return base
+	}
+	timer := newControlledCandidateRetryTimer()
+	type timerCreation struct {
+		delay                  time.Duration
+		referenceCapturedFirst bool
+	}
+	createdWith := make(chan timerCreation, 1)
+	runner.newCandidateRetryTimer = func(delay time.Duration) candidateRetryTimer {
+		createdWith <- timerCreation{delay: delay, referenceCapturedFirst: referenceCaptured}
+		return timer
+	}
+	recorder := &operationalEventRecorder{}
+	runner.OnOperationalEvent = recorder.record
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	<-github.candidateChanged
+	creation := <-createdWith
+	if creation.delay != retryDelay || !creation.referenceCapturedFirst {
+		t.Fatalf("retry timer creation = %#v, want %s after the event reference time", creation, retryDelay)
+	}
+	events := recorder.waitFor(t, func(events []OperationalEvent) bool { return len(events) >= 1 })
+	failure, ok := events[0].(CandidateDiscoveryFailed)
+	if !ok || !failure.OccurredAt.Equal(base) || !failure.RetryAt.Equal(base.Add(retryDelay)) {
+		t.Fatalf("Candidate failure timing = %#v, want occurrence %s and retry %s", events[0], base, base.Add(retryDelay))
+	}
+	select {
+	case <-github.candidateChanged:
+		t.Fatal("Candidate discovery retried before the controlled retry timer fired")
+	default:
+	}
+
+	timer.ticks <- base.Add(retryDelay)
+	select {
+	case <-github.candidateChanged:
+	case <-time.After(time.Second):
+		t.Fatal("Candidate discovery did not retry after the controlled timer fired")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	select {
+	case <-timer.stopped:
+	default:
+		t.Fatal("completed Runner did not stop the retry timer")
+	}
+}
+
+func TestRunnerCancellationStopsPendingCandidateRetryTimer(t *testing.T) {
+	github := &fakeGitHub{
+		candidateResults: []candidateResult{{err: errors.New("temporary failure")}},
+		candidateChanged: make(chan struct{}, 1),
+	}
+	runner := testRunner(github, newFakeWorkers(), &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+	runner.Config.PollInterval = time.Hour
+	timer := newControlledCandidateRetryTimer()
+	created := make(chan struct{}, 1)
+	runner.newCandidateRetryTimer = func(time.Duration) candidateRetryTimer {
+		created <- struct{}{}
+		return timer
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	<-github.candidateChanged
+	<-created
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	select {
+	case <-timer.stopped:
+	default:
+		t.Fatal("canceled Runner did not stop the pending retry timer")
+	}
+}
+
+func TestRunnerStructuredPresentationCanSuppressCompatibleAdmissionOutput(t *testing.T) {
+	github := &fakeGitHub{
+		candidateResults: []candidateResult{{err: errors.New("temporary failure")}, {}},
+		candidateChanged: make(chan struct{}, 2),
+	}
+	runner := testRunner(github, newFakeWorkers(), &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+	runner.Config.PollInterval = time.Millisecond
+	runner.SuppressOperationalEventOutput = true
+	var output bytes.Buffer
+	runner.Output = &output
+	recorder := &operationalEventRecorder{}
+	runner.OnOperationalEvent = recorder.record
+
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	runner.WaitForOperationalEventDelivery()
+	if events := recorder.snapshot(); len(events) != 2 {
+		t.Fatalf("structured events = %#v, want failure and recovery", events)
+	}
+	if strings.Contains(output.String(), "candidate discovery") {
+		t.Fatalf("structured presentation received compatible Admission rows: %q", output.String())
+	}
+}
+
+func TestRunnerRetainsAtMostTwentyFullAdmissionDiagnostics(t *testing.T) {
+	runner := &Runner{}
+	events := make([]CandidateDiscoveryFailed, 0, candidateDiscoveryDiagnosticLimit+5)
+	for failure := 1; failure <= candidateDiscoveryDiagnosticLimit+5; failure++ {
+		event := runner.retainCandidateDiagnostic(CandidateDiscoveryFailed{
+			ConsecutiveFailures: failure,
+			Err:                 fmt.Errorf("full failure %d", failure),
+		}).(CandidateDiscoveryFailed)
+		events = append(events, event)
+	}
+	if count := runner.candidateDiagnostics.count(); count != candidateDiscoveryDiagnosticLimit {
+		t.Fatalf("retained full diagnostics = %d, want %d", count, candidateDiscoveryDiagnosticLimit)
+	}
+	if got := events[0].Err.Error(); !strings.Contains(got, "no longer retained") {
+		t.Fatalf("old diagnostic = %q, want bounded-retention marker", got)
+	}
+	if !errors.Is(events[0].Err, ErrCandidateDiscoveryDiagnosticExpired) {
+		t.Fatalf("old diagnostic does not expose expiry state after delayed delivery: %v", events[0].Err)
+	}
+	if got := events[len(events)-1].Err.Error(); got != "full failure 25" {
+		t.Fatalf("latest diagnostic = %q, want full failure 25", got)
+	}
+	if errors.Is(events[len(events)-1].Err, ErrCandidateDiscoveryDiagnosticExpired) {
+		t.Fatalf("latest retained diagnostic was marked expired: %v", events[len(events)-1].Err)
+	}
+}
+
+func TestCandidateDiagnosticSnapshotSurvivesLaterReferenceEviction(t *testing.T) {
+	runner := &Runner{}
+	first := runner.retainCandidateDiagnostic(CandidateDiscoveryFailed{Err: errors.New("complete first evidence")}).(CandidateDiscoveryFailed)
+	snapshot := SnapshotCandidateDiscoveryDiagnostic(first.Err)
+	for failure := 2; failure <= candidateDiscoveryDiagnosticLimit+1; failure++ {
+		runner.retainCandidateDiagnostic(CandidateDiscoveryFailed{Err: fmt.Errorf("failure %d", failure)})
+	}
+	if !errors.Is(first.Err, ErrCandidateDiscoveryDiagnosticExpired) {
+		t.Fatalf("original bounded reference remained available: %v", first.Err)
+	}
+	if got := snapshot.Error(); got != "complete first evidence" {
+		t.Fatalf("presentation snapshot after reference eviction = %q", got)
+	}
+}
+
+func TestRunnerRetainsExactLightweightAdmissionCountsBeyondOneThousandIdentities(t *testing.T) {
+	const distinctIdentities = 1024
+	var counts map[string]int
+	counts = retainOperationalFailureOccurrences(counts, "recurring cause", 1)
+	for identity := 1; identity <= distinctIdentities; identity++ {
+		counts = retainOperationalFailureOccurrences(counts, fmt.Sprintf("distinct cause %d", identity), 1)
+	}
+	counts = retainOperationalFailureOccurrences(counts, "recurring cause", 1)
+
+	if occurrences := takeOperationalFailureOccurrences(counts, "recurring cause"); occurrences != 2 {
+		t.Fatalf("recurring cause after %d identities = %d occurrences, want 2", distinctIdentities, occurrences)
+	}
+	if identities := len(counts); identities != distinctIdentities {
+		t.Fatalf("lightweight Runner identities = %d, want all %d episode identities", identities, distinctIdentities)
+	}
+}
+
+func TestRunnerPreservesAdmissionOccurrencesAcrossSlowDeliveryAndClearsOnRecovery(t *testing.T) {
+	runner := &Runner{}
+	deliveryStarted := make(chan struct{})
+	releaseDelivery := make(chan struct{})
+	var startOnce sync.Once
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseDelivery) })
+	recorder := &operationalEventRecorder{}
+	runner.OnOperationalEvent = func(event OperationalEvent) {
+		startOnce.Do(func() { close(deliveryStarted) })
+		<-releaseDelivery
+		recorder.record(event)
+	}
+
+	runner.enqueueOperationalEvent(ShutdownEvent{Stage: ShutdownStageDraining})
+	<-deliveryStarted
+
+	episodeStarted := time.Date(2026, 7, 2, 3, 4, 5, 0, time.UTC)
+	enqueueFailure := func(cause string, consecutive int, firstFailureAt time.Time) {
+		runner.enqueueOperationalEvent(CandidateDiscoveryFailed{
+			Operation: CandidateDiscoveryList, Err: fmt.Errorf("full diagnostic for %s", cause), Cause: cause,
+			FirstFailureAt: firstFailureAt, OccurredAt: episodeStarted.Add(time.Duration(consecutive) * time.Second),
+			ConsecutiveFailures: consecutive, Occurrences: 1,
+		})
+	}
+
+	enqueueFailure("recurring cause", 1, episodeStarted)
+	for failure := 2; failure <= operationalAdmissionFailureLimit+2; failure++ {
+		enqueueFailure(fmt.Sprintf("distinct cause %d", failure), failure, episodeStarted)
+	}
+	enqueueFailure("recurring cause", operationalAdmissionFailureLimit+3, episodeStarted)
+
+	runner.operationalEventMu.Lock()
+	if len(runner.operationalEvictedFailureCounts) == 0 {
+		runner.operationalEventMu.Unlock()
+		t.Fatal("slow delivery did not retain lightweight counts for evicted failure identities")
+	}
+	runner.operationalEventMu.Unlock()
+
+	runner.enqueueOperationalEvent(CandidateDiscoveryRecovered{
+		OccurredAt: episodeStarted.Add(time.Minute), Failures: operationalAdmissionFailureLimit + 3,
+	})
+	enqueueFailure("recurring cause", 1, episodeStarted.Add(2*time.Minute))
+
+	runner.operationalEventMu.Lock()
+	queuedFailures := operationalAdmissionFailureCount(runner.operationalEvents)
+	retainedCounts := len(runner.operationalEvictedFailureCounts)
+	runner.operationalEventMu.Unlock()
+	if queuedFailures != operationalAdmissionFailureLimit {
+		t.Fatalf("queued full failure records = %d, want %d", queuedFailures, operationalAdmissionFailureLimit)
+	}
+	if retainedCounts != 0 {
+		t.Fatalf("recovery retained episode-wide failure counts: %d", retainedCounts)
+	}
+	if diagnostics := runner.candidateDiagnostics.count(); diagnostics != candidateDiscoveryDiagnosticLimit {
+		t.Fatalf("retained full diagnostics = %d, want %d", diagnostics, candidateDiscoveryDiagnosticLimit)
+	}
+
+	runner.stopOperationalEventDelivery()
+	releaseOnce.Do(func() { close(releaseDelivery) })
+	runner.WaitForOperationalEventDelivery()
+
+	recovered := false
+	beforeRecoveryOccurrences := 0
+	afterRecoveryOccurrences := 0
+	for _, event := range recorder.snapshot() {
+		switch event := event.(type) {
+		case CandidateDiscoveryRecovered:
+			recovered = true
+		case CandidateDiscoveryFailed:
+			if event.Cause != "recurring cause" {
+				continue
+			}
+			if recovered {
+				afterRecoveryOccurrences += candidateDiscoveryFailureOccurrences(event)
+			} else {
+				beforeRecoveryOccurrences += candidateDiscoveryFailureOccurrences(event)
+			}
+		}
+	}
+	if beforeRecoveryOccurrences != 2 {
+		t.Fatalf("recurring failure occurrences before recovery = %d, want 2", beforeRecoveryOccurrences)
+	}
+	if afterRecoveryOccurrences != 1 {
+		t.Fatalf("recurring failure occurrences after recovery = %d, want 1", afterRecoveryOccurrences)
 	}
 }
 

@@ -21,8 +21,9 @@ import (
 )
 
 const (
-	dashboardOutputUpdateLimit = 64
-	dashboardNavigationHelp    = "Nav: ↑↓/jk PgUp/Dn/f/b Home/End g/G a:Attention Enter:Toggle"
+	dashboardOutputUpdateLimit     = 64
+	dashboardNavigationHelp        = "Nav: d:Diagnostics ↑↓/jk PgUp/Dn/f/b Home/End g/G a:Attention Enter:Toggle"
+	dashboardCompactNavigationHelp = "N:jk/fb Pg H/E gG a d Ent"
 )
 
 type dashboardConfiguredMsg struct {
@@ -37,7 +38,10 @@ type dashboardInterruptResultMsg struct{ err error }
 type dashboardElapsedMsg time.Time
 type dashboardActivityMsg time.Time
 type dashboardQueueStoppedMsg struct{ err error }
-type dashboardFlushMsg struct{ acknowledged chan struct{} }
+type dashboardFlushMsg struct {
+	acknowledged chan struct{}
+	naturalExit  bool
+}
 type dashboardFlushRenderedMsg struct{ acknowledged chan struct{} }
 
 // bubbleDashboardSession is the asynchronous boundary between Runner writes
@@ -144,7 +148,10 @@ func (s *bubbleDashboardSession) stateSaved(current state.State) {
 
 func (s *bubbleDashboardSession) flush(ctx context.Context) error {
 	acknowledged := make(chan struct{})
-	s.publish(dashboardFlushMsg{acknowledged: acknowledged})
+	s.finalMu.Lock()
+	naturalExit := s.finalState != nil
+	s.finalMu.Unlock()
+	s.publish(dashboardFlushMsg{acknowledged: acknowledged, naturalExit: naturalExit})
 	select {
 	case <-acknowledged:
 		return nil
@@ -310,6 +317,7 @@ type bubbleDashboardModel struct {
 
 	interruptsWaiting int
 	pendingFlushes    []dashboardFlushMsg
+	flushAfter        func(time.Duration) <-chan time.Time
 	startup           *atomic.Bool
 }
 
@@ -328,7 +336,7 @@ func newBubbleDashboardModel(ctx context.Context, control PresentationControl, s
 		viewport:  view, width: dimensions.Width, height: dimensions.Height,
 		attentionKnown: make(map[string]struct{}), attentionPending: make(map[string]struct{}),
 		colorProfile: profile, styler: newDashboardFallbackStyler(profile),
-		expansionOverrides: make(map[string]bool), startup: &atomic.Bool{},
+		expansionOverrides: make(map[string]bool), flushAfter: time.After, startup: &atomic.Bool{},
 	}
 	model.refreshViewport(dashboardSelection{})
 	model.selectViewportAnchor()
@@ -383,18 +391,31 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var commands []tea.Cmd
 	trackAttention := false
 	configured := false
+	keepSelectionVisible := false
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = max(1, msg.Width), max(1, msg.Height)
+		keepSelectionVisible = true
 	case tea.BackgroundColorMsg:
 		m.styler = newDashboardStyler(m.colorProfile, msg.IsDark())
 	case tea.KeyPressMsg:
-		if msg.String() == "ctrl+c" {
+		switch msg.String() {
+		case "ctrl+c":
 			m.interruptsWaiting++
 			if m.interruptsWaiting == 1 {
 				commands = append(commands, m.interrupt())
 			}
 			return m, tea.Batch(commands...)
+		case "d":
+			m.dashboard.toggleDiagnostics()
+		case "[":
+			m.dashboard.moveDiagnosticRecord(-1)
+		case "]":
+			m.dashboard.moveDiagnosticRecord(1)
+		case ",":
+			m.dashboard.moveDiagnosticPage(-1)
+		case ".":
+			m.dashboard.moveDiagnosticPage(1)
 		}
 		if msg.String() == "enter" {
 			m.toggleExpansion()
@@ -434,14 +455,22 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case dashboardElapsedMsg:
 		commands = append(commands, dashboardElapsedTick())
 	case dashboardActivityMsg:
-		_ = m.dashboard.activityChanged()
 		commands = append(commands, dashboardActivityTick())
+		if !m.dashboard.activityChanged() {
+			// Most 100 ms activity ticks observe no filesystem change. Keep the
+			// existing viewport instead of rebuilding and wrapping it.
+			return m, tea.Batch(commands...)
+		}
 	case dashboardFlushMsg:
+		if msg.naturalExit {
+			m.dashboard.markNaturalExit()
+		}
 		m.pendingFlushes = append(m.pendingFlushes, msg)
 		commands = append(commands, m.renderPendingFlushes()...)
 		commands = append(commands, m.waitForSessionUpdate())
 	case dashboardFlushRenderedMsg:
 		close(msg.acknowledged)
+		return m, nil
 	case dashboardQueueStoppedMsg:
 		if m.ctx.Err() != nil || errors.Is(msg.err, context.Canceled) {
 			return m, tea.Quit
@@ -449,7 +478,7 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.dashboard.recordMessage(msg.err.Error())
 	}
 
-	m.refreshViewport(selection)
+	m.refreshViewportWithVisibility(selection, keepSelectionVisible)
 	enteredRoomy := previousDensity != dashboardDensityRoomy && dashboardDensityForHeight(m.height) == dashboardDensityRoomy
 	if configured || enteredRoomy {
 		m.ensureRunSelection()
@@ -494,12 +523,25 @@ func (m *bubbleDashboardModel) renderPendingFlushes() []tea.Cmd {
 	commands := make([]tea.Cmd, 0, len(m.pendingFlushes))
 	for _, pending := range m.pendingFlushes {
 		message := pending
-		commands = append(commands, tea.Tick(time.Second/30, func(time.Time) tea.Msg {
-			return dashboardFlushRenderedMsg(message)
-		}))
+		delay := time.Second / 30
+		if pending.naturalExit {
+			delay = dashboardFlushDelay(m.dashboard, m.dashboard.now())
+		}
+		commands = append(commands, func() tea.Msg {
+			<-m.flushAfter(delay)
+			return dashboardFlushRenderedMsg{acknowledged: message.acknowledged}
+		})
 	}
 	m.pendingFlushes = nil
 	return commands
+}
+
+func dashboardFlushDelay(dashboard *liveDashboard, now time.Time) time.Duration {
+	delay := time.Second / 30
+	if remaining := dashboard.recoveryNoticeRemaining(now); remaining > delay {
+		return remaining
+	}
+	return delay
 }
 
 type dashboardSelection struct {
@@ -509,6 +551,10 @@ type dashboardSelection struct {
 }
 
 func (m *bubbleDashboardModel) refreshViewport(selection dashboardSelection) {
+	m.refreshViewportWithVisibility(selection, false)
+}
+
+func (m *bubbleDashboardModel) refreshViewportWithVisibility(selection dashboardSelection, keepSelectionVisible bool) {
 	density := dashboardDensityForHeight(m.height)
 	options := responsiveDashboardOptions{
 		density: density, width: m.width, selected: m.selectedAnchor, expansionOverrides: m.expansionOverrides, styler: m.styler,
@@ -530,7 +576,12 @@ func (m *bubbleDashboardModel) refreshViewport(selection dashboardSelection) {
 	m.viewport.SetContent(layout.text)
 	if selection.valid {
 		if line, exists := m.anchorVisualLine(selection.identity); exists {
-			m.viewport.SetYOffset(m.dashboardBodyStart() + line - selection.relative)
+			frame := m.dashboardFrame()
+			relative := selection.relative
+			if keepSelectionVisible && frame.bodyHeight > 0 {
+				relative = max(frame.bodyStart, min(relative, frame.bodyStart+frame.bodyHeight-1))
+			}
+			m.viewport.SetYOffset(frame.bodyStart + line - relative)
 			m.selectedAnchor = selection.identity
 			return
 		}
@@ -821,10 +872,8 @@ func (m *bubbleDashboardModel) clearVisibleAttention() bool {
 }
 
 func (m bubbleDashboardModel) View() tea.View {
-	// Keep direct projection updates visible to callers that render without a
-	// preceding Bubble Tea message. The program's normal path already refreshes
-	// in Update, so this local copy does not alter navigation state.
-	m.refreshViewport(m.currentSelection())
+	// Update owns projection refreshes. View only composes the already wrapped
+	// viewport with fixed chrome, avoiding a duplicate full refresh per message.
 	frame := m.dashboardFrame()
 
 	lines := make([]string, 0, m.height)
@@ -896,7 +945,7 @@ func dashboardChromeLines(header, footer []string, pendingAttention int, stage d
 	footerGroups := dashboardChromeGroups(lifecycle)
 	compactNavigation := append([]string(nil), footer...)
 	if len(compactNavigation) > 2 {
-		compactNavigation[2] = "N:jk/fb Pg H/E gG a Enter"
+		compactNavigation[2] = dashboardCompactNavigationHelp
 	}
 	compactNavigation = styledDashboardFooterItems(compactNavigation, stage, styler)
 	compactHeader := styledDashboardHeaderItems(compactDashboardHeader(header), pendingAttention, true, styler)
@@ -966,7 +1015,7 @@ func compactDashboardFooter(footer []string) []string {
 	for _, line := range footer {
 		line = strings.Replace(line, "Runner stage: ", "S:", 1)
 		line = strings.Replace(line, "Next Ctrl-C: ", "^C:", 1)
-		line = strings.Replace(line, dashboardNavigationHelp, "N:jk/fb Pg H/E gG a Enter", 1)
+		line = strings.Replace(line, dashboardNavigationHelp, dashboardCompactNavigationHelp, 1)
 		compact = append(compact, line)
 	}
 	return compact
