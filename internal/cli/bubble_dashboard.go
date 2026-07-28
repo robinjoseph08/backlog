@@ -771,7 +771,7 @@ type dashboardFrame struct {
 }
 
 func (m bubbleDashboardModel) dashboardFrame() dashboardFrame {
-	headerLines := strings.SplitN(m.header, "\n", 3)
+	headerLines := strings.Split(m.header, "\n")
 	chrome := dashboardChromeLines(headerLines[1:], strings.Split(m.footer, "\n"), len(m.attentionPending), m.stage, m.styler, m.width, m.height)
 	chromeHeight := len(chrome.top) + len(chrome.bottom)
 	titleHeight := 0

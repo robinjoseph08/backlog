@@ -676,8 +676,7 @@ func (b *dashboardBodyBuilder) renderResponsiveMessages(messages []dashboardMess
 	b.write(options.styler.render(dashboardSemanticMetadata, heading) + "\n")
 	if expanded {
 		for _, message := range messages {
-			line := truncateDashboardContent("    "+message.text, options.width)
-			b.write(options.styler.render(message.semantic, line) + "\n")
+			b.write(options.styler.render(message.semantic, "    "+message.text) + "\n")
 		}
 	}
 }

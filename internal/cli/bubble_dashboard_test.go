@@ -889,7 +889,10 @@ func TestCompactDashboardActiveRowPrioritizesElapsedBeforeVariableFields(t *test
 
 func TestBubbleDashboardCompactRowsTruncateAndExpandedDetailsWrap(t *testing.T) {
 	now := time.Date(2026, 7, 28, 14, 0, 0, 0, time.UTC)
-	run := scheduler.Run{Issue: 69, IssueTitle: strings.Repeat("wide界", 20), IssueURL: "https://github.com/acme/widgets/issues/69/with/a/very/long/detail", RunID: "run-wide", Status: scheduler.StatusRunning, StartedAt: now.Add(-time.Minute)}
+	urlPrefix := "https://github.com/acme/widgets/issues/69/start/"
+	urlSuffix := "reachable-detail-suffix"
+	issueURL := urlPrefix + strings.Repeat("segment/", 60) + "x" + urlSuffix
+	run := scheduler.Run{Issue: 69, IssueTitle: strings.Repeat("wide界", 20), IssueURL: issueURL, RunID: "run-wide", Status: scheduler.StatusRunning, StartedAt: now.Add(-time.Minute)}
 	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}
 	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 32, Height: 18})
 	model.dashboard.source = &dashboardTestSource{current: current}
@@ -902,13 +905,87 @@ func TestBubbleDashboardCompactRowsTruncateAndExpandedDetailsWrap(t *testing.T) 
 	}
 	updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
 	model = updated.(bubbleDashboardModel)
-	if !strings.Contains(model.viewport.GetContent(), run.IssueURL) {
+	if !strings.Contains(model.viewport.GetContent(), issueURL) {
 		t.Fatalf("expanded details were truncated instead of retained for wrapping:\n%s", model.viewport.GetContent())
+	}
+	initial := ansi.Strip(model.View().Content)
+	if !strings.Contains(initial, "Issue URL:") || strings.Contains(initial, urlSuffix) {
+		t.Fatalf("expanded detail did not begin as an offscreen wrapped suffix:\n%s", initial)
+	}
+
+	reached := false
+	for range 128 {
+		updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
+		model = updated.(bubbleDashboardModel)
+		rendered := ansi.Strip(model.View().Content)
+		if !strings.Contains(rendered, urlSuffix) {
+			continue
+		}
+		reached = true
+		for _, line := range strings.Split(rendered, "\n") {
+			if strings.Contains(line, urlSuffix) && strings.Contains(line, "Issue URL:") {
+				t.Fatalf("expanded detail suffix did not render on a later wrapped visual line: %q", line)
+			}
+		}
+		break
+	}
+	if !reached {
+		t.Fatalf("expanded detail suffix was not reachable by scrolling:\n%s", ansi.Strip(model.View().Content))
 	}
 	for _, line := range strings.Split(ansi.Strip(model.View().Content), "\n") {
 		if width := lipgloss.Width(line); width > 32 {
 			t.Fatalf("wrapped viewport line width = %d, want at most 32: %q", width, line)
 		}
+	}
+}
+
+func TestBubbleDashboardExpandedOperationalMessagesWrapAndRemainScrollable(t *testing.T) {
+	const width = 28
+	messagePrefix := "candidate discovery failed: "
+	messageSuffix := "retry-with-manual-token"
+	message := messagePrefix + strings.Repeat("upstream-unavailable/", 40) + messageSuffix
+	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: time.Now}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: width, Height: 12})
+	model.dashboard.update(current)
+	model.dashboard.recordMessage(message)
+	operational := dashboardSectionAnchor("Operational messages")
+	model.selectedAnchor = operational
+	model.refreshViewport(dashboardSelection{identity: operational, relative: model.dashboardBodyStart(), valid: true})
+
+	if !strings.Contains(model.viewport.GetContent(), messageSuffix) {
+		t.Fatalf("expanded Operational message lost its actionable suffix:\n%s", model.viewport.GetContent())
+	}
+	initial := ansi.Strip(model.View().Content)
+	if !strings.Contains(initial, "Operational messages (1)") || strings.Contains(initial, messageSuffix) {
+		t.Fatalf("Operational message did not begin with its suffix offscreen:\n%s", initial)
+	}
+
+	sawPrefix := false
+	reached := false
+	for range 128 {
+		updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
+		model = updated.(bubbleDashboardModel)
+		rendered := ansi.Strip(model.View().Content)
+		for _, line := range strings.Split(rendered, "\n") {
+			if lipgloss.Width(line) > width {
+				t.Fatalf("wrapped Operational message overflowed width %d: %q", width, line)
+			}
+			if strings.Contains(line, "candidate") {
+				sawPrefix = true
+			}
+			if strings.Contains(line, messageSuffix) {
+				if !sawPrefix || strings.Contains(line, "candidate") {
+					t.Fatalf("Operational suffix did not render on a later wrapped visual line: %q", line)
+				}
+				reached = true
+			}
+		}
+		if reached {
+			break
+		}
+	}
+	if !reached {
+		t.Fatalf("Operational message suffix was not reachable by scrolling:\n%s", ansi.Strip(model.View().Content))
 	}
 }
 
@@ -1001,6 +1078,26 @@ func TestBubbleDashboardConstrainedChromeKeepsRequiredLifecycleInformation(t *te
 			if lipgloss.Width(line) > dimensions.Width {
 				t.Fatalf("%dx%d dashboard overflowed with %q", dimensions.Width, dimensions.Height, line)
 			}
+		}
+	}
+}
+
+func TestBubbleDashboardFrameKeepsCapacityAndHealthAsSeparateMetadata(t *testing.T) {
+	now := time.Date(2026, 7, 28, 14, 0, 0, 0, time.UTC)
+	run := scheduler.Run{Issue: 69, RunID: "active", Status: scheduler.StatusRunning, StartedAt: now.Add(-time.Minute)}
+	current := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 2,
+		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+	}
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 18, Height: 12})
+	model.dashboard.update(current)
+	model.refreshViewport(dashboardSelection{})
+	frame := model.dashboardFrame()
+	chrome := ansi.Strip(strings.Join(append(append([]string(nil), frame.chrome.top...), frame.chrome.bottom...), "\n"))
+	normalized := strings.Join(strings.Fields(chrome), " ")
+	for _, want := range []string{"W:1u/1a/2t", "Worker health: 0 healthy, 1 anomalous"} {
+		if !strings.Contains(normalized, want) {
+			t.Fatalf("production dashboard frame malformed or omitted %q:\n%s", want, chrome)
 		}
 	}
 }
