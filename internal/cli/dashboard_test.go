@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -787,6 +788,31 @@ func TestDashboardCapacityMatchesSchedulerSemantics(t *testing.T) {
 				t.Fatalf("used capacity = %d, want %d", got, test.want)
 			}
 		})
+	}
+}
+
+func TestDashboardRenderersShareProjectionMetadata(t *testing.T) {
+	now := time.Date(2026, 7, 28, 14, 0, 0, 0, time.UTC)
+	active := scheduler.Run{Issue: 69, RunID: "active", Status: scheduler.StatusRunning, StartedAt: now.Add(-time.Minute)}
+	attention := scheduler.Run{Issue: 70, RunID: "attention", Status: scheduler.StatusNeedsHuman}
+	current := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 2,
+		Runs: []scheduler.Run{active, attention},
+		Leases: []scheduler.Lease{
+			{LeaseID: active.RunID, Issue: active.Issue, RunID: active.RunID},
+			{LeaseID: attention.RunID, Issue: attention.Issue, RunID: attention.RunID},
+		},
+	}
+	dashboard := newLiveDashboard(io.Discard, &dashboardTestSource{current: current}, current, func() time.Time { return now })
+	dashboard.recordMessage("observation changed")
+	responsiveHeader, responsiveLayout, responsiveFooter := dashboard.renderResponsiveParts(now, responsiveDashboardOptions{
+		density: dashboardDensityConstrained, width: 120,
+	})
+	plainHeader, plainLayout, plainFooter := dashboard.renderPartsForWithLayout(current, []string{"observation changed"}, dashboardRunning, now)
+
+	if responsiveHeader != plainHeader || responsiveFooter != plainFooter || !maps.Equal(responsiveLayout.attention, plainLayout.attention) {
+		t.Fatalf("responsive and plain projection metadata drifted:\nresponsive header: %q\nplain header: %q\nresponsive footer: %q\nplain footer: %q\nresponsive Attention: %#v\nplain Attention: %#v",
+			responsiveHeader, plainHeader, responsiveFooter, plainFooter, responsiveLayout.attention, plainLayout.attention)
 	}
 }
 

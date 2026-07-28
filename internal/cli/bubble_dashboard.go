@@ -536,16 +536,20 @@ func (m *bubbleDashboardModel) toggleExpansion() {
 }
 
 func minimalDashboardHeader(header string, attention, pending int) string {
-	lines := strings.Split(header, "\n")
 	repository := "not initialized"
-	if len(lines) > 1 {
-		repository = strings.TrimPrefix(lines[1], "Repository: ")
-	}
 	capacity := "W:pending"
-	if len(lines) > 2 {
-		capacity = compactDashboardCapacity(lines[2])
+	health := "unknown"
+	for _, line := range strings.Split(header, "\n") {
+		switch {
+		case strings.HasPrefix(line, "Repository: "):
+			repository = strings.TrimPrefix(line, "Repository: ")
+		case strings.HasPrefix(line, "Worker capacity: "):
+			capacity = compactDashboardCapacity(line)
+		case strings.HasPrefix(line, "Worker health: "):
+			health = strings.TrimPrefix(line, "Worker health: ")
+		}
 	}
-	status := fmt.Sprintf("R:%s | %s | Attention:%d", repository, capacity, attention)
+	status := fmt.Sprintf("R:%s | %s | Health:%s | Attention:%d", repository, capacity, health, attention)
 	if pending > 0 {
 		status += fmt.Sprintf(" | New:%d", pending)
 	}

@@ -691,7 +691,7 @@ func TestBubbleDashboardResponsiveDensityAndSelectedDetails(t *testing.T) {
 
 	minimal := newModel(11)
 	minimalView := ansi.Strip(minimal.View().Content)
-	for _, want := range []string{"acme/widgets", "Attention:1", "#69", "N:jk", "Enter"} {
+	for _, want := range []string{"acme/widgets", "Health:1 healthy, 0 anomalous", "Attention:1", "#69", "N:jk", "Enter"} {
 		if !strings.Contains(minimalView, want) {
 			t.Fatalf("sub-12-row layout omitted %q:\n%s", want, minimalView)
 		}
@@ -792,7 +792,7 @@ func TestBubbleDashboardPromotesOnlyAnomalousLivenessInCompactRows(t *testing.T)
 		{Issue: 2, IssueTitle: "Missing", RunID: "missing", Status: scheduler.StatusRunning, StartedAt: now},
 	}
 	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 2, Runs: runs, Leases: []scheduler.Lease{{LeaseID: "healthy", Issue: 1, RunID: "healthy"}, {LeaseID: "missing", Issue: 2, RunID: "missing"}}}
-	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 120, Height: 18})
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 120, Height: 11})
 	model.dashboard.source = &dashboardPreviewOnlySource{current: current}
 	model.dashboard.update(current)
 	model.refreshViewport(dashboardSelection{})
@@ -808,6 +808,9 @@ func TestBubbleDashboardPromotesOnlyAnomalousLivenessInCompactRows(t *testing.T)
 		if !strings.Contains(missing, want) {
 			t.Fatalf("anomalous compact row omitted %q: %q", want, missing)
 		}
+	}
+	if view := ansi.Strip(model.View().Content); !strings.Contains(view, "Health:0 healthy, 2 anomalous") {
+		t.Fatalf("minimal dashboard omitted anomalous Worker health:\n%s", view)
 	}
 }
 
