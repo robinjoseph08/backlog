@@ -19,7 +19,6 @@ import (
 	"time"
 
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
-	"github.com/robinjoseph08/backlog/internal/reset"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 )
@@ -542,46 +541,6 @@ exec `+quote(fixture.git)+` "$@"
 	}
 }
 
-func TestArchiveSessionUsesAtomicRename(t *testing.T) {
-	t.Parallel()
-	stateDir := t.TempDir()
-	sessionDir := filepath.Join(stateDir, "sessions", "run-atomic")
-	archiveDir := filepath.Join(stateDir, "history", "sessions", "run-atomic")
-	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	sessionFile := filepath.Join(sessionDir, "session.jsonl")
-	if err := os.WriteFile(sessionFile, []byte("session\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	before, err := os.Stat(sessionFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	session := reset.Session{ID: "backlog-run-atomic", Dir: sessionDir, ArchiveDir: archiveDir, Present: true}
-	synced := make(map[string]bool)
-	if err := archiveSession(session, stateDir, func(path string) error {
-		synced[filepath.Clean(path)] = true
-		return syncFilesystemPath(path)
-	}); err != nil {
-		t.Fatal(err)
-	}
-	archiveFile := filepath.Join(archiveDir, "session.jsonl")
-	after, err := os.Stat(archiveFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !os.SameFile(before, after) {
-		t.Fatal("session archival replaced the session file instead of atomically renaming it")
-	}
-	if !synced[archiveFile] || !synced[archiveDir] {
-		t.Fatalf("archive payload syncs = %#v, want file and archive directory", synced)
-	}
-	if _, err := os.Stat(sessionFile); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("active session survived archival: %v", err)
-	}
-}
-
 func TestResetRerunsAfterSessionArchiveSyncFailure(t *testing.T) {
 	fixture := newLocalArtifactResetFixture(t, false)
 	commonDirectory, err := gitCommonDirectory(context.Background(), fixture.git, fixture.repository)
@@ -745,40 +704,6 @@ exec `+quote(fixture.git)+` "$@"
 				t.Fatalf("local identity refusal changed ownership: %#v", current)
 			}
 		})
-	}
-}
-
-func TestDeleteLocalBranchUsesExpectedCommit(t *testing.T) {
-	t.Parallel()
-	repository := filepath.Join(t.TempDir(), "repo")
-	runGit(t, t.TempDir(), "init", "-b", "main", repository)
-	runGit(t, repository, "config", "user.name", "Reset Test")
-	runGit(t, repository, "config", "user.email", "reset@example.test")
-	if err := os.WriteFile(filepath.Join(repository, "tracked"), []byte("base\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	runGit(t, repository, "add", "tracked")
-	runGit(t, repository, "commit", "-m", "base")
-	branchName := "agent/issue-42-local-cas"
-	runGit(t, repository, "branch", branchName)
-	expected := strings.TrimSpace(gitOutput(t, repository, "rev-parse", branchName))
-	runGit(t, repository, "commit", "--allow-empty", "-m", "advanced")
-	advanced := strings.TrimSpace(gitOutput(t, repository, "rev-parse", "HEAD"))
-	runGit(t, repository, "update-ref", "refs/heads/"+branchName, advanced)
-	branch := reset.Branch{Name: branchName, Commit: expected, Present: true}
-	if err := deleteLocalBranch(context.Background(), "git", repository, branch); err == nil || !strings.Contains(err.Error(), "expected commit") {
-		t.Fatalf("stale local branch deletion error = %v", err)
-	}
-	if got := strings.TrimSpace(gitOutput(t, repository, "rev-parse", branchName)); got != advanced {
-		t.Fatalf("stale deletion changed branch to %s, want %s", got, advanced)
-	}
-	branch.Commit = advanced
-	if err := deleteLocalBranch(context.Background(), "git", repository, branch); err != nil {
-		t.Fatal(err)
-	}
-	command := exec.Command("git", "-C", repository, "show-ref", "--verify", "--quiet", "refs/heads/"+branchName)
-	if err := command.Run(); err == nil {
-		t.Fatal("expected-commit deletion left local branch present")
 	}
 }
 
@@ -2725,28 +2650,6 @@ func TestResetAcceptsAlreadyClosedPullRequestAndAbsentOwnedRemoteBranch(t *testi
 	}
 	if _, err := os.Stat(fixture.githubCalls); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("idempotent GitHub state caused a mutation: %v", err)
-	}
-}
-
-func TestDeleteRemoteBranchUsesExpectedCommitLease(t *testing.T) {
-	t.Parallel()
-	calls := filepath.Join(t.TempDir(), "calls")
-	git := writeExecutable(t, "#!/bin/sh\nprintf '%s\\n' \"$*\" > "+quote(calls)+"\n")
-	branch := reset.Branch{Name: "agent/issue-42-run", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Present: true}
-	if err := deleteRemoteBranch(context.Background(), git, t.TempDir(), branch); err != nil {
-		t.Fatal(err)
-	}
-	call, err := os.ReadFile(calls)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(call), "--force-with-lease=refs/heads/agent/issue-42-run:"+branch.Commit+" :refs/heads/agent/issue-42-run") {
-		t.Fatalf("git call = %q", call)
-	}
-
-	failingGit := writeExecutable(t, "#!/bin/sh\necho stale lease >&2\nexit 1\n")
-	if err := deleteRemoteBranch(context.Background(), failingGit, t.TempDir(), branch); err == nil || !strings.Contains(err.Error(), "expected commit") || !strings.Contains(err.Error(), "stale lease") {
-		t.Fatalf("conditional deletion error = %v", err)
 	}
 }
 

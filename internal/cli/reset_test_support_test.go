@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"os"
 
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
 	"github.com/robinjoseph08/backlog/internal/reset"
@@ -43,18 +44,16 @@ func (e resetExecutor) apply(ctx context.Context, plan reset.Plan) error {
 	return e.module().Retire(ctx, plan)
 }
 
-func archiveSession(session reset.Session, stateDirectory string, syncPath func(string) error) error {
-	return retirement.ArchiveSession(session, stateDirectory, syncPath)
-}
-
-func syncFilesystemPath(path string) error { return retirement.SyncFilesystemPath(path) }
-
-func deleteLocalBranch(ctx context.Context, executable, root string, branch reset.Branch) error {
-	return retirement.DeleteLocalBranch(ctx, executable, root, branch)
-}
-
-func deleteRemoteBranch(ctx context.Context, executable, root string, branch reset.Branch) error {
-	return retirement.DeleteRemoteBranch(ctx, executable, root, branch)
+func syncFilesystemPath(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	return file.Close()
 }
 
 func inspectSession(run scheduler.Run, stateDirectory string) (reset.Session, error) {

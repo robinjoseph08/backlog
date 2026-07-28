@@ -35,20 +35,6 @@ func InspectSession(run scheduler.Run, stateDirectory string) (Session, error) {
 	return inspectSession(run, stateDirectory)
 }
 
-func DeleteRemoteBranch(ctx context.Context, gitExecutable, repositoryRoot string, branch Branch) error {
-	return deleteRemoteBranch(ctx, gitExecutable, repositoryRoot, branch)
-}
-
-func DeleteLocalBranch(ctx context.Context, gitExecutable, repositoryRoot string, branch Branch) error {
-	return deleteLocalBranch(ctx, gitExecutable, repositoryRoot, branch)
-}
-
-func ArchiveSession(session Session, stateDirectory string, syncPath func(string) error) error {
-	return archiveSession(session, stateDirectory, syncPath)
-}
-
-func SyncFilesystemPath(path string) error { return syncFilesystemPath(path) }
-
 func VerifyFinalState(current state.State, expected scheduler.Run, policy Policy) error {
 	return (Service{policy: policy}).verifyFinalState(current, expected)
 }

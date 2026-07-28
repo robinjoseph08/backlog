@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/robinjoseph08/backlog/internal/activity"
-	"github.com/robinjoseph08/backlog/internal/retirement"
+	"github.com/robinjoseph08/backlog/internal/processidentity"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 )
@@ -330,7 +330,7 @@ func observeWorkerLiveness(run scheduler.Run) (string, workerLivenessState) {
 			return "absent", workerLivenessAbsent
 		}
 		var err error
-		pid, err = retirement.ProcessIdentityPID(run.ProcessIdentity)
+		pid, err = processidentity.PID(run.ProcessIdentity)
 		if err != nil {
 			return "unknown (persisted process-start identity has no valid PID)", workerLivenessUnknown
 		}

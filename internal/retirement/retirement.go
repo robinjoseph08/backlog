@@ -15,12 +15,11 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
-	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
+	"github.com/robinjoseph08/backlog/internal/processidentity"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 	"github.com/robinjoseph08/backlog/internal/worktree"
@@ -929,7 +928,7 @@ func inspectWorkerAbsent(run scheduler.Run) error {
 			return nil
 		}
 		var err error
-		pid, err = ProcessIdentityPID(run.ProcessIdentity)
+		pid, err = processidentity.PID(run.ProcessIdentity)
 		if err != nil {
 			return fmt.Errorf("Run %s has uncertain retained Worker identity: %w", run.RunID, err)
 		}
@@ -937,11 +936,11 @@ func inspectWorkerAbsent(run scheduler.Run) error {
 	if pid < 0 || run.ProcessIdentity == "" {
 		return fmt.Errorf("Run %s has incomplete Worker identity", run.RunID)
 	}
-	processAlive, err := signalZero(pid)
+	processAlive, err := processidentity.Alive(pid)
 	if err != nil {
 		return fmt.Errorf("verify Worker PID %d: %w", pid, err)
 	}
-	groupAlive, err := signalZero(-pid)
+	groupAlive, err := processidentity.Alive(-pid)
 	if err != nil {
 		return fmt.Errorf("verify Worker process group %d: %w", pid, err)
 	}
@@ -951,7 +950,7 @@ func inspectWorkerAbsent(run scheduler.Run) error {
 	if !processAlive || !groupAlive {
 		return fmt.Errorf("Worker PID/process-group liveness is uncertain for Run %s", run.RunID)
 	}
-	identity, err := pidStartIdentity(pid)
+	identity, err := processidentity.Start(pid)
 	if err != nil {
 		return fmt.Errorf("verify live Worker identity: %w", err)
 	}
@@ -961,20 +960,10 @@ func inspectWorkerAbsent(run scheduler.Run) error {
 	return fmt.Errorf("Worker for Run %s is live at PID %d", run.RunID, pid)
 }
 
-// ProcessIdentityPID extracts the recorded PID from an owned Worker process identity.
-func ProcessIdentityPID(identity string) (int, error) {
-	value, started, found := strings.Cut(identity, ":")
-	pid, err := strconv.Atoi(value)
-	if !found || err != nil || pid <= 0 || strings.TrimSpace(started) == "" {
-		return 0, errors.New("invalid process identity")
-	}
-	return pid, nil
-}
-
 func absentWorkerSummary(run scheduler.Run) string {
 	pid := run.PID
 	if pid == 0 && run.ProcessIdentity != "" {
-		pid, _ = ProcessIdentityPID(run.ProcessIdentity)
+		pid, _ = processidentity.PID(run.ProcessIdentity)
 	}
 	if pid == 0 {
 		return "absent (no recorded PID)"
@@ -1367,6 +1356,9 @@ func inspectSessionDirectory(directory string, run scheduler.Run) ([]string, boo
 		return nil, false, fmt.Errorf("inspect Pi session directory: %w", err)
 	}
 	sort.Strings(files)
+	if len(files) == 0 {
+		return nil, false, fmt.Errorf("Pi session directory %s contains no identity-bearing session files", directory)
+	}
 	for _, path := range files {
 		if err := verifySessionHeader(path, run); err != nil {
 			return nil, false, err
@@ -1397,33 +1389,6 @@ func verifySessionHeader(path string, run scheduler.Run) error {
 		return fmt.Errorf("Pi session file %s identity does not match Run %s", path, run.RunID)
 	}
 	return nil
-}
-
-func signalZero(pid int) (bool, error) {
-	err := syscall.Kill(pid, syscall.Signal(0))
-	switch {
-	case err == nil:
-		return true, nil
-	case errors.Is(err, syscall.ESRCH):
-		return false, nil
-	case errors.Is(err, syscall.EPERM):
-		return false, errors.New("permission denied; liveness is unknown")
-	default:
-		return false, err
-	}
-}
-
-func pidStartIdentity(pid int) (string, error) {
-	command := exec.Command("ps", "-p", fmt.Sprint(pid), "-o", "lstart=") // #nosec G204 -- validated numeric PID
-	output, err := command.CombinedOutput()
-	if err != nil {
-		return "", err
-	}
-	started := strings.TrimSpace(string(output))
-	if started == "" {
-		return "", errors.New("empty process start identity")
-	}
-	return fmt.Sprintf("%d:%s", pid, started), nil
 }
 
 // WritePlan prints the complete operator-visible retirement plan.
