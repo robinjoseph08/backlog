@@ -1600,11 +1600,11 @@ func (r *Runner) reconcileAfterWorkerSettlementWithinLifecycle(ctx context.Conte
 }
 
 // reconcileAfterWorkerSettlement runs only after normal Worker settlement,
-// process-group exit, durable log closure, and an initial outcome that verified
-// issue closure. It gives the expected branch one final Completion check before
+// process-group exit, and durable log closure. It detects closure during Worker
+// close, then gives the expected branch one final Completion check before
 // complete External Resolution may release the Run's Lease.
 func (r *Runner) reconcileAfterWorkerSettlement(ctx context.Context, current *state.State, runID string, issueClosed bool) error {
-	if !issueClosed || r.ExternalResolution == nil {
+	if r.ExternalResolution == nil {
 		return nil
 	}
 	run := findRun(current.Runs, runID)
@@ -1614,6 +1614,20 @@ func (r *Runner) reconcileAfterWorkerSettlement(ctx context.Context, current *st
 	}
 	if run.WorkerLogOpen {
 		return fmt.Errorf("post-settlement reconciliation for Run %s started before durable Worker log closure", runID)
+	}
+	if !issueClosed {
+		issueState, err := r.GitHub.IssueState(ctx, r.Config.Repo, run.Issue)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// The initial Completion check already verified the issue as open.
+			// A failed late-closure probe must not escalate an ordinary open Run.
+			return nil
+		}
+		if issueState.Open {
+			return nil
+		}
 	}
 
 	outcome, err := r.GitHub.Completion(ctx, r.Config.Repo, run.Issue, run.Branch)
