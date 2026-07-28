@@ -249,31 +249,27 @@ esac
 		t.Fatalf("return to Admission after retries: %v", err)
 	}
 	waitForDashboardScreen(t, &stdout, "2 consecutive failures")
-	if visible := terminalScreenText(stdout.String(), 100, 12); !strings.Contains(visible, "Admission health") || !strings.Contains(visible, "DEGRADED") {
-		t.Fatalf("automatic dashboard did not render degraded Admission health:\n%s", visible)
-	}
-	if _, err := writeInput.Write([]byte("j")); err != nil {
-		t.Fatalf("reveal closed Diagnostics below Admission details: %v", err)
+	if _, err := writeInput.Write([]byte{'\r'}); err != nil {
+		t.Fatalf("collapse Admission to expose closed Diagnostics: %v", err)
 	}
 	waitForDashboardScreen(t, &stdout, "Diagnostics: closed")
 	closedOutput := stdout.String()
-	closedVisible := terminalScreenText(closedOutput, 100, 12)
-	if !strings.Contains(closedVisible, "DEGRADED") || !strings.Contains(closedVisible, "Diagnostics: closed") {
-		t.Fatalf("automatic dashboard did not render closed Admission Diagnostics:\n%s", closedVisible)
+	closedScreen := terminalScreenText(closedOutput, 100, 12)
+	if !strings.Contains(closedScreen, "Admission health [collapsed]") || !strings.Contains(closedScreen, "DEGRADED") || !strings.Contains(closedScreen, "Diagnostics: closed") {
+		t.Fatalf("automatic dashboard did not render closed Admission health:\n%s\nraw output: %q", closedScreen, closedOutput)
 	}
 	if strings.Contains(closedOutput, "retained stderr evidence") || strings.Contains(closedOutput, "Operational messages") || strings.Contains(closedOutput, "candidate discovery failed; admission paused") {
 		t.Fatalf("closed automatic dashboard exposed full evidence or duplicated Admission as operational rows: %q", closedOutput)
 	}
 
-	diagnosticsOffset := len(stdout.String())
-	if _, err := writeInput.Write([]byte("d" + strings.Repeat("j", 5))); err != nil {
+	if _, err := writeInput.Write([]byte("d")); err != nil {
 		t.Fatalf("open paged Diagnostics: %v", err)
 	}
-	waitForDashboardOutputAfter(t, &stdout, diagnosticsOffset, "Diagnostics (")
+	waitForDashboardScreen(t, &stdout, "Diagnostics (")
 	if _, err := writeInput.Write([]byte("f")); err != nil {
 		t.Fatalf("page through the selected Diagnostics evidence: %v", err)
 	}
-	waitForDashboardOutputAfter(t, &stdout, diagnosticsOffset, "for attempt 2")
+	waitForDashboardScreen(t, &stdout, "for attempt 2")
 
 	if _, err := writeInput.Write([]byte("G")); err != nil {
 		t.Fatalf("jump to bottom of existing dashboard sections: %v", err)
@@ -288,6 +284,10 @@ esac
 		t.Fatalf("return to Admission: %v", err)
 	}
 	waitForDashboardScreen(t, &stdout, "Admission: DEGRADED")
+	if _, err := writeInput.Write([]byte{'\r'}); err != nil {
+		t.Fatalf("expand Admission before Drain: %v", err)
+	}
+	waitForDashboardScreen(t, &stdout, "First failure:")
 	if _, err := writeInput.Write([]byte{0x03}); err != nil {
 		t.Fatalf("start Drain: %v", err)
 	}
@@ -312,22 +312,6 @@ esac
 	if strings.Contains(visible, "Next retry:") {
 		t.Fatalf("final degraded Admission screen retained an actionable retry:\n%s\nraw output: %q", visible, output)
 	}
-}
-
-func waitForDashboardOutputAfter(t *testing.T, output *synchronizedBuffer, offset int, want string) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		current := output.String()
-		if offset > len(current) {
-			offset = len(current)
-		}
-		if strings.Contains(current[offset:], want) {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatalf("dashboard output after byte %d never contained %q: %q", offset, want, output.String())
 }
 
 func waitForDashboardScreen(t *testing.T, output *synchronizedBuffer, want string) {

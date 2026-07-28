@@ -27,19 +27,19 @@ func TestInspectWorkerAbsentRefusesContradictoryRecordedPIDs(t *testing.T) {
 
 func TestArchiveSessionUsesAtomicRenameAndSyncsEveryDurabilityPath(t *testing.T) {
 	t.Parallel()
-	stateDir, session, activeFile, archiveFile, nestedArchiveDir, nestedArchiveFile := newArchivableSession(t)
-	before, err := os.Stat(activeFile)
+	fixture := newArchivableSession(t)
+	before, err := os.Stat(fixture.activeFile)
 	if err != nil {
 		t.Fatal(err)
 	}
 	synced := make(map[string]bool)
-	if err := archiveSession(session, stateDir, func(path string) error {
+	if err := archiveSession(fixture.run, fixture.session, fixture.stateDir, func(path string) error {
 		synced[filepath.Clean(path)] = true
 		return syncFilesystemPath(path)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	after, err := os.Stat(archiveFile)
+	after, err := os.Stat(fixture.archiveFile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,20 +47,20 @@ func TestArchiveSessionUsesAtomicRenameAndSyncsEveryDurabilityPath(t *testing.T)
 		t.Fatal("session archival replaced the session file instead of atomically renaming it")
 	}
 	for _, path := range []string{
-		archiveFile,
-		nestedArchiveFile,
-		nestedArchiveDir,
-		session.ArchiveDir,
-		filepath.Dir(session.ArchiveDir),
-		filepath.Dir(filepath.Dir(session.ArchiveDir)),
-		stateDir,
-		filepath.Dir(session.Dir),
+		fixture.archiveFile,
+		fixture.nestedArchiveFile,
+		fixture.nestedArchiveDir,
+		fixture.session.ArchiveDir,
+		filepath.Dir(fixture.session.ArchiveDir),
+		filepath.Dir(filepath.Dir(fixture.session.ArchiveDir)),
+		fixture.stateDir,
+		filepath.Dir(fixture.session.Dir),
 	} {
 		if !synced[filepath.Clean(path)] {
 			t.Errorf("durability path %s was not synced; syncs = %#v", path, synced)
 		}
 	}
-	if _, err := os.Stat(activeFile); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(fixture.activeFile); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("active session survived archival: %v", err)
 	}
 }
@@ -85,10 +85,10 @@ func TestArchiveSessionReportsEveryDurabilitySyncFailure(t *testing.T) {
 	for _, boundary := range boundaries {
 		t.Run(boundary.name, func(t *testing.T) {
 			t.Parallel()
-			stateDir, session, activeFile, _, _, _ := newArchivableSession(t)
-			target := filepath.Clean(boundary.target(stateDir, session))
+			fixture := newArchivableSession(t)
+			target := filepath.Clean(boundary.target(fixture.stateDir, fixture.session))
 			injected := "injected " + boundary.name + " sync failure"
-			err := archiveSession(session, stateDir, func(path string) error {
+			err := archiveSession(fixture.run, fixture.session, fixture.stateDir, func(path string) error {
 				if filepath.Clean(path) == target {
 					return errors.New(injected)
 				}
@@ -97,17 +97,94 @@ func TestArchiveSessionReportsEveryDurabilitySyncFailure(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), injected) {
 				t.Fatalf("durability sync error = %v, want %q", err, injected)
 			}
-			if _, err := os.Stat(activeFile); !errors.Is(err, os.ErrNotExist) {
+			if _, err := os.Stat(fixture.activeFile); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("active session survived failed archive sync: %v", err)
 			}
-			if info, err := os.Stat(session.ArchiveDir); err != nil || !info.IsDir() {
+			if info, err := os.Stat(fixture.session.ArchiveDir); err != nil || !info.IsDir() {
 				t.Fatalf("historical session missing after failed archive sync: %v", err)
 			}
 		})
 	}
 }
 
-func newArchivableSession(t *testing.T) (string, Session, string, string, string, string) {
+func TestArchiveSessionRefusesSourceReplacementAfterInspection(t *testing.T) {
+	t.Parallel()
+	fixture := newArchivableSession(t)
+	if _, err := inspectSession(fixture.run, fixture.stateDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(fixture.session.Dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(fixture.session.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	replacement := `{"type":"session","id":"unrelated","cwd":"/unrelated"}` + "\n"
+	if err := os.WriteFile(filepath.Join(fixture.session.Dir, "session.jsonl"), []byte(replacement), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := archiveSession(fixture.run, fixture.session, fixture.stateDir, syncFilesystemPath)
+	if err == nil || !strings.Contains(err.Error(), "identity changed immediately before archival") {
+		t.Fatalf("replacement session archival error = %v", err)
+	}
+	if info, statErr := os.Stat(fixture.session.Dir); statErr != nil || !info.IsDir() {
+		t.Fatalf("replacement session was moved: %v", statErr)
+	}
+	if _, statErr := os.Stat(fixture.session.ArchiveDir); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("replacement session reached historical archive: %v", statErr)
+	}
+}
+
+func TestArchiveSessionRestoresSourceAfterPostRenameIdentityMismatch(t *testing.T) {
+	t.Parallel()
+	fixture := newArchivableSession(t)
+	replacement := []byte(`{"type":"session","id":"unrelated","cwd":"/unrelated"}` + "\n")
+	renameCalls := 0
+	renamePath := func(source, destination string) error {
+		if err := os.Rename(source, destination); err != nil {
+			return err
+		}
+		renameCalls++
+		if renameCalls != 1 {
+			return nil
+		}
+		for _, path := range []string{
+			filepath.Join(destination, "session.jsonl"),
+			filepath.Join(destination, "nested", "events.jsonl"),
+		} {
+			if err := os.WriteFile(path, replacement, 0o600); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	err := archiveSessionWithRename(fixture.run, fixture.session, fixture.stateDir, syncFilesystemPath, renamePath)
+	if err == nil || !strings.Contains(err.Error(), "refuse Pi session archival after source identity changed") {
+		t.Fatalf("post-rename identity error = %v", err)
+	}
+	if renameCalls != 2 {
+		t.Fatalf("rename calls = %d, want archive and rollback", renameCalls)
+	}
+	for _, path := range []string{fixture.activeFile, filepath.Join(fixture.session.Dir, "nested", "events.jsonl")} {
+		content, readErr := os.ReadFile(path)
+		if readErr != nil || string(content) != string(replacement) {
+			t.Fatalf("restored replacement session file %s = %q, %v", path, content, readErr)
+		}
+	}
+	if _, statErr := os.Stat(fixture.session.ArchiveDir); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("replacement session remained in historical archive: %v", statErr)
+	}
+}
+
+type archivableSessionFixture struct {
+	stateDir, activeFile, archiveFile, nestedArchiveDir, nestedArchiveFile string
+	run                                                                    scheduler.Run
+	session                                                                Session
+}
+
+func newArchivableSession(t *testing.T) archivableSessionFixture {
 	t.Helper()
 	stateDir := t.TempDir()
 	sessionDir := filepath.Join(stateDir, "sessions", "run-atomic")
@@ -116,15 +193,26 @@ func newArchivableSession(t *testing.T) (string, Session, string, string, string
 	if err := os.MkdirAll(nestedSessionDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	run := scheduler.Run{
+		RunID: "run-atomic", WorkerMode: scheduler.WorkerModeRPC,
+		Worktree:  filepath.Join(stateDir, "worktrees", "run-atomic"),
+		SessionID: "backlog-run-atomic", SessionDir: sessionDir,
+	}
+	header := `{"type":"session","id":"` + run.SessionID + `","cwd":"` + run.Worktree + `"}` + "\n"
 	activeFile := filepath.Join(sessionDir, "session.jsonl")
-	if err := os.WriteFile(activeFile, []byte("session\n"), 0o600); err != nil {
+	if err := os.WriteFile(activeFile, []byte(header), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(nestedSessionDir, "events.jsonl"), []byte("event\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(nestedSessionDir, "events.jsonl"), []byte(header), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	session := Session{ID: "backlog-run-atomic", Dir: sessionDir, ArchiveDir: archiveDir, Present: true}
-	return stateDir, session, activeFile, filepath.Join(archiveDir, "session.jsonl"), filepath.Join(archiveDir, "nested"), filepath.Join(archiveDir, "nested", "events.jsonl")
+	session := Session{ID: run.SessionID, Dir: sessionDir, ArchiveDir: archiveDir, Present: true}
+	return archivableSessionFixture{
+		stateDir: stateDir, run: run, session: session, activeFile: activeFile,
+		archiveFile:       filepath.Join(archiveDir, "session.jsonl"),
+		nestedArchiveDir:  filepath.Join(archiveDir, "nested"),
+		nestedArchiveFile: filepath.Join(archiveDir, "nested", "events.jsonl"),
+	}
 }
 
 func TestDeleteLocalBranchUsesExpectedCommit(t *testing.T) {

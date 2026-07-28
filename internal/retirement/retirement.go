@@ -225,6 +225,16 @@ func PlansEqual(left, right Plan) bool {
 // Retire executes the complete ordered retirement, revalidating immediately
 // before each mutation and verifying every postcondition before returning.
 func (e Service) Retire(ctx context.Context, approved Plan) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if e.policy.MarkProgressBeforeMutation && len(approved.Actions) != 0 && approved.Actions[0].kind == actionMarkProgress {
+		if err := e.markProgress(approved.Snapshot); err != nil {
+			return err
+		}
+		approved.Snapshot.Run.Status = e.policy.ProgressStatus
+		approved.Actions = append([]Action(nil), approved.Actions[1:]...)
+	}
 	return e.apply(ctx, approved)
 }
 
@@ -234,6 +244,9 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 		return err
 	}
 	if err := e.validateMutation(plan); err != nil {
+		return err
+	}
+	if completed, err := e.completeMergedPlanWithContinuity(ctx, approved.Snapshot, plan); completed {
 		return err
 	}
 	if !executablePlansEqual(approved, plan) {
@@ -258,18 +271,18 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 		action := plan.Actions[0]
 		switch action.kind {
 		case actionMarkProgress:
-			if plan.Snapshot.Run.Status == scheduler.StatusWaitingForMerge {
+			if plan.Snapshot.Run.Status == scheduler.StatusWaitingForMerge && !e.policy.MarkProgressBeforeMutation {
 				if err := verifyWaitingForMergeDisarmed(plan); err != nil {
 					return err
 				}
 			}
-			if err := e.markProgress(); err != nil {
+			if err := e.markProgress(plan.Snapshot); err != nil {
 				return err
 			}
 			continue
 		case actionDisablePullRequestAutoMerge:
-			before, err := e.revalidateAction(ctx, plan, approved, action, "disabling pull request auto-merge")
-			if err != nil {
+			before, completed, err := e.revalidateAction(ctx, plan, approved, action, "disabling pull request auto-merge")
+			if err != nil || completed {
 				return err
 			}
 			pull, found := pullRequestByNumber(before.Snapshot.PullRequests, action.pullRequest)
@@ -277,13 +290,10 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return fmt.Errorf("pull request #%d is not ready for auto-merge disablement", action.pullRequest)
 			}
 			if err := e.github.DisablePullRequestAutoMerge(ctx, before.Snapshot.Repository, pull.Number); err != nil {
-				return fmt.Errorf("disable auto-merge for pull request #%d: %w", pull.Number, err)
+				return e.reconcileMutationFailure(ctx, approved, fmt.Errorf("disable auto-merge for pull request #%d: %w", pull.Number, err))
 			}
-			after, err := e.inspect(ctx)
-			if err != nil {
-				return err
-			}
-			if err := e.verifyGitHubIdentityContinuity(approved.Snapshot, after.Snapshot); err != nil {
+			after, completed, err := e.inspectMutationPostcondition(ctx, approved)
+			if err != nil || completed {
 				return err
 			}
 			updated, found := pullRequestByNumber(after.Snapshot.PullRequests, pull.Number)
@@ -291,8 +301,8 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return fmt.Errorf("pull request #%d was not freshly verified open, unmerged, and auto-merge unarmed", pull.Number)
 			}
 		case actionExplainPullRequest:
-			before, err := e.revalidateAction(ctx, plan, approved, action, "commenting on pull request")
-			if err != nil {
+			before, completed, err := e.revalidateAction(ctx, plan, approved, action, "commenting on pull request")
+			if err != nil || completed {
 				return err
 			}
 			pull, found := pullRequestByNumber(before.Snapshot.PullRequests, action.pullRequest)
@@ -300,22 +310,19 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return fmt.Errorf("pull request #%d is not ready for the %s explanation", action.pullRequest, e.policy.Operation)
 			}
 			if err := e.github.CommentOnPullRequest(ctx, before.Snapshot.Repository, pull.Number, e.policy.Explanation(before.Snapshot.Run)); err != nil {
-				return fmt.Errorf("%s on pull request #%d: %w", e.policy.ExplanationAction, pull.Number, err)
+				return e.reconcileMutationFailure(ctx, approved, fmt.Errorf("%s on pull request #%d: %w", e.policy.ExplanationAction, pull.Number, err))
 			}
-			after, err := e.inspect(ctx)
-			if err != nil {
-				return err
-			}
-			if err := e.verifyGitHubIdentityContinuity(approved.Snapshot, after.Snapshot); err != nil {
+			after, completed, err := e.inspectMutationPostcondition(ctx, approved)
+			if err != nil || completed {
 				return err
 			}
 			updated, found := pullRequestByNumber(after.Snapshot.PullRequests, pull.Number)
-			if !found || updated.State != PullRequestOpen || updated.AutoMergeArmed || !updated.Explained {
+			if !found || updated.State == PullRequestMerged || updated.AutoMergeArmed || !updated.Explained {
 				return fmt.Errorf("pull request #%d %s explanation did not satisfy its verified postcondition", pull.Number, e.policy.Operation)
 			}
 		case actionClosePullRequest:
-			before, err := e.revalidateAction(ctx, plan, approved, action, "closing pull request")
-			if err != nil {
+			before, completed, err := e.revalidateAction(ctx, plan, approved, action, "closing pull request")
+			if err != nil || completed {
 				return err
 			}
 			pull, found := pullRequestByNumber(before.Snapshot.PullRequests, action.pullRequest)
@@ -323,13 +330,10 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return fmt.Errorf("pull request #%d is not ready for safe closure", action.pullRequest)
 			}
 			if err := e.github.ClosePullRequest(ctx, before.Snapshot.Repository, pull.Number); err != nil {
-				return fmt.Errorf("close unmerged pull request #%d: %w", pull.Number, err)
+				return e.reconcileMutationFailure(ctx, approved, fmt.Errorf("close unmerged pull request #%d: %w", pull.Number, err))
 			}
-			after, err := e.inspect(ctx)
-			if err != nil {
-				return err
-			}
-			if err := e.verifyGitHubIdentityContinuity(approved.Snapshot, after.Snapshot); err != nil {
+			after, completed, err := e.inspectMutationPostcondition(ctx, approved)
+			if err != nil || completed {
 				return err
 			}
 			updated, found := pullRequestByNumber(after.Snapshot.PullRequests, pull.Number)
@@ -337,24 +341,24 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return fmt.Errorf("pull request #%d was not freshly verified closed and unmerged with auto-merge unarmed", pull.Number)
 			}
 		case actionDeleteRemoteBranch:
-			before, err := e.revalidateAction(ctx, plan, approved, action, "deleting remote branch")
-			if err != nil {
+			before, completed, err := e.revalidateAction(ctx, plan, approved, action, "deleting remote branch")
+			if err != nil || completed {
 				return err
 			}
 			branch := before.Snapshot.RemoteBranch
 			if err := deleteRemoteBranch(ctx, e.gitExecutable, e.repositoryRoot, branch); err != nil {
 				return err
 			}
-			after, err := e.inspect(ctx)
-			if err != nil {
+			after, completed, err := e.inspectMutationPostcondition(ctx, approved)
+			if err != nil || completed {
 				return err
 			}
 			if after.Snapshot.RemoteBranch.Present {
 				return fmt.Errorf("owned remote branch %s is still present after deletion", branch.Name)
 			}
 		case actionRemoveLocalWorktree:
-			before, err := e.revalidateAction(ctx, plan, approved, action, "removing local worktree")
-			if err != nil {
+			before, completed, err := e.revalidateAction(ctx, plan, approved, action, "removing local worktree")
+			if err != nil || completed {
 				return err
 			}
 			worktree := before.Snapshot.Worktree
@@ -364,16 +368,16 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			if err := removeLocalWorktree(ctx, e.gitExecutable, e.repositoryRoot, worktree); err != nil {
 				return err
 			}
-			after, err := e.inspect(ctx)
-			if err != nil {
+			after, completed, err := e.inspectMutationPostcondition(ctx, approved)
+			if err != nil || completed {
 				return err
 			}
 			if after.Snapshot.Worktree.Present {
 				return fmt.Errorf("owned local worktree %s is still present after removal", worktree.Path)
 			}
 		case actionDeleteLocalBranch:
-			before, err := e.revalidateAction(ctx, plan, approved, action, "deleting local branch")
-			if err != nil {
+			before, completed, err := e.revalidateAction(ctx, plan, approved, action, "deleting local branch")
+			if err != nil || completed {
 				return err
 			}
 			branch := before.Snapshot.LocalBranch
@@ -383,54 +387,54 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			if err := deleteLocalBranch(ctx, e.gitExecutable, e.repositoryRoot, branch); err != nil {
 				return err
 			}
-			after, err := e.inspect(ctx)
-			if err != nil {
+			after, completed, err := e.inspectMutationPostcondition(ctx, approved)
+			if err != nil || completed {
 				return err
 			}
 			if after.Snapshot.LocalBranch.Present {
 				return fmt.Errorf("owned local branch %s is still present after deletion", branch.Name)
 			}
 		case actionArchiveSession:
-			before, err := e.revalidateAction(ctx, plan, approved, action, "archiving Pi session")
-			if err != nil {
+			before, completed, err := e.revalidateAction(ctx, plan, approved, action, "archiving Pi session")
+			if err != nil || completed {
 				return err
 			}
 			session := before.Snapshot.Session
-			if err := archiveSession(session, e.stateDirectory, e.filesystemSync); err != nil {
+			if err := archiveSession(before.Snapshot.Run, session, e.stateDirectory, e.filesystemSync); err != nil {
 				return err
 			}
-			after, err := e.inspect(ctx)
-			if err != nil {
+			after, completed, err := e.inspectMutationPostcondition(ctx, approved)
+			if err != nil || completed {
 				return err
 			}
 			if after.Snapshot.Session.Present || !after.Snapshot.Session.Archived {
 				return fmt.Errorf("Pi session %s was not verified in its non-resumable historical archive", session.ID)
 			}
 		case actionRemoveIssueLabel:
-			before, err := e.revalidateAction(ctx, plan, approved, action, "removing issue label "+action.label)
-			if err != nil {
+			before, completed, err := e.revalidateAction(ctx, plan, approved, action, "removing issue label "+action.label)
+			if err != nil || completed {
 				return err
 			}
 			if err := e.github.RemoveIssueLabel(ctx, before.Snapshot.Repository, before.Snapshot.Run.Issue, action.label); err != nil {
 				return fmt.Errorf("remove issue label %s: %w", action.label, err)
 			}
-			after, err := e.inspect(ctx)
-			if err != nil {
+			after, completed, err := e.inspectMutationPostcondition(ctx, approved)
+			if err != nil || completed {
 				return err
 			}
 			if err := verifyLabelMutation(before.Snapshot.Issue.Labels, after.Snapshot.Issue.Labels, "", action.label); err != nil {
 				return err
 			}
 		case actionAddIssueLabel:
-			before, err := e.revalidateAction(ctx, plan, approved, action, "adding issue label "+action.label)
-			if err != nil {
+			before, completed, err := e.revalidateAction(ctx, plan, approved, action, "adding issue label "+action.label)
+			if err != nil || completed {
 				return err
 			}
 			if err := e.github.AddIssueLabel(ctx, before.Snapshot.Repository, before.Snapshot.Run.Issue, action.label); err != nil {
 				return fmt.Errorf("add issue label %s: %w", action.label, err)
 			}
-			after, err := e.inspect(ctx)
-			if err != nil {
+			after, completed, err := e.inspectMutationPostcondition(ctx, approved)
+			if err != nil || completed {
 				return err
 			}
 			if err := verifyLabelMutation(before.Snapshot.Issue.Labels, after.Snapshot.Issue.Labels, action.label, ""); err != nil {
@@ -446,32 +450,35 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 	}
 }
 
-func (e Service) revalidatePlan(ctx context.Context, current, approved Plan, action string) (Plan, error) {
+func (e Service) revalidatePlan(ctx context.Context, current, approved Plan, action string) (Plan, bool, error) {
 	fresh, err := e.inspect(ctx)
 	if err != nil {
-		return Plan{}, err
+		return Plan{}, false, err
 	}
 	if err := e.validateMutation(fresh); err != nil {
-		return Plan{}, err
+		return Plan{}, false, err
+	}
+	if completed, err := e.completeMergedPlanWithContinuity(ctx, approved.Snapshot, fresh); completed {
+		return Plan{}, true, err
 	}
 	if err := e.verifyGitHubIdentityContinuity(approved.Snapshot, fresh.Snapshot); err != nil {
-		return Plan{}, err
+		return Plan{}, false, err
 	}
 	if !executablePlansEqual(current, fresh) {
-		return Plan{}, fmt.Errorf("%s Plan changed immediately before %s", e.policy.Operation, action)
+		return Plan{}, false, fmt.Errorf("%s Plan changed immediately before %s", e.policy.Operation, action)
 	}
-	return fresh, nil
+	return fresh, false, nil
 }
 
-func (e Service) revalidateAction(ctx context.Context, current, approved Plan, action Action, description string) (Plan, error) {
-	fresh, err := e.revalidatePlan(ctx, current, approved, description)
-	if err != nil {
-		return Plan{}, err
+func (e Service) revalidateAction(ctx context.Context, current, approved Plan, action Action, description string) (Plan, bool, error) {
+	fresh, completed, err := e.revalidatePlan(ctx, current, approved, description)
+	if err != nil || completed {
+		return Plan{}, completed, err
 	}
 	if len(fresh.Actions) == 0 || fresh.Actions[0] != action {
-		return Plan{}, fmt.Errorf("%s Plan no longer authorizes %s as its next action", e.policy.Operation, description)
+		return Plan{}, false, fmt.Errorf("%s Plan no longer authorizes %s as its next action", e.policy.Operation, description)
 	}
-	return fresh, nil
+	return fresh, false, nil
 }
 
 func executablePlansEqual(left, right Plan) bool {
@@ -622,7 +629,11 @@ func deleteLocalBranch(ctx context.Context, gitExecutable, repositoryRoot string
 	return nil
 }
 
-func archiveSession(session Session, stateDirectory string, syncPath func(string) error) error {
+func archiveSession(run scheduler.Run, session Session, stateDirectory string, syncPath func(string) error) error {
+	return archiveSessionWithRename(run, session, stateDirectory, syncPath, os.Rename)
+}
+
+func archiveSessionWithRename(run scheduler.Run, session Session, stateDirectory string, syncPath func(string) error, renamePath func(string, string) error) error {
 	if !session.Present || session.Archived || session.Dir == "" || session.ArchiveDir == "" {
 		return errors.New("Pi session is not ready for atomic archival")
 	}
@@ -644,8 +655,22 @@ func archiveSession(session Session, stateDirectory string, syncPath func(string
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect historical Pi session archive: %w", err)
 	}
-	if err := os.Rename(session.Dir, session.ArchiveDir); err != nil {
+	if _, present, err := inspectSessionDirectory(session.Dir, run); err != nil {
+		return fmt.Errorf("active Pi session identity changed immediately before archival: %w", err)
+	} else if !present {
+		return errors.New("active Pi session disappeared immediately before archival")
+	}
+	if err := renamePath(session.Dir, session.ArchiveDir); err != nil {
 		return fmt.Errorf("atomically archive Pi session %s: %w", session.ID, err)
+	}
+	if _, archived, err := inspectSessionDirectory(session.ArchiveDir, run); err != nil || !archived {
+		if restoreErr := renamePath(session.ArchiveDir, session.Dir); restoreErr != nil {
+			return fmt.Errorf("verify archived Pi session identity: %v; restore active session: %w", err, restoreErr)
+		}
+		if err != nil {
+			return fmt.Errorf("refuse Pi session archival after source identity changed: %w", err)
+		}
+		return errors.New("refuse Pi session archival because the renamed source disappeared")
 	}
 	return syncArchivedSession(session, stateDirectory, syncPath)
 }
@@ -748,7 +773,56 @@ func verifyLabelMutation(before, after []string, added, removed string) error {
 	return fmt.Errorf("issue label mutation did not satisfy its verified postcondition: labels changed from %s to %s", formatLabels(before), formatLabels(after))
 }
 
-func (e Service) markProgress() error {
+func (e Service) inspectMutationPostcondition(ctx context.Context, approved Plan) (Plan, bool, error) {
+	after, err := e.inspect(ctx)
+	if err != nil {
+		return Plan{}, false, err
+	}
+	if completed, err := e.completeMergedPlanWithContinuity(ctx, approved.Snapshot, after); completed {
+		return Plan{}, true, err
+	}
+	if err := e.verifyGitHubIdentityContinuity(approved.Snapshot, after.Snapshot); err != nil {
+		return Plan{}, false, err
+	}
+	return after, false, nil
+}
+
+func (e Service) reconcileMutationFailure(ctx context.Context, approved Plan, mutationErr error) error {
+	if completed, completionErr := e.completeLateMerge(ctx, approved); completed {
+		return completionErr
+	}
+	return mutationErr
+}
+
+func (e Service) completeLateMerge(ctx context.Context, approved Plan) (bool, error) {
+	fresh, err := e.inspect(ctx)
+	if err != nil {
+		return false, nil
+	}
+	return e.completeMergedPlanWithContinuity(ctx, approved.Snapshot, fresh)
+}
+
+func (e Service) completeMergedPlanWithContinuity(ctx context.Context, approved Snapshot, plan Plan) (bool, error) {
+	if !e.policy.AllowMergedCompletion || plan.TerminalState != scheduler.StatusMerged {
+		return false, nil
+	}
+	if err := e.verifyGitHubIdentityContinuity(approved, plan.Snapshot); err != nil {
+		return true, err
+	}
+	return e.completeMergedPlan(ctx, plan)
+}
+
+func (e Service) completeMergedPlan(ctx context.Context, plan Plan) (bool, error) {
+	if !e.policy.AllowMergedCompletion || plan.TerminalState != scheduler.StatusMerged {
+		return false, nil
+	}
+	if len(plan.Actions) != 1 || plan.Actions[0].kind != actionFinalizeCompletion {
+		return true, errors.New("merged expected pull request did not produce an executable Completion plan")
+	}
+	return true, e.finalizeCompletion(ctx, plan, plan.Actions[0].pullRequest)
+}
+
+func (e Service) markProgress(expected Snapshot) error {
 	current, _, err := e.store.Preview()
 	if err != nil {
 		return err
@@ -756,6 +830,9 @@ func (e Service) markProgress() error {
 	run, lease, err := e.policy.SelectRun(current)
 	if err != nil {
 		return err
+	}
+	if run.RunID != expected.Run.RunID || run.Issue != expected.Run.Issue || run.Status != expected.Run.Status || lease != expected.Lease {
+		return errors.New("Run or Lease identity changed before recording retirement progress")
 	}
 	if run.Status == e.policy.TerminalStatus || run.Status == e.policy.ProgressStatus {
 		return nil
@@ -813,7 +890,6 @@ func (e Service) finalizeCompletion(ctx context.Context, verified Plan, pullNumb
 			current.Runs[index].ProcessIdentity = ""
 			current.Runs[index].WorkerLogOpen = false
 			current.Runs[index].CleanupPending = fresh.Snapshot.Worktree.Present || fresh.Snapshot.LocalBranch.Present
-			current.Runs[index].Error = ""
 			break
 		}
 	}
@@ -851,6 +927,12 @@ func (e Service) finalize(ctx context.Context, verified Plan) error {
 	}
 	fresh, err := e.inspect(ctx)
 	if err != nil {
+		return err
+	}
+	if completed, err := e.completeMergedPlanWithContinuity(ctx, verified.Snapshot, fresh); completed {
+		return err
+	}
+	if err := e.verifyGitHubIdentityContinuity(verified.Snapshot, fresh.Snapshot); err != nil {
 		return err
 	}
 	if !executablePlansEqual(verified, fresh) {
@@ -945,6 +1027,9 @@ func (e Service) verifyOwnedFinalState(snapshot Snapshot) error {
 		if pull.State != PullRequestClosed || pull.AutoMergeArmed {
 			return fmt.Errorf("pull request #%d final state is not verified closed, unmerged, and auto-merge unarmed", pull.Number)
 		}
+		if e.policy.RequireClosedExplanation && !pull.Explained {
+			return fmt.Errorf("pull request #%d final state is missing its verified %s explanation", pull.Number, e.policy.Operation)
+		}
 	}
 	if snapshot.RemoteBranch.Present {
 		return fmt.Errorf("owned remote branch %s remains present at %s", snapshot.RemoteBranch.Name, snapshot.RemoteBranch.Commit)
@@ -1000,9 +1085,11 @@ func (e Service) verifyFinalState(current state.State, expected scheduler.Run) e
 			if run.Status != e.policy.TerminalStatus {
 				return fmt.Errorf("Run %s final status is %s, not %s", expected.RunID, run.Status, e.policy.TerminalStatus)
 			}
+			if run.WorkerLogOpen {
+				return fmt.Errorf("Run %s Worker-log-open marker remains open after %s", expected.RunID, e.policy.Operation)
+			}
 			metadata := run
 			metadata.Status = expected.Status
-			metadata.WorkerLogOpen = expected.WorkerLogOpen
 			metadata.UpdatedAt = expected.UpdatedAt
 			metadata.CompletedAt = expected.CompletedAt
 			if !reflect.DeepEqual(metadata, expected) {

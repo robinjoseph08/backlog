@@ -315,6 +315,104 @@ esac
 	}
 }
 
+func TestRetirePersistsProgressBeforeFullReinspectionCanFail(t *testing.T) {
+	run := scheduler.Run{Issue: 42, RunID: "run-42", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint}
+	lease := scheduler.Lease{LeaseID: "lease-42", Issue: 42, RunID: run.RunID}
+	store := &policyStateStore{current: state.State{Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{lease}}}
+	policy := testPolicy()
+	policy.MarkProgressBeforeMutation = true
+	policy.SelectRun = func(current state.State) (scheduler.Run, scheduler.Lease, error) {
+		return current.Runs[0], current.Leases[0], nil
+	}
+	service := Service{
+		store: store, github: ghadapter.Client{Executable: filepath.Join(t.TempDir(), "missing-gh")},
+		policy: policy,
+	}
+	approved := Plan{
+		Snapshot: Snapshot{Run: run, Lease: lease},
+		Actions: []Action{
+			plannedAction(actionMarkProgress, "mark progress"),
+			plannedAction(actionFinalize, "finalize"),
+		},
+	}
+
+	err := service.Retire(context.Background(), approved)
+	if err == nil || !strings.Contains(err.Error(), "discover repository") {
+		t.Fatalf("reinspection error = %v", err)
+	}
+	if len(store.saved) != 1 || store.current.Runs[0].Status != scheduler.StatusResetting || store.current.Leases[0] != lease {
+		t.Fatalf("inspection failure did not retain durable progress and Lease: %#v", store.current)
+	}
+}
+
+func TestRetireWithCancelledContextDoesNotPersistProgress(t *testing.T) {
+	run := scheduler.Run{Issue: 42, RunID: "run-42", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint}
+	lease := scheduler.Lease{LeaseID: "lease-42", Issue: 42, RunID: run.RunID}
+	store := &policyStateStore{current: state.State{Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{lease}}}
+	policy := testPolicy()
+	policy.MarkProgressBeforeMutation = true
+	policy.SelectRun = func(current state.State) (scheduler.Run, scheduler.Lease, error) {
+		return current.Runs[0], current.Leases[0], nil
+	}
+	service := Service{store: store, policy: policy}
+	approved := Plan{
+		Snapshot: Snapshot{Run: run, Lease: lease},
+		Actions: []Action{
+			plannedAction(actionMarkProgress, "mark progress"),
+			plannedAction(actionFinalize, "finalize"),
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := service.Retire(ctx, approved)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled retirement error = %v", err)
+	}
+	if store.saves != 0 || store.current.Runs[0].Status != scheduler.StatusFailed || store.current.Leases[0] != lease {
+		t.Fatalf("cancelled retirement changed state: %#v", store.current)
+	}
+}
+
+func TestRetireRefusesReplacementRunAndLeaseBeforeProgressMutation(t *testing.T) {
+	approvedRun := scheduler.Run{Issue: 42, RunID: "approved", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint}
+	approvedLease := scheduler.Lease{LeaseID: "approved-lease", Issue: 42, RunID: approvedRun.RunID}
+	replacementRun := scheduler.Run{Issue: 42, RunID: "replacement", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint}
+	replacementLease := scheduler.Lease{LeaseID: "replacement-lease", Issue: 42, RunID: replacementRun.RunID}
+	store := &policyStateStore{current: state.State{Runs: []scheduler.Run{replacementRun}, Leases: []scheduler.Lease{replacementLease}}}
+	policy := testPolicy()
+	policy.MarkProgressBeforeMutation = true
+	policy.SelectRun = func(current state.State) (scheduler.Run, scheduler.Lease, error) {
+		return current.Runs[0], current.Leases[0], nil
+	}
+	service := Service{store: store, policy: policy}
+	approved := Plan{
+		Snapshot: Snapshot{Run: approvedRun, Lease: approvedLease},
+		Actions: []Action{
+			plannedAction(actionMarkProgress, "mark progress"),
+			plannedAction(actionFinalize, "finalize"),
+		},
+	}
+
+	err := service.Retire(context.Background(), approved)
+	if err == nil || !strings.Contains(err.Error(), "identity changed before recording retirement progress") {
+		t.Fatalf("replacement selection error = %v", err)
+	}
+	if store.saves != 0 || store.current.Runs[0] != replacementRun || store.current.Leases[0] != replacementLease {
+		t.Fatalf("replacement Run or Lease was mutated: %#v", store.current)
+	}
+}
+
+func TestFinalStateRequiresExplanationOnClosedUnmergedPullRequest(t *testing.T) {
+	policy := testPolicy()
+	policy.RequireClosedExplanation = true
+	service := Service{policy: policy}
+	err := service.verifyOwnedFinalState(Snapshot{PullRequests: []PullRequest{{Number: 7, State: PullRequestClosed}}})
+	if err == nil || !strings.Contains(err.Error(), "explanation") {
+		t.Fatalf("unexplained final pull request error = %v", err)
+	}
+}
+
 func TestPolicyValidationRefusesEveryIncompletePolicyShape(t *testing.T) {
 	tests := []struct {
 		name   string

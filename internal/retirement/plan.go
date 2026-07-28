@@ -168,7 +168,7 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 	if !foundRecorded {
 		return Plan{}, fmt.Errorf("recorded pull request %s was not found for Run branch %s", snapshot.Run.PullRequest, snapshot.Run.Branch)
 	}
-	if len(mergedPulls) != 0 && snapshot.Run.Status != policy.TerminalStatus && policy.AllowMergedCompletion {
+	if len(mergedPulls) != 0 && snapshot.Run.PullRequest != "" && snapshot.Run.Status != policy.TerminalStatus && policy.AllowMergedCompletion {
 		if snapshot.Issue.Open {
 			return Plan{}, fmt.Errorf("issue #%d is open; Completion requires a verified GitHub closure", snapshot.Issue.Number)
 		}
@@ -207,24 +207,25 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 	plan := Plan{Snapshot: snapshot, Operation: policy.Operation, TerminalState: policy.TerminalStatus}
 	planning := snapshot
 	planning.PullRequests = pullRequests
-	hasOpenPullRequest := false
+	hasPullRequestAction := false
 	for _, pull := range pullRequests {
-		if pull.State == PullRequestOpen {
-			hasOpenPullRequest = true
+		if pull.State == PullRequestOpen || policy.RequireClosedExplanation && pull.State == PullRequestClosed && !pull.Explained {
+			hasPullRequestAction = true
 			break
 		}
 	}
 	addLabels, removeLabels := policy.desiredLabels(snapshot.Issue.Labels)
 	requiresProgressTransition := planning.Run.Status != policy.ProgressStatus && planning.Run.Status != policy.TerminalStatus &&
 		!policy.CanTransition(planning.Run.Status, policy.TerminalStatus)
-	needsProgress := requiresProgressTransition || hasOpenPullRequest || snapshot.RemoteBranch.Present || snapshot.LocalBranch.Present ||
+	needsProgress := requiresProgressTransition || hasPullRequestAction || snapshot.RemoteBranch.Present || snapshot.LocalBranch.Present ||
 		snapshot.Worktree.Present || snapshot.Session.Present || len(addLabels) > 0 || len(removeLabels) > 0
-	if needsProgress && planning.Run.Status != policy.ProgressStatus && planning.Run.Status != scheduler.StatusWaitingForMerge && planning.Run.Status != policy.TerminalStatus {
+	if needsProgress && planning.Run.Status != policy.ProgressStatus &&
+		(planning.Run.Status != scheduler.StatusWaitingForMerge || policy.MarkProgressBeforeMutation) && planning.Run.Status != policy.TerminalStatus {
 		plan.Actions = append(plan.Actions, plannedAction(actionMarkProgress, fmt.Sprintf("mark Run %s %s while retaining Lease %s", snapshot.Run.RunID, policy.ProgressStatus, snapshot.Lease.LeaseID)))
 		planning.Run.Status = policy.ProgressStatus
 	}
 	for {
-		pull, found := NextPullRequest(planning)
+		pull, found := nextPullRequest(planning, policy.RequireClosedExplanation)
 		if planning.Run.Status == scheduler.StatusWaitingForMerge && (!found || !pull.AutoMergeArmed) {
 			plan.Actions = append(plan.Actions, plannedAction(actionMarkProgress, fmt.Sprintf("mark Run %s %s while retaining Lease %s", snapshot.Run.RunID, policy.ProgressStatus, snapshot.Lease.LeaseID)))
 			planning.Run.Status = policy.ProgressStatus
@@ -283,10 +284,14 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 // retirement action. A waiting-for-merge Run must handle its recorded pull
 // request before retirement can advance to other pull requests for its branch.
 func NextPullRequest(snapshot Snapshot) (PullRequest, bool) {
+	return nextPullRequest(snapshot, false)
+}
+
+func nextPullRequest(snapshot Snapshot, requireClosedExplanation bool) (PullRequest, bool) {
 	if snapshot.Run.Status == scheduler.StatusWaitingForMerge {
 		for _, pull := range snapshot.PullRequests {
 			if pull.URL == snapshot.Run.PullRequest {
-				return pull, pull.State == PullRequestOpen
+				return pull, pull.State == PullRequestOpen || requireClosedExplanation && pull.State == PullRequestClosed && !pull.Explained
 			}
 		}
 		return PullRequest{}, false
@@ -295,7 +300,7 @@ func NextPullRequest(snapshot Snapshot) (PullRequest, bool) {
 	result := PullRequest{}
 	found := false
 	for _, pull := range snapshot.PullRequests {
-		if pull.State != PullRequestOpen {
+		if pull.State != PullRequestOpen && (!requireClosedExplanation || pull.State != PullRequestClosed || pull.Explained) {
 			continue
 		}
 		if !found || (pull.AutoMergeArmed && !result.AutoMergeArmed) || (pull.AutoMergeArmed == result.AutoMergeArmed && pull.Number < result.Number) {
