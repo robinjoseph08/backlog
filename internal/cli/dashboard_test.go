@@ -163,6 +163,53 @@ func TestTerminalDashboardSetupFailureLeavesNormalScreenResult(t *testing.T) {
 	}
 }
 
+func TestTerminalDashboardSetupFailureRetainsAvailableState(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	active := scheduler.Run{
+		Issue: 72, IssueTitle: "Existing setup work", RunID: "active-72",
+		Status: scheduler.StatusClaimed, WorkerMode: scheduler.WorkerModePrint,
+	}
+	attention := scheduler.Run{
+		Issue: 73, IssueTitle: "Existing operator decision", RunID: "attention-73",
+		Status: scheduler.StatusNeedsHuman, WorkerMode: scheduler.WorkerModePrint, Error: "review retained state",
+	}
+	if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 2,
+		Runs: []scheduler.Run{active, attention},
+		Leases: []scheduler.Lease{
+			{LeaseID: active.RunID, Issue: active.Issue, RunID: active.RunID},
+			{LeaseID: attention.RunID, Issue: attention.Issue, RunID: attention.RunID},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	gh := writeExecutable(t, "#!/bin/sh\necho 'repository lookup failed' >&2\nexit 9\n")
+
+	var stdout, stderr bytes.Buffer
+	exit := MainWithTerminal(context.Background(), []string{
+		"run", "--repo-dir", repository, "--state-dir", stateDir, "--gh", gh,
+	}, TerminalDependencies{
+		Input: strings.NewReader(""), Output: &stdout, ErrorOutput: &stderr,
+		IsTerminal:   func() bool { return true },
+		Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
+		ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+	})
+	if exit != 1 || !strings.Contains(stderr.String(), "repository lookup failed") {
+		t.Fatalf("repository setup failure exit = %d, stderr = %q", exit, stderr.String())
+	}
+	result := stdout.String()
+	for _, want := range []string{
+		"Final aggregate summary", "Final outcome: Error:", "Repository: acme/widgets",
+		"Active (1)", "#72  Existing setup work  claimed",
+		"Attention Required (1)", "#73  Existing operator decision  needs-human", "review retained state",
+	} {
+		if !strings.Contains(result, want) {
+			t.Fatalf("setup failure result missing %q: %q", want, result)
+		}
+	}
+}
+
 func TestTerminalDashboardRunnerFailureRestoresBeforeErrorResult(t *testing.T) {
 	repository := initializeFollowRepository(t)
 	gh := writeExecutable(t, `#!/bin/sh
