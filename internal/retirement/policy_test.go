@@ -47,68 +47,170 @@ func TestBuildAppliesLifecyclePolicyWithoutOwningLifecycleDecisions(t *testing.T
 	}
 }
 
-func TestModuleAppliesDistinctExternalResolutionPolicy(t *testing.T) {
+func TestModuleRetiresWithDistinctExternalResolutionPolicy(t *testing.T) {
 	const (
 		statusResolvingExternally scheduler.Status = "resolving-externally"
 		statusResolvedExternally  scheduler.Status = "resolved-externally"
+		explanation                                = "externally resolved run-42"
 	)
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	readyLabel := filepath.Join(root, "ready-label")
+	progressLabel := filepath.Join(root, "progress-label")
+	openPullRequest := filepath.Join(root, "open-pull-request")
+	commentedPullRequest := filepath.Join(root, "commented-pull-request")
+	mutationLog := filepath.Join(root, "mutations")
+	for _, path := range []string{readyLabel, progressLabel, openPullRequest} {
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	branch := "agent/issue-42-run-42"
+	commit := strings.Repeat("a", 40)
+	git := writeRetirementExecutable(t, `#!/bin/sh
+case "$*" in
+  *" remote get-url origin") printf '%s\n' 'https://github.com/acme/widgets.git' ;;
+  *" ls-remote --exit-code --heads origin refs/heads/`+branch+`") exit 2 ;;
+  *" for-each-ref --format=%(objectname) refs/heads/`+branch+`") exit 0 ;;
+  *" worktree list --porcelain -z") exit 0 ;;
+  *) echo "unexpected git: $*" >&2; exit 9 ;;
+esac
+`)
+	gh := writeRetirementExecutable(t, `#!/bin/sh
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef")
+    printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    labels='{"name":"unrelated"}'
+    if [ -f `+shellQuote(readyLabel)+` ]; then labels="$labels,{\"name\":\"ready-for-agent\"}"; fi
+    if [ -f `+shellQuote(progressLabel)+` ]; then labels="$labels,{\"name\":\"in-progress\"}"; fi
+    printf '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","labels":[%s]}\n' "$labels" ;;
+  "pr list --repo acme/widgets --state all --head `+branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    state=CLOSED
+    if [ -f `+shellQuote(openPullRequest)+` ]; then state=OPEN; fi
+    printf '[{"number":7,"url":"https://github.com/acme/widgets/pull/7","state":"%s","mergedAt":null,"autoMergeRequest":null,"isDraft":false,"headRefName":"`+branch+`","headRefOid":"`+commit+`","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]\n' "$state" ;;
+  api\ *)
+    if [ -f `+shellQuote(commentedPullRequest)+` ]; then
+      printf '%s\n' '[[{"body":"`+explanation+`"}]]'
+    else
+      printf '%s\n' '[[]]'
+    fi ;;
+  pr\ comment\ 7\ *)
+    printf 'explanation:%s\n' "$7" >> `+shellQuote(mutationLog)+`
+    : > `+shellQuote(commentedPullRequest)+` ;;
+  "pr close 7 --repo acme/widgets")
+    printf '%s\n' 'close:7' >> `+shellQuote(mutationLog)+`
+    rm -f `+shellQuote(openPullRequest)+` ;;
+  "issue edit 42 --repo acme/widgets --remove-label ready-for-agent")
+    printf '%s\n' 'remove:ready-for-agent' >> `+shellQuote(mutationLog)+`
+    rm -f `+shellQuote(readyLabel)+` ;;
+  "issue edit 42 --repo acme/widgets --remove-label in-progress")
+    printf '%s\n' 'remove:in-progress' >> `+shellQuote(mutationLog)+`
+    rm -f `+shellQuote(progressLabel)+` ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+
+	run := scheduler.Run{
+		Issue: 42, RunID: "run-42", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint,
+		Branch: branch, Worktree: filepath.Join(stateDir, "worktrees", "issue-42-run-42"), WorkerLogOpen: true,
+	}
+	lease := scheduler.Lease{LeaseID: "lease-42", Issue: 42, RunID: run.RunID}
+	store := &policyStateStore{current: state.State{
+		Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{lease},
+	}}
 	policy := testPolicy()
 	policy.Operation = "External Resolution"
+	policy.SelectRun = func(current state.State) (scheduler.Run, scheduler.Lease, error) {
+		selected := current.Runs[0]
+		for _, candidate := range current.Leases {
+			if candidate.RunID == selected.RunID {
+				return selected, candidate, nil
+			}
+		}
+		return selected, scheduler.Lease{}, nil
+	}
+	policy.ValidateSnapshot = func(snapshot Snapshot) error {
+		if snapshot.Issue.Open {
+			return errors.New("issue is not externally resolved")
+		}
+		return nil
+	}
 	policy.EligibleStatuses = []scheduler.Status{
 		scheduler.StatusFailed, statusResolvingExternally, statusResolvedExternally,
 	}
+	policy.CanTransition = func(from, to scheduler.Status) bool {
+		return from == scheduler.StatusFailed && to == statusResolvingExternally ||
+			from == statusResolvingExternally && to == statusResolvedExternally
+	}
+	policy.Explanation = func(scheduler.Run) string { return explanation }
+	policy.ExplanationAction = "explain External Resolution"
 	policy.Labels = LabelOutcome{Remove: []string{"ready-for-agent", "in-progress"}}
 	policy.ProgressStatus = statusResolvingExternally
 	policy.TerminalStatus = statusResolvedExternally
 
-	run := scheduler.Run{Issue: 42, RunID: "run-42", Status: scheduler.StatusFailed}
-	lease := scheduler.Lease{LeaseID: "lease-42", Issue: 42, RunID: "run-42"}
-	snapshot := Snapshot{
-		Run: run, Lease: lease,
-		Issue: Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", Labels: []string{"ready-for-agent", "in-progress"}},
+	module, err := New(Config{
+		Store: store, GitHub: ghadapter.Client{Executable: gh, Dir: root}, RepositoryRoot: root,
+		CommonDirectory: root, StateDirectory: stateDir, GitExecutable: git,
+	}, policy)
+	if err != nil {
+		t.Fatal(err)
 	}
-	plan, err := Build(policy, snapshot)
+	approved, err := module.Inspect(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
 		"mark Run run-42 resolving-externally while retaining Lease lease-42",
+		"explain External Resolution on pull request #7 (https://github.com/acme/widgets/pull/7)",
+		"close unmerged pull request #7 (https://github.com/acme/widgets/pull/7)",
 		"remove issue label ready-for-agent from https://github.com/acme/widgets/issues/42",
 		"remove issue label in-progress from https://github.com/acme/widgets/issues/42",
 		"mark Run run-42 resolved-externally and release Lease lease-42",
 	}
-	if strings.Join(actionDescriptions(plan), "\n") != strings.Join(want, "\n") {
-		t.Fatalf("External Resolution actions = %q, want %q", actionDescriptions(plan), want)
+	if strings.Join(actionDescriptions(approved), "\n") != strings.Join(want, "\n") {
+		t.Fatalf("External Resolution actions = %q, want %q", actionDescriptions(approved), want)
 	}
 	var output bytes.Buffer
-	WritePlan(&output, plan)
-	if !strings.Contains(output.String(), "External Resolution Plan for issue #42") {
-		t.Fatalf("External Resolution operation missing from plan output: %q", output.String())
+	WritePlan(&output, approved)
+	if !strings.Contains(output.String(), "External Resolution Plan for issue #42") ||
+		!strings.Contains(output.String(), "Issue: https://github.com/acme/widgets/issues/42 (closed; labels: in-progress, ready-for-agent, unrelated)") {
+		t.Fatalf("External Resolution plan output = %q", output.String())
 	}
-	if !strings.Contains(output.String(), "Issue: https://github.com/acme/widgets/issues/42 (closed; labels: in-progress, ready-for-agent)") {
-		t.Fatalf("External Resolution issue state missing from plan output: %q", output.String())
+	if err := module.Retire(context.Background(), approved); err != nil {
+		t.Fatalf("External Resolution retirement: %v", err)
 	}
-
-	module, err := New(Config{
-		Store: &policyStateStore{}, RepositoryRoot: "/repo", CommonDirectory: "/repo/.git",
-		StateDirectory: "/state", GitExecutable: "git",
-	}, policy)
+	if len(store.saved) != 2 || store.saved[0].Runs[0].Status != statusResolvingExternally || len(store.saved[0].Leases) != 1 {
+		t.Fatalf("External Resolution progress state = %#v", store.saved)
+	}
+	terminal := store.current
+	if terminal.Runs[0].Status != statusResolvedExternally || terminal.Runs[0].WorkerLogOpen || terminal.Runs[0].CompletedAt == nil || len(terminal.Leases) != 0 {
+		t.Fatalf("External Resolution terminal state = %#v", terminal)
+	}
+	mutations, err := os.ReadFile(mutationLog)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := module.Validate(plan); err != nil {
-		t.Fatalf("External Resolution plan validation: %v", err)
+	wantMutations := "explanation:" + explanation + "\nclose:7\nremove:ready-for-agent\nremove:in-progress\n"
+	if string(mutations) != wantMutations {
+		t.Fatalf("External Resolution mutations = %q, want %q", mutations, wantMutations)
 	}
-	terminal := plan
-	terminal.Snapshot.Run.Status = statusResolvedExternally
-	terminal.Snapshot.Lease = scheduler.Lease{}
-	if err := module.Validate(terminal); err != nil {
-		t.Fatalf("External Resolution terminal validation: %v", err)
+
+	rerun, err := module.Inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
 	}
-	outsidePolicy := plan
-	outsidePolicy.Snapshot.Run.Status = scheduler.StatusResetting
-	if err := module.Validate(outsidePolicy); err == nil || !strings.Contains(err.Error(), "not eligible for External Resolution") {
-		t.Fatalf("External Resolution eligibility error = %v", err)
+	if len(rerun.Actions) != 0 {
+		t.Fatalf("idempotent External Resolution actions = %q", actionDescriptions(rerun))
+	}
+	if err := module.Retire(context.Background(), rerun); err != nil {
+		t.Fatalf("idempotent External Resolution retirement: %v", err)
+	}
+	if len(store.saved) != 2 {
+		t.Fatalf("idempotent External Resolution persisted %d states, want 2", len(store.saved))
 	}
 }
 
@@ -119,6 +221,7 @@ func TestPolicyValidationRefusesEveryIncompletePolicyShape(t *testing.T) {
 		want   string
 	}{
 		{name: "core behavior", mutate: func(policy *Policy) { policy.Explanation = nil }, want: "policy is incomplete"},
+		{name: "transition policy", mutate: func(policy *Policy) { policy.CanTransition = nil }, want: "policy is incomplete"},
 		{name: "lifecycle states", mutate: func(policy *Policy) { policy.ProgressStatus = "" }, want: "incomplete lifecycle states"},
 		{name: "equal lifecycle states", mutate: func(policy *Policy) { policy.TerminalStatus = policy.ProgressStatus }, want: "distinct progress and terminal states"},
 		{name: "label outcome", mutate: func(policy *Policy) { policy.Labels = LabelOutcome{} }, want: "no label outcome"},
@@ -272,6 +375,7 @@ func (e *testError) Error() string { return e.message }
 type policyStateStore struct {
 	current state.State
 	saves   int
+	saved   []state.State
 }
 
 func (s *policyStateStore) Preview() (state.State, bool, error) {
@@ -281,6 +385,10 @@ func (s *policyStateStore) Preview() (state.State, bool, error) {
 func (s *policyStateStore) Save(current state.State) error {
 	s.current = current
 	s.saves++
+	snapshot := current
+	snapshot.Runs = append([]scheduler.Run(nil), current.Runs...)
+	snapshot.Leases = append([]scheduler.Lease(nil), current.Leases...)
+	s.saved = append(s.saved, snapshot)
 	return nil
 }
 
@@ -300,6 +408,7 @@ func testPolicy() Policy {
 		},
 		ValidateSnapshot:  func(Snapshot) error { return nil },
 		EligibleStatuses:  []scheduler.Status{scheduler.StatusFailed, scheduler.StatusResetting, scheduler.StatusReset},
+		CanTransition:     scheduler.CanTransition,
 		Explanation:       func(scheduler.Run) string { return "explanation" },
 		ExplanationAction: "explain retirement",
 		Labels:            LabelOutcome{Remove: []string{"owned"}, Add: []string{"available"}},

@@ -47,6 +47,7 @@ func Policy(issue int) retirement.Policy {
 			scheduler.StatusWaitingForMerge, scheduler.StatusFailed, scheduler.StatusSuspended,
 			scheduler.StatusNeedsHuman, scheduler.StatusResetting, scheduler.StatusReset,
 		},
+		CanTransition:     scheduler.CanTransition,
 		Explanation:       Explanation,
 		ExplanationAction: "explain Reset",
 		Labels: retirement.LabelOutcome{

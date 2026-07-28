@@ -9,8 +9,21 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/robinjoseph08/backlog/internal/processidentity"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
+
+func TestInspectWorkerAbsentRefusesContradictoryRecordedPIDs(t *testing.T) {
+	t.Parallel()
+	identity, err := processidentity.Start(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := scheduler.Run{RunID: "contradictory-worker", PID: os.Getpid() + 1, ProcessIdentity: identity}
+	if err := inspectWorkerAbsent(run); err == nil || !strings.Contains(err.Error(), "recorded PID") || !strings.Contains(err.Error(), "does not match process identity PID") {
+		t.Fatalf("contradictory Worker identity error = %v", err)
+	}
+}
 
 func TestArchiveSessionUsesAtomicRenameAndSyncsEveryDurabilityPath(t *testing.T) {
 	t.Parallel()

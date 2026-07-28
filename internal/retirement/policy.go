@@ -16,6 +16,7 @@ type Policy struct {
 	SelectRun          func(state.State) (scheduler.Run, scheduler.Lease, error)
 	ValidateSnapshot   func(Snapshot) error
 	EligibleStatuses   []scheduler.Status
+	CanTransition      func(scheduler.Status, scheduler.Status) bool
 	Explanation        func(scheduler.Run) string
 	ExplanationAction  string
 	Labels             LabelOutcome
@@ -32,7 +33,7 @@ type LabelOutcome struct {
 }
 
 func (p Policy) validate() error {
-	if strings.TrimSpace(p.Operation) == "" || p.SelectRun == nil || p.ValidateSnapshot == nil || p.Explanation == nil || strings.TrimSpace(p.ExplanationAction) == "" {
+	if strings.TrimSpace(p.Operation) == "" || p.SelectRun == nil || p.ValidateSnapshot == nil || p.CanTransition == nil || p.Explanation == nil || strings.TrimSpace(p.ExplanationAction) == "" {
 		return fmt.Errorf("owned Run retirement policy is incomplete")
 	}
 	if p.ProgressStatus == "" || p.TerminalStatus == "" || len(p.EligibleStatuses) == 0 ||

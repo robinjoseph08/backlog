@@ -740,7 +740,7 @@ func (e Service) markProgress() error {
 	if run.Status == e.policy.TerminalStatus || run.Status == e.policy.ProgressStatus {
 		return nil
 	}
-	if !scheduler.CanTransition(run.Status, e.policy.ProgressStatus) {
+	if !e.policy.CanTransition(run.Status, e.policy.ProgressStatus) {
 		return fmt.Errorf("Run status %s cannot transition to %s", run.Status, e.policy.ProgressStatus)
 	}
 	for index := range current.Runs {
@@ -796,7 +796,7 @@ func (e Service) finalize(ctx context.Context, verified Plan) error {
 	if lease != verified.Snapshot.Lease {
 		return fmt.Errorf("Lease for Run %s changed before finalization", run.RunID)
 	}
-	if !scheduler.CanTransition(run.Status, e.policy.TerminalStatus) {
+	if !e.policy.CanTransition(run.Status, e.policy.TerminalStatus) {
 		return fmt.Errorf("Run status %s cannot transition to %s", run.Status, e.policy.TerminalStatus)
 	}
 	now := time.Now().UTC()
@@ -910,19 +910,21 @@ func inspectWorkerAbsent(run scheduler.Run) error {
 	if run.ResumePending {
 		return errors.New("replacement Worker launch is pending; Worker absence is uncertain")
 	}
-	pid := run.PID
-	if pid == 0 {
-		if run.ProcessIdentity == "" {
+	if run.ProcessIdentity == "" {
+		if run.PID == 0 {
 			return nil
 		}
-		var err error
-		pid, err = processidentity.PID(run.ProcessIdentity)
-		if err != nil {
-			return fmt.Errorf("Run %s has uncertain retained Worker identity: %w", run.RunID, err)
-		}
-	}
-	if pid < 0 || run.ProcessIdentity == "" {
 		return fmt.Errorf("Run %s has incomplete Worker identity", run.RunID)
+	}
+	pid, err := processidentity.PID(run.ProcessIdentity)
+	if err != nil {
+		if run.PID != 0 {
+			return fmt.Errorf("Worker PID %d has uncertain identity %q: %w", run.PID, run.ProcessIdentity, err)
+		}
+		return fmt.Errorf("Run %s has uncertain retained Worker identity: %w", run.RunID, err)
+	}
+	if run.PID != 0 && run.PID != pid {
+		return fmt.Errorf("Run %s has contradictory Worker identity: recorded PID %d does not match process identity PID %d", run.RunID, run.PID, pid)
 	}
 	processAlive, err := processidentity.Alive(pid)
 	if err != nil {
