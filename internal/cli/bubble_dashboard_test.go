@@ -196,6 +196,78 @@ func TestBubbleDashboardKeyboardOpensSelectedIssueAndPullRequestAsynchronously(t
 	}
 }
 
+func TestBubbleDashboardKeyboardOpensSynthesizedIssueOnlyAndRejectsMalformedResources(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	current := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 3,
+		Runs: []scheduler.Run{
+			{Issue: 13, IssueTitle: "Historical issue", RunID: "historical", Status: scheduler.StatusFailed, StartedAt: now.Add(-time.Hour)},
+			{Issue: 14, IssueTitle: "Malformed issue", IssueURL: "javascript:alert(1)", RunID: "malformed-issue", Status: scheduler.StatusRunning, StartedAt: now},
+			{
+				Issue: 15, IssueTitle: "Malformed pull request", IssueURL: "https://github.com/acme/widgets/issues/15",
+				RunID: "malformed-pr", Status: scheduler.StatusWaitingForMerge,
+				PullRequest: "https://github.com/acme/widgets/pull/not-a-number\x1b]8;;https://attacker.test", StartedAt: now,
+			},
+		},
+		Leases: []scheduler.Lease{
+			{LeaseID: "malformed-issue", Issue: 14, RunID: "malformed-issue"},
+			{LeaseID: "malformed-pr", Issue: 15, RunID: "malformed-pr"},
+		},
+	}
+	var opened []string
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{
+		Now: func() time.Time { return now },
+		OpenURL: func(_ context.Context, target string) error {
+			opened = append(opened, target)
+			return nil
+		},
+	}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 20})
+	updated, _ := model.Update(dashboardConfiguredMsg{initial: current, source: &dashboardTestSource{current: current}})
+	model = updated.(bubbleDashboardModel)
+
+	selectRun := func(runID string) {
+		t.Helper()
+		anchor := dashboardRunAnchor(runID)
+		if _, exists := model.anchorVisualLine(anchor); !exists {
+			t.Fatalf("Run %q anchor missing", runID)
+		}
+		model.selectedAnchor = anchor
+	}
+	selectRun("historical")
+	updated, command := model.Update(tea.KeyPressMsg(tea.Key{Code: 'o', Text: "o"}))
+	model = updated.(bubbleDashboardModel)
+	if command == nil {
+		t.Fatal("o did not open the synthesized historical issue URL")
+	}
+	result := command().(dashboardOpenURLResultMsg)
+	if result.err != nil {
+		t.Fatalf("synthesized historical issue opener result = %#v", result)
+	}
+	updated, _ = model.Update(result)
+	model = updated.(bubbleDashboardModel)
+	if !reflect.DeepEqual(opened, []string{"https://github.com/acme/widgets/issues/13"}) {
+		t.Fatalf("opened URLs = %q, want only synthesized historical issue URL", opened)
+	}
+
+	for _, test := range []struct {
+		runID string
+		key   rune
+	}{
+		{runID: "malformed-issue", key: 'o'},
+		{runID: "malformed-pr", key: 'p'},
+	} {
+		selectRun(test.runID)
+		updated, command = model.Update(tea.KeyPressMsg(tea.Key{Code: test.key, Text: string(test.key)}))
+		model = updated.(bubbleDashboardModel)
+		if command != nil {
+			t.Fatalf("%c returned an opener command for malformed metadata on %q", test.key, test.runID)
+		}
+	}
+	if len(opened) != 1 {
+		t.Fatalf("malformed metadata reached the opener: %q", opened)
+	}
+}
+
 func TestBubbleDashboardURLFailureIsTemporaryDiagnosticOnly(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	current := state.State{
@@ -227,10 +299,21 @@ func TestBubbleDashboardURLFailureIsTemporaryDiagnosticOnly(t *testing.T) {
 	if !reflect.DeepEqual(model.dashboard.current, before) {
 		t.Fatal("URL opener failure altered Runner state projection")
 	}
+	firstDiagnosticID := model.urlDiagnosticID
+	updated, newerExpiry := model.Update(dashboardOpenURLResultMsg{resource: dashboardIssueResource, err: errors.New("newer opener failure")})
+	model = updated.(bubbleDashboardModel)
+	if newerExpiry == nil || !strings.Contains(ansi.Strip(model.View().Content), "Open issue failed: newer opener failure") {
+		t.Fatalf("newer opener failure did not replace the diagnostic:\n%s", ansi.Strip(model.View().Content))
+	}
+	updated, _ = model.Update(dashboardURLDiagnosticExpiredMsg{id: firstDiagnosticID})
+	model = updated.(bubbleDashboardModel)
+	if !strings.Contains(ansi.Strip(model.View().Content), "newer opener failure") {
+		t.Fatal("older diagnostic timer cleared the newer diagnostic")
+	}
 	updated, _ = model.Update(dashboardURLDiagnosticExpiredMsg{id: model.urlDiagnosticID})
 	model = updated.(bubbleDashboardModel)
-	if strings.Contains(ansi.Strip(model.View().Content), "opener unavailable") {
-		t.Fatal("URL opener diagnostic did not expire")
+	if strings.Contains(ansi.Strip(model.View().Content), "newer opener failure") {
+		t.Fatal("newer URL opener diagnostic did not expire")
 	}
 
 	updated, command = model.Update(tea.KeyPressMsg(tea.Key{Code: 'p', Text: "p"}))
