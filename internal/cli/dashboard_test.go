@@ -839,8 +839,12 @@ func TestDashboardProjectsCurrentAndHistoricalRunsAcrossInvocations(t *testing.T
 		if index == 0 {
 			status = scheduler.StatusNeedsHuman
 		}
+		issue := 200 + index
+		if index == 11 {
+			issue = 210
+		}
 		current.Runs = append(current.Runs, scheduler.Run{
-			Issue: 200 + index, IssueTitle: fmt.Sprintf("Outcome %02d", index), RunID: fmt.Sprintf("outcome-%02d", index),
+			Issue: issue, IssueTitle: fmt.Sprintf("Outcome %02d", index), RunID: fmt.Sprintf("outcome-%02d", index),
 			Status: status, StartedAt: started, UpdatedAt: updatedAt,
 		})
 	}
@@ -854,8 +858,12 @@ func TestDashboardProjectsCurrentAndHistoricalRunsAcrossInvocations(t *testing.T
 		if index == 10 {
 			completedAt = now.Add(-time.Minute)
 		}
+		issue := 300 + index
+		if index == 11 {
+			issue = 310
+		}
 		current.Runs = append(current.Runs, scheduler.Run{
-			Issue: 300 + index, IssueTitle: fmt.Sprintf("Completion %02d", index), RunID: fmt.Sprintf("completion-%02d", index),
+			Issue: issue, IssueTitle: fmt.Sprintf("Completion %02d", index), RunID: fmt.Sprintf("completion-%02d", index),
 			Status: scheduler.StatusMerged, PID: 999999, StartedAt: started, UpdatedAt: completedAt, CompletedAt: &completedAt,
 			PullRequest: fmt.Sprintf("https://github.com/acme/widgets/pull/%d", 300+index), LogPath: "/missing/worker.jsonl",
 		})
@@ -898,6 +906,31 @@ func TestDashboardProjectsCurrentAndHistoricalRunsAcrossInvocations(t *testing.T
 		if strings.Contains(completionsOutput, verbose) {
 			t.Fatalf("compact Completion rows included %q:\n%s", verbose, completionsOutput)
 		}
+	}
+}
+
+func TestRenderDashboardCompletionsUsesOneLineRowsAndVerifiedCompletionTime(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC)
+	completedAt := now.Add(-30 * time.Minute)
+	runs := []statusRun{
+		{run: scheduler.Run{
+			Issue: 42, IssueTitle: "Populated metadata", RunID: "completion-current", Status: scheduler.StatusMerged,
+			PullRequest: "https://github.com/acme/widgets/pull/42", StartedAt: now.Add(-time.Hour), CompletedAt: &completedAt,
+		}},
+		{run: scheduler.Run{
+			Issue: 42, IssueTitle: "Legacy completion", RunID: "completion-legacy", Status: scheduler.StatusMerged,
+			PullRequest: "https://github.com/acme/widgets/pull/41", StartedAt: now.Add(-2 * time.Hour), UpdatedAt: now.Add(-time.Hour),
+		}},
+	}
+	var output strings.Builder
+	renderDashboardCompletions(&output, runs, now)
+	want := "\nRecent Completions (2)\n" +
+		"  #42  Populated metadata | PR: https://github.com/acme/widgets/pull/42 | Elapsed: 30m0s | Completed: 30m0s ago\n" +
+		"  #42  Legacy completion | PR: https://github.com/acme/widgets/pull/41 | Elapsed: 1h0m0s | Completed: n/a\n"
+	if got := output.String(); got != want {
+		t.Fatalf("compact Completion output = %q, want %q", got, want)
 	}
 }
 

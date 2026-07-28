@@ -547,8 +547,8 @@ func renderDashboardCompletions(output *strings.Builder, runs []statusRun, now t
 			pullRequest = " | PR: " + plainStatusValue(run.PullRequest)
 		}
 		completed := "n/a"
-		if completedAt := completionTime(run); !completedAt.IsZero() {
-			completed = displayDuration(now.Sub(completedAt)) + " ago"
+		if run.CompletedAt != nil && !run.CompletedAt.IsZero() {
+			completed = displayDuration(now.Sub(*run.CompletedAt)) + " ago"
 		}
 		fmt.Fprintf(output, "  %s%s | Elapsed: %s | Completed: %s\n", identity, pullRequest, progress.elapsed, completed)
 	}
