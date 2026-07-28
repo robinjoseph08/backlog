@@ -80,6 +80,9 @@ func TestModuleAppliesDistinctExternalResolutionPolicy(t *testing.T) {
 	if !strings.Contains(output.String(), "External Resolution Plan for issue #42") {
 		t.Fatalf("External Resolution operation missing from plan output: %q", output.String())
 	}
+	if !strings.Contains(output.String(), "Issue: https://github.com/acme/widgets/issues/42 (closed; labels: in-progress, ready-for-agent)") {
+		t.Fatalf("External Resolution issue state missing from plan output: %q", output.String())
+	}
 
 	module, err := New(Config{
 		Store: &policyStateStore{}, RepositoryRoot: "/repo", CommonDirectory: "/repo/.git",

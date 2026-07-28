@@ -1381,7 +1381,11 @@ func printPlan(writer io.Writer, plan Plan) {
 	} else {
 		fmt.Fprintf(writer, "Lease: %s\n", snapshot.Lease.LeaseID)
 	}
-	fmt.Fprintf(writer, "Issue: %s (open; labels: %s)\n", snapshot.Issue.URL, formatLabels(snapshot.Issue.Labels))
+	issueState := "closed"
+	if snapshot.Issue.Open {
+		issueState = "open"
+	}
+	fmt.Fprintf(writer, "Issue: %s (%s; labels: %s)\n", snapshot.Issue.URL, issueState, formatLabels(snapshot.Issue.Labels))
 	fmt.Fprintf(writer, "Worker: %s\n", snapshot.WorkerSummary)
 	printBranchResource(writer, "Remote branch", snapshot.RemoteBranch)
 	printBranchResource(writer, "Local branch", snapshot.LocalBranch)
