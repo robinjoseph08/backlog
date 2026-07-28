@@ -261,9 +261,19 @@ func loadFollowRun(source followStateSource, runID string) (scheduler.Run, error
 	return scheduler.Run{}, fmt.Errorf("Run %q was not found", runID)
 }
 
+type workerLivenessState uint8
+
+const (
+	workerLivenessUnknown workerLivenessState = iota
+	workerLivenessAbsent
+	workerLivenessDead
+	workerLivenessAlive
+)
+
 type followObservation struct {
-	supervision    string
-	workerLiveness string
+	supervision         string
+	workerLiveness      string
+	workerLivenessState workerLivenessState
 }
 
 // runObservation is the shared one-shot observation model used by Follow and
@@ -281,7 +291,8 @@ type followSupervisionSource interface {
 }
 
 func observeFollowRun(source followStateSource, run scheduler.Run) followObservation {
-	observation := followObservation{workerLiveness: followWorkerLiveness(run)}
+	workerLiveness, workerLivenessState := observeWorkerLiveness(run)
+	observation := followObservation{workerLiveness: workerLiveness, workerLivenessState: workerLivenessState}
 	if scheduler.IsTerminal(run.Status) {
 		observation.supervision = "n/a (terminal Run)"
 		return observation
@@ -307,35 +318,40 @@ func observeFollowRun(source followStateSource, run scheduler.Run) followObserva
 }
 
 func followWorkerLiveness(run scheduler.Run) string {
+	presentation, _ := observeWorkerLiveness(run)
+	return presentation
+}
+
+func observeWorkerLiveness(run scheduler.Run) (string, workerLivenessState) {
 	pid := run.PID
 	if pid <= 0 {
 		if run.ProcessIdentity == "" {
-			return "absent"
+			return "absent", workerLivenessAbsent
 		}
 		var err error
 		pid, err = processIdentityPID(run.ProcessIdentity)
 		if err != nil {
-			return "unknown (persisted process-start identity has no valid PID)"
+			return "unknown (persisted process-start identity has no valid PID)", workerLivenessUnknown
 		}
 	}
 	if run.ProcessIdentity == "" {
-		return fmt.Sprintf("unknown (PID %d has no persisted process-start identity)", pid)
+		return fmt.Sprintf("unknown (PID %d has no persisted process-start identity)", pid), workerLivenessUnknown
 	}
 	alive, err := signalZero(pid)
 	if err != nil {
-		return "unknown (PID liveness could not be verified)"
+		return "unknown (PID liveness could not be verified)", workerLivenessUnknown
 	}
 	if !alive {
-		return fmt.Sprintf("dead (recorded PID %d is absent)", pid)
+		return fmt.Sprintf("dead (recorded PID %d is absent)", pid), workerLivenessDead
 	}
 	identity, err := pidStartIdentity(pid)
 	if err != nil {
-		return fmt.Sprintf("unknown (PID %d process-start identity could not be verified)", pid)
+		return fmt.Sprintf("unknown (PID %d process-start identity could not be verified)", pid), workerLivenessUnknown
 	}
 	if identity != run.ProcessIdentity {
-		return fmt.Sprintf("dead (stale PID %d has a different process-start identity)", pid)
+		return fmt.Sprintf("dead (stale PID %d has a different process-start identity)", pid), workerLivenessDead
 	}
-	return fmt.Sprintf("alive (PID %d and process-start identity verified)", pid)
+	return fmt.Sprintf("alive (PID %d and process-start identity verified)", pid), workerLivenessAlive
 }
 
 func followObservationDue(status scheduler.Status, statusChanged bool, now, nextObservation time.Time) bool {

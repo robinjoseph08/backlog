@@ -775,6 +775,27 @@ func TestDashboardCloseShowsThatRunnerStopped(t *testing.T) {
 	}
 }
 
+func TestDashboardActiveLivenessAnomalyUsesVerifiedState(t *testing.T) {
+	t.Parallel()
+
+	run := scheduler.Run{Status: scheduler.StatusRunning}
+	verified := statusRun{run: run, observation: runObservation{process: followObservation{
+		workerLiveness:      "live Worker presentation changed",
+		workerLivenessState: workerLivenessAlive,
+	}}}
+	if dashboardActiveLivenessAnomaly(verified) {
+		t.Fatal("verified-live Worker was classified as a liveness anomaly after presentation changed")
+	}
+
+	unverified := statusRun{run: run, observation: runObservation{process: followObservation{
+		workerLiveness:      "alive (presentation alone is not verification)",
+		workerLivenessState: workerLivenessUnknown,
+	}}}
+	if !dashboardActiveLivenessAnomaly(unverified) {
+		t.Fatal("presentation text caused an unverified Worker to avoid anomaly priority")
+	}
+}
+
 func TestDashboardProjectsCurrentAndHistoricalRunsAcrossInvocations(t *testing.T) {
 	now := time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC)
 	started := now.Add(-4 * time.Hour)

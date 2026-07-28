@@ -503,7 +503,7 @@ func sortDashboardActiveRuns(runs []statusRun) {
 
 func dashboardActiveLivenessAnomaly(observed statusRun) bool {
 	return observed.run.Status == scheduler.StatusRunning &&
-		!strings.HasPrefix(observed.observation.process.workerLiveness, "alive (")
+		observed.observation.process.workerLivenessState != workerLivenessAlive
 }
 
 func sortDashboardCompletions(runs []statusRun) {
