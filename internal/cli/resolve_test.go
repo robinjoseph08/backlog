@@ -1449,14 +1449,121 @@ exec `+quote(gh)+` "$@"
 	}
 }
 
+func TestCompiledResolveRecordsCompletionWhenPullRequestIsCreatedAndMergedAfterConfirmation(t *testing.T) {
+	fixture := newResolveFixture(t, []string{"in-progress", "spec"}, "COMPLETED")
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := "agent/issue-42-run-42"
+	pullRequest := "https://github.com/acme/widgets/pull/9"
+	current.Runs[1].Branch = branch
+	current.Runs[1].Worktree = filepath.Join(fixture.stateDir, "worktrees", "issue-42-run-42")
+	if err := fixture.store.Save(current); err != nil {
+		t.Fatal(err)
+	}
+	fixture.git = writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  *" remote get-url origin") printf '%s\n' 'git@github.com:acme/widgets.git' ;;
+  *" ls-remote --exit-code --heads origin refs/heads/`+branch+`") exit 2 ;;
+  *" for-each-ref --format=%(objectname) refs/heads/`+branch+`") exit 0 ;;
+  *" worktree list --porcelain -z") exit 0 ;;
+  *) exec git "$@" ;;
+esac
+`)
+	counter := filepath.Join(t.TempDir(), "pull-request-inspections")
+	commit := strings.Repeat("a", 40)
+	fixture.gh = writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "pr list --repo acme/widgets --state all --head `+branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    count=0
+    if [ -f `+quote(counter)+` ]; then count=$(cat `+quote(counter)+`); fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > `+quote(counter)+`
+    if [ "$count" -lt 3 ]; then
+      printf '%s\n' '[]'
+    else
+      printf '%s\n' '[{"number":9,"url":"`+pullRequest+`","state":"MERGED","mergedAt":"2026-07-28T01:01:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"`+branch+`","headRefOid":"`+commit+`","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]'
+    fi ;;
+  *) exec `+quote(fixture.gh)+` "$@" ;;
+esac
+`)
+
+	binary := buildExecutable(t, t.TempDir())
+	command := exec.Command(binary, append([]string{"resolve"}, fixture.args("run-42", "--yes")...)...)
+	output, err := command.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "Completion recorded for Run run-42 from merged expected pull request "+pullRequest) {
+		t.Fatalf("created-and-merged race: %v\n%s", err, output)
+	}
+	persisted, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Runs[1].Status != scheduler.StatusMerged || persisted.Runs[1].PullRequest != pullRequest || persisted.Runs[1].CompletedAt == nil || len(persisted.Leases) != 0 {
+		t.Fatalf("created-and-merged race state = %#v", persisted)
+	}
+}
+
+func TestResolveKeepsLeaseForAmbiguousUnrecordedMergedExpectedBranchPullRequests(t *testing.T) {
+	fixture := newResolveFixture(t, []string{"in-progress", "spec"}, "COMPLETED")
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := "agent/issue-42-run-42"
+	current.Runs[1].Branch = branch
+	current.Runs[1].Worktree = filepath.Join(fixture.stateDir, "worktrees", "issue-42-run-42")
+	if err := fixture.store.Save(current); err != nil {
+		t.Fatal(err)
+	}
+	fixture.git = writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  *" remote get-url origin") printf '%s\n' 'git@github.com:acme/widgets.git' ;;
+  *" ls-remote --exit-code --heads origin refs/heads/`+branch+`") exit 2 ;;
+  *" for-each-ref --format=%(objectname) refs/heads/`+branch+`") exit 0 ;;
+  *" worktree list --porcelain -z") exit 0 ;;
+  *) exec git "$@" ;;
+esac
+`)
+	fixture.gh = writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "pr list --repo acme/widgets --state all --head `+branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    printf '%s\n' '[{"number":9,"url":"https://github.com/acme/widgets/pull/9","state":"MERGED","mergedAt":"2026-07-28T01:01:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"`+branch+`","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}},{"number":10,"url":"https://github.com/acme/widgets/pull/10","state":"MERGED","mergedAt":"2026-07-28T01:02:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"`+branch+`","headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+  *) exec `+quote(fixture.gh)+` "$@" ;;
+esac
+`)
+
+	var stdout, stderr bytes.Buffer
+	err = resolveCommandWithInput(context.Background(), fixture.args("run-42", "--yes"), strings.NewReader(""), false, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "multiple merged pull requests") {
+		t.Fatalf("ambiguous merged pull requests error = %v, stderr=%q, stdout=%q", err, stderr.String(), stdout.String())
+	}
+	persisted, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Runs[1].Status != scheduler.StatusFailed || persisted.Runs[1].CompletedAt != nil || len(persisted.Leases) != 1 || persisted.Leases[0].RunID != "run-42" {
+		t.Fatalf("ambiguous merged pull requests state = %#v", persisted)
+	}
+	if strings.Contains(stdout.String(), "Completion recorded") || strings.Contains(stdout.String(), "External Resolution complete") {
+		t.Fatalf("ambiguous merged pull requests reported success: %q", stdout.String())
+	}
+}
+
 func TestResolveRecordsAndReportsCompletionFromMergedExpectedBranchPullRequest(t *testing.T) {
 	for _, test := range []struct {
 		name, reasonJSON string
 		status           scheduler.Status
 		recorded         bool
 	}{
-		{name: "missing closure reason", reasonJSON: "null", status: scheduler.StatusWaitingForMerge, recorded: true},
-		{name: "future closure reason", reasonJSON: `"FUTURE"`, status: scheduler.StatusWaitingForMerge, recorded: true},
+		{name: "missing closure reason for recorded pull request", reasonJSON: "null", status: scheduler.StatusWaitingForMerge, recorded: true},
+		{name: "missing closure reason for discovered pull request", reasonJSON: "null", status: scheduler.StatusFailed},
+		{name: "future closure reason for recorded pull request", reasonJSON: `"FUTURE"`, status: scheduler.StatusWaitingForMerge, recorded: true},
+		{name: "future closure reason for discovered pull request", reasonJSON: `"FUTURE"`, status: scheduler.StatusFailed},
 		{name: "discovered after Run failure", reasonJSON: `"COMPLETED"`, status: scheduler.StatusFailed},
 	} {
 		t.Run(test.name, func(t *testing.T) {
