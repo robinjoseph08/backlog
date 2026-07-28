@@ -491,11 +491,6 @@ func (d *liveDashboard) render(current state.State, messages []dashboardMessage,
 	return header + "\n" + body + "\n\n" + dashboardFooter(stage) + "\n"
 }
 
-func (d *liveDashboard) renderParts(now time.Time) (string, string, string) {
-	header, body, footer, _ := d.renderStyledParts(now, dashboardStyler{})
-	return header, body, footer
-}
-
 func (d *liveDashboard) renderPartsWithLayout(now time.Time, styler dashboardStyler) (string, dashboardBodyLayout, string, dashboardStage) {
 	d.mu.Lock()
 	current := cloneDashboardState(d.current)
@@ -504,11 +499,6 @@ func (d *liveDashboard) renderPartsWithLayout(now time.Time, styler dashboardSty
 	d.mu.Unlock()
 	header, layout, footer := d.renderPartsForWithLayout(current, messages, stage, now, styler)
 	return header, layout, footer, stage
-}
-
-func (d *liveDashboard) renderStyledParts(now time.Time, styler dashboardStyler) (string, string, string, dashboardStage) {
-	header, layout, footer, stage := d.renderPartsWithLayout(now, styler)
-	return header, layout.text, footer, stage
 }
 
 func (d *liveDashboard) renderPartsFor(current state.State, messages []dashboardMessage, stage dashboardStage, now time.Time, styler dashboardStyler) (string, string, string) {
@@ -734,75 +724,115 @@ type dashboardStagePresentation struct {
 	nextInterrupt string
 }
 
-func dashboardStagePresentationFor(stage dashboardStage) dashboardStagePresentation {
-	switch stage {
-	case dashboardDraining:
-		return dashboardStagePresentation{
-			summary:       "Draining: admission is stopped; next Ctrl-C suspends unfinished Runs within the shared deadline.",
-			stage:         "Draining",
-			nextInterrupt: "suspend unfinished Runs within the shared deadline",
-		}
-	case dashboardSuspending:
-		return dashboardStagePresentation{
-			summary:       "Suspending: continuation boundaries are being established; next Ctrl-C force stops remaining verified Worker groups.",
-			stage:         "Suspending",
-			nextInterrupt: "force stop remaining verified Worker groups",
-		}
-	case dashboardForceStopping:
-		return dashboardStagePresentation{
-			summary:       "Force stopping: Worker identities are revalidated before signaling; next Ctrl-C repeats the force-stop request.",
-			stage:         "Force stopping",
-			nextInterrupt: "repeat the force-stop request after identity checks",
-		}
-	case dashboardDrainComplete:
-		return dashboardStagePresentation{
-			summary:       "Drain complete: no Owned Workers remain; no further interrupt is needed.",
-			stage:         "Drain complete",
-			nextInterrupt: "no effect",
-		}
-	case dashboardDrainFailed:
-		return dashboardStagePresentation{
-			summary:       "Drain complete: no Owned Workers remain, but the Runner is exiting after an operational failure.",
-			stage:         "Drain complete after operational failure",
-			nextInterrupt: "no effect",
-		}
-	case dashboardDrainIncomplete:
-		return dashboardStagePresentation{
-			summary:       "Drain incomplete: Worker liveness remains unverified; no further interrupt has an effect before exit.",
-			stage:         "Drain incomplete; Worker liveness is unverified",
-			nextInterrupt: "no effect",
-		}
-	case dashboardSuspensionComplete:
-		return dashboardStagePresentation{
-			summary:       "Suspension finished: no further interrupt has an effect before exit.",
-			stage:         "Suspension finished",
-			nextInterrupt: "no effect",
-		}
-	case dashboardSuspensionIncomplete:
-		return dashboardStagePresentation{
-			summary:       "Suspension incomplete: one or more shutdown steps failed; review operational messages and Run diagnostics; no further interrupt has an effect before exit.",
-			stage:         "Suspension incomplete",
-			nextInterrupt: "no effect",
-		}
-	case dashboardStopped:
-		return dashboardStagePresentation{
-			summary:       "Stopped: the runner is exiting; interrupts have no further effect.",
-			stage:         "Stopped; the Runner is exiting",
-			nextInterrupt: "no effect",
-		}
-	case dashboardFinished:
-		return dashboardStagePresentation{
-			summary:       "Complete: the runner has exited; interrupts have no further effect.",
-			stage:         "Complete; the Runner has exited",
-			nextInterrupt: "no effect",
-		}
-	default:
-		return dashboardStagePresentation{
+type dashboardStageDefinition struct {
+	presentation dashboardStagePresentation
+	semantic     dashboardSemantic
+}
+
+var dashboardStageDefinitions = [dashboardStageCount]dashboardStageDefinition{
+	dashboardRunning: {
+		presentation: dashboardStagePresentation{
 			summary:       "Running: Ctrl-C starts Drain, stopping admission while Owned Workers finish.",
 			stage:         "Running",
 			nextInterrupt: "start Drain and stop Admission",
-		}
+		},
+		semantic: dashboardSemanticActive,
+	},
+	dashboardDraining: {
+		presentation: dashboardStagePresentation{
+			summary:       "Draining: admission is stopped; next Ctrl-C suspends unfinished Runs within the shared deadline.",
+			stage:         "Draining",
+			nextInterrupt: "suspend unfinished Runs within the shared deadline",
+		},
+		semantic: dashboardSemanticWarning,
+	},
+	dashboardSuspending: {
+		presentation: dashboardStagePresentation{
+			summary:       "Suspending: continuation boundaries are being established; next Ctrl-C force stops remaining verified Worker groups.",
+			stage:         "Suspending",
+			nextInterrupt: "force stop remaining verified Worker groups",
+		},
+		semantic: dashboardSemanticWarning,
+	},
+	dashboardForceStopping: {
+		presentation: dashboardStagePresentation{
+			summary:       "Force stopping: Worker identities are revalidated before signaling; next Ctrl-C repeats the force-stop request.",
+			stage:         "Force stopping",
+			nextInterrupt: "repeat the force-stop request after identity checks",
+		},
+		semantic: dashboardSemanticAttention,
+	},
+	dashboardDrainComplete: {
+		presentation: dashboardStagePresentation{
+			summary:       "Drain complete: no Owned Workers remain; no further interrupt is needed.",
+			stage:         "Drain complete",
+			nextInterrupt: "no effect",
+		},
+		semantic: dashboardSemanticCompletion,
+	},
+	dashboardDrainFailed: {
+		presentation: dashboardStagePresentation{
+			summary:       "Drain complete: no Owned Workers remain, but the Runner is exiting after an operational failure.",
+			stage:         "Drain complete after operational failure",
+			nextInterrupt: "no effect",
+		},
+		semantic: dashboardSemanticAttention,
+	},
+	dashboardDrainIncomplete: {
+		presentation: dashboardStagePresentation{
+			summary:       "Drain incomplete: Worker liveness remains unverified; no further interrupt has an effect before exit.",
+			stage:         "Drain incomplete; Worker liveness is unverified",
+			nextInterrupt: "no effect",
+		},
+		semantic: dashboardSemanticAttention,
+	},
+	dashboardSuspensionComplete: {
+		presentation: dashboardStagePresentation{
+			summary:       "Suspension finished: no further interrupt has an effect before exit.",
+			stage:         "Suspension finished",
+			nextInterrupt: "no effect",
+		},
+		semantic: dashboardSemanticWarning,
+	},
+	dashboardSuspensionIncomplete: {
+		presentation: dashboardStagePresentation{
+			summary:       "Suspension incomplete: one or more shutdown steps failed; review operational messages and Run diagnostics; no further interrupt has an effect before exit.",
+			stage:         "Suspension incomplete",
+			nextInterrupt: "no effect",
+		},
+		semantic: dashboardSemanticAttention,
+	},
+	dashboardStopped: {
+		presentation: dashboardStagePresentation{
+			summary:       "Stopped: the runner is exiting; interrupts have no further effect.",
+			stage:         "Stopped; the Runner is exiting",
+			nextInterrupt: "no effect",
+		},
+		semantic: dashboardSemanticWarning,
+	},
+	dashboardFinished: {
+		presentation: dashboardStagePresentation{
+			summary:       "Complete: the runner has exited; interrupts have no further effect.",
+			stage:         "Complete; the Runner has exited",
+			nextInterrupt: "no effect",
+		},
+		semantic: dashboardSemanticCompletion,
+	},
+}
+
+func dashboardStageDefinitionFor(stage dashboardStage) dashboardStageDefinition {
+	if stage < dashboardRunning || stage >= dashboardStageCount {
+		return dashboardStageDefinitions[dashboardRunning]
 	}
+	return dashboardStageDefinitions[stage]
+}
+
+func dashboardStagePresentationFor(stage dashboardStage) dashboardStagePresentation {
+	return dashboardStageDefinitionFor(stage).presentation
+}
+
+func dashboardStageSemantic(stage dashboardStage) dashboardSemantic {
+	return dashboardStageDefinitionFor(stage).semantic
 }
 
 func dashboardFooter(stage dashboardStage) string {

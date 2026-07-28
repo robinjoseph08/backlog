@@ -243,12 +243,22 @@ func TestDashboardStylingDisablesColorsForNoColorProfile(t *testing.T) {
 	}
 }
 
-func TestBubbleDashboardUsesReadableFallbackUntilBackgroundResponse(t *testing.T) {
+func TestBubbleDashboardUsesSemanticFallbackUntilBackgroundResponse(t *testing.T) {
 	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{
 		Now: time.Now, ColorProfile: func() TerminalColorProfile { return TerminalColorTrueColor },
 	}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 12})
-	if model.styler.enabled || strings.Contains(model.styler.render(dashboardSemanticActive, "Active"), "\x1b[") {
-		t.Fatal("dashboard applied a background-specific palette before the terminal background response")
+	fallback := newDashboardFallbackStyler(TerminalColorTrueColor)
+	for semantic, want := range map[dashboardSemantic]string{
+		dashboardSemanticActive:     fallback.active.Render("status"),
+		dashboardSemanticCompletion: fallback.completion.Render("status"),
+		dashboardSemanticWarning:    fallback.warning.Render("status"),
+		dashboardSemanticAttention:  fallback.attention.Render("status"),
+		dashboardSemanticMetadata:   fallback.metadata.Render("status"),
+	} {
+		got := model.styler.render(semantic, "status")
+		if !model.styler.enabled || got != want || !strings.Contains(got, "\x1b[") || strings.Contains(got, "38;") {
+			t.Fatalf("semantic %d fallback = %q, want attribute-only styling %q", semantic, got, want)
+		}
 	}
 
 	updated, _ := model.Update(tea.BackgroundColorMsg{Color: color.White})

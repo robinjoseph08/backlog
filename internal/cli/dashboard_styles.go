@@ -16,6 +16,20 @@ type dashboardStyler struct {
 	metadata   lipgloss.Style
 }
 
+func newDashboardFallbackStyler(profile TerminalColorProfile) dashboardStyler {
+	if profile == TerminalColorNone {
+		return dashboardStyler{}
+	}
+	return dashboardStyler{
+		enabled:    true,
+		active:     lipgloss.NewStyle().Bold(true),
+		completion: lipgloss.NewStyle().Italic(true),
+		warning:    lipgloss.NewStyle().Underline(true),
+		attention:  lipgloss.NewStyle().Bold(true).Underline(true),
+		metadata:   lipgloss.NewStyle().Faint(true),
+	}
+}
+
 func newDashboardStyler(profile TerminalColorProfile, darkBackground bool) dashboardStyler {
 	if profile == TerminalColorNone {
 		return dashboardStyler{}
@@ -128,19 +142,4 @@ func dashboardLivenessSemantic(observed statusRun) dashboardSemantic {
 		}
 	}
 	return dashboardSemanticMetadata
-}
-
-func dashboardStageSemantic(stage dashboardStage) dashboardSemantic {
-	switch stage {
-	case dashboardRunning:
-		return dashboardSemanticActive
-	case dashboardDraining, dashboardSuspending, dashboardSuspensionComplete, dashboardStopped:
-		return dashboardSemanticWarning
-	case dashboardForceStopping, dashboardDrainFailed, dashboardDrainIncomplete, dashboardSuspensionIncomplete:
-		return dashboardSemanticAttention
-	case dashboardDrainComplete, dashboardFinished:
-		return dashboardSemanticCompletion
-	default:
-		return dashboardSemanticNone
-	}
 }

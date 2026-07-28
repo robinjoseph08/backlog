@@ -753,6 +753,9 @@ func TestDashboardStagePresentationCoversEveryStage(t *testing.T) {
 		if presentation.summary == "" || presentation.stage == "" || presentation.nextInterrupt == "" {
 			t.Fatalf("stage %d has incomplete presentation: %#v", stage, presentation)
 		}
+		if semantic := dashboardStageSemantic(stage); semantic == dashboardSemanticNone {
+			t.Fatalf("stage %d has no semantic styling", stage)
+		}
 		if previous, exists := seen[presentation.stage]; exists {
 			t.Fatalf("stages %d and %d share presentation %q; the stage switch may be incomplete", previous, stage, presentation.stage)
 		}
