@@ -317,6 +317,44 @@ func TestBubbleDashboardPreservesSelectedRunAcrossLiveProjectionChanges(t *testi
 	assertStable("Completion", dashboardStateMsg(current))
 }
 
+func TestBubbleDashboardPreservesSelectedRunAcrossAdmissionChanges(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	current := navigationTestState(now, 7)
+	model := configuredNavigationTestModel(t, now, current, &dashboardTestSource{current: current})
+	selected := dashboardRunAnchor("run-4")
+	line, exists := model.anchorVisualLine(selected)
+	if !exists {
+		t.Fatalf("selected Run anchor %q missing", selected)
+	}
+	model.viewport.SetYOffset(line + 1)
+	model.selectViewportAnchor()
+	wantSelection := model.currentSelection()
+	if !wantSelection.valid || wantSelection.identity != selected {
+		t.Fatalf("selected anchor = %#v, want %q", wantSelection, selected)
+	}
+
+	assertStable := func(name string, msg tea.Msg, bodyText string) {
+		t.Helper()
+		updated, _ := model.Update(msg)
+		model = updated.(bubbleDashboardModel)
+		if selection := model.currentSelection(); selection != wantSelection {
+			t.Fatalf("%s selection = %#v, want %#v", name, selection, wantSelection)
+		}
+		if body := model.viewport.GetContent(); !strings.Contains(body, bodyText) {
+			t.Fatalf("%s did not update Admission content with %q:\n%s", name, bodyText, body)
+		}
+	}
+
+	failure := runner.CandidateDiscoveryFailed{
+		Operation: runner.CandidateDiscoveryList,
+		Err:       errors.New("gh issue list: connection refused"), Cause: "connection refused",
+		FirstFailureAt: now, OccurredAt: now, RetryAt: now.Add(30 * time.Second), ConsecutiveFailures: 1,
+	}
+	assertStable("failure", dashboardOperationalMsg{event: failure}, "Admission: DEGRADED")
+	assertStable("Diagnostics toggle", tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}), "Full error/command: candidate discovery failed")
+	assertStable("recovery", dashboardOperationalMsg{event: runner.CandidateDiscoveryRecovered{OccurredAt: now.Add(time.Second), Failures: 1}}, "Admission: healthy | Recovered")
+}
+
 func TestBubbleDashboardPreservesSelectedSectionAcrossLiveProjectionChanges(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	current := navigationTestState(now, 5)

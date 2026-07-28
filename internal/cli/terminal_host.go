@@ -125,10 +125,11 @@ const (
 )
 
 type presentationEventQueue struct {
-	mu       sync.Mutex
-	events   []runner.OperationalEvent
-	inFlight int
-	wake     chan struct{}
+	mu                        sync.Mutex
+	events                    []runner.OperationalEvent
+	inFlight                  int
+	evictedFailureOccurrences map[string]int
+	wake                      chan struct{}
 }
 
 func newPresentationEventQueue() *presentationEventQueue {
@@ -137,6 +138,17 @@ func newPresentationEventQueue() *presentationEventQueue {
 
 func (q *presentationEventQueue) publish(event runner.OperationalEvent) {
 	q.mu.Lock()
+	switch typed := event.(type) {
+	case runner.CandidateDiscoveryFailed:
+		key := presentationFailureKey(typed)
+		if occurrences := q.evictedFailureOccurrences[key]; occurrences > 0 {
+			typed.Occurrences = presentationFailureOccurrences(typed) + occurrences
+			delete(q.evictedFailureOccurrences, key)
+			event = typed
+		}
+	case runner.CandidateDiscoveryRecovered:
+		clear(q.evictedFailureOccurrences)
+	}
 	q.events = append(q.events, event)
 	for presentationAdmissionFailureCount(q.events) > presentationAdmissionFailureLimit {
 		q.remove(oldestPresentationAdmissionFailure(q.events))
@@ -230,20 +242,20 @@ func presentationEventIsTerminal(event runner.OperationalEvent) bool {
 }
 
 func (q *presentationEventQueue) remove(index int) {
-	preservePresentationFailureOccurrences(q.events, index)
+	q.preserveFailureOccurrences(index)
 	copy(q.events[index:], q.events[index+1:])
 	q.events[len(q.events)-1] = nil
 	q.events = q.events[:len(q.events)-1]
 }
 
-func preservePresentationFailureOccurrences(events []runner.OperationalEvent, index int) {
-	evicted, ok := events[index].(runner.CandidateDiscoveryFailed)
+func (q *presentationEventQueue) preserveFailureOccurrences(index int) {
+	evicted, ok := q.events[index].(runner.CandidateDiscoveryFailed)
 	if !ok {
 		return
 	}
 	key := presentationFailureKey(evicted)
-	for later := index + 1; later < len(events); later++ {
-		switch event := events[later].(type) {
+	for later := index + 1; later < len(q.events); later++ {
+		switch event := q.events[later].(type) {
 		case runner.CandidateDiscoveryRecovered:
 			return
 		case runner.CandidateDiscoveryFailed:
@@ -254,10 +266,14 @@ func preservePresentationFailureOccurrences(events []runner.OperationalEvent, in
 			if event.FirstFailureAt.IsZero() || (!evicted.FirstFailureAt.IsZero() && evicted.FirstFailureAt.Before(event.FirstFailureAt)) {
 				event.FirstFailureAt = evicted.FirstFailureAt
 			}
-			events[later] = event
+			q.events[later] = event
 			return
 		}
 	}
+	if q.evictedFailureOccurrences == nil {
+		q.evictedFailureOccurrences = make(map[string]int)
+	}
+	q.evictedFailureOccurrences[key] += presentationFailureOccurrences(evicted)
 }
 
 func presentationFailureOccurrences(failure runner.CandidateDiscoveryFailed) int {

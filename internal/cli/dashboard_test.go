@@ -214,11 +214,9 @@ esac
 	if _, err := writeInput.Write([]byte(strings.Repeat("k", 100))); err != nil {
 		t.Fatalf("return to Admission: %v", err)
 	}
-	drainOffset := len(stdout.String())
 	if _, err := writeInput.Write([]byte{0x03}); err != nil {
 		t.Fatalf("start Drain: %v", err)
 	}
-	waitForDashboardOutputAfter(t, &stdout, drainOffset, "Retry: stopped")
 	select {
 	case exit := <-done:
 		if exit != 0 {
@@ -227,8 +225,18 @@ esac
 	case <-time.After(3 * time.Second):
 		t.Fatal("automatic dashboard did not finish Drain")
 	}
-	if output := stdout.String(); !strings.Contains(output, "\x1b[?1049h") || !strings.Contains(output, "\x1b[?1049l") || stderr.Len() != 0 {
+	output := stdout.String()
+	if !strings.Contains(output, "\x1b[?1049h") || !strings.Contains(output, "\x1b[?1049l") || stderr.Len() != 0 {
 		t.Fatalf("automatic dashboard terminal lifecycle changed: stdout=%q stderr=%q", output, stderr.String())
+	}
+	visible := terminalScreenText(output, 100, 12)
+	for _, want := range []string{"Admission: DEGRADED", "Retry: stopped"} {
+		if !strings.Contains(visible, want) {
+			t.Fatalf("final degraded Admission screen missing %q:\n%s\nraw output: %q", want, visible, output)
+		}
+	}
+	if strings.Contains(visible, "Next retry:") {
+		t.Fatalf("final degraded Admission screen retained an actionable retry:\n%s\nraw output: %q", visible, output)
 	}
 }
 
@@ -554,6 +562,54 @@ func TestPresentationQueuePreservesAdmissionAggregateThroughDashboard(t *testing
 	_, body, _ = dashboard.renderParts(now)
 	if !strings.Contains(body, "full gh command 6") || !strings.Contains(body, "full gh command 25") || strings.Contains(body, "full gh command 5") {
 		t.Fatalf("queue-to-dashboard Diagnostics did not retain exactly the latest twenty failures:\n%s", body)
+	}
+}
+
+func TestPresentationQueuePreservesRecurringAdmissionAggregateAfterEviction(t *testing.T) {
+	firstFailure := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	queue := newPresentationEventQueue()
+	publish := func(failure int, cause string) {
+		queue.publish(runner.CandidateDiscoveryFailed{
+			Operation: runner.CandidateDiscoveryList,
+			Err:       fmt.Errorf("full gh command %d", failure), Cause: cause,
+			FirstFailureAt: firstFailure, OccurredAt: firstFailure.Add(time.Duration(failure-1) * time.Second),
+			RetryAt: firstFailure.Add(time.Minute), ConsecutiveFailures: failure, Occurrences: 1,
+		})
+	}
+	publish(1, "recurring cause")
+	for failure := 2; failure <= 22; failure++ {
+		publish(failure, fmt.Sprintf("distinct cause %d", failure))
+	}
+	publish(23, "recurring cause")
+
+	dashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, time.Now)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for {
+		event, err := queue.next(ctx)
+		if errors.Is(err, context.Canceled) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read presentation queue: %v", err)
+		}
+		dashboard.operationalEvent(event)
+		queue.complete()
+	}
+
+	_, body, _ := dashboard.renderParts(firstFailure.Add(22 * time.Second))
+	for _, want := range []string{
+		"23 consecutive failures", "Cause: recurring cause | Equivalent failures: 2",
+		"Diagnostics: closed (d to open; 20 recent)",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("queue-to-dashboard recurring aggregate missing %q:\n%s", want, body)
+		}
+	}
+	dashboard.toggleDiagnostics()
+	_, body, _ = dashboard.renderParts(firstFailure.Add(22 * time.Second))
+	if !strings.Contains(body, "full gh command 4") || !strings.Contains(body, "full gh command 23") || strings.Contains(body, "full gh command 3") {
+		t.Fatalf("queue-to-dashboard Diagnostics did not remain bounded to the latest twenty failures:\n%s", body)
 	}
 }
 
