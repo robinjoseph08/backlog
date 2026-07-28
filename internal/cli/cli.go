@@ -65,6 +65,7 @@ func MainWithTerminal(ctx context.Context, args []string, dependencies TerminalD
 		return 2
 	}
 	var err error
+	var ancillaryOutputErr error
 	switch args[0] {
 	case "run":
 		options, parseErr := parseRunOptions(args[1:], stderr)
@@ -93,6 +94,7 @@ func MainWithTerminal(ctx context.Context, args []string, dependencies TerminalD
 		if dashboard != nil {
 			dashboard.setResult(err)
 			if summaryErr := dashboard.printFinalSummary(stdout); summaryErr != nil {
+				ancillaryOutputErr = summaryErr
 				err = errors.Join(err, summaryErr)
 			}
 		}
@@ -140,10 +142,16 @@ func MainWithTerminal(ctx context.Context, args []string, dependencies TerminalD
 		}
 		var signalExit *runner.SignalExit
 		if errors.As(err, &signalExit) {
+			if ancillaryOutputErr != nil {
+				fmt.Fprintln(stderr, "error:", ancillaryOutputErr)
+			}
 			return signalExit.Code
 		}
 		var intervention *runner.InterventionRequired
 		if errors.As(err, &intervention) {
+			if ancillaryOutputErr != nil {
+				fmt.Fprintln(stderr, "error:", ancillaryOutputErr)
+			}
 			return 1
 		}
 		fmt.Fprintln(stderr, "error:", err)
@@ -307,6 +315,11 @@ func runCommand(ctx context.Context, options runOptions, stdout io.Writer, signa
 	}
 	store := state.FileStore{Path: filepath.Join(resolvedStateDir, "state.json")}
 	summarySource := repositoryFollowSource{followStateSource: store, commonDirectory: commonDirectory}
+	lock, err := acquireRepositoryLock(commonDirectory)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lock.Release() }()
 	var dashboardInitial state.State
 	if dashboard != nil && !options.plain {
 		dashboardInitial, _, err = store.Preview()
@@ -315,11 +328,6 @@ func runCommand(ctx context.Context, options runOptions, stdout io.Writer, signa
 		}
 		dashboard.configure(dashboardInitial, summarySource)
 	}
-	lock, err := acquireRepositoryLock(commonDirectory)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = lock.Release() }()
 	if err := bindStateDirectory(commonDirectory, resolvedStateDir); err != nil {
 		return err
 	}

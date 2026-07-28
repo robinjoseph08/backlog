@@ -143,6 +143,44 @@ esac
 	}
 }
 
+func TestTerminalDashboardAcquiresRepositoryLockBeforeCompletionBaselinePreview(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	completed := scheduler.Run{Issue: 73, IssueTitle: "Other invocation completion", RunID: "run-73", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint}
+	if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1, Runs: []scheduler.Run{completed},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := acquireRepositoryLock(filepath.Join(repository, ".git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+
+	var stdout, stderr bytes.Buffer
+	exit := MainWithTerminal(context.Background(), []string{
+		"run", "--repo-dir", repository, "--state-dir", stateDir,
+	}, TerminalDependencies{
+		Input: strings.NewReader(""), Output: &stdout, ErrorOutput: &stderr,
+		IsTerminal:   func() bool { return true },
+		Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
+		ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+	})
+	if exit != 1 || !strings.Contains(stderr.String(), "repository runner already active") {
+		t.Fatalf("contended invocation exit = %d, stderr = %q", exit, stderr.String())
+	}
+	raw := stdout.String()
+	summaryAt := strings.Index(raw, "Final aggregate summary")
+	if summaryAt < 0 {
+		t.Fatalf("contended invocation omitted final summary: %q", raw)
+	}
+	summary := raw[summaryAt:]
+	if !strings.Contains(summary, "Repository: not initialized") || strings.Contains(summary, completed.IssueTitle) {
+		t.Fatalf("contended invocation previewed state before acquiring the repository lock: %q", summary)
+	}
+}
+
 func TestTerminalDashboardSetupFailureLeavesNormalScreenResult(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	exit := MainWithTerminal(context.Background(), []string{"run"}, TerminalDependencies{
@@ -276,37 +314,191 @@ exit 9
 	}
 }
 
-func TestTerminalDashboardRunnerFailureRestoresBeforeErrorResult(t *testing.T) {
+func TestTerminalDashboardRestoresPTYAttributesAfterNaturalExhaustionAndRunnerFailure(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		maxWorkers string
+		wantExit   int
+		wantFinal  string
+		wantError  string
+	}{
+		{name: "natural exhaustion", maxWorkers: "1", wantFinal: "Final outcome: Natural exhaustion"},
+		{name: "Runner failure", maxWorkers: "0", wantExit: 1, wantFinal: "Final outcome: Error: max concurrent issues must be positive", wantError: "max concurrent issues must be positive"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repository := initializeFollowRepository(t)
+			root := t.TempDir()
+			setupStarted := filepath.Join(root, "setup-started")
+			releaseSetup := filepath.Join(root, "release-setup")
+			gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef")
+    touch `+quote(setupStarted)+`
+    while ! test -f `+quote(releaseSetup)+`; do sleep 0.01; done
+    printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url") printf '%s\n' '[]' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+			primary, terminal, err := pty.Open()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer primary.Close()
+			defer terminal.Close()
+			if err := pty.Setsize(terminal, &pty.Winsize{Rows: 24, Cols: 80}); err != nil {
+				t.Fatal(err)
+			}
+			initialState, err := term.GetState(int(terminal.Fd()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			output := newPTYPresentationOutput(terminal)
+			input := newPTYPresentationInput(terminal)
+			go func() { _, _ = io.Copy(io.Discard, primary) }()
+			var stderr bytes.Buffer
+			done := make(chan int, 1)
+			go func() {
+				done <- MainWithTerminal(context.Background(), []string{
+					"run", "--repo-dir", repository, "--state-dir", filepath.Join(root, "state"), "--max-workers", test.maxWorkers, "--poll", "5ms", "--gh", gh,
+				}, TerminalDependencies{
+					Input: input, Output: output, ErrorOutput: &stderr,
+					IsTerminal:   func() bool { return true },
+					Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
+					ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+				})
+			}()
+			waitForFile(t, setupStarted)
+			select {
+			case <-output.enteredAlternateScreen:
+			case <-time.After(10 * time.Second):
+				t.Fatal("default dashboard did not enter the alternate screen")
+			}
+			inputCtx, cancelInput := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancelInput()
+			if err := finishPTYPresentationInput(inputCtx, primary, input); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(releaseSetup, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case exit := <-done:
+				if exit != test.wantExit {
+					t.Fatalf("exit = %d, want %d; stderr = %q", exit, test.wantExit, stderr.String())
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("default dashboard did not finish")
+			}
+			restoredState, stateErr := term.GetState(int(terminal.Fd()))
+			if stateErr != nil {
+				t.Fatal(stateErr)
+			}
+			if !reflect.DeepEqual(restoredState, initialState) {
+				t.Fatalf("terminal state after %s = %#v, want %#v", test.name, restoredState, initialState)
+			}
+			if test.wantError == "" {
+				if stderr.Len() != 0 {
+					t.Fatalf("natural exhaustion stderr = %q", stderr.String())
+				}
+			} else if !strings.Contains(stderr.String(), test.wantError) {
+				t.Fatalf("Runner failure stderr = %q, want %q", stderr.String(), test.wantError)
+			}
+			raw := output.String()
+			restore := strings.LastIndex(raw, "\x1b[?1049l")
+			summary := strings.Index(raw, "Final aggregate summary")
+			if restore < 0 || summary < restore || !strings.Contains(raw[summary:], test.wantFinal) {
+				t.Fatalf("%s result was not printed after terminal restoration: %q", test.name, raw)
+			}
+		})
+	}
+}
+
+type finalSummaryFailureWriter struct {
+	output synchronizedBuffer
+	failed atomic.Bool
+}
+
+func (w *finalSummaryFailureWriter) Write(content []byte) (int, error) {
+	if bytes.Contains(content, []byte("Final aggregate summary")) && w.failed.CompareAndSwap(false, true) {
+		return 0, errors.New("final summary output lost")
+	}
+	return w.output.Write(content)
+}
+
+func TestTerminalDashboardReportsFinalSummaryFailureWithoutChangingSignalExit(t *testing.T) {
+	root := t.TempDir()
+	setupStarted := filepath.Join(root, "setup-started")
+	git := writeExecutable(t, `#!/bin/sh
+set -eu
+touch `+quote(setupStarted)+`
+exec sleep 30
+`)
+	var stdout finalSummaryFailureWriter
+	var stderr bytes.Buffer
+	externalSignals := make(chan os.Signal)
+	done := make(chan int, 1)
+	go func() {
+		done <- MainWithTerminal(context.Background(), []string{"run", "--git", git}, TerminalDependencies{
+			Input: strings.NewReader(""), Output: &stdout, ErrorOutput: &stderr, Signals: externalSignals,
+			IsTerminal:   func() bool { return true },
+			Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
+			ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+		})
+	}()
+	waitForFile(t, setupStarted)
+	select {
+	case externalSignals <- syscall.SIGTERM:
+	case <-time.After(10 * time.Second):
+		t.Fatal("SIGTERM was not accepted during setup")
+	}
+	select {
+	case exit := <-done:
+		if exit != 143 {
+			t.Fatalf("signal exit = %d, want 143; stderr = %q", exit, stderr.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("signal shutdown did not finish")
+	}
+	if !stdout.failed.Load() || !strings.Contains(stderr.String(), "error: final summary output lost") {
+		t.Fatalf("final summary failure was not reported: failed=%t stderr=%q", stdout.failed.Load(), stderr.String())
+	}
+}
+
+func TestTerminalDashboardReportsFinalSummaryFailureWithoutChangingInterventionExit(t *testing.T) {
 	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	run := scheduler.Run{Issue: 73, IssueTitle: "Operator decision", RunID: "run-73", Status: scheduler.StatusNeedsHuman, WorkerMode: scheduler.WorkerModePrint}
+	if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
+		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	gh := writeExecutable(t, `#!/bin/sh
 set -eu
 case "$*" in
   "repo view --json nameWithOwner,defaultBranchRef") printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url") printf '%s\n' '[]' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
 `)
-	var stdout, stderr bytes.Buffer
+	var stdout finalSummaryFailureWriter
+	var stderr bytes.Buffer
 	exit := MainWithTerminal(context.Background(), []string{
-		"run", "--repo-dir", repository, "--state-dir", t.TempDir(), "--max-workers", "0", "--gh", gh,
+		"run", "--repo-dir", repository, "--state-dir", stateDir, "--poll", "5ms", "--gh", gh,
 	}, TerminalDependencies{
 		Input: strings.NewReader(""), Output: &stdout, ErrorOutput: &stderr,
 		IsTerminal:   func() bool { return true },
 		Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
 		ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
 	})
-	if exit != 1 || !strings.Contains(stderr.String(), "max concurrent issues must be positive") {
-		t.Fatalf("Runner failure exit = %d, stderr = %q", exit, stderr.String())
+	if exit != 1 {
+		t.Fatalf("intervention exit = %d, want 1; stderr = %q", exit, stderr.String())
 	}
-	output := stdout.String()
-	restore := strings.LastIndex(output, "\x1b[?1049l")
-	summary := strings.Index(output, "Final aggregate summary")
-	if restore < 0 || summary < restore || !strings.Contains(output[summary:], "Final outcome: Error: max concurrent issues must be positive") {
-		t.Fatalf("Runner error result was not printed after terminal restoration: %q", output)
-	}
-	for _, control := range []string{"\x1b[?1049h", "\x1b[?25l", "\x1b[?25h"} {
-		if !strings.Contains(output, control) {
-			t.Fatalf("Runner failure output missing terminal control %q: %q", control, output)
-		}
+	if !stdout.failed.Load() || !strings.Contains(stderr.String(), "error: final summary output lost") {
+		t.Fatalf("final summary failure was not reported: failed=%t stderr=%q", stdout.failed.Load(), stderr.String())
 	}
 }
 

@@ -70,15 +70,16 @@ type bubbleDashboardSession struct {
 	doneOnce    sync.Once
 	done        chan struct{}
 
-	finalMu            sync.Mutex
-	finalState         *state.State
-	initialCompletions map[string]struct{}
-	source             followStateSource
-	naturalExit        bool
-	shutdownResult     runner.ShutdownResult
-	forceStopping      bool
-	resultErr          error
-	now                func() time.Time
+	finalMu               sync.Mutex
+	finalState            *state.State
+	initialCompletions    map[string]struct{}
+	completionBaselineSet bool
+	source                followStateSource
+	naturalExit           bool
+	shutdownResult        runner.ShutdownResult
+	forceStopping         bool
+	resultErr             error
+	now                   func() time.Time
 }
 
 func newBubbleDashboardSession(now func() time.Time) *bubbleDashboardSession {
@@ -262,7 +263,10 @@ func (s *bubbleDashboardSession) configure(initial state.State, source followSta
 	s.finalMu.Lock()
 	s.source = source
 	s.finalState = &cloned
-	s.initialCompletions = mergedRunIdentities(initial)
+	if !s.completionBaselineSet {
+		s.initialCompletions = mergedRunIdentities(initial)
+		s.completionBaselineSet = true
+	}
 	s.finalMu.Unlock()
 	s.publish(dashboardConfiguredMsg{initial: cloned, source: source})
 }

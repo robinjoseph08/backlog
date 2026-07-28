@@ -2119,6 +2119,8 @@ type ptyPresentationOutput struct {
 	entered                atomic.Bool
 	fail                   atomic.Bool
 	failed                 atomic.Bool
+	failedWriteSize        atomic.Int64
+	failedWriteAttemptSize atomic.Int64
 }
 
 func newPTYPresentationOutput(file *os.File) *ptyPresentationOutput {
@@ -2126,13 +2128,19 @@ func newPTYPresentationOutput(file *os.File) *ptyPresentationOutput {
 }
 
 func (w *ptyPresentationOutput) Write(content []byte) (int, error) {
-	fail := w.fail.Load()
-	written, err := w.File.Write(content)
-	_, _ = w.output.Write(content[:written])
-	if bytes.Contains(content[:written], []byte("\x1b[?1049h")) && w.entered.CompareAndSwap(false, true) {
+	failThisWrite := len(content) > 1 && w.fail.Load() && w.failed.CompareAndSwap(false, true)
+	writeContent := content
+	if failThisWrite {
+		writeContent = content[:len(content)/2]
+	}
+	written, err := w.File.Write(writeContent)
+	_, _ = w.output.Write(writeContent[:written])
+	if bytes.Contains(writeContent[:written], []byte("\x1b[?1049h")) && w.entered.CompareAndSwap(false, true) {
 		close(w.enteredAlternateScreen)
 	}
-	if err == nil && written > 0 && fail && w.failed.CompareAndSwap(false, true) {
+	if err == nil && failThisWrite {
+		w.failedWriteSize.Store(int64(written))
+		w.failedWriteAttemptSize.Store(int64(len(content)))
 		return written, errors.New("terminal output lost")
 	}
 	return written, err
@@ -2230,8 +2238,8 @@ func TestBubbleDashboardPostStartFailuresRestorePTYStateBeforeStaticErrorResult(
 				if !panicked.Load() || !errors.Is(failure.Err, tea.ErrProgramPanic) {
 					t.Fatalf("model panic result = %v, panicked = %t", err, panicked.Load())
 				}
-			} else if !output.failed.Load() || !strings.Contains(failure.Err.Error(), "terminal output lost") {
-				t.Fatalf("output-loss result = %v, failed = %t", err, output.failed.Load())
+			} else if written, attempted := output.failedWriteSize.Load(), output.failedWriteAttemptSize.Load(); !output.failed.Load() || written <= 0 || written >= attempted || !strings.Contains(failure.Err.Error(), "terminal output lost") {
+				t.Fatalf("output-loss result = %v, failed = %t, interrupted write = %d/%d bytes", err, output.failed.Load(), written, attempted)
 			}
 
 			restoredState, stateErr := term.GetState(int(terminal.Fd()))
@@ -2801,6 +2809,28 @@ func TestDashboardFinalOutcomeDistinguishesEveryExitPath(t *testing.T) {
 				t.Fatalf("final outcome = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestBubbleDashboardReconfigurationPreservesLockedCompletionBaseline(t *testing.T) {
+	session := newBubbleDashboardSession(time.Now)
+	initial := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+	source := &dashboardTestSource{current: initial}
+	session.configure(initial, source)
+
+	completed := initial
+	completed.Runs = []scheduler.Run{{Issue: 73, IssueTitle: "Invocation completion", RunID: "run-73", Status: scheduler.StatusMerged}}
+	source.current = completed
+	session.configure(completed, source)
+	if err := session.captureFinalSummary(completed); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := session.printFinalSummary(&output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "Completions produced (1)") || !strings.Contains(output.String(), "#73  Invocation completion") {
+		t.Fatalf("reconfiguration replaced the invocation completion baseline:\n%s", output.String())
 	}
 }
 
