@@ -630,6 +630,10 @@ func deleteLocalBranch(ctx context.Context, gitExecutable, repositoryRoot string
 }
 
 func archiveSession(run scheduler.Run, session Session, stateDirectory string, syncPath func(string) error) error {
+	return archiveSessionWithRename(run, session, stateDirectory, syncPath, os.Rename)
+}
+
+func archiveSessionWithRename(run scheduler.Run, session Session, stateDirectory string, syncPath func(string) error, renamePath func(string, string) error) error {
 	if !session.Present || session.Archived || session.Dir == "" || session.ArchiveDir == "" {
 		return errors.New("Pi session is not ready for atomic archival")
 	}
@@ -656,11 +660,11 @@ func archiveSession(run scheduler.Run, session Session, stateDirectory string, s
 	} else if !present {
 		return errors.New("active Pi session disappeared immediately before archival")
 	}
-	if err := os.Rename(session.Dir, session.ArchiveDir); err != nil {
+	if err := renamePath(session.Dir, session.ArchiveDir); err != nil {
 		return fmt.Errorf("atomically archive Pi session %s: %w", session.ID, err)
 	}
 	if _, archived, err := inspectSessionDirectory(session.ArchiveDir, run); err != nil || !archived {
-		if restoreErr := os.Rename(session.ArchiveDir, session.Dir); restoreErr != nil {
+		if restoreErr := renamePath(session.ArchiveDir, session.Dir); restoreErr != nil {
 			return fmt.Errorf("verify archived Pi session identity: %v; restore active session: %w", err, restoreErr)
 		}
 		if err != nil {

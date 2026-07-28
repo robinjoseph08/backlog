@@ -136,6 +136,48 @@ func TestArchiveSessionRefusesSourceReplacementAfterInspection(t *testing.T) {
 	}
 }
 
+func TestArchiveSessionRestoresSourceAfterPostRenameIdentityMismatch(t *testing.T) {
+	t.Parallel()
+	fixture := newArchivableSession(t)
+	replacement := []byte(`{"type":"session","id":"unrelated","cwd":"/unrelated"}` + "\n")
+	renameCalls := 0
+	renamePath := func(source, destination string) error {
+		if err := os.Rename(source, destination); err != nil {
+			return err
+		}
+		renameCalls++
+		if renameCalls != 1 {
+			return nil
+		}
+		for _, path := range []string{
+			filepath.Join(destination, "session.jsonl"),
+			filepath.Join(destination, "nested", "events.jsonl"),
+		} {
+			if err := os.WriteFile(path, replacement, 0o600); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	err := archiveSessionWithRename(fixture.run, fixture.session, fixture.stateDir, syncFilesystemPath, renamePath)
+	if err == nil || !strings.Contains(err.Error(), "refuse Pi session archival after source identity changed") {
+		t.Fatalf("post-rename identity error = %v", err)
+	}
+	if renameCalls != 2 {
+		t.Fatalf("rename calls = %d, want archive and rollback", renameCalls)
+	}
+	for _, path := range []string{fixture.activeFile, filepath.Join(fixture.session.Dir, "nested", "events.jsonl")} {
+		content, readErr := os.ReadFile(path)
+		if readErr != nil || string(content) != string(replacement) {
+			t.Fatalf("restored replacement session file %s = %q, %v", path, content, readErr)
+		}
+	}
+	if _, statErr := os.Stat(fixture.session.ArchiveDir); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("replacement session remained in historical archive: %v", statErr)
+	}
+}
+
 type archivableSessionFixture struct {
 	stateDir, activeFile, archiveFile, nestedArchiveDir, nestedArchiveFile string
 	run                                                                    scheduler.Run

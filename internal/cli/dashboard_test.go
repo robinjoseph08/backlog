@@ -262,15 +262,14 @@ esac
 		t.Fatalf("closed automatic dashboard exposed full evidence or duplicated Admission as operational rows: %q", closedOutput)
 	}
 
-	diagnosticsOffset := len(stdout.String())
 	if _, err := writeInput.Write([]byte("d")); err != nil {
 		t.Fatalf("open paged Diagnostics: %v", err)
 	}
-	waitForDashboardOutputAfter(t, &stdout, diagnosticsOffset, "Diagnostics (")
+	waitForDashboardScreen(t, &stdout, "Diagnostics (")
 	if _, err := writeInput.Write([]byte("f")); err != nil {
 		t.Fatalf("page through the selected Diagnostics evidence: %v", err)
 	}
-	waitForDashboardOutputAfter(t, &stdout, diagnosticsOffset, "for attempt 2")
+	waitForDashboardScreen(t, &stdout, "for attempt 2")
 
 	if _, err := writeInput.Write([]byte("G")); err != nil {
 		t.Fatalf("jump to bottom of existing dashboard sections: %v", err)
@@ -313,22 +312,6 @@ esac
 	if strings.Contains(visible, "Next retry:") {
 		t.Fatalf("final degraded Admission screen retained an actionable retry:\n%s\nraw output: %q", visible, output)
 	}
-}
-
-func waitForDashboardOutputAfter(t *testing.T, output *synchronizedBuffer, offset int, want string) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		current := output.String()
-		if offset > len(current) {
-			offset = len(current)
-		}
-		if strings.Contains(current[offset:], want) {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatalf("dashboard output after byte %d never contained %q: %q", offset, want, output.String())
 }
 
 func waitForDashboardScreen(t *testing.T, output *synchronizedBuffer, want string) {
