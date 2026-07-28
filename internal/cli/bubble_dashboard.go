@@ -315,6 +315,7 @@ type bubbleDashboardModel struct {
 
 	interruptsWaiting int
 	pendingFlushes    []dashboardFlushMsg
+	flushAfter        func(time.Duration) <-chan time.Time
 	startup           *atomic.Bool
 }
 
@@ -332,7 +333,7 @@ func newBubbleDashboardModel(ctx context.Context, control PresentationControl, s
 		dashboard: newLiveDashboard(io.Discard, nil, empty, control.Terminal.Now),
 		viewport:  view, width: dimensions.Width, height: dimensions.Height,
 		attentionKnown: make(map[string]struct{}), attentionPending: make(map[string]struct{}),
-		colorProfile: profile, styler: newDashboardFallbackStyler(profile), startup: &atomic.Bool{},
+		colorProfile: profile, styler: newDashboardFallbackStyler(profile), flushAfter: time.After, startup: &atomic.Bool{},
 	}
 	model.refreshViewport(dashboardSelection{})
 	model.selectViewportAnchor()
@@ -492,9 +493,10 @@ func (m *bubbleDashboardModel) renderPendingFlushes() []tea.Cmd {
 	commands := make([]tea.Cmd, 0, len(m.pendingFlushes))
 	for _, pending := range m.pendingFlushes {
 		message := pending
-		commands = append(commands, tea.Tick(delay, func(time.Time) tea.Msg {
+		commands = append(commands, func() tea.Msg {
+			<-m.flushAfter(delay)
 			return dashboardFlushRenderedMsg{acknowledged: message.acknowledged}
-		}))
+		})
 	}
 	m.pendingFlushes = nil
 	return commands

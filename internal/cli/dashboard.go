@@ -78,6 +78,7 @@ type dashboardMessage struct {
 }
 
 type dashboardAdmission struct {
+	snapshotComplete    bool
 	degraded            bool
 	consecutiveFailures int
 	firstFailure        time.Time
@@ -328,6 +329,15 @@ func cloneDashboardMessages(messages []dashboardMessage) []dashboardMessage {
 // other operational semantics from append-only prose.
 func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
 	switch event := event.(type) {
+	case runner.CandidateSnapshotCompleted:
+		d.mu.Lock()
+		d.admission.snapshotComplete = true
+		d.admission.degraded = false
+		d.admission.recoveredAt = time.Time{}
+		d.admission.recoveredFailures = 0
+		d.mu.Unlock()
+		d.requestRedraw()
+		return
 	case runner.CandidateDiscoveryFailed:
 		d.mu.Lock()
 		d.recordAdmissionFailureLocked(event)
@@ -336,6 +346,7 @@ func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
 		return
 	case runner.CandidateDiscoveryRecovered:
 		d.mu.Lock()
+		d.admission.snapshotComplete = true
 		d.admission.degraded = false
 		d.admission.consecutiveFailures = 0
 		d.admission.equivalentFailures = nil
@@ -407,6 +418,7 @@ func (d *liveDashboard) recordAdmissionFailureLocked(failure runner.CandidateDis
 		d.admission.equivalentFailures = make(map[string]int)
 		d.admission.equivalentOrder = nil
 	}
+	d.admission.snapshotComplete = false
 	d.admission.degraded = true
 	d.admission.consecutiveFailures = failure.ConsecutiveFailures
 	d.admission.latestFailure = failure.OccurredAt
@@ -515,7 +527,7 @@ func dashboardOperationalEventSemantic(event runner.OperationalEvent) dashboardS
 	switch event := event.(type) {
 	case runner.CandidateDiscoveryFailed:
 		return dashboardSemanticWarning
-	case runner.CandidateDiscoveryRecovered:
+	case runner.CandidateSnapshotCompleted, runner.CandidateDiscoveryRecovered:
 		return dashboardSemanticActive
 	case runner.RunLifecycleEvent:
 		switch event.Stage {
@@ -755,9 +767,11 @@ func cloneDashboardAdmission(admission dashboardAdmission) dashboardAdmission {
 }
 
 func renderAdmissionHealth(output *strings.Builder, admission dashboardAdmission, diagnosticsOpen bool, stage dashboardStage, now time.Time, styler dashboardStyler) {
-	semantic := dashboardSemanticActive
+	semantic := dashboardSemanticMetadata
 	if admission.degraded {
 		semantic = dashboardSemanticWarning
+	} else if admission.snapshotComplete {
+		semantic = dashboardSemanticActive
 	}
 	output.WriteByte('\n')
 	writeDashboardStyledLine(output, styler, semantic, "Admission health")
@@ -785,6 +799,8 @@ func renderAdmissionHealth(output *strings.Builder, admission dashboardAdmission
 			cause += fmt.Sprintf(" | Equivalent failures: %d", equivalent)
 		}
 		writeDashboardStyledLine(output, styler, dashboardSemanticWarning, cause)
+	} else if !admission.snapshotComplete {
+		writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, "  Admission: checking | Candidate snapshot not yet complete")
 	} else {
 		health := "  Admission: healthy"
 		if !admission.recoveredAt.IsZero() {

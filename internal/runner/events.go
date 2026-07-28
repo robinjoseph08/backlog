@@ -45,6 +45,14 @@ type CandidateDiscoveryFailed struct {
 
 func (CandidateDiscoveryFailed) operationalEvent() {}
 
+// CandidateSnapshotCompleted reports the first complete Candidate snapshot in
+// an invocation without implying that Admission recovered from a failure.
+type CandidateSnapshotCompleted struct {
+	OccurredAt time.Time
+}
+
+func (CandidateSnapshotCompleted) operationalEvent() {}
+
 const candidateDiscoveryDiagnosticLimit = 20
 
 // ErrCandidateDiscoveryDiagnosticExpired marks a full diagnostic reference
@@ -199,6 +207,8 @@ func FormatOperationalEvent(event OperationalEvent) string {
 	switch event := event.(type) {
 	case CandidateDiscoveryFailed:
 		return fmt.Sprintf("candidate discovery failed; admission paused; retry due in %s: %v", event.RetryAt.Sub(event.OccurredAt), event.Err)
+	case CandidateSnapshotCompleted:
+		return ""
 	case CandidateDiscoveryRecovered:
 		noun := "failures"
 		if event.Failures == 1 {

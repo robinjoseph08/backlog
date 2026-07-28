@@ -146,7 +146,7 @@ func (q *presentationEventQueue) publish(event runner.OperationalEvent) {
 			typed.Occurrences = presentationFailureOccurrences(typed) + occurrences
 			event = typed
 		}
-	case runner.CandidateDiscoveryRecovered:
+	case runner.CandidateSnapshotCompleted, runner.CandidateDiscoveryRecovered:
 		clear(q.evictedFailureOccurrences)
 		q.evictedFailureOrder = nil
 	}
@@ -210,13 +210,13 @@ func presentationEventEvictionIndex(events []runner.OperationalEvent) int {
 
 func presentationEventIsLatestAdmissionTransition(events []runner.OperationalEvent, index int) bool {
 	switch events[index].(type) {
-	case runner.CandidateDiscoveryFailed, runner.CandidateDiscoveryRecovered:
+	case runner.CandidateSnapshotCompleted, runner.CandidateDiscoveryFailed, runner.CandidateDiscoveryRecovered:
 	default:
 		return false
 	}
 	for _, later := range events[index+1:] {
 		switch later.(type) {
-		case runner.CandidateDiscoveryFailed, runner.CandidateDiscoveryRecovered:
+		case runner.CandidateSnapshotCompleted, runner.CandidateDiscoveryFailed, runner.CandidateDiscoveryRecovered:
 			return false
 		}
 	}
@@ -230,7 +230,7 @@ func presentationEventIsSuperseded(events []runner.OperationalEvent, index int) 
 			switch later.(type) {
 			case runner.CandidateDiscoveryFailed:
 				return true
-			case runner.CandidateDiscoveryRecovered:
+			case runner.CandidateSnapshotCompleted, runner.CandidateDiscoveryRecovered:
 				return false
 			}
 		}
@@ -277,7 +277,7 @@ func (q *presentationEventQueue) preserveFailureOccurrences(index int) {
 	key := presentationFailureKey(evicted)
 	for later := index + 1; later < len(q.events); later++ {
 		switch event := q.events[later].(type) {
-		case runner.CandidateDiscoveryRecovered:
+		case runner.CandidateSnapshotCompleted, runner.CandidateDiscoveryRecovered:
 			return
 		case runner.CandidateDiscoveryFailed:
 			if presentationFailureKey(event) != key {

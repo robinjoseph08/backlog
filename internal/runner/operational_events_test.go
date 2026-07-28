@@ -123,6 +123,40 @@ func TestRunnerReportsClaimStartAndMergeLifecycleEvents(t *testing.T) {
 	}
 }
 
+func TestRunnerReportsInitialCandidateSnapshotCompletionWithoutRecovery(t *testing.T) {
+	t.Parallel()
+
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+	var output bytes.Buffer
+	runner.Output = &output
+	recorder := &operationalEventRecorder{}
+	runner.OnOperationalEvent = recorder.record
+
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	runner.WaitForOperationalEventDelivery()
+	events := recorder.snapshot()
+	completed := 0
+	for _, event := range events {
+		switch event := event.(type) {
+		case CandidateSnapshotCompleted:
+			completed++
+			if event.OccurredAt.IsZero() {
+				t.Fatal("initial Candidate snapshot completion omitted its occurrence time")
+			}
+		case CandidateDiscoveryRecovered:
+			t.Fatalf("initial success was reported as a recovery: %#v", event)
+		}
+	}
+	if completed != 1 {
+		t.Fatalf("initial Candidate snapshot completion events = %d, want 1 in %#v", completed, events)
+	}
+	if strings.Contains(output.String(), "candidate discovery recovered") {
+		t.Fatalf("initial success emitted compatible recovery output: %q", output.String())
+	}
+}
+
 func TestRunnerReportsCandidateDiscoveryFailuresAndResetsCountAfterRecovery(t *testing.T) {
 	t.Parallel()
 

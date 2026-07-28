@@ -94,8 +94,19 @@ func TestDashboardAdmissionStylingUsesHealthSemanticsWithoutChangingLabels(t *te
 		}
 	}
 
+	var checking strings.Builder
+	renderAdmissionHealth(&checking, dashboardAdmission{}, false, dashboardRunning, now, styler)
+	for _, want := range []string{styler.metadata.Render("Admission health"), styler.metadata.Render("  Admission: checking | Candidate snapshot not yet complete")} {
+		if !strings.Contains(checking.String(), want) {
+			t.Fatalf("styled checking Admission omitted metadata span %q: %q", ansi.Strip(want), checking.String())
+		}
+	}
+	if strings.Contains(ansi.Strip(checking.String()), "Admission: healthy") {
+		t.Fatalf("styled checking Admission claimed unverified health: %q", checking.String())
+	}
+
 	var healthy strings.Builder
-	renderAdmissionHealth(&healthy, dashboardAdmission{}, false, dashboardRunning, now, styler)
+	renderAdmissionHealth(&healthy, dashboardAdmission{snapshotComplete: true}, false, dashboardRunning, now, styler)
 	for _, want := range []string{styler.active.Render("Admission health"), styler.active.Render("  Admission: healthy")} {
 		if !strings.Contains(healthy.String(), want) {
 			t.Fatalf("styled healthy Admission omitted active span %q: %q", ansi.Strip(want), healthy.String())
@@ -296,6 +307,7 @@ func TestDashboardOperationalMessagesUseTypedEventSemantics(t *testing.T) {
 		style    lipgloss.Style
 	}{
 		{event: runner.CandidateDiscoveryFailed{}, semantic: dashboardSemanticWarning, style: styler.warning},
+		{event: runner.CandidateSnapshotCompleted{}, semantic: dashboardSemanticActive, style: styler.active},
 		{event: runner.CandidateDiscoveryRecovered{}, semantic: dashboardSemanticActive, style: styler.active},
 		{event: runner.RunLifecycleEvent{Stage: runner.RunLifecycleClaimed}, semantic: dashboardSemanticActive, style: styler.active},
 		{event: runner.RunLifecycleEvent{Stage: runner.RunLifecycleStarted}, semantic: dashboardSemanticActive, style: styler.active},

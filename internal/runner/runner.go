@@ -285,6 +285,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	var candidateRetryTimer *time.Timer
 	var candidateRetry <-chan time.Time
 	candidateDiscoveryFailures := 0
+	candidateSnapshotCompleted := false
 	var candidateDiscoveryFirstFailure time.Time
 	defer func() {
 		if candidateRetryTimer != nil {
@@ -406,6 +407,12 @@ func (r *Runner) Run(ctx context.Context) error {
 					}
 					candidateDiscoveryFailures = 0
 					candidateDiscoveryFirstFailure = time.Time{}
+					candidateSnapshotCompleted = true
+				} else if !candidateSnapshotCompleted {
+					if !r.emitWhileAdmissionActive(admission, CandidateSnapshotCompleted{OccurredAt: r.Now().UTC()}) {
+						continue
+					}
+					candidateSnapshotCompleted = true
 				}
 				plan := scheduler.Plan(scheduler.Snapshot{Candidates: candidates, Runs: current.Runs, Leases: current.Leases}, r.Config.MaxConcurrentIssues)
 				startedWorker := false
@@ -2233,7 +2240,7 @@ func (r *Runner) enqueueOperationalEvent(event OperationalEvent) {
 			typed.Occurrences = candidateDiscoveryFailureOccurrences(typed) + occurrences
 			event = typed
 		}
-	case CandidateDiscoveryRecovered:
+	case CandidateSnapshotCompleted, CandidateDiscoveryRecovered:
 		clear(r.operationalEvictedFailureCounts)
 		r.operationalEvictedFailureOrder = nil
 	}
@@ -2282,7 +2289,7 @@ func (r *Runner) preserveOperationalFailureOccurrences(index int) {
 	key := candidateDiscoveryFailureKey(evicted)
 	for later := index + 1; later < len(r.operationalEvents); later++ {
 		switch event := r.operationalEvents[later].(type) {
-		case CandidateDiscoveryRecovered:
+		case CandidateSnapshotCompleted, CandidateDiscoveryRecovered:
 			return
 		case CandidateDiscoveryFailed:
 			if candidateDiscoveryFailureKey(event) != key {

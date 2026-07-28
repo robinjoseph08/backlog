@@ -75,18 +75,31 @@ func assertBubbleDashboardFits(t *testing.T, model bubbleDashboardModel, width, 
 	}
 }
 
-func TestBubbleDashboardInitialFrameShowsCapacityPendingUntilConfigured(t *testing.T) {
+func TestBubbleDashboardShowsAdmissionCheckingThroughSetupUntilSnapshotCompletes(t *testing.T) {
 	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: time.Now}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 12})
 	initial := ansi.Strip(model.View().Content)
 	if !strings.Contains(initial, "Worker capacity: pending configuration") || strings.Contains(initial, "Worker capacity: 0 used | 0 available | 0 total") {
 		t.Fatalf("initial capacity was not pending configuration:\n%s", initial)
 	}
+	if !strings.Contains(initial, "Admission: checking | Candidate snapshot not yet complete") || strings.Contains(initial, "Admission: healthy") {
+		t.Fatalf("startup Admission claimed health before a Candidate snapshot completed:\n%s", initial)
+	}
 
 	configured := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 3}
 	updated, _ := model.Update(dashboardConfiguredMsg{initial: configured, source: &dashboardTestSource{current: configured}})
-	configuredView := ansi.Strip(updated.(bubbleDashboardModel).View().Content)
+	model = updated.(bubbleDashboardModel)
+	configuredView := ansi.Strip(model.View().Content)
 	if !strings.Contains(configuredView, "Worker capacity: 0 used | 3 available | 3 total") || strings.Contains(configuredView, "pending configuration") {
 		t.Fatalf("configured capacity was not rendered:\n%s", configuredView)
+	}
+	if !strings.Contains(configuredView, "Admission: checking | Candidate snapshot not yet complete") || strings.Contains(configuredView, "Admission: healthy") {
+		t.Fatalf("setup configuration falsely established Admission health:\n%s", configuredView)
+	}
+
+	updated, _ = model.Update(dashboardOperationalMsg{event: runner.CandidateSnapshotCompleted{OccurredAt: time.Now()}})
+	completedView := ansi.Strip(updated.(bubbleDashboardModel).View().Content)
+	if !strings.Contains(completedView, "Admission: healthy") || strings.Contains(completedView, "Admission: checking") || strings.Contains(completedView, "Recovered") {
+		t.Fatalf("first complete Candidate snapshot did not establish immediate health:\n%s", completedView)
 	}
 }
 
@@ -854,7 +867,7 @@ func TestBubbleDashboardPresentationRejectsDimensionFailureBeforeRunnerStartup(t
 	}
 }
 
-func TestBubbleDashboardFinalFlushKeepsRecoveryNoticeVisibleWithTruthfulNaturalExitStage(t *testing.T) {
+func TestBubbleDashboardFinalFlushWaitsForRecoveryNoticeBeforeAcknowledgingNaturalExit(t *testing.T) {
 	recoveredAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	now := recoveredAt.Add(2 * time.Second)
 	control := PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}
@@ -875,14 +888,26 @@ func TestBubbleDashboardFinalFlushKeepsRecoveryNoticeVisibleWithTruthfulNaturalE
 		t.Fatalf("post-Runner flush = %#v, want natural-exit marker", msg)
 	}
 
+	requestedDelay := make(chan time.Duration, 1)
+	clockFired := make(chan time.Time, 1)
 	model := newBubbleDashboardModel(context.Background(), control, session, TerminalDimensions{Width: 100, Height: 20})
-	model.dashboard.operationalEvent(runner.CandidateDiscoveryRecovered{OccurredAt: recoveredAt, Failures: 3})
-	updated, _ := model.Update(flush)
-	model = updated.(bubbleDashboardModel)
-	close(flush.acknowledged)
-	if err := <-flushDone; err != nil {
-		t.Fatalf("acknowledge natural-exit flush: %v", err)
+	model.flushAfter = func(delay time.Duration) <-chan time.Time {
+		requestedDelay <- delay
+		return clockFired
 	}
+	model.dashboard.operationalEvent(runner.CandidateDiscoveryRecovered{OccurredAt: recoveredAt, Failures: 3})
+	updated, command := model.Update(flush)
+	model = updated.(bubbleDashboardModel)
+	batch, ok := command().(tea.BatchMsg)
+	if !ok || len(batch) < 1 {
+		t.Fatalf("natural-exit Update command = %T, want a delayed render batch", command())
+	}
+	rendered := make(chan tea.Msg, 1)
+	go func() { rendered <- batch[0]() }()
+	if delay := <-requestedDelay; delay != 8*time.Second {
+		t.Fatalf("controllable clock delay = %s, want remaining 8s", delay)
+	}
+
 	view := ansi.Strip(model.View().Content)
 	for _, want := range []string{
 		"Admission: healthy | Recovered 2s ago after 3 failures",
@@ -893,16 +918,34 @@ func TestBubbleDashboardFinalFlushKeepsRecoveryNoticeVisibleWithTruthfulNaturalE
 			t.Fatalf("natural-exit recovery hold omitted %q:\n%s", want, view)
 		}
 	}
+	select {
+	case <-flush.acknowledged:
+		t.Fatal("natural-exit flush acknowledged before the remaining recovery notice duration")
+	default:
+	}
+
+	clockFired <- recoveredAt.Add(admissionRecoveryNotice)
+	renderedMsg := <-rendered
+	select {
+	case <-flush.acknowledged:
+		t.Fatal("natural-exit flush acknowledged before the delayed render message was applied")
+	default:
+	}
+	updated, _ = model.Update(renderedMsg)
+	model = updated.(bubbleDashboardModel)
+	if err := <-flushDone; err != nil {
+		t.Fatalf("delayed natural-exit acknowledgment: %v", err)
+	}
+	view = ansi.Strip(model.View().Content)
+	for _, want := range []string{"Admission: healthy | Recovered", "Runner stage: Complete; the Runner has exited", "Next Ctrl-C: no effect"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("acknowledged natural-exit frame omitted %q:\n%s", want, view)
+		}
+	}
 	for _, stale := range []string{"Runner stage: Running", "Next Ctrl-C: start Drain and stop Admission"} {
 		if strings.Contains(view, stale) {
 			t.Fatalf("natural-exit recovery hold retained stale lifecycle guidance %q:\n%s", stale, view)
 		}
-	}
-	if delay := dashboardFlushDelay(model.dashboard, now); delay != 8*time.Second {
-		t.Fatalf("final flush delay = %s, want 8s", delay)
-	}
-	if delay := dashboardFlushDelay(model.dashboard, recoveredAt.Add(10*time.Second)); delay != time.Second/30 {
-		t.Fatalf("expired-notice flush delay = %s, want %s", delay, time.Second/30)
 	}
 
 	shutdownDashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, func() time.Time { return now })
