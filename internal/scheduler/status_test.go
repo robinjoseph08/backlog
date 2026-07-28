@@ -15,7 +15,9 @@ func TestRequiresLeaseCoversEveryStatus(t *testing.T) {
 		{StatusWaitingForMerge, true},
 		{StatusSuspended, true},
 		{StatusResetting, true},
+		{StatusResolvingExternally, true},
 		{StatusReset, false},
+		{StatusResolvedExternally, false},
 		{StatusMerged, false},
 		{StatusFailed, false},
 		{StatusNeedsHuman, false},
@@ -36,7 +38,7 @@ func TestActiveAndInterventionRequiredPartitionEveryStatus(t *testing.T) {
 	}
 	for _, status := range []Status{
 		StatusClaimed, StatusWorktreeReady, StatusRunning, StatusWaitingForMerge, StatusSuspended,
-		StatusResetting, StatusReset, StatusMerged, StatusFailed, StatusNeedsHuman,
+		StatusResetting, StatusResolvingExternally, StatusReset, StatusResolvedExternally, StatusMerged, StatusFailed, StatusNeedsHuman,
 	} {
 		if got := IsActive(status); got != active[status] {
 			t.Errorf("IsActive(%q) = %t, want %t", status, got, active[status])
@@ -60,7 +62,9 @@ func TestIsTerminalCoversEveryStatus(t *testing.T) {
 		{StatusWaitingForMerge, false},
 		{StatusSuspended, false},
 		{StatusResetting, false},
+		{StatusResolvingExternally, false},
 		{StatusReset, true},
+		{StatusResolvedExternally, true},
 		{StatusMerged, true},
 		{StatusFailed, true},
 		{StatusNeedsHuman, true},
@@ -106,6 +110,19 @@ func TestRunStateTransitionsAreExplicit(t *testing.T) {
 		{StatusNeedsHuman, StatusReset},
 		{StatusSuspended, StatusReset},
 		{StatusResetting, StatusReset},
+		{StatusClaimed, StatusResolvingExternally},
+		{StatusWorktreeReady, StatusResolvingExternally},
+		{StatusRunning, StatusResolvingExternally},
+		{StatusWaitingForMerge, StatusResolvingExternally},
+		{StatusSuspended, StatusResolvingExternally},
+		{StatusFailed, StatusResolvingExternally},
+		{StatusNeedsHuman, StatusResolvingExternally},
+		{StatusResetting, StatusResolvingExternally},
+		{StatusResolvingExternally, StatusResolvedExternally},
+		{StatusResolvingExternally, StatusMerged},
+		{StatusFailed, StatusMerged},
+		{StatusNeedsHuman, StatusMerged},
+		{StatusResetting, StatusMerged},
 	}
 	for _, transition := range allowed {
 		if !CanTransition(transition[0], transition[1]) {
@@ -120,6 +137,8 @@ func TestRunStateTransitionsAreExplicit(t *testing.T) {
 		{StatusClaimed, StatusWaitingForMerge},
 		{StatusReset, StatusRunning},
 		{StatusReset, StatusResetting},
+		{StatusResolvedExternally, StatusResolvingExternally},
+		{StatusResolvedExternally, StatusRunning},
 	}
 	for _, transition := range rejected {
 		if CanTransition(transition[0], transition[1]) {

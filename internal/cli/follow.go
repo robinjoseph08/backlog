@@ -298,7 +298,7 @@ func observeFollowRun(source followStateSource, run scheduler.Run) followObserva
 		observation.supervision = "n/a (terminal Run)"
 		return observation
 	}
-	if run.Status == scheduler.StatusResetting {
+	if run.Status == scheduler.StatusResetting || run.Status == scheduler.StatusResolvingExternally {
 		observation.supervision = "UNSUPERVISED"
 		return observation
 	}
@@ -860,6 +860,25 @@ func printFollowSummary(output io.Writer, run scheduler.Run, metrics followMetri
 		run.RunID, issue, run.Status, observation.supervision, observation.workerLiveness, progress.elapsed, progress.activityAge, progress.workerOperation, progress.workerTurns, progress.workerTokens, len(metrics.subagents), progress.activeSubagents,
 		progress.deepestOperation, progress.subagentTurns, progress.subagentToolUses, progress.subagentTokens, progress.observedTokens); err != nil {
 		return err
+	}
+	if run.Status == scheduler.StatusResolvedExternally {
+		resolvedAt := "n/a"
+		if run.ResolvedExternallyAt != nil && !run.ResolvedExternallyAt.IsZero() {
+			resolvedAt = run.ResolvedExternallyAt.UTC().Format(time.RFC3339)
+		}
+		if _, err := fmt.Fprintf(output, "External Resolution: %s | GitHub closure reason: %s\n", resolvedAt, valueOr(run.ClosureReason, "n/a")); err != nil {
+			return err
+		}
+		if run.Error != "" {
+			if _, err := fmt.Fprintln(output, "Retained diagnostic: "+run.Error); err != nil {
+				return err
+			}
+		}
+		if run.DiagnosticWarning != "" {
+			if _, err := fmt.Fprintln(output, "Diagnostic warning: "+run.DiagnosticWarning); err != nil {
+				return err
+			}
+		}
 	}
 	for index, id := range metrics.subagentOrder {
 		observed := metrics.subagents[id]

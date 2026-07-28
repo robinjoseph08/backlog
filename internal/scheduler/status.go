@@ -4,7 +4,7 @@ package scheduler
 // must retain active ownership of its issue.
 func RequiresLease(status Status) bool {
 	switch status {
-	case StatusClaimed, StatusWorktreeReady, StatusRunning, StatusWaitingForMerge, StatusSuspended, StatusResetting:
+	case StatusClaimed, StatusWorktreeReady, StatusRunning, StatusWaitingForMerge, StatusSuspended, StatusResetting, StatusResolvingExternally:
 		return true
 	default:
 		return false
@@ -32,34 +32,36 @@ func RequiresIntervention(status Status) bool {
 // IsTerminal reports whether a Run status stops producing autonomous work.
 func IsTerminal(status Status) bool {
 	switch status {
-	case StatusReset, StatusMerged, StatusFailed, StatusNeedsHuman:
+	case StatusReset, StatusResolvedExternally, StatusMerged, StatusFailed, StatusNeedsHuman:
 		return true
 	default:
 		return false
 	}
 }
 
-// CanTransition defines every persisted Run-state transition. Reset may move
-// an eligible unfinished Run through resetting before it becomes reset.
+// CanTransition defines every persisted Run-state transition. Retirement may
+// move an eligible unfinished Run through its durable progress state.
 func CanTransition(from, to Status) bool {
 	if from == to {
 		return from == StatusWaitingForMerge
 	}
 	switch from {
 	case StatusClaimed:
-		return to == StatusWorktreeReady || to == StatusResetting || to == StatusReset || to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman
+		return to == StatusWorktreeReady || to == StatusResetting || to == StatusReset || to == StatusResolvingExternally || to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman
 	case StatusWorktreeReady:
-		return to == StatusRunning || to == StatusResetting || to == StatusReset || to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman
+		return to == StatusRunning || to == StatusResetting || to == StatusReset || to == StatusResolvingExternally || to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman
 	case StatusRunning:
-		return to == StatusWaitingForMerge || to == StatusSuspended || to == StatusResetting || to == StatusReset || to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman
+		return to == StatusWaitingForMerge || to == StatusSuspended || to == StatusResetting || to == StatusReset || to == StatusResolvingExternally || to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman
 	case StatusSuspended:
-		return to == StatusRunning || to == StatusWaitingForMerge || to == StatusMerged || to == StatusNeedsHuman || to == StatusResetting || to == StatusReset
+		return to == StatusRunning || to == StatusWaitingForMerge || to == StatusMerged || to == StatusNeedsHuman || to == StatusResetting || to == StatusReset || to == StatusResolvingExternally
 	case StatusWaitingForMerge:
-		return to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman || to == StatusResetting
+		return to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman || to == StatusResetting || to == StatusResolvingExternally
 	case StatusFailed, StatusNeedsHuman:
-		return to == StatusResetting || to == StatusReset
+		return to == StatusResetting || to == StatusReset || to == StatusResolvingExternally || to == StatusMerged
 	case StatusResetting:
-		return to == StatusReset
+		return to == StatusReset || to == StatusResolvingExternally || to == StatusMerged
+	case StatusResolvingExternally:
+		return to == StatusResolvedExternally || to == StatusMerged
 	default:
 		return false
 	}

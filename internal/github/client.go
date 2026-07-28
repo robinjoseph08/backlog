@@ -36,10 +36,11 @@ type IssueState struct {
 }
 
 type OwnedRunIssue struct {
-	Number int
-	URL    string
-	State  string
-	Labels []string
+	Number        int
+	URL           string
+	State         string
+	ClosureReason string
+	Labels        []string
 }
 
 type OwnedRunPullRequest struct {
@@ -309,22 +310,22 @@ func (c Client) OwnedRunResources(ctx context.Context, repo string, issueNumber 
 	}
 	if err := c.jsonCommand(ctx, &issue, "issue", "view", fmt.Sprint(issueNumber), "--repo", repo,
 		"--json", "number,url,state,labels"); err != nil {
-		return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset issue: %w", err)
+		return OwnedRunIssue{}, nil, fmt.Errorf("inspect owned Run issue: %w", err)
 	}
 	if issue.Number != issueNumber || !resourceURLMatches(issue.URL, repo, "issues", issueNumber) ||
 		(!strings.EqualFold(issue.State, "open") && !strings.EqualFold(issue.State, "closed")) {
-		return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset issue: gh returned incomplete or unknown issue identity/state")
+		return OwnedRunIssue{}, nil, fmt.Errorf("inspect owned Run issue: gh returned incomplete or unknown issue identity/state")
 	}
 	var labels []struct {
 		Name string `json:"name"`
 	}
 	if len(issue.Labels) == 0 || string(issue.Labels) == "null" || json.Unmarshal(issue.Labels, &labels) != nil {
-		return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset issue: gh returned unknown labels")
+		return OwnedRunIssue{}, nil, fmt.Errorf("inspect owned Run issue: gh returned unknown labels")
 	}
 	resultIssue := OwnedRunIssue{Number: issue.Number, URL: issue.URL, State: strings.ToLower(issue.State)}
 	for _, label := range labels {
 		if label.Name == "" {
-			return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset issue: gh returned a label without identity")
+			return OwnedRunIssue{}, nil, fmt.Errorf("inspect owned Run issue: gh returned a label without identity")
 		}
 		resultIssue.Labels = append(resultIssue.Labels, label.Name)
 	}
@@ -334,7 +335,7 @@ func (c Client) OwnedRunResources(ctx context.Context, repo string, issueNumber 
 	}
 	parts := strings.SplitN(repo, "/", 2)
 	if len(parts) != 2 || parts[0] == "" {
-		return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset pull requests: invalid repository %q", repo)
+		return OwnedRunIssue{}, nil, fmt.Errorf("inspect owned Run pull requests: invalid repository %q", repo)
 	}
 	var pulls []struct {
 		Number           int             `json:"number"`
@@ -355,31 +356,31 @@ func (c Client) OwnedRunResources(ctx context.Context, repo string, issueNumber 
 	var pullsJSON json.RawMessage
 	if err := c.jsonCommand(ctx, &pullsJSON, "pr", "list", "--repo", repo, "--state", "all", "--head", branch, "--limit", "1000",
 		"--json", "number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository"); err != nil {
-		return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset pull requests: %w", err)
+		return OwnedRunIssue{}, nil, fmt.Errorf("inspect owned Run pull requests: %w", err)
 	}
 	if len(pullsJSON) == 0 || string(pullsJSON) == "null" || json.Unmarshal(pullsJSON, &pulls) != nil {
-		return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset pull requests: gh returned an unknown pull request list")
+		return OwnedRunIssue{}, nil, fmt.Errorf("inspect owned Run pull requests: gh returned an unknown pull request list")
 	}
 	if len(pulls) == 1000 {
-		return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset pull requests: result reached the inspection limit; completeness is unknown")
+		return OwnedRunIssue{}, nil, fmt.Errorf("inspect owned Run pull requests: result reached the inspection limit; completeness is unknown")
 	}
 	resultPulls := make([]OwnedRunPullRequest, 0, len(pulls))
 	for _, pull := range pulls {
 		if pull.Number <= 0 || !resourceURLMatches(pull.URL, repo, "pull", pull.Number) || pull.HeadRefName != branch || !validCommitOID(pull.HeadRefOID) ||
 			!strings.EqualFold(pull.HeadOwner.Login, parts[0]) || !strings.EqualFold(pull.HeadRepository.NameWithOwner, repo) {
-			return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset pull requests: gh returned incomplete or mismatched pull request identity")
+			return OwnedRunIssue{}, nil, fmt.Errorf("inspect owned Run pull requests: gh returned incomplete or mismatched pull request identity")
 		}
 		state := strings.ToLower(pull.State)
 		if state != "open" && state != "closed" && state != "merged" {
-			return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset pull request #%d: unknown state %q", pull.Number, pull.State)
+			return OwnedRunIssue{}, nil, fmt.Errorf("inspect owned Run pull request #%d: unknown state %q", pull.Number, pull.State)
 		}
 		merged, err := inspectedMergedState(pull.MergedAt)
 		if err != nil {
-			return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset pull request #%d: %w", pull.Number, err)
+			return OwnedRunIssue{}, nil, fmt.Errorf("inspect owned Run pull request #%d: %w", pull.Number, err)
 		}
 		autoMergeArmed, err := inspectedAutoMergeState(pull.AutoMergeRequest, pull.IsDraft)
 		if err != nil {
-			return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset pull request #%d: %w", pull.Number, err)
+			return OwnedRunIssue{}, nil, fmt.Errorf("inspect owned Run pull request #%d: %w", pull.Number, err)
 		}
 		merged = merged || state == "merged"
 		if merged {
@@ -392,7 +393,7 @@ func (c Client) OwnedRunResources(ctx context.Context, repo string, issueNumber 
 		if state == "open" {
 			comments, err := c.ownedPullRequestComments(ctx, repo, pull.Number)
 			if err != nil {
-				return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset pull request #%d comments: %w", pull.Number, err)
+				return OwnedRunIssue{}, nil, fmt.Errorf("inspect owned Run pull request #%d comments: %w", pull.Number, err)
 			}
 			result.Comments = comments
 		}
@@ -433,6 +434,54 @@ func (c Client) ownedPullRequestComments(ctx context.Context, repo string, numbe
 		}
 	}
 	return comments, nil
+}
+
+// IssueClosureReason verifies a closed issue and returns one of GitHub's
+// supported closure reasons. Open, unavailable, and unknown state fail closed.
+func (c Client) IssueClosureReason(ctx context.Context, repo string, issueNumber int) (string, error) {
+	var issue struct {
+		Number      int             `json:"number"`
+		URL         string          `json:"url"`
+		State       string          `json:"state"`
+		StateReason json.RawMessage `json:"stateReason"`
+	}
+	if err := c.jsonCommand(ctx, &issue, "issue", "view", fmt.Sprint(issueNumber), "--repo", repo,
+		"--json", "number,url,state,stateReason"); err != nil {
+		return "", fmt.Errorf("inspect issue closure: %w", err)
+	}
+	if issue.Number != issueNumber || !resourceURLMatches(issue.URL, repo, "issues", issueNumber) ||
+		(!strings.EqualFold(issue.State, "open") && !strings.EqualFold(issue.State, "closed")) {
+		return "", errors.New("inspect issue closure: gh returned incomplete or mismatched issue identity/state")
+	}
+	reason, err := inspectedClosureReason(issue.State, issue.StateReason)
+	if err != nil {
+		return "", fmt.Errorf("inspect issue closure: %w", err)
+	}
+	return reason, nil
+}
+
+func inspectedClosureReason(issueState string, raw json.RawMessage) (string, error) {
+	if strings.EqualFold(issueState, "open") {
+		if len(raw) == 0 || string(raw) == "null" {
+			return "", nil
+		}
+		return "", errors.New("open issue has an unsupported closure reason")
+	}
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", errors.New("closed issue has no supported closure reason")
+	}
+	var reason string
+	if err := json.Unmarshal(raw, &reason); err != nil {
+		return "", errors.New("closed issue has an unknown closure reason")
+	}
+	switch strings.ToUpper(reason) {
+	case "COMPLETED":
+		return "completed", nil
+	case "NOT_PLANNED":
+		return "not-planned", nil
+	default:
+		return "", fmt.Errorf("closed issue has unsupported closure reason %q", reason)
+	}
 }
 
 func validCommitOID(value string) bool {
@@ -653,7 +702,7 @@ func (c Client) jsonCommand(ctx context.Context, target any, args ...string) err
 
 var canonicalGitHubJSONFields = []string{
 	"nameWithOwner", "name", "defaultBranchRef", "number", "title", "createdAt", "url", "body", "state",
-	"created_at", "html_url", "labels", "mergedAt", "autoMergeRequest", "isDraft", "headRefName",
+	"created_at", "html_url", "labels", "stateReason", "mergedAt", "autoMergeRequest", "isDraft", "headRefName",
 	"login", "headRepositoryOwner", "headRepository",
 }
 

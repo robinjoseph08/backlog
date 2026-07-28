@@ -16,10 +16,11 @@ import (
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
 
-const CurrentVersion = 3
+const CurrentVersion = 4
 
 const legacyVersion = 1
-const previousVersion = 2
+const versionWithLeases = 2
+const previousVersion = 3
 const sha256HexLength = 64
 
 type State struct {
@@ -95,21 +96,23 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 			return State{}, false, err
 		}
 		return value, false, nil
-	case previousVersion:
+	case previousVersion, versionWithLeases:
 		value, err := decodeCurrentState(encoded)
 		if err != nil {
-			return State{}, false, fmt.Errorf("decode version 2 state: %w", err)
+			return State{}, false, fmt.Errorf("decode version %d state: %w", header.Version, err)
 		}
 		value.Version = CurrentVersion
-		for index := range value.Runs {
-			value.Runs[index].AcknowledgedAt = nil
+		if header.Version == versionWithLeases {
+			for index := range value.Runs {
+				value.Runs[index].AcknowledgedAt = nil
+			}
 		}
 		if err := validate(value, true); err != nil {
-			return State{}, false, fmt.Errorf("migrate version 2 state: %w", err)
+			return State{}, false, fmt.Errorf("migrate version %d state: %w", header.Version, err)
 		}
 		if persistMigration {
 			if err := s.Save(value); err != nil {
-				return State{}, false, fmt.Errorf("persist version 3 state migration: %w", err)
+				return State{}, false, fmt.Errorf("persist version 4 state migration: %w", err)
 			}
 		}
 		return value, true, nil
@@ -394,6 +397,9 @@ func validate(value State, recoverUnsafeContinuation bool) error {
 		if run.Status == scheduler.StatusReset {
 			return fmt.Errorf("Lease %q references reset Run %q", lease.LeaseID, run.RunID)
 		}
+		if run.Status == scheduler.StatusResolvedExternally {
+			return fmt.Errorf("Lease %q references externally resolved Run %q", lease.LeaseID, run.RunID)
+		}
 	}
 	for _, run := range value.Runs {
 		_, leased := leasedRuns[run.RunID]
@@ -407,6 +413,14 @@ func validate(value State, recoverUnsafeContinuation bool) error {
 			if leased || run.Status != scheduler.StatusFailed && run.Status != scheduler.StatusNeedsHuman {
 				return fmt.Errorf("state contains ineligible Run %q with an Outcome Acknowledgment", run.RunID)
 			}
+		}
+		if run.Status == scheduler.StatusResolvedExternally {
+			if leased || run.ResolvedExternallyAt == nil || run.ResolvedExternallyAt.IsZero() || run.CompletedAt != nil || run.CleanupPending ||
+				(run.ClosureReason != "completed" && run.ClosureReason != "not-planned") {
+				return fmt.Errorf("state contains externally resolved Run %q with invalid resolution metadata", run.RunID)
+			}
+		} else if run.ResolvedExternallyAt != nil || run.ClosureReason != "" || run.DiagnosticWarning != "" {
+			return fmt.Errorf("state contains non-resolved Run %q with External Resolution metadata", run.RunID)
 		}
 	}
 	return nil
@@ -467,6 +481,7 @@ func knownStatus(status scheduler.Status) bool {
 	switch status {
 	case scheduler.StatusClaimed, scheduler.StatusWorktreeReady, scheduler.StatusRunning,
 		scheduler.StatusWaitingForMerge, scheduler.StatusSuspended, scheduler.StatusResetting, scheduler.StatusReset,
+		scheduler.StatusResolvingExternally, scheduler.StatusResolvedExternally,
 		scheduler.StatusMerged, scheduler.StatusFailed, scheduler.StatusNeedsHuman:
 		return true
 	default:

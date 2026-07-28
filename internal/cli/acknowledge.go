@@ -187,7 +187,7 @@ func acknowledgmentEligible(run scheduler.Run, leased bool) bool {
 
 func ineligibleAcknowledgmentError(run scheduler.Run, leased bool) error {
 	if leased {
-		return fmt.Errorf("Run %q is not an eligible Historical Run outcome because it retains a Lease", run.RunID)
+		return fmt.Errorf("Run %q retains a Lease; Outcome Acknowledgment is non-destructive, so use backlog reset or backlog resolve after verifying the intended outcome", run.RunID)
 	}
 	return fmt.Errorf("Run %q is not eligible for Outcome Acknowledgment in state %q", run.RunID, run.Status)
 }

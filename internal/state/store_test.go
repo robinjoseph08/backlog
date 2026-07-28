@@ -229,7 +229,7 @@ func TestFileStoreMigratesV2ToV3WithoutAcknowledgingOutcomesOrLosingMetadata(t *
 
 	path := filepath.Join(t.TempDir(), "state.json")
 	completedAt := time.Date(2026, 7, 3, 3, 4, 5, 0, time.UTC)
-	fixture := State{Version: previousVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 2,
+	fixture := State{Version: versionWithLeases, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 2,
 		Runs: []scheduler.Run{
 			{Issue: 1, IssueTitle: "Historical failure", IssueURL: "https://example.test/issues/1", RunID: "failed", Status: scheduler.StatusFailed,
 				WorkerMode: scheduler.WorkerModePrint, Branch: "agent/failed", Worktree: "/worktrees/failed", LogPath: "/logs/failed.jsonl",
@@ -279,8 +279,8 @@ func TestFileStoreMigratesV2ToV3WithoutAcknowledgingOutcomesOrLosingMetadata(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(persisted), `"version": 3`) {
-		t.Fatalf("V3 migration was not persisted: %s", persisted)
+	if !strings.Contains(string(persisted), `"version": 4`) {
+		t.Fatalf("V4 migration was not persisted: %s", persisted)
 	}
 }
 
@@ -327,10 +327,10 @@ func TestFileStoreRejectsUnsupportedNewerStateVersion(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "state.json")
-	if err := os.WriteFile(path, []byte(`{"version":4,"runs":[],"leases":[]}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"version":5,"runs":[],"leases":[]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := (FileStore{Path: path}).Load(); err == nil || !strings.Contains(err.Error(), "unsupported state version 4") {
+	if _, err := (FileStore{Path: path}).Load(); err == nil || !strings.Contains(err.Error(), "unsupported state version 5") {
 		t.Fatalf("newer state error = %v", err)
 	}
 }

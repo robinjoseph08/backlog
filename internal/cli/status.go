@@ -174,7 +174,7 @@ func lifecycleTime(run scheduler.Run) time.Time {
 			latest = candidate
 		}
 	}
-	for _, candidate := range []*time.Time{run.SuspendingAt, run.SuspendedAt, run.CompletedAt, run.AcknowledgedAt} {
+	for _, candidate := range []*time.Time{run.SuspendingAt, run.SuspendedAt, run.CompletedAt, run.AcknowledgedAt, run.ResolvedExternallyAt} {
 		if candidate != nil && candidate.After(latest) {
 			latest = *candidate
 		}
@@ -253,6 +253,9 @@ func (p *statusPrinter) run(observed statusRun) {
 	case scheduler.StatusResetting:
 		p.printf("    Intervention: Reset is incomplete; rerun backlog reset; Worker not active\n")
 		p.printReason(run)
+	case scheduler.StatusResolvingExternally:
+		p.printf("    Intervention: External Resolution is incomplete; rerun backlog resolve; Worker not active\n")
+		p.printReason(run)
 	case scheduler.StatusMerged:
 		p.printf("    Completion: verified merged; Worker not active\n")
 		p.printf("    Pull request: %s\n", valueOr(plainStatusValue(run.PullRequest), "n/a"))
@@ -272,6 +275,14 @@ func (p *statusPrinter) run(observed statusRun) {
 	case scheduler.StatusReset:
 		p.printf("    Outcome: Reset completed; Lease released; Worker not active\n")
 		p.printReason(run)
+	case scheduler.StatusResolvedExternally:
+		p.printf("    Outcome: External Resolution; Lease released; Worker not active\n")
+		p.printTime("Resolved externally", run.ResolvedExternallyAt)
+		p.printf("    GitHub closure reason: %s\n", valueOr(plainStatusValue(run.ClosureReason), "n/a"))
+		p.printReason(run)
+		if run.DiagnosticWarning != "" {
+			p.printf("    Diagnostic warning: %s\n", plainStatusValue(run.DiagnosticWarning))
+		}
 	}
 }
 
