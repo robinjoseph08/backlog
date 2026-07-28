@@ -62,7 +62,7 @@ func canTransition(from, to scheduler.Status) bool {
 
 func validateSnapshot(snapshot retirement.Snapshot) error {
 	if snapshot.Issue.Open {
-		return fmt.Errorf("issue #%d is open; External Resolution requires a verified GitHub closure", snapshot.Issue.Number)
+		return fmt.Errorf("issue #%d is open; close the issue and rerun backlog resolve, or Reset the Run with backlog reset", snapshot.Issue.Number)
 	}
 	if snapshot.Issue.ClosureReason != "completed" && snapshot.Issue.ClosureReason != "not-planned" {
 		return fmt.Errorf("issue #%d has unsupported or unavailable GitHub closure reason %q", snapshot.Issue.Number, snapshot.Issue.ClosureReason)

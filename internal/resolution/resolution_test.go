@@ -39,16 +39,68 @@ func TestPolicyAcceptsSupportedClosureReasonsAndPreservesHumanLabels(t *testing.
 	}
 }
 
-func TestPolicyRefusesOpenAndUnsupportedClosureState(t *testing.T) {
-	for _, issue := range []retirement.Issue{
-		{Number: 42, URL: "https://example.test/42", Open: true},
-		{Number: 42, URL: "https://example.test/42"},
-		{Number: 42, URL: "https://example.test/42", ClosureReason: "future"},
+func TestPolicyEligibilityCoversIncompleteLeasedLifecycle(t *testing.T) {
+	policy := Policy("run")
+	eligible := make(map[scheduler.Status]bool, len(policy.EligibleStatuses))
+	for _, status := range policy.EligibleStatuses {
+		eligible[status] = true
+	}
+
+	for _, test := range []struct {
+		status scheduler.Status
+		target scheduler.Status
+	}{
+		{scheduler.StatusClaimed, scheduler.StatusResolvingExternally},
+		{scheduler.StatusWorktreeReady, scheduler.StatusResolvingExternally},
+		{scheduler.StatusRunning, scheduler.StatusResolvingExternally},
+		{scheduler.StatusSuspended, scheduler.StatusResolvingExternally},
+		{scheduler.StatusFailed, scheduler.StatusResolvingExternally},
+		{scheduler.StatusNeedsHuman, scheduler.StatusResolvingExternally},
+		{scheduler.StatusWaitingForMerge, scheduler.StatusResolvingExternally},
+		{scheduler.StatusResetting, scheduler.StatusResolvingExternally},
+		{scheduler.StatusResolvingExternally, scheduler.StatusResolvedExternally},
 	} {
-		snapshot := retirement.Snapshot{Run: scheduler.Run{Issue: 42, RunID: "run", Status: scheduler.StatusFailed}, Lease: scheduler.Lease{LeaseID: "lease", Issue: 42, RunID: "run"}, Issue: issue}
-		if _, err := retirement.Build(Policy("run"), snapshot); err == nil {
-			t.Fatalf("accepted issue %#v", issue)
-		}
+		t.Run(string(test.status), func(t *testing.T) {
+			if !eligible[test.status] {
+				t.Fatalf("incomplete leased status %s is not eligible", test.status)
+			}
+			if !policy.CanTransition(test.status, test.target) {
+				t.Fatalf("incomplete leased status %s cannot transition to %s", test.status, test.target)
+			}
+		})
+	}
+
+	if !eligible[scheduler.StatusResolvedExternally] {
+		t.Fatal("Historical External Resolution rerun is not eligible")
+	}
+	for _, status := range []scheduler.Status{scheduler.StatusReset, scheduler.StatusMerged} {
+		t.Run(string(status), func(t *testing.T) {
+			if eligible[status] {
+				t.Fatalf("terminal status %s is unexpectedly eligible", status)
+			}
+			if policy.CanTransition(status, scheduler.StatusResolvingExternally) || policy.CanTransition(status, scheduler.StatusResolvedExternally) {
+				t.Fatalf("terminal status %s has an External Resolution transition", status)
+			}
+		})
+	}
+}
+
+func TestPolicyRefusesOpenAndUnsupportedClosureState(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		issue retirement.Issue
+		want  string
+	}{
+		{name: "open", issue: retirement.Issue{Number: 42, URL: "https://example.test/42", Open: true}, want: "close the issue and rerun backlog resolve, or Reset the Run with backlog reset"},
+		{name: "missing reason", issue: retirement.Issue{Number: 42, URL: "https://example.test/42"}, want: "unsupported or unavailable GitHub closure reason"},
+		{name: "unsupported reason", issue: retirement.Issue{Number: 42, URL: "https://example.test/42", ClosureReason: "future"}, want: "unsupported or unavailable GitHub closure reason"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := retirement.Snapshot{Run: scheduler.Run{Issue: 42, RunID: "run", Status: scheduler.StatusFailed}, Lease: scheduler.Lease{LeaseID: "lease", Issue: 42, RunID: "run"}, Issue: test.issue}
+			if _, err := retirement.Build(Policy("run"), snapshot); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Build() error = %v, want refusal containing %q", err, test.want)
+			}
+		})
 	}
 }
 

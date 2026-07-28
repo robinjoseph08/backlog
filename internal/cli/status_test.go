@@ -484,6 +484,20 @@ func TestStatusDisplaysElapsedForEveryRunState(t *testing.T) {
 	}
 }
 
+func TestStatusGuidesInterruptedExternalResolutionRecovery(t *testing.T) {
+	run := scheduler.Run{Issue: 58, RunID: "interrupted-resolution", Status: scheduler.StatusResolvingExternally}
+	var output bytes.Buffer
+	printer := statusPrinter{output: &output}
+	printer.run(statusRun{run: run, observation: runObservation{run: run, observed: time.Now()}})
+	if printer.err != nil {
+		t.Fatal(printer.err)
+	}
+	want := "External Resolution is incomplete; close the issue if needed and rerun backlog resolve, or Reset the Run with backlog reset"
+	if !strings.Contains(output.String(), want) {
+		t.Fatalf("interrupted External Resolution status missing %q:\n%s", want, output.String())
+	}
+}
+
 func TestStatusUsesExactSharedActivityAge(t *testing.T) {
 	stateDir := t.TempDir()
 	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
