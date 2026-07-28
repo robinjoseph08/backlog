@@ -384,8 +384,8 @@ func TestStatusRejectsInvalidAndUnsupportedStateWithoutMutation(t *testing.T) {
 		},
 		{
 			name:       "unsupported state version",
-			fixture:    `{"version":4,"runs":[],"leases":[]}`,
-			diagnostic: "unsupported state version 4",
+			fixture:    `{"version":5,"runs":[],"leases":[]}`,
+			diagnostic: "unsupported state version 5",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -576,7 +576,7 @@ func TestCommandHelpExitsSuccessfully(t *testing.T) {
 	if exit := Main(context.Background(), []string{"help"}, &stdout, &stderr); exit != 0 {
 		t.Fatalf("top-level help exit = %d, stderr = %q", exit, stderr.String())
 	}
-	for _, text := range []string{"backlog run lifecycle", "First SIGINT", "first SIGTERM", "resumes verified Suspended Runs", "Reset retires verified artifacts", "presentation-only review", "deprecated alias for reset", "natural one-shot exhaustion with Intervention-required Runs", "first-SIGINT Drain exits 0", "second-SIGINT suspension exits 130", "SIGTERM suspension exits 143", "legacy print-mode Runs cannot Resume", "newer unsupported version"} {
+	for _, text := range []string{"backlog run lifecycle", "First SIGINT", "first SIGTERM", "resumes verified Suspended Runs", "Reset retires verified artifacts", "Resolve recognizes a supported GitHub closure", "presentation-only review", "deprecated alias for reset", "natural one-shot exhaustion with Intervention-required Runs", "first-SIGINT Drain exits 0", "second-SIGINT suspension exits 130", "SIGTERM suspension exits 143", "legacy print-mode Runs cannot Resume", "newer unsupported version"} {
 		if !strings.Contains(stdout.String(), text) {
 			t.Fatalf("top-level help omitted %q: %q", text, stdout.String())
 		}
@@ -608,6 +608,21 @@ func TestCommandHelpExitsSuccessfully(t *testing.T) {
 	if !strings.Contains(stderr.String(), "Usage: backlog acknowledge <run-id|positive-issue-number>...") ||
 		!strings.Contains(stderr.String(), "--all") || strings.Contains(stderr.String(), "--yes") || strings.Contains(stderr.String(), "--dry-run") {
 		t.Fatalf("acknowledge help = %q", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if exit := Main(context.Background(), []string{"resolve", "--help"}, &stdout, &stderr); exit != 0 {
+		t.Fatalf("resolve help exit = %d, stderr = %q", exit, stderr.String())
+	}
+	resolveHelp := stderr.String()
+	for _, text := range []string{"run-id|positive-issue-number", "--yes", "owned unmerged pull requests", "remote", "local branches", "worktrees", "active Pi sessions are absent"} {
+		if !strings.Contains(resolveHelp, text) {
+			t.Fatalf("resolve help omitted %q: %q", text, resolveHelp)
+		}
+	}
+	if strings.Contains(resolveHelp, "retire owned artifacts") {
+		t.Fatalf("resolve help claims unsupported artifact retirement: %q", resolveHelp)
 	}
 
 	stdout.Reset()

@@ -18,10 +18,11 @@ const (
 )
 
 type Issue struct {
-	Number int
-	URL    string
-	Open   bool
-	Labels []string
+	Number        int
+	URL           string
+	Open          bool
+	ClosureReason string
+	Labels        []string
 }
 
 type PullRequest struct {
@@ -84,6 +85,7 @@ const (
 	actionRemoveIssueLabel
 	actionAddIssueLabel
 	actionFinalize
+	actionFinalizeCompletion
 )
 
 // Action is one ordered mutation authorized by a Plan. Its executable identity
@@ -134,6 +136,7 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 	pullRequests := append([]PullRequest(nil), snapshot.PullRequests...)
 	sort.Slice(pullRequests, func(i, j int) bool { return pullRequests[i].Number < pullRequests[j].Number })
 	foundRecorded := snapshot.Run.PullRequest == ""
+	var mergedPulls []PullRequest
 	pullNumbers := make(map[int]struct{}, len(pullRequests))
 	pullURLs := make(map[string]struct{}, len(pullRequests))
 	for _, pull := range pullRequests {
@@ -152,7 +155,8 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 			foundRecorded = true
 		}
 		if pull.State == PullRequestMerged {
-			return Plan{}, fmt.Errorf("pull request #%d is merged; merged work cannot be %s", pull.Number, policy.Operation)
+			mergedPulls = append(mergedPulls, pull)
+			continue
 		}
 		if pull.State != PullRequestOpen && pull.State != PullRequestClosed {
 			return Plan{}, fmt.Errorf("pull request #%d has unknown state %q", pull.Number, pull.State)
@@ -164,8 +168,40 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 	if !foundRecorded {
 		return Plan{}, fmt.Errorf("recorded pull request %s was not found for Run branch %s", snapshot.Run.PullRequest, snapshot.Run.Branch)
 	}
+	if len(mergedPulls) != 0 && snapshot.Run.Status != policy.TerminalStatus && policy.AllowMergedCompletion {
+		if snapshot.Issue.Open {
+			return Plan{}, fmt.Errorf("issue #%d is open; Completion requires a verified GitHub closure", snapshot.Issue.Number)
+		}
+		merged := mergedPulls[len(mergedPulls)-1]
+		if snapshot.Run.PullRequest != "" {
+			found := false
+			for _, pull := range mergedPulls {
+				if pull.URL == snapshot.Run.PullRequest {
+					merged, found = pull, true
+					break
+				}
+			}
+			if !found {
+				return Plan{}, fmt.Errorf("merged pull request is not the expected pull request %s", snapshot.Run.PullRequest)
+			}
+		}
+		return Plan{
+			Snapshot: snapshot, Operation: policy.Operation, TerminalState: scheduler.StatusMerged,
+			Actions: []Action{plannedPullRequestAction(actionFinalizeCompletion, merged,
+				fmt.Sprintf("record Completion from merged expected pull request #%d (%s) and release Lease %s", merged.Number, merged.URL, snapshot.Lease.LeaseID))},
+		}, nil
+	}
 	if err := policy.ValidateSnapshot(snapshot); err != nil {
 		return Plan{}, err
+	}
+	if len(mergedPulls) != 0 && snapshot.Run.Status != policy.TerminalStatus {
+		return Plan{}, fmt.Errorf("pull request #%d is merged; merged work cannot be %s", mergedPulls[0].Number, policy.Operation)
+	}
+	if snapshot.Run.Status == policy.TerminalStatus && policy.VerifyHistoricalOnly {
+		if !policy.labelsSatisfied(snapshot.Issue.Labels) {
+			return Plan{}, fmt.Errorf("historical %s Run %s has managed issue label drift; verification-only rerun will not mutate without a Lease", policy.TerminalStatus, snapshot.Run.RunID)
+		}
+		return Plan{Snapshot: snapshot, Operation: policy.Operation, TerminalState: policy.TerminalStatus}, nil
 	}
 
 	plan := Plan{Snapshot: snapshot, Operation: policy.Operation, TerminalState: policy.TerminalStatus}

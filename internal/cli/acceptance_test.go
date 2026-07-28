@@ -1321,7 +1321,7 @@ esac
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(persistedAfterRun), `"version": 3`) || strings.Contains(string(persistedAfterRun), `"paused"`) {
+	if !strings.Contains(string(persistedAfterRun), `"version": 4`) || strings.Contains(string(persistedAfterRun), `"paused"`) {
 		t.Fatalf("Runner did not persist legacy migration:\n%s", persistedAfterRun)
 	}
 	final, err := (state.FileStore{Path: statePath}).Load()

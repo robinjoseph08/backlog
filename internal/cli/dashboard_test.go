@@ -891,6 +891,21 @@ func TestDashboardCloseShowsThatRunnerStopped(t *testing.T) {
 	}
 }
 
+func TestCloneDashboardStateIsolatesExternalResolutionTimestamp(t *testing.T) {
+	t.Parallel()
+
+	resolvedAt := time.Date(2026, 7, 28, 1, 2, 3, 0, time.UTC)
+	want := resolvedAt
+	current := state.State{Runs: []scheduler.Run{{ResolvedExternallyAt: &resolvedAt}}}
+	cloned := cloneDashboardState(current)
+
+	changed := resolvedAt.Add(time.Hour)
+	*current.Runs[0].ResolvedExternallyAt = changed
+	if cloned.Runs[0].ResolvedExternallyAt == current.Runs[0].ResolvedExternallyAt || !cloned.Runs[0].ResolvedExternallyAt.Equal(want) {
+		t.Fatalf("cloned External Resolution timestamp changed through source snapshot: cloned=%v source=%v", cloned.Runs[0].ResolvedExternallyAt, current.Runs[0].ResolvedExternallyAt)
+	}
+}
+
 func TestDashboardWorkerExpectationFollowsRunLifecycle(t *testing.T) {
 	t.Parallel()
 
@@ -901,7 +916,9 @@ func TestDashboardWorkerExpectationFollowsRunLifecycle(t *testing.T) {
 		scheduler.StatusWaitingForMerge,
 		scheduler.StatusSuspended,
 		scheduler.StatusResetting,
+		scheduler.StatusResolvingExternally,
 		scheduler.StatusReset,
+		scheduler.StatusResolvedExternally,
 		scheduler.StatusMerged,
 		scheduler.StatusFailed,
 		scheduler.StatusNeedsHuman,

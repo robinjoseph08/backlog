@@ -161,6 +161,10 @@ func cloneDashboardState(current state.State) state.State {
 			value := *run.AcknowledgedAt
 			run.AcknowledgedAt = &value
 		}
+		if run.ResolvedExternallyAt != nil {
+			value := *run.ResolvedExternallyAt
+			run.ResolvedExternallyAt = &value
+		}
 	}
 	return cloned
 }

@@ -3,6 +3,7 @@ package retirement
 import (
 	"fmt"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/robinjoseph08/backlog/internal/scheduler"
@@ -12,17 +13,22 @@ import (
 // Policy supplies lifecycle-specific decisions while Service owns all
 // safety-critical inspection, mutation, revalidation, and verification.
 type Policy struct {
-	Operation          string
-	SelectRun          func(state.State) (scheduler.Run, scheduler.Lease, error)
-	ValidateSnapshot   func(Snapshot) error
-	EligibleStatuses   []scheduler.Status
-	CanTransition      func(scheduler.Status, scheduler.Status) bool
-	Explanation        func(scheduler.Run) string
-	ExplanationAction  string
-	Labels             LabelOutcome
-	ProgressStatus     scheduler.Status
-	TerminalStatus     scheduler.Status
-	RequireDurableLogs bool
+	Operation             string
+	SelectRun             func(state.State) (scheduler.Run, scheduler.Lease, error)
+	ValidateSnapshot      func(Snapshot) error
+	EligibleStatuses      []scheduler.Status
+	CanTransition         func(scheduler.Status, scheduler.Status) bool
+	Explanation           func(scheduler.Run) string
+	ExplanationAction     string
+	Labels                LabelOutcome
+	ProgressStatus        scheduler.Status
+	TerminalStatus        scheduler.Status
+	RequireDurableLogs    bool
+	RecordMissingLogWarn  bool
+	RequireClosureReason  bool
+	AllowMergedCompletion bool
+	VerifyHistoricalOnly  bool
+	FinalizeMetadata      func(*scheduler.Run, Snapshot, time.Time)
 }
 
 // LabelOutcome identifies managed labels that must be present or absent when
