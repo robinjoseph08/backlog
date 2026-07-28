@@ -70,11 +70,53 @@ type Snapshot struct {
 	WorkerSummary string
 }
 
+type actionKind uint8
+
+const (
+	actionMarkProgress actionKind = iota + 1
+	actionDisablePullRequestAutoMerge
+	actionExplainPullRequest
+	actionClosePullRequest
+	actionDeleteRemoteBranch
+	actionRemoveLocalWorktree
+	actionDeleteLocalBranch
+	actionArchiveSession
+	actionRemoveIssueLabel
+	actionAddIssueLabel
+	actionFinalize
+)
+
+// Action is one ordered mutation authorized by a Plan. Its executable identity
+// is private so callers can approve and render actions without constructing a
+// mutation that did not come from Build.
+type Action struct {
+	kind        actionKind
+	description string
+	pullRequest int
+	label       string
+}
+
+func (a Action) String() string {
+	return a.description
+}
+
 type Plan struct {
 	Snapshot      Snapshot
-	Actions       []string
+	Actions       []Action
 	Operation     string
 	TerminalState scheduler.Status
+}
+
+func plannedAction(kind actionKind, description string) Action {
+	return Action{kind: kind, description: description}
+}
+
+func plannedPullRequestAction(kind actionKind, pull PullRequest, description string) Action {
+	return Action{kind: kind, description: description, pullRequest: pull.Number}
+}
+
+func plannedLabelAction(kind actionKind, label, description string) Action {
+	return Action{kind: kind, description: description, label: label}
 }
 
 // Build refuses unsafe resource combinations and orders only mutations whose
@@ -140,13 +182,13 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 	needsProgress := hasOpenPullRequest || snapshot.RemoteBranch.Present || snapshot.LocalBranch.Present ||
 		snapshot.Worktree.Present || snapshot.Session.Present || len(addLabels) > 0 || len(removeLabels) > 0
 	if needsProgress && planning.Run.Status != policy.ProgressStatus && planning.Run.Status != scheduler.StatusWaitingForMerge && planning.Run.Status != policy.TerminalStatus {
-		plan.Actions = append(plan.Actions, fmt.Sprintf("mark Run %s %s while retaining Lease %s", snapshot.Run.RunID, policy.ProgressStatus, snapshot.Lease.LeaseID))
+		plan.Actions = append(plan.Actions, plannedAction(actionMarkProgress, fmt.Sprintf("mark Run %s %s while retaining Lease %s", snapshot.Run.RunID, policy.ProgressStatus, snapshot.Lease.LeaseID)))
 		planning.Run.Status = policy.ProgressStatus
 	}
 	for {
 		pull, found := NextPullRequest(planning)
 		if planning.Run.Status == scheduler.StatusWaitingForMerge && (!found || !pull.AutoMergeArmed) {
-			plan.Actions = append(plan.Actions, fmt.Sprintf("mark Run %s %s while retaining Lease %s", snapshot.Run.RunID, policy.ProgressStatus, snapshot.Lease.LeaseID))
+			plan.Actions = append(plan.Actions, plannedAction(actionMarkProgress, fmt.Sprintf("mark Run %s %s while retaining Lease %s", snapshot.Run.RunID, policy.ProgressStatus, snapshot.Lease.LeaseID)))
 			planning.Run.Status = policy.ProgressStatus
 			continue
 		}
@@ -159,42 +201,42 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 			}
 			switch {
 			case pull.AutoMergeArmed:
-				plan.Actions = append(plan.Actions, fmt.Sprintf("disable auto-merge for pull request #%d (%s)", pull.Number, pull.URL))
+				plan.Actions = append(plan.Actions, plannedPullRequestAction(actionDisablePullRequestAutoMerge, pull, fmt.Sprintf("disable auto-merge for pull request #%d (%s)", pull.Number, pull.URL)))
 				planning.PullRequests[index].AutoMergeArmed = false
 				if planning.Run.Status == scheduler.StatusWaitingForMerge {
-					plan.Actions = append(plan.Actions, fmt.Sprintf("mark Run %s %s while retaining Lease %s", snapshot.Run.RunID, policy.ProgressStatus, snapshot.Lease.LeaseID))
+					plan.Actions = append(plan.Actions, plannedAction(actionMarkProgress, fmt.Sprintf("mark Run %s %s while retaining Lease %s", snapshot.Run.RunID, policy.ProgressStatus, snapshot.Lease.LeaseID)))
 					planning.Run.Status = policy.ProgressStatus
 				}
 			case !pull.Explained:
-				plan.Actions = append(plan.Actions, fmt.Sprintf("%s on pull request #%d (%s)", policy.ExplanationAction, pull.Number, pull.URL))
+				plan.Actions = append(plan.Actions, plannedPullRequestAction(actionExplainPullRequest, pull, fmt.Sprintf("%s on pull request #%d (%s)", policy.ExplanationAction, pull.Number, pull.URL)))
 				planning.PullRequests[index].Explained = true
 			default:
-				plan.Actions = append(plan.Actions, fmt.Sprintf("close unmerged pull request #%d (%s)", pull.Number, pull.URL))
+				plan.Actions = append(plan.Actions, plannedPullRequestAction(actionClosePullRequest, pull, fmt.Sprintf("close unmerged pull request #%d (%s)", pull.Number, pull.URL)))
 				planning.PullRequests[index].State = PullRequestClosed
 			}
 			break
 		}
 	}
 	if snapshot.RemoteBranch.Present {
-		plan.Actions = append(plan.Actions, fmt.Sprintf("delete remote branch %s at %s", snapshot.RemoteBranch.Name, snapshot.RemoteBranch.Commit))
+		plan.Actions = append(plan.Actions, plannedAction(actionDeleteRemoteBranch, fmt.Sprintf("delete remote branch %s at %s", snapshot.RemoteBranch.Name, snapshot.RemoteBranch.Commit)))
 	}
 	if snapshot.Worktree.Present {
-		plan.Actions = append(plan.Actions, fmt.Sprintf("remove local worktree %s for %s at %s", snapshot.Worktree.Path, snapshot.Worktree.Branch, snapshot.Worktree.Commit))
+		plan.Actions = append(plan.Actions, plannedAction(actionRemoveLocalWorktree, fmt.Sprintf("remove local worktree %s for %s at %s", snapshot.Worktree.Path, snapshot.Worktree.Branch, snapshot.Worktree.Commit)))
 	}
 	if snapshot.LocalBranch.Present {
-		plan.Actions = append(plan.Actions, fmt.Sprintf("delete local branch %s at %s", snapshot.LocalBranch.Name, snapshot.LocalBranch.Commit))
+		plan.Actions = append(plan.Actions, plannedAction(actionDeleteLocalBranch, fmt.Sprintf("delete local branch %s at %s", snapshot.LocalBranch.Name, snapshot.LocalBranch.Commit)))
 	}
 	if snapshot.Session.Present {
-		plan.Actions = append(plan.Actions, fmt.Sprintf("archive Pi session %s from %s to %s", snapshot.Session.ID, snapshot.Session.Dir, snapshot.Session.ArchiveDir))
+		plan.Actions = append(plan.Actions, plannedAction(actionArchiveSession, fmt.Sprintf("archive Pi session %s from %s to %s", snapshot.Session.ID, snapshot.Session.Dir, snapshot.Session.ArchiveDir)))
 	}
 	for _, label := range removeLabels {
-		plan.Actions = append(plan.Actions, fmt.Sprintf("remove issue label %s from %s", label, snapshot.Issue.URL))
+		plan.Actions = append(plan.Actions, plannedLabelAction(actionRemoveIssueLabel, label, fmt.Sprintf("remove issue label %s from %s", label, snapshot.Issue.URL)))
 	}
 	for _, label := range addLabels {
-		plan.Actions = append(plan.Actions, fmt.Sprintf("add issue label %s to %s", label, snapshot.Issue.URL))
+		plan.Actions = append(plan.Actions, plannedLabelAction(actionAddIssueLabel, label, fmt.Sprintf("add issue label %s to %s", label, snapshot.Issue.URL)))
 	}
 	if snapshot.Run.Status != policy.TerminalStatus {
-		plan.Actions = append(plan.Actions, fmt.Sprintf("mark Run %s %s and release Lease %s", snapshot.Run.RunID, policy.TerminalStatus, snapshot.Lease.LeaseID))
+		plan.Actions = append(plan.Actions, plannedAction(actionFinalize, fmt.Sprintf("mark Run %s %s and release Lease %s", snapshot.Run.RunID, policy.TerminalStatus, snapshot.Lease.LeaseID)))
 	}
 	return plan, nil
 }

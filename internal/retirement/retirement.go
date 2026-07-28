@@ -221,7 +221,7 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 	if err := e.validateMutation(plan); err != nil {
 		return err
 	}
-	if !PlansEqual(approved, plan) {
+	if !executablePlansEqual(approved, plan) {
 		return fmt.Errorf("%s Plan changed after confirmation; rerun %s to review the current plan", e.policy.Operation, e.policy.Operation)
 	}
 
@@ -237,33 +237,30 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			return err
 		}
 
-		pull, hasOpenPull := NextPullRequest(plan.Snapshot)
-		addLabels, removeLabels := e.policy.desiredLabels(plan.Snapshot.Issue.Labels)
-		needsProgress := hasOpenPull || plan.Snapshot.RemoteBranch.Present || plan.Snapshot.LocalBranch.Present ||
-			plan.Snapshot.Worktree.Present || plan.Snapshot.Session.Present || len(addLabels) > 0 || len(removeLabels) > 0
-		if plan.Snapshot.Run.Status == scheduler.StatusWaitingForMerge && (!hasOpenPull || !pull.AutoMergeArmed) {
-			if err := verifyWaitingForMergeDisarmed(plan); err != nil {
-				return err
+		if len(plan.Actions) == 0 {
+			return e.finalize(ctx, plan)
+		}
+		action := plan.Actions[0]
+		switch action.kind {
+		case actionMarkProgress:
+			if plan.Snapshot.Run.Status == scheduler.StatusWaitingForMerge {
+				if err := verifyWaitingForMergeDisarmed(plan); err != nil {
+					return err
+				}
 			}
 			if err := e.markProgress(); err != nil {
 				return err
 			}
 			continue
-		}
-		if needsProgress && plan.Snapshot.Run.Status != e.policy.ProgressStatus && plan.Snapshot.Run.Status != scheduler.StatusWaitingForMerge && plan.Snapshot.Run.Status != e.policy.TerminalStatus {
-			if err := e.markProgress(); err != nil {
-				return err
-			}
-			continue
-		}
-
-		switch {
-		case hasOpenPull && pull.AutoMergeArmed:
-			before, err := e.revalidatePlan(ctx, plan, approved, "disabling pull request auto-merge")
+		case actionDisablePullRequestAutoMerge:
+			before, err := e.revalidateAction(ctx, plan, approved, action, "disabling pull request auto-merge")
 			if err != nil {
 				return err
 			}
-			pull, _ = pullRequestByNumber(before.Snapshot.PullRequests, pull.Number)
+			pull, found := pullRequestByNumber(before.Snapshot.PullRequests, action.pullRequest)
+			if !found || !pull.AutoMergeArmed {
+				return fmt.Errorf("pull request #%d is not ready for auto-merge disablement", action.pullRequest)
+			}
 			if err := e.github.DisablePullRequestAutoMerge(ctx, before.Snapshot.Repository, pull.Number); err != nil {
 				return fmt.Errorf("disable auto-merge for pull request #%d: %w", pull.Number, err)
 			}
@@ -278,19 +275,14 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			if !found || updated.State != PullRequestOpen || updated.AutoMergeArmed {
 				return fmt.Errorf("pull request #%d was not freshly verified open, unmerged, and auto-merge unarmed", pull.Number)
 			}
-			if before.Snapshot.Run.Status == scheduler.StatusWaitingForMerge {
-				if err := e.markProgress(); err != nil {
-					return err
-				}
-			}
-		case hasOpenPull && !pull.Explained:
-			before, err := e.revalidatePlan(ctx, plan, approved, "commenting on pull request")
+		case actionExplainPullRequest:
+			before, err := e.revalidateAction(ctx, plan, approved, action, "commenting on pull request")
 			if err != nil {
 				return err
 			}
-			pull, _ = pullRequestByNumber(before.Snapshot.PullRequests, pull.Number)
-			if pull.AutoMergeArmed {
-				return fmt.Errorf("pull request #%d auto-merge was rearmed before the %s explanation", pull.Number, e.policy.Operation)
+			pull, found := pullRequestByNumber(before.Snapshot.PullRequests, action.pullRequest)
+			if !found || pull.AutoMergeArmed || pull.Explained {
+				return fmt.Errorf("pull request #%d is not ready for the %s explanation", action.pullRequest, e.policy.Operation)
 			}
 			if err := e.github.CommentOnPullRequest(ctx, before.Snapshot.Repository, pull.Number, e.policy.Explanation(before.Snapshot.Run)); err != nil {
 				return fmt.Errorf("%s on pull request #%d: %w", e.policy.ExplanationAction, pull.Number, err)
@@ -306,14 +298,14 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			if !found || updated.State != PullRequestOpen || updated.AutoMergeArmed || !updated.Explained {
 				return fmt.Errorf("pull request #%d %s explanation did not satisfy its verified postcondition", pull.Number, e.policy.Operation)
 			}
-		case hasOpenPull:
-			before, err := e.revalidatePlan(ctx, plan, approved, "closing pull request")
+		case actionClosePullRequest:
+			before, err := e.revalidateAction(ctx, plan, approved, action, "closing pull request")
 			if err != nil {
 				return err
 			}
-			pull, _ = pullRequestByNumber(before.Snapshot.PullRequests, pull.Number)
-			if pull.AutoMergeArmed || !pull.Explained {
-				return fmt.Errorf("pull request #%d is not ready for safe closure", pull.Number)
+			pull, found := pullRequestByNumber(before.Snapshot.PullRequests, action.pullRequest)
+			if !found || pull.AutoMergeArmed || !pull.Explained {
+				return fmt.Errorf("pull request #%d is not ready for safe closure", action.pullRequest)
 			}
 			if err := e.github.ClosePullRequest(ctx, before.Snapshot.Repository, pull.Number); err != nil {
 				return fmt.Errorf("close unmerged pull request #%d: %w", pull.Number, err)
@@ -329,8 +321,8 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			if !found || updated.State != PullRequestClosed || updated.AutoMergeArmed {
 				return fmt.Errorf("pull request #%d was not freshly verified closed and unmerged with auto-merge unarmed", pull.Number)
 			}
-		case plan.Snapshot.RemoteBranch.Present:
-			before, err := e.revalidatePlan(ctx, plan, approved, "deleting remote branch")
+		case actionDeleteRemoteBranch:
+			before, err := e.revalidateAction(ctx, plan, approved, action, "deleting remote branch")
 			if err != nil {
 				return err
 			}
@@ -345,8 +337,8 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			if after.Snapshot.RemoteBranch.Present {
 				return fmt.Errorf("owned remote branch %s is still present after deletion", branch.Name)
 			}
-		case plan.Snapshot.Worktree.Present:
-			before, err := e.revalidatePlan(ctx, plan, approved, "removing local worktree")
+		case actionRemoveLocalWorktree:
+			before, err := e.revalidateAction(ctx, plan, approved, action, "removing local worktree")
 			if err != nil {
 				return err
 			}
@@ -364,8 +356,8 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			if after.Snapshot.Worktree.Present {
 				return fmt.Errorf("owned local worktree %s is still present after removal", worktree.Path)
 			}
-		case plan.Snapshot.LocalBranch.Present:
-			before, err := e.revalidatePlan(ctx, plan, approved, "deleting local branch")
+		case actionDeleteLocalBranch:
+			before, err := e.revalidateAction(ctx, plan, approved, action, "deleting local branch")
 			if err != nil {
 				return err
 			}
@@ -383,8 +375,8 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			if after.Snapshot.LocalBranch.Present {
 				return fmt.Errorf("owned local branch %s is still present after deletion", branch.Name)
 			}
-		case plan.Snapshot.Session.Present:
-			before, err := e.revalidatePlan(ctx, plan, approved, "archiving Pi session")
+		case actionArchiveSession:
+			before, err := e.revalidateAction(ctx, plan, approved, action, "archiving Pi session")
 			if err != nil {
 				return err
 			}
@@ -399,40 +391,40 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			if after.Snapshot.Session.Present || !after.Snapshot.Session.Archived {
 				return fmt.Errorf("Pi session %s was not verified in its non-resumable historical archive", session.ID)
 			}
-		case len(removeLabels) > 0:
-			label := removeLabels[0]
-			before, err := e.revalidatePlan(ctx, plan, approved, "removing issue label "+label)
+		case actionRemoveIssueLabel:
+			before, err := e.revalidateAction(ctx, plan, approved, action, "removing issue label "+action.label)
 			if err != nil {
 				return err
 			}
-			if err := e.github.RemoveIssueLabel(ctx, before.Snapshot.Repository, before.Snapshot.Run.Issue, label); err != nil {
-				return fmt.Errorf("remove issue label %s: %w", label, err)
+			if err := e.github.RemoveIssueLabel(ctx, before.Snapshot.Repository, before.Snapshot.Run.Issue, action.label); err != nil {
+				return fmt.Errorf("remove issue label %s: %w", action.label, err)
 			}
 			after, err := e.inspect(ctx)
 			if err != nil {
 				return err
 			}
-			if err := verifyLabelMutation(before.Snapshot.Issue.Labels, after.Snapshot.Issue.Labels, "", label); err != nil {
+			if err := verifyLabelMutation(before.Snapshot.Issue.Labels, after.Snapshot.Issue.Labels, "", action.label); err != nil {
 				return err
 			}
-		case len(addLabels) > 0:
-			label := addLabels[0]
-			before, err := e.revalidatePlan(ctx, plan, approved, "adding issue label "+label)
+		case actionAddIssueLabel:
+			before, err := e.revalidateAction(ctx, plan, approved, action, "adding issue label "+action.label)
 			if err != nil {
 				return err
 			}
-			if err := e.github.AddIssueLabel(ctx, before.Snapshot.Repository, before.Snapshot.Run.Issue, label); err != nil {
-				return fmt.Errorf("add issue label %s: %w", label, err)
+			if err := e.github.AddIssueLabel(ctx, before.Snapshot.Repository, before.Snapshot.Run.Issue, action.label); err != nil {
+				return fmt.Errorf("add issue label %s: %w", action.label, err)
 			}
 			after, err := e.inspect(ctx)
 			if err != nil {
 				return err
 			}
-			if err := verifyLabelMutation(before.Snapshot.Issue.Labels, after.Snapshot.Issue.Labels, label, ""); err != nil {
+			if err := verifyLabelMutation(before.Snapshot.Issue.Labels, after.Snapshot.Issue.Labels, action.label, ""); err != nil {
 				return err
 			}
-		default:
+		case actionFinalize:
 			return e.finalize(ctx, plan)
+		default:
+			return fmt.Errorf("%s Plan contains an unknown action", e.policy.Operation)
 		}
 	}
 }
@@ -448,10 +440,33 @@ func (e Service) revalidatePlan(ctx context.Context, current, approved Plan, act
 	if err := e.verifyGitHubIdentityContinuity(approved.Snapshot, fresh.Snapshot); err != nil {
 		return Plan{}, err
 	}
-	if !PlansEqual(current, fresh) {
+	if !executablePlansEqual(current, fresh) {
 		return Plan{}, fmt.Errorf("%s Plan changed immediately before %s", e.policy.Operation, action)
 	}
 	return fresh, nil
+}
+
+func (e Service) revalidateAction(ctx context.Context, current, approved Plan, action Action, description string) (Plan, error) {
+	fresh, err := e.revalidatePlan(ctx, current, approved, description)
+	if err != nil {
+		return Plan{}, err
+	}
+	if len(fresh.Actions) == 0 || fresh.Actions[0] != action {
+		return Plan{}, fmt.Errorf("%s Plan no longer authorizes %s as its next action", e.policy.Operation, description)
+	}
+	return fresh, nil
+}
+
+func executablePlansEqual(left, right Plan) bool {
+	if !PlansEqual(left, right) || len(left.Actions) != len(right.Actions) {
+		return false
+	}
+	for index := range left.Actions {
+		if left.Actions[index] != right.Actions[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (e Service) verifyGitHubIdentityContinuity(expected, actual Snapshot) error {
@@ -751,7 +766,7 @@ func (e Service) finalize(ctx context.Context, verified Plan) error {
 	if err != nil {
 		return err
 	}
-	if !PlansEqual(verified, fresh) {
+	if !executablePlansEqual(verified, fresh) {
 		return fmt.Errorf("%s Plan changed immediately before finalization", e.policy.Operation)
 	}
 	verified = fresh
@@ -1423,7 +1438,7 @@ func printPlan(writer io.Writer, plan Plan) {
 		fmt.Fprintln(writer, "  None.")
 	}
 	for index, action := range plan.Actions {
-		fmt.Fprintf(writer, "  %d. %s\n", index+1, action)
+		fmt.Fprintf(writer, "  %d. %s\n", index+1, action.String())
 	}
 }
 

@@ -32,8 +32,8 @@ func TestBuildAppliesLifecyclePolicyWithoutOwningLifecycleDecisions(t *testing.T
 		"add issue label available to https://github.com/acme/widgets/issues/42",
 		"mark Run run-42 reset and release Lease lease-42",
 	}
-	if strings.Join(plan.Actions, "\n") != strings.Join(want, "\n") {
-		t.Fatalf("actions = %q, want %q", plan.Actions, want)
+	if strings.Join(actionDescriptions(plan), "\n") != strings.Join(want, "\n") {
+		t.Fatalf("actions = %q, want %q", actionDescriptions(plan), want)
 	}
 	var output bytes.Buffer
 	WritePlan(&output, plan)
@@ -72,8 +72,8 @@ func TestModuleAppliesDistinctExternalResolutionPolicy(t *testing.T) {
 		"remove issue label in-progress from https://github.com/acme/widgets/issues/42",
 		"mark Run run-42 resolved-externally and release Lease lease-42",
 	}
-	if strings.Join(plan.Actions, "\n") != strings.Join(want, "\n") {
-		t.Fatalf("External Resolution actions = %q, want %q", plan.Actions, want)
+	if strings.Join(actionDescriptions(plan), "\n") != strings.Join(want, "\n") {
+		t.Fatalf("External Resolution actions = %q, want %q", actionDescriptions(plan), want)
 	}
 	var output bytes.Buffer
 	WritePlan(&output, plan)
@@ -185,6 +185,14 @@ func (s *policyStateStore) Save(current state.State) error {
 	s.current = current
 	s.saves++
 	return nil
+}
+
+func actionDescriptions(plan Plan) []string {
+	descriptions := make([]string, len(plan.Actions))
+	for index, action := range plan.Actions {
+		descriptions[index] = action.String()
+	}
+	return descriptions
 }
 
 func testPolicy() Policy {

@@ -7,6 +7,14 @@ import (
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
 
+func planActionDescriptions(plan Plan) []string {
+	descriptions := make([]string, len(plan.Actions))
+	for index, action := range plan.Actions {
+		descriptions[index] = action.String()
+	}
+	return descriptions
+}
+
 func TestBuildTailorsOrderedResetActions(t *testing.T) {
 	plan, err := Build(Snapshot{
 		Run:          scheduler.Run{Issue: 42, RunID: "run-42", Status: scheduler.StatusSuspended, Branch: "agent/issue-42-run-42", Worktree: "/state/worktrees/issue-42-run-42", SessionID: "backlog-run-42", SessionDir: "/state/sessions/run-42", PullRequest: "https://github.com/acme/widgets/pull/7"},
@@ -34,8 +42,8 @@ func TestBuildTailorsOrderedResetActions(t *testing.T) {
 		"add issue label ready-for-agent to https://github.com/acme/widgets/issues/42",
 		"mark Run run-42 reset and release Lease lease-42",
 	}
-	if strings.Join(plan.Actions, "\n") != strings.Join(want, "\n") {
-		t.Fatalf("actions =\n%s\nwant =\n%s", strings.Join(plan.Actions, "\n"), strings.Join(want, "\n"))
+	if strings.Join(planActionDescriptions(plan), "\n") != strings.Join(want, "\n") {
+		t.Fatalf("actions =\n%s\nwant =\n%s", strings.Join(planActionDescriptions(plan), "\n"), strings.Join(want, "\n"))
 	}
 }
 
@@ -63,8 +71,8 @@ func TestBuildOrdersWaitingForMergeRecordedPullRequestBeforeOtherBranchPullReque
 		"close unmerged pull request #8 (https://github.com/acme/widgets/pull/8)",
 		"mark Run run-42 reset and release Lease lease-42",
 	}
-	if strings.Join(plan.Actions, "\n") != strings.Join(want, "\n") {
-		t.Fatalf("actions =\n%s\nwant =\n%s", strings.Join(plan.Actions, "\n"), strings.Join(want, "\n"))
+	if strings.Join(planActionDescriptions(plan), "\n") != strings.Join(want, "\n") {
+		t.Fatalf("actions =\n%s\nwant =\n%s", strings.Join(planActionDescriptions(plan), "\n"), strings.Join(want, "\n"))
 	}
 }
 
@@ -101,8 +109,8 @@ func TestBuildOmitsAlreadySatisfiedActionsForEveryManagedLabelCombination(t *tes
 			if err != nil {
 				t.Fatal(err)
 			}
-			if strings.Join(plan.Actions, "\n") != strings.Join(test.want, "\n") {
-				t.Fatalf("actions = %q, want %q", plan.Actions, test.want)
+			if strings.Join(planActionDescriptions(plan), "\n") != strings.Join(test.want, "\n") {
+				t.Fatalf("actions = %q, want %q", planActionDescriptions(plan), test.want)
 			}
 		})
 	}

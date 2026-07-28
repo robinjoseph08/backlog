@@ -20,6 +20,7 @@ import (
 	"time"
 
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
+	"github.com/robinjoseph08/backlog/internal/retirement"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 )
@@ -2792,8 +2793,22 @@ func TestResetWaitingForMergeDisablesAutoMergeBeforeResetting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(calls), "disable\ncomment\nclose\n") {
-		t.Fatalf("GitHub action order = %q", calls)
+	var rendered bytes.Buffer
+	retirement.WritePlan(&rendered, approved)
+	var displayedGitHubOrder []string
+	for _, line := range strings.Split(rendered.String(), "\n") {
+		switch {
+		case strings.Contains(line, "disable auto-merge for pull request"):
+			displayedGitHubOrder = append(displayedGitHubOrder, "disable")
+		case strings.Contains(line, "explain Reset on pull request"):
+			displayedGitHubOrder = append(displayedGitHubOrder, "comment")
+		case strings.Contains(line, "close unmerged pull request"):
+			displayedGitHubOrder = append(displayedGitHubOrder, "close")
+		}
+	}
+	wantCalls := strings.Join(displayedGitHubOrder, "\n") + "\n"
+	if string(calls) != wantCalls {
+		t.Fatalf("executed GitHub action order = %q, displayed order = %q", calls, wantCalls)
 	}
 }
 
