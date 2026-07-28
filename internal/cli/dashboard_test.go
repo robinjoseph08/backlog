@@ -497,6 +497,22 @@ func TestDashboardDiagnosticsPreserveReadableWhitespaceAndRemoveControls(t *test
 	}
 }
 
+func TestDashboardDiagnosticsLabelsExpiredReferencesHonestly(t *testing.T) {
+	var output strings.Builder
+	renderAdmissionDiagnostics(&output, []runner.CandidateDiscoveryFailed{{
+		Operation:  runner.CandidateDiscoveryList,
+		Err:        runner.ErrCandidateDiscoveryDiagnosticExpired,
+		OccurredAt: time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC),
+	}})
+	got := output.String()
+	if !strings.Contains(got, "Diagnostic unavailable: full Candidate discovery diagnostic is no longer retained") {
+		t.Fatalf("expired diagnostic did not expose an honest unavailable state: %q", got)
+	}
+	if strings.Contains(got, "Full error/command:") {
+		t.Fatalf("expired diagnostic was falsely labeled as full evidence: %q", got)
+	}
+}
+
 func TestDashboardStopsAdmissionRetryCountdownDuringShutdown(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	dashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, func() time.Time { return now })

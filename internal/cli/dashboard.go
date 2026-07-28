@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -482,6 +483,15 @@ func (d *liveDashboard) toggleDiagnostics() {
 	d.requestRedraw()
 }
 
+func (d *liveDashboard) markNaturalExit() {
+	d.mu.Lock()
+	if d.stage == dashboardRunning {
+		d.stage = dashboardFinished
+	}
+	d.mu.Unlock()
+	d.requestRedraw()
+}
+
 func (d *liveDashboard) recoveryNoticeRemaining(now time.Time) time.Duration {
 	d.mu.Lock()
 	degraded := d.admission.degraded
@@ -820,7 +830,13 @@ func renderAdmissionDiagnosticsStyled(output *strings.Builder, failures []runner
 		return
 	}
 	for _, failure := range failures {
-		line := fmt.Sprintf("  [%s] Full error/command: %s", formatAdmissionTime(failure.OccurredAt), normalizedDashboardDiagnostic(runner.FormatOperationalEvent(failure)))
+		diagnostic := normalizedDashboardDiagnostic(runner.FormatOperationalEvent(failure))
+		label := "Full error/command"
+		if errors.Is(failure.Err, runner.ErrCandidateDiscoveryDiagnosticExpired) {
+			label = "Diagnostic unavailable"
+			diagnostic = runner.ErrCandidateDiscoveryDiagnosticExpired.Error()
+		}
+		line := fmt.Sprintf("  [%s] %s: %s", formatAdmissionTime(failure.OccurredAt), label, diagnostic)
 		writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, line)
 	}
 }

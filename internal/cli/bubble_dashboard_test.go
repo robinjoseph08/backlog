@@ -854,16 +854,63 @@ func TestBubbleDashboardPresentationRejectsDimensionFailureBeforeRunnerStartup(t
 	}
 }
 
-func TestBubbleDashboardFinalFlushKeepsRecoveryNoticeVisible(t *testing.T) {
+func TestBubbleDashboardFinalFlushKeepsRecoveryNoticeVisibleWithTruthfulNaturalExitStage(t *testing.T) {
 	recoveredAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
-	dashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, time.Now)
-	dashboard.operationalEvent(runner.CandidateDiscoveryRecovered{OccurredAt: recoveredAt, Failures: 3})
+	now := recoveredAt.Add(2 * time.Second)
+	control := PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}
+	session := newBubbleDashboardSession(time.Now)
+	if err := session.captureFinalSummary(state.State{Version: state.CurrentVersion}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	flushDone := make(chan error, 1)
+	go func() { flushDone <- session.flush(ctx) }()
+	msg, err := session.next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flush, ok := msg.(dashboardFlushMsg)
+	if !ok || !flush.naturalExit {
+		t.Fatalf("post-Runner flush = %#v, want natural-exit marker", msg)
+	}
 
-	if delay := dashboardFlushDelay(dashboard, recoveredAt.Add(2*time.Second)); delay != 8*time.Second {
+	model := newBubbleDashboardModel(context.Background(), control, session, TerminalDimensions{Width: 100, Height: 20})
+	model.dashboard.operationalEvent(runner.CandidateDiscoveryRecovered{OccurredAt: recoveredAt, Failures: 3})
+	updated, _ := model.Update(flush)
+	model = updated.(bubbleDashboardModel)
+	close(flush.acknowledged)
+	if err := <-flushDone; err != nil {
+		t.Fatalf("acknowledge natural-exit flush: %v", err)
+	}
+	view := ansi.Strip(model.View().Content)
+	for _, want := range []string{
+		"Admission: healthy | Recovered 2s ago after 3 failures",
+		"Runner stage: Complete; the Runner has exited",
+		"Next Ctrl-C: no effect",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("natural-exit recovery hold omitted %q:\n%s", want, view)
+		}
+	}
+	for _, stale := range []string{"Runner stage: Running", "Next Ctrl-C: start Drain and stop Admission"} {
+		if strings.Contains(view, stale) {
+			t.Fatalf("natural-exit recovery hold retained stale lifecycle guidance %q:\n%s", stale, view)
+		}
+	}
+	if delay := dashboardFlushDelay(model.dashboard, now); delay != 8*time.Second {
 		t.Fatalf("final flush delay = %s, want 8s", delay)
 	}
-	if delay := dashboardFlushDelay(dashboard, recoveredAt.Add(10*time.Second)); delay != time.Second/30 {
+	if delay := dashboardFlushDelay(model.dashboard, recoveredAt.Add(10*time.Second)); delay != time.Second/30 {
 		t.Fatalf("expired-notice flush delay = %s, want %s", delay, time.Second/30)
+	}
+
+	shutdownDashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, func() time.Time { return now })
+	shutdownDashboard.operationalEvent(runner.ShutdownEvent{Stage: runner.ShutdownStageDraining})
+	shutdownDashboard.markNaturalExit()
+	_, _, footer := shutdownDashboard.renderParts(now)
+	if !strings.Contains(footer, "Runner stage: Draining") || strings.Contains(footer, "Complete; the Runner has exited") {
+		t.Fatalf("natural-exit marker replaced an established shutdown stage: %q", footer)
 	}
 }
 

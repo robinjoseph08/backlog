@@ -244,8 +244,14 @@ func TestRunnerRetainsAtMostTwentyFullAdmissionDiagnostics(t *testing.T) {
 	if got := events[0].Err.Error(); !strings.Contains(got, "no longer retained") {
 		t.Fatalf("old diagnostic = %q, want bounded-retention marker", got)
 	}
+	if !errors.Is(events[0].Err, ErrCandidateDiscoveryDiagnosticExpired) {
+		t.Fatalf("old diagnostic does not expose expiry state after delayed delivery: %v", events[0].Err)
+	}
 	if got := events[len(events)-1].Err.Error(); got != "full failure 25" {
 		t.Fatalf("latest diagnostic = %q, want full failure 25", got)
+	}
+	if errors.Is(events[len(events)-1].Err, ErrCandidateDiscoveryDiagnosticExpired) {
+		t.Fatalf("latest retained diagnostic was marked expired: %v", events[len(events)-1].Err)
 	}
 }
 

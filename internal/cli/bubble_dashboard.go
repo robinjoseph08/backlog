@@ -37,7 +37,10 @@ type dashboardInterruptResultMsg struct{ err error }
 type dashboardElapsedMsg time.Time
 type dashboardActivityMsg time.Time
 type dashboardQueueStoppedMsg struct{ err error }
-type dashboardFlushMsg struct{ acknowledged chan struct{} }
+type dashboardFlushMsg struct {
+	acknowledged chan struct{}
+	naturalExit  bool
+}
 type dashboardFlushRenderedMsg struct{ acknowledged chan struct{} }
 
 // bubbleDashboardSession is the asynchronous boundary between Runner writes
@@ -144,7 +147,10 @@ func (s *bubbleDashboardSession) stateSaved(current state.State) {
 
 func (s *bubbleDashboardSession) flush(ctx context.Context) error {
 	acknowledged := make(chan struct{})
-	s.publish(dashboardFlushMsg{acknowledged: acknowledged})
+	s.finalMu.Lock()
+	naturalExit := s.finalState != nil
+	s.finalMu.Unlock()
+	s.publish(dashboardFlushMsg{acknowledged: acknowledged, naturalExit: naturalExit})
 	select {
 	case <-acknowledged:
 		return nil
@@ -436,6 +442,9 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		_ = m.dashboard.activityChanged()
 		commands = append(commands, dashboardActivityTick())
 	case dashboardFlushMsg:
+		if msg.naturalExit {
+			m.dashboard.markNaturalExit()
+		}
 		m.pendingFlushes = append(m.pendingFlushes, msg)
 		commands = append(commands, m.renderPendingFlushes()...)
 		commands = append(commands, m.waitForSessionUpdate())
@@ -484,7 +493,7 @@ func (m *bubbleDashboardModel) renderPendingFlushes() []tea.Cmd {
 	for _, pending := range m.pendingFlushes {
 		message := pending
 		commands = append(commands, tea.Tick(delay, func(time.Time) tea.Msg {
-			return dashboardFlushRenderedMsg(message)
+			return dashboardFlushRenderedMsg{acknowledged: message.acknowledged}
 		}))
 	}
 	m.pendingFlushes = nil

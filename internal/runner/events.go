@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -45,6 +46,10 @@ type CandidateDiscoveryFailed struct {
 func (CandidateDiscoveryFailed) operationalEvent() {}
 
 const candidateDiscoveryDiagnosticLimit = 20
+
+// ErrCandidateDiscoveryDiagnosticExpired marks a full diagnostic reference
+// whose bounded invocation-local evidence has been evicted.
+var ErrCandidateDiscoveryDiagnosticExpired = errors.New("full Candidate discovery diagnostic is no longer retained")
 
 type candidateDiscoveryDiagnostics struct {
 	mu      sync.Mutex
@@ -94,11 +99,14 @@ func (e retainedCandidateDiscoveryError) Error() string {
 	if err := e.diagnostics.lookup(e.id); err != nil {
 		return err.Error()
 	}
-	return "full Candidate discovery diagnostic is no longer retained"
+	return ErrCandidateDiscoveryDiagnosticExpired.Error()
 }
 
 func (e retainedCandidateDiscoveryError) Unwrap() error {
-	return e.diagnostics.lookup(e.id)
+	if err := e.diagnostics.lookup(e.id); err != nil {
+		return err
+	}
+	return ErrCandidateDiscoveryDiagnosticExpired
 }
 
 // CandidateDiscoveryRecovered reports that a complete Candidate snapshot made
