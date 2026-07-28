@@ -19,9 +19,36 @@ func TestTerminalScreenTextAppliesCursorAddressedDashboardUpdates(t *testing.T) 
 	}
 }
 
+func TestTerminalScreenTextScrollsConfiguredRegion(t *testing.T) {
+	const initial = "top\none\ntwo\nthree\nbottom"
+	tests := []struct {
+		name, operation, want string
+	}{
+		{name: "scroll up", operation: "\x1b[2;4r\x1b[2S", want: "top\nthree\n\n\nbottom"},
+		{name: "scroll down", operation: "\x1b[2;4r\x1b[2T", want: "top\n\n\none\nbottom"},
+		{name: "line feed at lower margin", operation: "\x1b[2;4r\x1b[4;1H\n", want: "top\ntwo\nthree\n\nbottom"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := terminalScreenText(initial+test.operation, 8, 5); got != test.want {
+				t.Fatalf("terminal screen:\n%s\nwant:\n%s", got, test.want)
+			}
+		})
+	}
+}
+
+func TestTerminalScreenTextAppliesReverseIndexAtUpperMargin(t *testing.T) {
+	output := "top\none\ntwo\nbottom\x1b[2;3r\x1b[2;1H\x1bM"
+	want := "top\n\none\nbottom"
+	if got := terminalScreenText(output, 8, 4); got != want {
+		t.Fatalf("terminal screen:\n%s\nwant:\n%s", got, want)
+	}
+}
+
 type testTerminalScreen struct {
-	cells       [][]rune
-	row, column int
+	cells                   [][]rune
+	row, column             int
+	scrollTop, scrollBottom int
 }
 
 // terminalScreenText applies the cursor and erase operations used by Bubble Tea
@@ -33,6 +60,7 @@ func terminalScreenText(output string, width, height int) string {
 		Print:     screen.print,
 		Execute:   screen.execute,
 		HandleCsi: screen.handleCSI,
+		HandleEsc: screen.handleESC,
 	})
 	parser.Parse([]byte(output))
 	return screen.text()
@@ -46,7 +74,7 @@ func newTestTerminalScreen(width, height int) *testTerminalScreen {
 			cells[row][column] = ' '
 		}
 	}
-	return &testTerminalScreen{cells: cells}
+	return &testTerminalScreen{cells: cells, scrollBottom: height - 1}
 }
 
 func (s *testTerminalScreen) print(value rune) {
@@ -67,7 +95,7 @@ func (s *testTerminalScreen) print(value rune) {
 func (s *testTerminalScreen) execute(control byte) {
 	switch control {
 	case '\n', '\v', '\f':
-		s.row++
+		s.index()
 		s.column = 0
 	case '\r':
 		s.column = 0
@@ -77,6 +105,18 @@ func (s *testTerminalScreen) execute(control byte) {
 		}
 	case '\t':
 		s.column = min((s.column/8+1)*8, s.width()-1)
+	}
+	s.clampCursor()
+}
+
+func (s *testTerminalScreen) handleESC(command ansi.Cmd) {
+	if command.Final() != 'M' {
+		return
+	}
+	if s.row == s.scrollTop {
+		s.scrollDown(1)
+	} else {
+		s.row--
 	}
 	s.clampCursor()
 }
@@ -116,8 +156,61 @@ func (s *testTerminalScreen) handleCSI(command ansi.Cmd, params ansi.Params) {
 		s.eraseDisplay(parameter(0, 0))
 	case 'K':
 		s.eraseLine(parameter(0, 0))
+	case 'S':
+		s.scrollUp(parameter(0, 1))
+	case 'T':
+		s.scrollDown(parameter(0, 1))
+	case 'r':
+		top := parameter(0, 1) - 1
+		bottom := parameter(1, len(s.cells)) - 1
+		if top >= 0 && top < bottom && bottom < len(s.cells) {
+			s.scrollTop, s.scrollBottom = top, bottom
+			s.row, s.column = 0, 0
+		}
 	}
 	s.clampCursor()
+}
+
+func (s *testTerminalScreen) index() {
+	if s.row == s.scrollBottom {
+		s.scrollUp(1)
+		return
+	}
+	s.row++
+}
+
+func (s *testTerminalScreen) scrollUp(count int) {
+	s.scroll(count, true)
+}
+
+func (s *testTerminalScreen) scrollDown(count int) {
+	s.scroll(count, false)
+}
+
+func (s *testTerminalScreen) scroll(count int, up bool) {
+	if len(s.cells) == 0 || s.scrollTop < 0 || s.scrollBottom >= len(s.cells) || s.scrollTop > s.scrollBottom {
+		return
+	}
+	count = min(max(count, 0), s.scrollBottom-s.scrollTop+1)
+	for step := 0; step < count; step++ {
+		if up {
+			for row := s.scrollTop; row < s.scrollBottom; row++ {
+				copy(s.cells[row], s.cells[row+1])
+			}
+			s.clearRow(s.scrollBottom)
+		} else {
+			for row := s.scrollBottom; row > s.scrollTop; row-- {
+				copy(s.cells[row], s.cells[row-1])
+			}
+			s.clearRow(s.scrollTop)
+		}
+	}
+}
+
+func (s *testTerminalScreen) clearRow(row int) {
+	for column := range s.cells[row] {
+		s.cells[row][column] = ' '
+	}
 }
 
 func (s *testTerminalScreen) eraseDisplay(mode int) {
