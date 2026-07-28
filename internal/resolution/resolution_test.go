@@ -121,6 +121,50 @@ func TestMergedExpectedPullRequestPlansCompletionBeforeClosureReasonEligibility(
 	}
 }
 
+func TestOnlyRecordedExpectedPullRequestCanPlanCompletion(t *testing.T) {
+	const (
+		branch   = "agent/run"
+		expected = "https://github.com/acme/widgets/pull/9"
+	)
+	for _, expectedState := range []retirement.PullRequestState{retirement.PullRequestOpen, retirement.PullRequestClosed} {
+		t.Run(string(expectedState), func(t *testing.T) {
+			expectedPull := retirement.PullRequest{Number: 9, URL: expected, Branch: branch, Commit: strings.Repeat("a", 40), State: expectedState}
+			snapshot := retirement.Snapshot{
+				Run:   scheduler.Run{Issue: 42, RunID: "run", Status: scheduler.StatusWaitingForMerge, PullRequest: expected, Branch: branch},
+				Lease: scheduler.Lease{LeaseID: "lease", Issue: 42, RunID: "run"},
+				Issue: retirement.Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", ClosureReason: "completed"},
+				PullRequests: []retirement.PullRequest{
+					expectedPull,
+					{Number: 10, URL: "https://github.com/acme/widgets/pull/10", Branch: branch, Commit: strings.Repeat("b", 40), State: retirement.PullRequestMerged},
+				},
+			}
+			if plan, err := retirement.Build(Policy("run"), snapshot); err == nil || !strings.Contains(err.Error(), "merged pull request is not the expected pull request "+expected) || plan.TerminalState == scheduler.StatusMerged {
+				t.Fatalf("unrelated merged pull request plan = %#v, error = %v", plan, err)
+			}
+
+			snapshot.PullRequests = []retirement.PullRequest{expectedPull}
+			if plan, err := retirement.Build(Policy("run"), snapshot); err == nil || !strings.Contains(err.Error(), "pull request #9 remains "+string(expectedState)) || plan.TerminalState == scheduler.StatusMerged {
+				t.Fatalf("unmerged expected pull request plan = %#v, error = %v", plan, err)
+			}
+		})
+	}
+
+	t.Run("unrelated branch identity", func(t *testing.T) {
+		snapshot := retirement.Snapshot{
+			Run:   scheduler.Run{Issue: 42, RunID: "run", Status: scheduler.StatusWaitingForMerge, PullRequest: expected, Branch: branch},
+			Lease: scheduler.Lease{LeaseID: "lease", Issue: 42, RunID: "run"},
+			Issue: retirement.Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", ClosureReason: "completed"},
+			PullRequests: []retirement.PullRequest{
+				{Number: 9, URL: expected, Branch: branch, Commit: strings.Repeat("a", 40), State: retirement.PullRequestOpen},
+				{Number: 10, URL: "https://github.com/acme/widgets/pull/10", Branch: "unrelated", Commit: strings.Repeat("b", 40), State: retirement.PullRequestMerged},
+			},
+		}
+		if plan, err := retirement.Build(Policy("run"), snapshot); err == nil || !strings.Contains(err.Error(), "incomplete or mismatched branch identity") || plan.TerminalState == scheduler.StatusMerged {
+			t.Fatalf("unrelated branch Completion plan = %#v, error = %v", plan, err)
+		}
+	})
+}
+
 func TestMergedExpectedPullRequestStillRequiresClosedIssue(t *testing.T) {
 	snapshot := retirement.Snapshot{
 		Run:          scheduler.Run{Issue: 42, RunID: "run", Status: scheduler.StatusWaitingForMerge, PullRequest: "https://github.com/acme/widgets/pull/9", Branch: "agent/run"},

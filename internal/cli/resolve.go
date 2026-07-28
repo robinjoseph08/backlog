@@ -154,8 +154,10 @@ func resolveCommandWithInput(ctx context.Context, args []string, stdin io.Reader
 	if err := output.Err(); err != nil {
 		return err
 	}
-	if err := ensureResetStateBinding(commonDirectory, resolvedState); err != nil {
-		return err
+	if plan.Snapshot.Run.Status != scheduler.StatusResolvedExternally {
+		if err := ensureResetStateBinding(commonDirectory, resolvedState); err != nil {
+			return err
+		}
 	}
 	if err := module.Retire(ctx, plan); err != nil {
 		return err

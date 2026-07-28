@@ -78,6 +78,16 @@ func (f resolveFixture) args(selector string, extra ...string) []string {
 	return append(args, extra...)
 }
 
+func assertResolveStateBindingsAbsent(t *testing.T, repository string) {
+	t.Helper()
+	for _, name := range []string{stateDirectoryBindingFile, legacyStateDirectoryBindingFile} {
+		path := filepath.Join(repository, ".git", name)
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("read-only Resolve created repository state binding %s: %v", path, err)
+		}
+	}
+}
+
 func TestResolveDryRunAndCancellationDoNotMigrateBindOrMutate(t *testing.T) {
 	for _, test := range []struct {
 		name, input string
@@ -107,6 +117,7 @@ func TestResolveDryRunAndCancellationDoNotMigrateBindOrMutate(t *testing.T) {
 			if !bytes.Equal(before, after) {
 				t.Fatal("read-only operation persisted migration or mutation")
 			}
+			assertResolveStateBindingsAbsent(t, fixture.repository)
 			if test.dry && !strings.Contains(stdout.String(), "Dry-run") || !test.dry && !strings.Contains(stdout.String(), "cancelled") {
 				t.Fatalf("output = %q", stdout.String())
 			}
@@ -142,6 +153,7 @@ func TestCompiledResolveDryRunAndInteractiveCancellation(t *testing.T) {
 		if fileDigest(t, fixture.store.Path) != before {
 			t.Fatal("compiled dry-run changed state")
 		}
+		assertResolveStateBindingsAbsent(t, fixture.repository)
 	})
 	for _, test := range []struct{ name, input string }{{"Enter", "\n"}, {"EOF", ""}, {"non-affirmative", "no\n"}} {
 		t.Run(test.name, func(t *testing.T) {
@@ -156,6 +168,7 @@ func TestCompiledResolveDryRunAndInteractiveCancellation(t *testing.T) {
 			if fileDigest(t, fixture.store.Path) != before {
 				t.Fatal("compiled cancellation changed state")
 			}
+			assertResolveStateBindingsAbsent(t, fixture.repository)
 		})
 	}
 }
@@ -254,6 +267,62 @@ func TestCompiledResolveFinalizesAndRerunsIdempotently(t *testing.T) {
 	_ = json.Unmarshal(data, &github)
 	if strings.Join(github.Labels, ",") != "needs-info,spec" {
 		t.Fatalf("preserved labels = %v", github.Labels)
+	}
+}
+
+func TestResolvedExternallyRerunIsVerificationOnly(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		labels  []string
+		wantErr string
+	}{
+		{name: "verified terminal outcome", labels: []string{"needs-info", "spec"}},
+		{name: "managed label drift", labels: []string{"ready-for-agent", "spec"}, wantErr: "verification-only rerun will not mutate without a Lease"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newResolveFixture(t, test.labels, "NOT_PLANNED")
+			current, err := fixture.store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolvedAt := time.Date(2026, 7, 28, 2, 3, 4, 0, time.UTC)
+			current.Runs[1].Status = scheduler.StatusResolvedExternally
+			current.Runs[1].ResolvedExternallyAt = &resolvedAt
+			current.Runs[1].ClosureReason = "not-planned"
+			current.Runs[1].UpdatedAt = resolvedAt
+			current.Runs[1].CompletedAt = nil
+			current.Runs[1].WorkerLogOpen = false
+			current.Leases = nil
+			if err := fixture.store.Save(current); err != nil {
+				t.Fatal(err)
+			}
+			if test.wantErr != "" {
+				data, err := os.ReadFile(fixture.githubState)
+				if err != nil {
+					t.Fatal(err)
+				}
+				data = bytes.Replace(data, []byte(`"reopenAfterFirstMutation":false`), []byte(`"reopenAfterFirstMutation":true`), 1)
+				if err := os.WriteFile(fixture.githubState, data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			beforeState := fileDigest(t, fixture.store.Path)
+			beforeGitHub := fileDigest(t, fixture.githubState)
+
+			var stdout, stderr bytes.Buffer
+			err = resolveCommandWithInput(context.Background(), fixture.args("run-42", "--yes"), strings.NewReader(""), false, &stdout, &stderr)
+			if test.wantErr == "" {
+				if err != nil || !strings.Contains(stdout.String(), "External Resolution complete for Run run-42") {
+					t.Fatalf("verified rerun: error=%v, stderr=%q, stdout=%q", err, stderr.String(), stdout.String())
+				}
+			} else if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("drift rerun: error=%v, stderr=%q, stdout=%q", err, stderr.String(), stdout.String())
+			}
+			if fileDigest(t, fixture.store.Path) != beforeState || fileDigest(t, fixture.githubState) != beforeGitHub {
+				t.Fatal("Historical rerun changed original Run metadata or GitHub state")
+			}
+			assertResolveStateBindingsAbsent(t, fixture.repository)
+		})
 	}
 }
 

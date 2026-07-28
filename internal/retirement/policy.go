@@ -27,6 +27,7 @@ type Policy struct {
 	RecordMissingLogWarn  bool
 	RequireClosureReason  bool
 	AllowMergedCompletion bool
+	VerifyHistoricalOnly  bool
 	FinalizeMetadata      func(*scheduler.Run, Snapshot, time.Time)
 }
 

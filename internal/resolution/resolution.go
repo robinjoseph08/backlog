@@ -34,6 +34,7 @@ func Policy(selector string) retirement.Policy {
 		RecordMissingLogWarn:  true,
 		RequireClosureReason:  true,
 		AllowMergedCompletion: true,
+		VerifyHistoricalOnly:  true,
 		FinalizeMetadata: func(run *scheduler.Run, snapshot retirement.Snapshot, now time.Time) {
 			run.ResolvedExternallyAt = &now
 			run.ClosureReason = snapshot.Issue.ClosureReason

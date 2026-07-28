@@ -197,6 +197,12 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 	if len(mergedPulls) != 0 && snapshot.Run.Status != policy.TerminalStatus {
 		return Plan{}, fmt.Errorf("pull request #%d is merged; merged work cannot be %s", mergedPulls[0].Number, policy.Operation)
 	}
+	if snapshot.Run.Status == policy.TerminalStatus && policy.VerifyHistoricalOnly {
+		if !policy.labelsSatisfied(snapshot.Issue.Labels) {
+			return Plan{}, fmt.Errorf("historical %s Run %s has managed issue label drift; verification-only rerun will not mutate without a Lease", policy.TerminalStatus, snapshot.Run.RunID)
+		}
+		return Plan{Snapshot: snapshot, Operation: policy.Operation, TerminalState: policy.TerminalStatus}, nil
+	}
 
 	plan := Plan{Snapshot: snapshot, Operation: policy.Operation, TerminalState: policy.TerminalStatus}
 	planning := snapshot
