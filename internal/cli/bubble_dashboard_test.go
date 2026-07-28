@@ -18,10 +18,12 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/creack/pty"
 	"github.com/robinjoseph08/backlog/internal/activity"
 	"github.com/robinjoseph08/backlog/internal/runner"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
+	"golang.org/x/term"
 )
 
 func TestBubbleDashboardModelResizesViewportAroundFixedLifecycleChrome(t *testing.T) {
@@ -2227,6 +2229,55 @@ func TestRestoreDashboardTerminalReleasesInterruptedModesBeforeStaticOutput(t *t
 	summary := strings.Index(visible, "Final aggregate summary")
 	if output.synchronized || output.unicodeCore || output.pending.Len() != 0 || synchronizedReset < 0 || unicodeReset != synchronizedReset+len(ansi.ResetModeSynchronizedOutput) || restore < unicodeReset || summary < restore {
 		t.Fatalf("interrupted terminal modes retained restoration or static output: synchronized=%t unicode_core=%t visible=%q pending=%q", output.synchronized, output.unicodeCore, visible, output.pending.String())
+	}
+}
+
+type initializationFailureTTY struct {
+	*os.File
+	fdCalls atomic.Int32
+}
+
+func (f *initializationFailureTTY) Fd() uintptr {
+	if f.fdCalls.Add(1) == 1 {
+		return f.File.Fd()
+	}
+	return ^uintptr(0)
+}
+
+func TestBubbleDashboardRestoresRawModeAfterBubbleTeaInitializationFailure(t *testing.T) {
+	primary, terminal, err := pty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer primary.Close()
+	defer terminal.Close()
+
+	initialState, err := term.GetState(int(terminal.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := &initializationFailureTTY{File: terminal}
+	session := newBubbleDashboardSession(time.Now)
+	err = session.presentation(context.Background(), PresentationControl{Terminal: PresentationTerminal{
+		Input: terminal, Output: output,
+		Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
+		ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+	}})
+	if err == nil || !strings.Contains(err.Error(), "getting terminal size") {
+		t.Fatalf("Bubble Tea initialization error = %v", err)
+	}
+	if calls := output.fdCalls.Load(); calls < 2 {
+		t.Fatalf("output file descriptor calls = %d, want initialization to fail after TTY detection", calls)
+	}
+	restoredState, stateErr := term.GetState(int(terminal.Fd()))
+	if stateErr != nil {
+		t.Fatal(stateErr)
+	}
+	if !reflect.DeepEqual(restoredState, initialState) {
+		t.Fatalf("terminal remained in raw mode after Bubble Tea initialization failure: got %#v, want %#v", restoredState, initialState)
+	}
+	if startupErr := session.waitForStartup(context.Background()); startupErr == nil || startupErr.Error() != err.Error() {
+		t.Fatalf("Runner startup error = %v, want %v", startupErr, err)
 	}
 }
 

@@ -116,6 +116,9 @@ func (s *bubbleDashboardSession) presentation(ctx context.Context, control Prese
 		tea.WithColorProfile(bubbleColorProfile(model.colorProfile)),
 		tea.WithoutSignalHandler(),
 	)
+	// Bubble Tea v2.0.8 does not shut down when initialization fails after
+	// entering raw mode. Kill is idempotent with Run's normal shutdown path.
+	defer program.Kill()
 	watchStopped := make(chan struct{})
 	go func() {
 		defer close(watchStopped)
