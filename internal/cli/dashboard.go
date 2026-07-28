@@ -409,21 +409,61 @@ func (d *liveDashboard) redraw() {
 	}
 }
 
+type dashboardBodyAnchor struct {
+	identity string
+	line     int
+}
+
+type dashboardBodyLayout struct {
+	text      string
+	anchors   []dashboardBodyAnchor
+	attention map[string]struct{}
+}
+
+type dashboardBodyBuilder struct {
+	body    strings.Builder
+	line    int
+	anchors []dashboardBodyAnchor
+}
+
+func (b *dashboardBodyBuilder) separate() {
+	if b.body.Len() > 0 {
+		b.write("\n")
+	}
+}
+
+func (b *dashboardBodyBuilder) write(content string) {
+	b.body.WriteString(content)
+	b.line += strings.Count(content, "\n")
+}
+
+func (b *dashboardBodyBuilder) anchor(identity string) {
+	b.anchors = append(b.anchors, dashboardBodyAnchor{identity: identity, line: b.line})
+}
+
+func dashboardSectionAnchor(name string) string { return "section:" + name }
+func dashboardRunAnchor(runID string) string    { return "run:" + runID }
+
 func (d *liveDashboard) render(current state.State, messages []string, stage dashboardStage, now time.Time) string {
 	header, body, _ := d.renderPartsFor(current, messages, stage, now)
 	return header + "\n" + body + "\n\n" + dashboardFooter(stage) + "\n"
 }
 
-func (d *liveDashboard) renderParts(now time.Time) (string, string, string) {
+func (d *liveDashboard) renderPartsWithLayout(now time.Time) (string, dashboardBodyLayout, string) {
 	d.mu.Lock()
 	current := cloneDashboardState(d.current)
 	messages := dashboardMessageTexts(d.messages)
 	stage := d.stage
 	d.mu.Unlock()
-	return d.renderPartsFor(current, messages, stage, now)
+	return d.renderPartsForWithLayout(current, messages, stage, now)
 }
 
 func (d *liveDashboard) renderPartsFor(current state.State, messages []string, stage dashboardStage, now time.Time) (string, string, string) {
+	header, layout, footer := d.renderPartsForWithLayout(current, messages, stage, now)
+	return header, layout.text, footer
+}
+
+func (d *liveDashboard) renderPartsForWithLayout(current state.State, messages []string, stage dashboardStage, now time.Time) (string, dashboardBodyLayout, string) {
 	sections := d.observeSections(current, now)
 	capacity := "Worker capacity: pending configuration"
 	if current.MaxConcurrentIssues > 0 {
@@ -434,18 +474,24 @@ func (d *liveDashboard) renderPartsFor(current state.State, messages []string, s
 
 	header := fmt.Sprintf("Backlog Run Dashboard\nRepository: %s\n%s",
 		valueOr(plainStatusValue(current.Repo), "not initialized"), capacity)
-	var body strings.Builder
-	renderDashboardSection(&body, "Active Runs", sections[statusActive], now)
-	renderDashboardSection(&body, "Attention Required", sections[statusAttention], now)
-	renderDashboardSection(&body, "Outcomes to Acknowledge", sections[statusOutcomes], now)
-	renderDashboardCompletions(&body, sections[statusCompletions], now)
+	body := dashboardBodyBuilder{}
+	body.renderSection("Active Runs", sections[statusActive], now)
+	body.renderSection("Attention Required", sections[statusAttention], now)
+	body.renderSection("Outcomes to Acknowledge", sections[statusOutcomes], now)
+	body.renderCompletions(sections[statusCompletions], now)
 	if len(messages) > 0 {
-		body.WriteString("\nOperational messages\n")
+		body.separate()
+		body.anchor(dashboardSectionAnchor("Operational messages"))
+		body.write("Operational messages\n")
 		for _, message := range messages {
-			fmt.Fprintf(&body, "  %s\n", message)
+			body.write(fmt.Sprintf("  %s\n", message))
 		}
 	}
-	return header, strings.TrimPrefix(body.String(), "\n"), dashboardFooterParts(stage)
+	attention := make(map[string]struct{}, len(sections[statusAttention]))
+	for _, observed := range sections[statusAttention] {
+		attention[observed.run.RunID] = struct{}{}
+	}
+	return header, dashboardBodyLayout{text: body.body.String(), anchors: body.anchors, attention: attention}, dashboardFooterParts(stage)
 }
 
 // observeSections applies the shared status ownership and history projection.
@@ -529,14 +575,23 @@ func (d *liveDashboard) observeActivity(run scheduler.Run) followMetrics {
 }
 
 func renderDashboardCompletions(output *strings.Builder, runs []statusRun, now time.Time) {
-	fmt.Fprintf(output, "\nRecent Completions (%d)\n", len(runs))
+	body := dashboardBodyBuilder{}
+	body.renderCompletions(runs, now)
+	_, _ = output.WriteString("\n" + body.body.String())
+}
+
+func (b *dashboardBodyBuilder) renderCompletions(runs []statusRun, now time.Time) {
+	b.separate()
+	b.anchor(dashboardSectionAnchor("Recent Completions"))
+	b.write(fmt.Sprintf("Recent Completions (%d)\n", len(runs)))
 	if len(runs) == 0 {
-		output.WriteString("  none\n")
+		b.write("  none\n")
 		return
 	}
 	visible := min(3, len(runs))
 	for _, observed := range runs[:visible] {
 		run := observed.run
+		b.anchor(dashboardRunAnchor(run.RunID))
 		identity := fmt.Sprintf("#%d", run.Issue)
 		if title := plainStatusValue(run.IssueTitle); title != "" {
 			identity += "  " + title
@@ -550,38 +605,41 @@ func renderDashboardCompletions(output *strings.Builder, runs []statusRun, now t
 		if run.CompletedAt != nil && !run.CompletedAt.IsZero() {
 			completed = displayDuration(now.Sub(*run.CompletedAt)) + " ago"
 		}
-		fmt.Fprintf(output, "  %s%s | Elapsed: %s | Completed: %s\n", identity, pullRequest, progress.elapsed, completed)
+		b.write(fmt.Sprintf("  %s%s | Elapsed: %s | Completed: %s\n", identity, pullRequest, progress.elapsed, completed))
 	}
 	if remainder := len(runs) - visible; remainder > 0 {
-		fmt.Fprintf(output, "  %d more completions\n", remainder)
+		b.write(fmt.Sprintf("  %d more completions\n", remainder))
 	}
 }
 
-func renderDashboardSection(output *strings.Builder, name string, runs []statusRun, now time.Time) {
-	fmt.Fprintf(output, "\n%s (%d)\n", name, len(runs))
+func (b *dashboardBodyBuilder) renderSection(name string, runs []statusRun, now time.Time) {
+	b.separate()
+	b.anchor(dashboardSectionAnchor(name))
+	b.write(fmt.Sprintf("%s (%d)\n", name, len(runs)))
 	if len(runs) == 0 {
-		output.WriteString("  none\n")
+		b.write("  none\n")
 		return
 	}
 	for _, observed := range runs {
 		run := observed.run
+		b.anchor(dashboardRunAnchor(run.RunID))
 		identity := fmt.Sprintf("#%d", run.Issue)
 		if title := plainStatusValue(run.IssueTitle); title != "" {
 			identity += "  " + title
 		}
 		progress := summarizeRunProgress(run, observed.observation.metrics, now)
-		fmt.Fprintf(output, "  %s\n", identity)
+		b.write(fmt.Sprintf("  %s\n", identity))
 		if run.IssueURL != "" {
-			fmt.Fprintf(output, "    Issue: %s\n", plainStatusValue(run.IssueURL))
+			b.write(fmt.Sprintf("    Issue: %s\n", plainStatusValue(run.IssueURL)))
 		}
-		fmt.Fprintf(output, "    State: %s | Elapsed: %s | Worker liveness: %s\n",
-			displayedRunState(run, observed.observation.process), progress.elapsed, plainStatusValue(observed.observation.process.workerLiveness))
-		fmt.Fprintf(output, "    Activity age: %s | Deepest operation: %s\n",
-			progress.activityAge, plainStatusValue(progress.deepestOperation))
-		fmt.Fprintf(output, "    Turns: Worker %s | Subagent %s | Observed tokens: %s\n",
-			progress.workerTurns, progress.subagentTurns, progress.observedTokens)
+		b.write(fmt.Sprintf("    State: %s | Elapsed: %s | Worker liveness: %s\n",
+			displayedRunState(run, observed.observation.process), progress.elapsed, plainStatusValue(observed.observation.process.workerLiveness)))
+		b.write(fmt.Sprintf("    Activity age: %s | Deepest operation: %s\n",
+			progress.activityAge, plainStatusValue(progress.deepestOperation)))
+		b.write(fmt.Sprintf("    Turns: Worker %s | Subagent %s | Observed tokens: %s\n",
+			progress.workerTurns, progress.subagentTurns, progress.observedTokens))
 		if run.Error != "" {
-			fmt.Fprintf(output, "    Diagnostic: %s\n", plainStatusValue(strings.TrimSpace(run.Error)))
+			b.write(fmt.Sprintf("    Diagnostic: %s\n", plainStatusValue(strings.TrimSpace(run.Error))))
 		}
 	}
 }
