@@ -1548,30 +1548,42 @@ func (r *Runner) reconcileExternalResolutions(ctx context.Context, current *stat
 		}
 
 		attempted, resolutionErr := r.ExternalResolution.Reconcile(ctx, run)
+		if attempted {
+			persisted, err := r.Store.Load()
+			if err != nil {
+				return fmt.Errorf("reload state after automatic External Resolution for Run %s: %w", run.RunID, err)
+			}
+			*current = persisted
+		}
 		if resolutionErr != nil && ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if !attempted {
-			continue
-		}
-
-		persisted, err := r.Store.Load()
-		if err != nil {
-			return fmt.Errorf("reload state after automatic External Resolution for Run %s: %w", run.RunID, err)
-		}
-		*current = persisted
-		if resolutionErr == nil {
+		if !attempted || resolutionErr == nil {
 			continue
 		}
 
 		updated := findRun(current.Runs, run.RunID)
-		if updated.RunID == "" || findActiveRun(current, run.Issue).RunID != run.RunID {
+		active := findActiveRun(current, run.Issue)
+		if updated.RunID != "" && updated.Issue == run.Issue && active.RunID == "" &&
+			(updated.Status == scheduler.StatusResolvedExternally || updated.Status == scheduler.StatusMerged) {
+			continue
+		}
+		if updated.RunID == "" || active.RunID != run.RunID {
 			return fmt.Errorf("automatic External Resolution for Run %s failed after its Lease changed: %w", run.RunID, resolutionErr)
 		}
 		if scheduler.IsActive(updated.Status) {
 			transitionStatus(&updated, scheduler.StatusNeedsHuman)
 		}
-		updated.Error = fmt.Sprintf("automatic External Resolution refused: %v", resolutionErr)
+		refusalDiagnostic := fmt.Sprintf("automatic External Resolution refused: %v", resolutionErr)
+		previousDiagnostic := strings.TrimSpace(updated.Error)
+		switch {
+		case previousDiagnostic == "":
+			updated.Error = refusalDiagnostic
+		case previousDiagnostic == refusalDiagnostic || strings.HasSuffix(previousDiagnostic, "; "+refusalDiagnostic):
+			updated.Error = previousDiagnostic
+		default:
+			updated.Error = previousDiagnostic + "; " + refusalDiagnostic
+		}
 		updated.UpdatedAt = r.Now().UTC()
 		replaceRun(current, updated)
 		if err := r.Store.Save(*current); err != nil {

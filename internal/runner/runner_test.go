@@ -2178,6 +2178,45 @@ func TestRunnerStartupAutomaticallyResolvesBeforeAdmissionAndNaturalExhaustion(t
 	}
 }
 
+func TestRunnerReloadsAutomaticResolutionProgressBeforeReturningCancellation(t *testing.T) {
+	t.Parallel()
+
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs:   []scheduler.Run{{Issue: 6, RunID: "failed", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint}},
+		Leases: []scheduler.Lease{{LeaseID: "failed", Issue: 6, RunID: "failed"}},
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+		persisted := store.LoadValue()
+		partial := findRun(persisted.Runs, "failed")
+		partial.Status = scheduler.StatusResolvingExternally
+		partial.Error = "durable partial External Resolution progress"
+		replaceRun(&persisted, partial)
+		if err := store.Save(persisted); err != nil {
+			return true, err
+		}
+		cancel()
+		return true, context.Canceled
+	})
+	current := store.LoadValue()
+
+	err := runner.reconcileExternalResolutions(ctx, &current, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("automatic External Resolution cancellation = %v", err)
+	}
+	if got := findRun(current.Runs, "failed"); got.Status != scheduler.StatusResolvingExternally || got.Error != "durable partial External Resolution progress" {
+		t.Fatalf("reloaded partial External Resolution = %#v", got)
+	}
+	if err := store.Save(current); err != nil {
+		t.Fatal(err)
+	}
+	if got := findRun(store.LoadValue().Runs, "failed"); got.Status != scheduler.StatusResolvingExternally || got.Error != "durable partial External Resolution progress" {
+		t.Fatalf("shutdown persistence overwrote partial External Resolution = %#v", got)
+	}
+}
+
 func TestRunnerWatchAutomaticallyResolvesClosureDuringPoll(t *testing.T) {
 	t.Parallel()
 
@@ -2250,6 +2289,40 @@ func TestRunnerNeverAutomaticallyResolvesRunWithOwnedWorker(t *testing.T) {
 	}
 }
 
+func TestRunnerAcceptsFinalizedAutomaticResolutionAfterVerificationReadFailure(t *testing.T) {
+	t.Parallel()
+
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs:   []scheduler.Run{{Issue: 7, RunID: "partial", Status: scheduler.StatusResolvingExternally, WorkerMode: scheduler.WorkerModePrint}},
+		Leases: []scheduler.Lease{{LeaseID: "partial", Issue: 7, RunID: "partial"}},
+	}}
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+		persisted := store.LoadValue()
+		resolved := findRun(persisted.Runs, "partial")
+		resolved.Status = scheduler.StatusResolvedExternally
+		resolvedAt := time.Now().UTC()
+		resolved.ResolvedExternallyAt = &resolvedAt
+		resolved.ClosureReason = "completed"
+		replaceRun(&persisted, resolved)
+		removeLease(&persisted, resolved.RunID)
+		if err := store.Save(persisted); err != nil {
+			return true, err
+		}
+		return true, errors.New("verify finalized External Resolution state: injected preview failure")
+	})
+	current := store.LoadValue()
+
+	if err := runner.reconcileExternalResolutions(context.Background(), &current, nil); err != nil {
+		t.Fatalf("accept persisted terminal External Resolution: %v", err)
+	}
+	got := findRun(current.Runs, "partial")
+	if got.Status != scheduler.StatusResolvedExternally || got.ResolvedExternallyAt == nil || got.ClosureReason != "completed" || len(current.Leases) != 0 {
+		t.Fatalf("persisted terminal External Resolution = %#v / %#v", got, current.Leases)
+	}
+}
+
 func TestRunnerRetainsLeaseAndActionableDiagnosticWhenAutomaticResolutionIsRefused(t *testing.T) {
 	t.Parallel()
 
@@ -2265,8 +2338,9 @@ func TestRunnerRetainsLeaseAndActionableDiagnosticWhenAutomaticResolutionIsRefus
 
 	assertInterventionRequired(t, runner.Run(context.Background()), 1)
 	got := store.LoadValue()
-	if got.Runs[0].Status != scheduler.StatusResolvingExternally || len(got.Leases) != 1 || !strings.Contains(got.Runs[0].Error, "remote branch liveness is unknown") {
-		t.Fatalf("refused automatic External Resolution = %#v", got)
+	wantDiagnostic := "earlier failure; automatic External Resolution refused: remote branch liveness is unknown"
+	if got.Runs[0].Status != scheduler.StatusResolvingExternally || len(got.Leases) != 1 || got.Runs[0].Error != wantDiagnostic {
+		t.Fatalf("refused automatic External Resolution = %#v, want diagnostic %q", got, wantDiagnostic)
 	}
 }
 
