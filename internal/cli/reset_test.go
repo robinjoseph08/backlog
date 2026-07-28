@@ -13,13 +13,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
-	"github.com/robinjoseph08/backlog/internal/reset"
+	"github.com/robinjoseph08/backlog/internal/retirement"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 )
@@ -344,15 +345,16 @@ esac
 }
 
 type localArtifactResetFixture struct {
-	repository string
-	stateDir   string
-	store      state.FileStore
-	branch     string
-	worktree   string
-	sessionDir string
-	archiveDir string
-	github     string
-	git        string
+	repository  string
+	stateDir    string
+	store       state.FileStore
+	branch      string
+	worktree    string
+	sessionDir  string
+	archiveDir  string
+	githubState string
+	github      string
+	git         string
 }
 
 func newLocalArtifactResetFixture(t *testing.T, failLabelOnce bool) localArtifactResetFixture {
@@ -431,7 +433,8 @@ esac
 `)
 	return localArtifactResetFixture{
 		repository: repository, stateDir: stateDir, store: store, branch: branch, worktree: worktreePath,
-		sessionDir: sessionDir, archiveDir: filepath.Join(stateDir, "history", "sessions", runID), github: gh, git: githubGit(t),
+		sessionDir: sessionDir, archiveDir: filepath.Join(stateDir, "history", "sessions", runID),
+		githubState: githubState, github: gh, git: githubGit(t),
 	}
 }
 
@@ -542,46 +545,6 @@ exec `+quote(fixture.git)+` "$@"
 	}
 }
 
-func TestArchiveSessionUsesAtomicRename(t *testing.T) {
-	t.Parallel()
-	stateDir := t.TempDir()
-	sessionDir := filepath.Join(stateDir, "sessions", "run-atomic")
-	archiveDir := filepath.Join(stateDir, "history", "sessions", "run-atomic")
-	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	sessionFile := filepath.Join(sessionDir, "session.jsonl")
-	if err := os.WriteFile(sessionFile, []byte("session\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	before, err := os.Stat(sessionFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	session := reset.Session{ID: "backlog-run-atomic", Dir: sessionDir, ArchiveDir: archiveDir, Present: true}
-	synced := make(map[string]bool)
-	if err := archiveSession(session, stateDir, func(path string) error {
-		synced[filepath.Clean(path)] = true
-		return syncFilesystemPath(path)
-	}); err != nil {
-		t.Fatal(err)
-	}
-	archiveFile := filepath.Join(archiveDir, "session.jsonl")
-	after, err := os.Stat(archiveFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !os.SameFile(before, after) {
-		t.Fatal("session archival replaced the session file instead of atomically renaming it")
-	}
-	if !synced[archiveFile] || !synced[archiveDir] {
-		t.Fatalf("archive payload syncs = %#v, want file and archive directory", synced)
-	}
-	if _, err := os.Stat(sessionFile); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("active session survived archival: %v", err)
-	}
-}
-
 func TestResetRerunsAfterSessionArchiveSyncFailure(t *testing.T) {
 	fixture := newLocalArtifactResetFixture(t, false)
 	commonDirectory, err := gitCommonDirectory(context.Background(), fixture.git, fixture.repository)
@@ -635,6 +598,59 @@ func TestResetRerunsAfterSessionArchiveSyncFailure(t *testing.T) {
 	}
 	if current.Runs[0].Status != scheduler.StatusReset || len(current.Leases) != 0 {
 		t.Fatalf("rerun final state = %#v", current)
+	}
+}
+
+func TestResetReinspectsExternalPostconditionsAfterArchiveSynchronization(t *testing.T) {
+	fixture := newLocalArtifactResetFixture(t, false)
+	commonDirectory, err := gitCommonDirectory(context.Background(), fixture.git, fixture.repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := false
+	executor := resetExecutor{
+		store: fixture.store, github: ghadapter.Client{Executable: fixture.github, Dir: fixture.repository}, issue: 42,
+		repositoryRoot: fixture.repository, commonDirectory: commonDirectory, stateDirectory: fixture.stateDir, gitExecutable: fixture.git,
+		syncPath: func(path string) error {
+			var value struct {
+				Labels []string `json:"labels"`
+			}
+			data, readErr := os.ReadFile(fixture.githubState)
+			if readErr != nil {
+				return readErr
+			}
+			if unmarshalErr := json.Unmarshal(data, &value); unmarshalErr != nil {
+				return unmarshalErr
+			}
+			if !mutated && slices.Contains(value.Labels, "ready-for-agent") {
+				temporary := fixture.githubState + ".tmp"
+				if writeErr := os.WriteFile(temporary, []byte(`{"labels":["in-progress","spec"]}`), 0o600); writeErr != nil {
+					return writeErr
+				}
+				if renameErr := os.Rename(temporary, fixture.githubState); renameErr != nil {
+					return renameErr
+				}
+				mutated = true
+			}
+			return syncFilesystemPath(path)
+		},
+	}
+	approved, err := executor.inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.apply(context.Background(), approved); err == nil || !strings.Contains(err.Error(), "Plan changed immediately before finalization") {
+		t.Fatalf("post-synchronization external race error = %v", err)
+	}
+	if !mutated {
+		t.Fatal("archive synchronization did not inject the external race")
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusResetting || len(current.Leases) != 1 {
+		t.Fatalf("post-synchronization race released ownership: %#v", current)
 	}
 }
 
@@ -745,40 +761,6 @@ exec `+quote(fixture.git)+` "$@"
 				t.Fatalf("local identity refusal changed ownership: %#v", current)
 			}
 		})
-	}
-}
-
-func TestDeleteLocalBranchUsesExpectedCommit(t *testing.T) {
-	t.Parallel()
-	repository := filepath.Join(t.TempDir(), "repo")
-	runGit(t, t.TempDir(), "init", "-b", "main", repository)
-	runGit(t, repository, "config", "user.name", "Reset Test")
-	runGit(t, repository, "config", "user.email", "reset@example.test")
-	if err := os.WriteFile(filepath.Join(repository, "tracked"), []byte("base\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	runGit(t, repository, "add", "tracked")
-	runGit(t, repository, "commit", "-m", "base")
-	branchName := "agent/issue-42-local-cas"
-	runGit(t, repository, "branch", branchName)
-	expected := strings.TrimSpace(gitOutput(t, repository, "rev-parse", branchName))
-	runGit(t, repository, "commit", "--allow-empty", "-m", "advanced")
-	advanced := strings.TrimSpace(gitOutput(t, repository, "rev-parse", "HEAD"))
-	runGit(t, repository, "update-ref", "refs/heads/"+branchName, advanced)
-	branch := reset.Branch{Name: branchName, Commit: expected, Present: true}
-	if err := deleteLocalBranch(context.Background(), "git", repository, branch); err == nil || !strings.Contains(err.Error(), "expected commit") {
-		t.Fatalf("stale local branch deletion error = %v", err)
-	}
-	if got := strings.TrimSpace(gitOutput(t, repository, "rev-parse", branchName)); got != advanced {
-		t.Fatalf("stale deletion changed branch to %s, want %s", got, advanced)
-	}
-	branch.Commit = advanced
-	if err := deleteLocalBranch(context.Background(), "git", repository, branch); err != nil {
-		t.Fatal(err)
-	}
-	command := exec.Command("git", "-C", repository, "show-ref", "--verify", "--quiet", "refs/heads/"+branchName)
-	if err := command.Run(); err == nil {
-		t.Fatal("expected-commit deletion left local branch present")
 	}
 }
 
@@ -1641,6 +1623,177 @@ func TestResetFinalizationPersistsRunAndLeaseTogether(t *testing.T) {
 	}
 }
 
+func TestResetStopsAtStatePersistenceFailuresWithLeaseRetained(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		failStatus   scheduler.Status
+		wantStatus   scheduler.Status
+		wantLabels   string
+		wantAttempts []scheduler.Status
+	}{
+		{
+			name: "progress state", failStatus: scheduler.StatusResetting,
+			wantStatus: scheduler.StatusFailed, wantLabels: "in-progress,spec",
+			wantAttempts: []scheduler.Status{scheduler.StatusResetting},
+		},
+		{
+			name: "final atomic state", failStatus: scheduler.StatusReset,
+			wantStatus: scheduler.StatusResetting, wantLabels: "ready-for-agent,spec",
+			wantAttempts: []scheduler.Status{scheduler.StatusResetting, scheduler.StatusReset},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "spec"})
+			commonDirectory, err := gitCommonDirectory(context.Background(), fixture.git, fixture.repository)
+			if err != nil {
+				t.Fatal(err)
+			}
+			injected := "injected " + test.name + " persistence failure"
+			store := &failingResetStore{
+				resetStateStore: fixture.store, failStatus: test.failStatus, failure: errors.New(injected),
+			}
+			executor := resetExecutor{
+				store: store, github: ghadapter.Client{Executable: fixture.gh, Dir: fixture.repository}, issue: 42,
+				repositoryRoot: fixture.repository, commonDirectory: commonDirectory, stateDirectory: fixture.stateDir, gitExecutable: fixture.git,
+			}
+			approved, err := executor.inspect(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := executor.apply(context.Background(), approved); err == nil || !strings.Contains(err.Error(), injected) {
+				t.Fatalf("persistence error = %v, want %q", err, injected)
+			}
+			current, err := fixture.store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if current.Runs[0].Status != test.wantStatus || len(current.Leases) != 1 {
+				t.Fatalf("persistence failure released ownership: %#v", current)
+			}
+			if labels := strings.Join(fixture.labels(t), ","); labels != test.wantLabels {
+				t.Fatalf("labels after persistence failure = %q, want %q", labels, test.wantLabels)
+			}
+			if !slices.Equal(store.attempts, test.wantAttempts) {
+				t.Fatalf("state persistence attempts = %v, want %v", store.attempts, test.wantAttempts)
+			}
+		})
+	}
+}
+
+func TestResetCancellationDuringGitHubMutationRetainsOwnershipAndStopsActions(t *testing.T) {
+	fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "spec"})
+	underlyingGH := fixture.gh
+	started := filepath.Join(t.TempDir(), "mutation-started")
+	calls := filepath.Join(t.TempDir(), "mutation-calls")
+	fixture.gh = writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "issue edit 42 --repo acme/widgets --remove-label in-progress")
+    printf '%s\n' remove >> `+quote(calls)+`
+    touch `+quote(started)+`
+    kill -STOP $$ ;;
+  "issue edit 42 --repo acme/widgets --add-label ready-for-agent")
+    printf '%s\n' add >> `+quote(calls)+` ;;
+esac
+exec `+quote(underlyingGH)+` "$@"
+`)
+	commonDirectory, err := gitCommonDirectory(context.Background(), fixture.git, fixture.repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := resetExecutor{
+		store: fixture.store, github: ghadapter.Client{Executable: fixture.gh, Dir: fixture.repository}, issue: 42,
+		repositoryRoot: fixture.repository, commonDirectory: commonDirectory, stateDirectory: fixture.stateDir, gitExecutable: fixture.git,
+	}
+	approved, err := executor.inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- executor.apply(ctx, approved) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			cancel()
+			t.Fatal(err)
+		}
+		select {
+		case err := <-done:
+			cancel()
+			t.Fatalf("Reset returned before cancellation: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("GitHub mutation did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Reset cancellation error = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Reset did not stop after cancellation")
+	}
+
+	callData, err := os.ReadFile(calls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(callData) != "remove\n" {
+		t.Fatalf("GitHub actions after cancellation = %q, want only blocked removal", callData)
+	}
+	if labels := strings.Join(fixture.labels(t), ","); labels != "in-progress,spec" {
+		t.Fatalf("labels after cancellation = %q", labels)
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.Runs) != 1 || current.Runs[0].RunID != "run-42" || current.Runs[0].Status != scheduler.StatusResetting ||
+		len(current.Leases) != 1 || current.Leases[0].LeaseID != "lease-42" || current.Leases[0].RunID != "run-42" {
+		t.Fatalf("canceled Reset released ownership: %#v", current)
+	}
+}
+
+func TestResetUsesRevalidatedRepositoryForLabelMutation(t *testing.T) {
+	fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "ready-for-agent", "spec"})
+	commonDirectory, err := gitCommonDirectory(context.Background(), fixture.git, fixture.repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &repositoryRaceResetStore{resetStateStore: fixture.store, raceAt: 7}
+	executor := resetExecutor{
+		store: store, github: ghadapter.Client{Executable: fixture.gh, Dir: fixture.repository}, issue: 42,
+		repositoryRoot: fixture.repository, commonDirectory: commonDirectory, stateDirectory: fixture.stateDir, gitExecutable: fixture.git,
+	}
+	approved, err := executor.inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.apply(context.Background(), approved); err == nil || !strings.Contains(err.Error(), "Run state belongs to \"other/widgets\"") {
+		t.Fatalf("repository race error = %v", err)
+	}
+	if labels := strings.Join(fixture.labels(t), ","); labels != "ready-for-agent,spec" {
+		t.Fatalf("verified repository label mutation did not occur: %q", labels)
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusResetting || len(current.Leases) != 1 {
+		t.Fatalf("repository race released ownership: %#v", current)
+	}
+}
+
 func TestResetFinalizationRejectsHistoricalMetadataChanges(t *testing.T) {
 	t.Parallel()
 	verifiedAt := time.Now().UTC()
@@ -2332,6 +2485,70 @@ esac
 	}
 }
 
+func newTwoPullRequestResetFixture(t *testing.T) githubArtifactResetFixture {
+	t.Helper()
+	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusFailed, false, false, false)
+	head := strings.TrimSpace(gitOutput(t, fixture.repository, "rev-parse", "origin/"+fixture.branch))
+	encoded := fmt.Sprintf(`{"pulls":[{"number":99,"state":"OPEN","auto":true,"comments":[]},{"number":100,"state":"OPEN","auto":false,"comments":[]}],"head":%q,"labels":["ready-for-agent"],"failClose":100}`, head)
+	if err := os.WriteFile(fixture.githubState, []byte(encoded), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixture.gh = writeExecutable(t, `#!/bin/sh
+set -eu
+state=`+quote(fixture.githubState)+`
+calls=`+quote(fixture.githubCalls)+`
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef")
+    printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    labels=$(jq -c '[.labels[] | {name:.}]' "$state")
+    printf '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":%s}\n' "$labels" ;;
+  "pr list --repo acme/widgets --state all --head `+fixture.branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    jq -c --arg branch `+quote(fixture.branch)+` --arg head "$(jq -r .head "$state")" '[.pulls[] | {number:.number,url:("https://github.com/acme/widgets/pull/" + (.number|tostring)),state:.state,mergedAt:null,autoMergeRequest:(if .auto then {mergeMethod:"SQUASH"} else null end),isDraft:false,headRefName:$branch,headRefOid:$head,headRepositoryOwner:{login:"acme"},headRepository:{nameWithOwner:"acme/widgets"}}]' "$state" ;;
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/99/comments?per_page=100 --paginate --slurp")
+    jq -c '[.pulls[] | select(.number == 99) | .comments | map({body:.})]' "$state" ;;
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/100/comments?per_page=100 --paginate --slurp")
+    jq -c '[.pulls[] | select(.number == 100) | .comments | map({body:.})]' "$state" ;;
+  "pr merge 99 --repo acme/widgets --disable-auto")
+    printf '%s\n' 'disable 99' >> "$calls"
+    temporary="$state.tmp"
+    jq '(.pulls[] | select(.number == 99) | .auto) = false' "$state" > "$temporary"
+    mv "$temporary" "$state" ;;
+  pr\ comment\ 99\ --repo\ acme/widgets\ --body\ *)
+    printf '%s\n' 'comment 99' >> "$calls"
+    body=''; for value in "$@"; do body=$value; done
+    temporary="$state.tmp"
+    jq --arg body "$body" '(.pulls[] | select(.number == 99) | .comments) += [$body]' "$state" > "$temporary"
+    mv "$temporary" "$state" ;;
+  pr\ comment\ 100\ --repo\ acme/widgets\ --body\ *)
+    printf '%s\n' 'comment 100' >> "$calls"
+    body=''; for value in "$@"; do body=$value; done
+    temporary="$state.tmp"
+    jq --arg body "$body" '(.pulls[] | select(.number == 100) | .comments) += [$body]' "$state" > "$temporary"
+    mv "$temporary" "$state" ;;
+  "pr close 99 --repo acme/widgets")
+    printf '%s\n' 'close 99' >> "$calls"
+    temporary="$state.tmp"
+    jq '(.pulls[] | select(.number == 99) | .state) = "CLOSED"' "$state" > "$temporary"
+    mv "$temporary" "$state" ;;
+  "pr close 100 --repo acme/widgets")
+    printf '%s\n' 'close 100' >> "$calls"
+    if [ "$(jq -r .failClose "$state")" = 100 ]; then
+      temporary="$state.tmp"
+      jq '.failClose=0' "$state" > "$temporary"
+      mv "$temporary" "$state"
+      echo 'temporary pull request #100 close failure' >&2
+      exit 1
+    fi
+    temporary="$state.tmp"
+    jq '(.pulls[] | select(.number == 100) | .state) = "CLOSED"' "$state" > "$temporary"
+    mv "$temporary" "$state" ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	return fixture
+}
+
 func (f githubArtifactResetFixture) githubStateValue(t *testing.T) struct {
 	PR       string   `json:"pr"`
 	Merged   bool     `json:"merged"`
@@ -2421,6 +2638,81 @@ func TestResetRerunsOnlyRemainingGitHubArtifactActionsAfterPartialFailure(t *tes
 	}
 	if got := string(calls); strings.Count(got, "disable\n") != 1 || strings.Count(got, "comment\n") != 1 || strings.Count(got, "close\n") != 2 {
 		t.Fatalf("GitHub calls = %q", got)
+	}
+}
+
+func TestResetExecutesTwoPullRequestsInOrderAndRerunsFromPartialProgress(t *testing.T) {
+	fixture := newTwoPullRequestResetFixture(t)
+
+	var stdout, stderr bytes.Buffer
+	if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit == 0 || !strings.Contains(stderr.String(), "temporary pull request #100 close failure") {
+		t.Fatalf("first exit = %d, stderr = %q", exit, stderr.String())
+	}
+	partial, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if partial.Runs[0].Status != scheduler.StatusResetting || len(partial.Leases) != 1 {
+		t.Fatalf("partial failure released ownership: %#v", partial)
+	}
+	var github struct {
+		Pulls []struct {
+			Number   int      `json:"number"`
+			State    string   `json:"state"`
+			Auto     bool     `json:"auto"`
+			Comments []string `json:"comments"`
+		} `json:"pulls"`
+	}
+	data, err := os.ReadFile(fixture.githubState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &github); err != nil {
+		t.Fatal(err)
+	}
+	if len(github.Pulls) != 2 || github.Pulls[0].Number != 99 || github.Pulls[0].State != "CLOSED" || github.Pulls[0].Auto || len(github.Pulls[0].Comments) != 1 ||
+		github.Pulls[1].Number != 100 || github.Pulls[1].State != "OPEN" || github.Pulls[1].Auto || len(github.Pulls[1].Comments) != 1 {
+		t.Fatalf("partial GitHub state = %#v", github.Pulls)
+	}
+	calls, err := os.ReadFile(fixture.githubCalls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const firstCalls = "disable 99\ncomment 99\nclose 99\ncomment 100\nclose 100\n"
+	if string(calls) != firstCalls {
+		t.Fatalf("first GitHub calls = %q, want %q", calls, firstCalls)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if exit := Main(context.Background(), fixture.args("reset", "--yes"), &stdout, &stderr); exit != 0 {
+		t.Fatalf("rerun exit = %d, stderr = %q", exit, stderr.String())
+	}
+	for _, completed := range []string{
+		"disable auto-merge for pull request #99", "explain Reset on pull request #99",
+		"close unmerged pull request #99", "explain Reset on pull request #100",
+	} {
+		if strings.Contains(stdout.String(), completed) {
+			t.Fatalf("rerun planned completed action %q: %q", completed, stdout.String())
+		}
+	}
+	if !strings.Contains(stdout.String(), "close unmerged pull request #100") {
+		t.Fatalf("rerun omitted remaining pull request action: %q", stdout.String())
+	}
+	final, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Runs[0].Status != scheduler.StatusReset || len(final.Leases) != 0 {
+		t.Fatalf("rerun final state = %#v", final)
+	}
+	calls, err = os.ReadFile(fixture.githubCalls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const allCalls = firstCalls + "close 100\n"
+	if string(calls) != allCalls {
+		t.Fatalf("all GitHub calls = %q, want %q", calls, allCalls)
 	}
 }
 
@@ -2640,8 +2932,22 @@ func TestResetWaitingForMergeDisablesAutoMergeBeforeResetting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(calls), "disable\ncomment\nclose\n") {
-		t.Fatalf("GitHub action order = %q", calls)
+	var rendered bytes.Buffer
+	retirement.WritePlan(&rendered, approved)
+	var displayedGitHubOrder []string
+	for _, line := range strings.Split(rendered.String(), "\n") {
+		switch {
+		case strings.Contains(line, "disable auto-merge for pull request"):
+			displayedGitHubOrder = append(displayedGitHubOrder, "disable")
+		case strings.Contains(line, "explain Reset on pull request"):
+			displayedGitHubOrder = append(displayedGitHubOrder, "comment")
+		case strings.Contains(line, "close unmerged pull request"):
+			displayedGitHubOrder = append(displayedGitHubOrder, "close")
+		}
+	}
+	wantCalls := strings.Join(displayedGitHubOrder, "\n") + "\n"
+	if string(calls) != wantCalls {
+		t.Fatalf("executed GitHub action order = %q, displayed order = %q", calls, wantCalls)
 	}
 }
 
@@ -2728,28 +3034,6 @@ func TestResetAcceptsAlreadyClosedPullRequestAndAbsentOwnedRemoteBranch(t *testi
 	}
 }
 
-func TestDeleteRemoteBranchUsesExpectedCommitLease(t *testing.T) {
-	t.Parallel()
-	calls := filepath.Join(t.TempDir(), "calls")
-	git := writeExecutable(t, "#!/bin/sh\nprintf '%s\\n' \"$*\" > "+quote(calls)+"\n")
-	branch := reset.Branch{Name: "agent/issue-42-run", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Present: true}
-	if err := deleteRemoteBranch(context.Background(), git, t.TempDir(), branch); err != nil {
-		t.Fatal(err)
-	}
-	call, err := os.ReadFile(calls)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(call), "--force-with-lease=refs/heads/agent/issue-42-run:"+branch.Commit+" :refs/heads/agent/issue-42-run") {
-		t.Fatalf("git call = %q", call)
-	}
-
-	failingGit := writeExecutable(t, "#!/bin/sh\necho stale lease >&2\nexit 1\n")
-	if err := deleteRemoteBranch(context.Background(), failingGit, t.TempDir(), branch); err == nil || !strings.Contains(err.Error(), "expected commit") || !strings.Contains(err.Error(), "stale lease") {
-		t.Fatalf("conditional deletion error = %v", err)
-	}
-}
-
 func TestResetAbortsBranchCommitRaceWithLeaseRetained(t *testing.T) {
 	t.Parallel()
 	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusFailed, false, false, true)
@@ -2784,6 +3068,37 @@ func (w *failOnTextWriter) Write(data []byte) (int, error) {
 		return 0, errors.New("injected output failure")
 	}
 	return len(data), nil
+}
+
+type repositoryRaceResetStore struct {
+	resetStateStore
+	previews int
+	raceAt   int
+}
+
+func (s *repositoryRaceResetStore) Preview() (state.State, bool, error) {
+	current, exists, err := s.resetStateStore.Preview()
+	s.previews++
+	if err == nil && s.previews == s.raceAt {
+		current.Repo = "other/widgets"
+	}
+	return current, exists, err
+}
+
+type failingResetStore struct {
+	resetStateStore
+	failStatus scheduler.Status
+	failure    error
+	attempts   []scheduler.Status
+}
+
+func (s *failingResetStore) Save(current state.State) error {
+	status := current.Runs[0].Status
+	s.attempts = append(s.attempts, status)
+	if status == s.failStatus {
+		return s.failure
+	}
+	return s.resetStateStore.Save(current)
 }
 
 type recordingResetStore struct {
