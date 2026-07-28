@@ -287,9 +287,15 @@ esac
 		t.Fatal("automatic Bubble Tea input did not complete Drain")
 	}
 	output := stdout.String()
-	for _, want := range []string{"Drain complete", "\x1b[?1049h", "\x1b[?1049l"} {
+	for _, want := range []string{"\x1b[?1049h", "\x1b[?1049l"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("raw Ctrl-C dashboard output missing %q: %q", want, output)
+		}
+	}
+	visible := terminalScreenText(output, 80, 24)
+	for _, want := range []string{"Runner stage: Drain complete", "Next Ctrl-C: no effect"} {
+		if !strings.Contains(visible, want) {
+			t.Fatalf("raw Ctrl-C dashboard screen missing %q:\n%s\nraw output: %q", want, visible, output)
 		}
 	}
 }
