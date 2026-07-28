@@ -65,10 +65,6 @@ func resolveCommandWithInput(ctx context.Context, args []string, stdin io.Reader
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected resolve arguments: %s", strings.Join(flags.Args(), " "))
 	}
-	if !*dryRun && !*yes && !interactive {
-		return errors.New("non-interactive External Resolution requires --yes")
-	}
-
 	absoluteRepo, err := filepath.Abs(*repoDir)
 	if err != nil {
 		return err
@@ -83,9 +79,12 @@ func resolveCommandWithInput(ctx context.Context, args []string, stdin io.Reader
 	}
 	lock, err := acquireResetReadLock(commonDirectory)
 	if err != nil {
-		return fmt.Errorf("External Resolution refused while Runner owns repository coordination: %w", err)
+		return fmt.Errorf("External Resolution refused while Runner owns repository coordination; the supervising Runner will reconcile the closed issue automatically: %w", err)
 	}
 	defer func() { _ = lock.Release() }()
+	if !*dryRun && !*yes && !interactive {
+		return errors.New("non-interactive External Resolution requires --yes")
+	}
 
 	resolvedState, err := repositoryStateDirectory(commonDirectory, repositoryRoot, *stateDir)
 	if err != nil {

@@ -11,10 +11,10 @@ Backlog will recognize External Resolution when GitHub verifies that an issue is
 The consequences below describe the accepted end-state architecture. Delivery is staged:
 
 - The explicit `backlog resolve` command provides complete owned-artifact retirement.
-- Issue #83 adds automatic reconciliation at Runner startup and during watch reconciliation.
+- Runner startup and watch reconciliation automatically use that complete retirement behavior.
 - Issue #84 adds automatic reconciliation after Worker settlement.
 
-Complete explicit artifact retirement is current behavior. Until those later slices land, the consequences below about automatic Runner reconciliation remain architectural decisions rather than descriptions of currently available behavior.
+Complete explicit retirement and automatic startup and watch reconciliation are current behavior. The consequence below about reconciliation immediately after Worker settlement remains an architectural decision until issue #84 lands.
 
 ## Consequences
 

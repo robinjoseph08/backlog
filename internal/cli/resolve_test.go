@@ -400,13 +400,100 @@ func TestResolveRequiresYesNonInteractivelyAndCompiledExecutableRefusesRunnerLoc
 		t.Fatal(err)
 	}
 	defer lock.Release()
-	command := exec.Command(binary, append([]string{"resolve"}, fixture.args("42", "--yes")...)...)
-	output, err := command.CombinedOutput()
-	if err == nil || !strings.Contains(string(output), "Runner owns repository coordination") {
-		t.Fatalf("compiled lock error = %v\n%s", err, output)
+	for _, mode := range []struct {
+		name string
+		args []string
+	}{
+		{name: "confirmed", args: fixture.args("42", "--yes")},
+		{name: "dry-run", args: fixture.args("42", "--dry-run")},
+		{name: "interactive", args: fixture.args("42")},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			command := exec.Command(binary, append([]string{"resolve"}, mode.args...)...)
+			output, commandErr := command.CombinedOutput()
+			if commandErr == nil || !strings.Contains(string(output), "Runner owns repository coordination") || !strings.Contains(string(output), "supervising Runner will reconcile the closed issue automatically") {
+				t.Fatalf("compiled lock error = %v\n%s", commandErr, output)
+			}
+		})
 	}
 	if fileDigest(t, fixture.store.Path) != beforeState || fileDigest(t, fixture.githubState) != beforeGitHub {
 		t.Fatal("compiled lock refusal changed state")
+	}
+}
+
+func TestCompiledRunWatchUsesCompleteExternalResolutionDuringPolling(t *testing.T) {
+	fixture := newResolveFixture(t, []string{"in-progress", "ready-for-agent", "spec"}, "COMPLETED")
+	fixtureState, err := os.ReadFile(fixture.githubState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var githubState map[string]any
+	if err := json.Unmarshal(fixtureState, &githubState); err != nil {
+		t.Fatal(err)
+	}
+	githubState["state"] = "OPEN"
+	updatedState, err := json.Marshal(githubState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fixture.githubState, updatedState, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	polled := filepath.Join(t.TempDir(), "candidate-polled")
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
+    touch `+quote(polled)+`; printf '%s\n' '[]' ;;
+  *) exec `+quote(fixture.gh)+` "$@" ;;
+esac
+`)
+	binary := buildExecutable(t, t.TempDir())
+	pi := writeExecutable(t, "#!/bin/sh\necho 'no Worker should be admitted' >&2\nexit 9\n")
+	command := exec.Command(binary, "run", "--watch", "--plain", "--repo-dir", fixture.repository, "--state-dir", fixture.stateDir,
+		"--max-workers", "1", "--poll", "10ms", "--git", fixture.git, "--gh", gh, "--pi", pi)
+	var output bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = &output
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitForFile(t, polled)
+	githubState["state"] = "CLOSED"
+	updatedState, err = json.Marshal(githubState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fixture.githubState, updatedState, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		current, loadErr := fixture.store.Load()
+		if loadErr == nil && len(current.Leases) == 0 && current.Runs[1].Status == scheduler.StatusResolvedExternally {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	current, err := fixture.store.Load()
+	if err != nil || len(current.Leases) != 0 || current.Runs[1].Status != scheduler.StatusResolvedExternally {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatalf("compiled watch did not complete External Resolution: state=%#v err=%v output=%s", current, err, output.String())
+	}
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err != nil {
+		t.Fatalf("compiled watch Drain after External Resolution: %v\n%s", err, output.String())
+	}
+	labelsData, err := os.ReadFile(fixture.githubState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(labelsData), "in-progress") || strings.Contains(string(labelsData), "ready-for-agent") || !strings.Contains(string(labelsData), "spec") {
+		t.Fatalf("compiled watch managed labels = %s", labelsData)
 	}
 }
 

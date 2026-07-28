@@ -70,6 +70,12 @@ type Workers interface {
 	Release(runID string) error
 }
 
+// ExternalResolutionReconciler performs the complete non-interactive
+// External Resolution lifecycle for a Run when its issue is closed.
+type ExternalResolutionReconciler interface {
+	Reconcile(context.Context, scheduler.Run) (attempted bool, err error)
+}
+
 type candidateRetryTimer interface {
 	channel() <-chan time.Time
 	reset(time.Duration)
@@ -89,13 +95,14 @@ func (t *systemCandidateRetryTimer) reset(delay time.Duration) { t.timer.Reset(d
 func (t *systemCandidateRetryTimer) stop()                     { t.timer.Stop() }
 
 type Runner struct {
-	Config    Config
-	GitHub    GitHub
-	Store     Store
-	Worktrees Worktrees
-	Workers   Workers
-	Output    io.Writer
-	Signals   <-chan os.Signal
+	Config             Config
+	GitHub             GitHub
+	Store              Store
+	Worktrees          Worktrees
+	Workers            Workers
+	ExternalResolution ExternalResolutionReconciler
+	Output             io.Writer
+	Signals            <-chan os.Signal
 
 	// OnOperationalEvent receives typed Admission, Run, and shutdown lifecycle
 	// events. Delivery is asynchronous, ordered, and isolated from callback panics so
@@ -272,6 +279,13 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	if err := r.initializeState(&current); err != nil {
 		return err
+	}
+	// Automatic External Resolution inspects through the shared retirement
+	// store, so publish Runner initialization before that independent inspection.
+	if r.ExternalResolution != nil {
+		if err := r.Store.Save(current); err != nil {
+			return fmt.Errorf("persist runner state before automatic External Resolution: %w", err)
+		}
 	}
 	if admission.stopped() {
 		event := <-signalEvents
@@ -1355,6 +1369,9 @@ func (r *Runner) handleWorkerCompletion(ctx context.Context, current *state.Stat
 }
 
 func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[int]WorkerProcess) error {
+	if err := r.reconcileExternalResolutions(ctx, current, owned); err != nil {
+		return err
+	}
 	changed := false
 	for _, historical := range append([]scheduler.Run(nil), current.Runs...) {
 		if !historical.CleanupPending {
@@ -1513,6 +1530,54 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 		if err := r.Store.Save(*current); err != nil {
 			return fmt.Errorf("persist reconciled state: %w", err)
 		}
+	}
+	return nil
+}
+
+func (r *Runner) reconcileExternalResolutions(ctx context.Context, current *state.State, owned map[int]WorkerProcess) error {
+	if r.ExternalResolution == nil {
+		return nil
+	}
+	for _, lease := range append([]scheduler.Lease(nil), current.Leases...) {
+		run := findRun(current.Runs, lease.RunID)
+		if run.RunID == "" || run.Issue != lease.Issue {
+			return fmt.Errorf("active Lease %q has an invalid Run reference", lease.LeaseID)
+		}
+		if _, isOwned := owned[run.Issue]; isOwned || run.Status == scheduler.StatusMerged || run.Status == scheduler.StatusReset || run.Status == scheduler.StatusResolvedExternally {
+			continue
+		}
+
+		attempted, resolutionErr := r.ExternalResolution.Reconcile(ctx, run)
+		if resolutionErr != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !attempted {
+			continue
+		}
+
+		persisted, err := r.Store.Load()
+		if err != nil {
+			return fmt.Errorf("reload state after automatic External Resolution for Run %s: %w", run.RunID, err)
+		}
+		*current = persisted
+		if resolutionErr == nil {
+			continue
+		}
+
+		updated := findRun(current.Runs, run.RunID)
+		if updated.RunID == "" || findActiveRun(current, run.Issue).RunID != run.RunID {
+			return fmt.Errorf("automatic External Resolution for Run %s failed after its Lease changed: %w", run.RunID, resolutionErr)
+		}
+		if scheduler.IsActive(updated.Status) {
+			transitionStatus(&updated, scheduler.StatusNeedsHuman)
+		}
+		updated.Error = fmt.Sprintf("automatic External Resolution refused: %v", resolutionErr)
+		updated.UpdatedAt = r.Now().UTC()
+		replaceRun(current, updated)
+		if err := r.Store.Save(*current); err != nil {
+			return fmt.Errorf("persist automatic External Resolution diagnostic for Run %s: %w", run.RunID, err)
+		}
+		r.runLifecycleEvent(RunLifecycleNeedsHuman, "automatic External Resolution for issue #%d requires attention: %v", run.Issue, resolutionErr)
 	}
 	return nil
 }
