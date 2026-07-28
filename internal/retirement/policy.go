@@ -43,8 +43,19 @@ func (p Policy) validate() error {
 	if p.ProgressStatus == p.TerminalStatus {
 		return fmt.Errorf("owned Run retirement policy must have distinct progress and terminal states")
 	}
+	if p.ProgressStatus == scheduler.StatusWaitingForMerge {
+		return fmt.Errorf("owned Run retirement policy cannot use waiting-for-merge as its progress state")
+	}
 	if !p.CanTransition(p.ProgressStatus, p.TerminalStatus) {
 		return fmt.Errorf("owned Run retirement policy cannot transition from progress state %s to terminal state %s", p.ProgressStatus, p.TerminalStatus)
+	}
+	for _, status := range p.EligibleStatuses {
+		if status == p.ProgressStatus || status == p.TerminalStatus {
+			continue
+		}
+		if !p.CanTransition(status, p.ProgressStatus) {
+			return fmt.Errorf("owned Run retirement policy cannot transition from eligible state %s to progress state %s", status, p.ProgressStatus)
+		}
 	}
 	if len(p.Labels.Add) == 0 && len(p.Labels.Remove) == 0 {
 		return fmt.Errorf("owned Run retirement policy has no label outcome")

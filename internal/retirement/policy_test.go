@@ -325,9 +325,18 @@ func TestPolicyValidationRefusesEveryIncompletePolicyShape(t *testing.T) {
 		{name: "transition policy", mutate: func(policy *Policy) { policy.CanTransition = nil }, want: "policy is incomplete"},
 		{name: "lifecycle states", mutate: func(policy *Policy) { policy.ProgressStatus = "" }, want: "incomplete lifecycle states"},
 		{name: "equal lifecycle states", mutate: func(policy *Policy) { policy.TerminalStatus = policy.ProgressStatus }, want: "distinct progress and terminal states"},
+		{name: "waiting for merge progress", mutate: func(policy *Policy) {
+			policy.EligibleStatuses = append(policy.EligibleStatuses, scheduler.StatusWaitingForMerge)
+			policy.ProgressStatus = scheduler.StatusWaitingForMerge
+		}, want: "cannot use waiting-for-merge as its progress state"},
 		{name: "progress cannot become terminal", mutate: func(policy *Policy) {
 			policy.CanTransition = func(scheduler.Status, scheduler.Status) bool { return false }
 		}, want: "cannot transition from progress state resetting to terminal state reset"},
+		{name: "eligible state cannot enter progress", mutate: func(policy *Policy) {
+			policy.CanTransition = func(from, to scheduler.Status) bool {
+				return from == policy.ProgressStatus && to == policy.TerminalStatus
+			}
+		}, want: "cannot transition from eligible state failed to progress state resetting"},
 		{name: "label outcome", mutate: func(policy *Policy) { policy.Labels = LabelOutcome{} }, want: "no label outcome"},
 		{name: "empty add label", mutate: func(policy *Policy) { policy.Labels.Add = append(policy.Labels.Add, " ") }, want: "empty label to add"},
 		{name: "empty remove label", mutate: func(policy *Policy) { policy.Labels.Remove = append(policy.Labels.Remove, "") }, want: "empty label to remove"},
@@ -351,20 +360,53 @@ func TestPolicyValidationRefusesEveryIncompletePolicyShape(t *testing.T) {
 	}
 }
 
-func TestNewRefusesPolicyWithoutProgressToTerminalTransition(t *testing.T) {
-	store := &policyStateStore{}
-	policy := testPolicy()
-	policy.CanTransition = func(scheduler.Status, scheduler.Status) bool { return false }
-
-	module, err := New(Config{
-		Store: store, RepositoryRoot: "repository", CommonDirectory: "common",
-		StateDirectory: "state", GitExecutable: "git",
-	}, policy)
-	if module != nil || err == nil || !strings.Contains(err.Error(), "cannot transition from progress state resetting to terminal state reset") {
-		t.Fatalf("constructed module, error = %v, %v", module, err)
+func TestNewRefusesInvalidLifecycleTransitionsBeforeMutation(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Policy)
+		want   string
+	}{
+		{name: "waiting for merge progress", mutate: func(policy *Policy) {
+			policy.EligibleStatuses = append(policy.EligibleStatuses, scheduler.StatusWaitingForMerge)
+			policy.ProgressStatus = scheduler.StatusWaitingForMerge
+		}, want: "cannot use waiting-for-merge as its progress state"},
+		{name: "progress cannot become terminal", mutate: func(policy *Policy) {
+			policy.CanTransition = func(scheduler.Status, scheduler.Status) bool { return false }
+		}, want: "cannot transition from progress state resetting to terminal state reset"},
+		{name: "eligible state cannot enter progress", mutate: func(policy *Policy) {
+			policy.CanTransition = func(from, to scheduler.Status) bool {
+				return from == policy.ProgressStatus && to == policy.TerminalStatus
+			}
+		}, want: "cannot transition from eligible state failed to progress state resetting"},
 	}
-	if store.saves != 0 {
-		t.Fatalf("state mutations during refused construction = %d, want 0", store.saves)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &policyStateStore{}
+			policy := testPolicy()
+			test.mutate(&policy)
+
+			module, err := New(Config{
+				Store: store, RepositoryRoot: "repository", CommonDirectory: "common",
+				StateDirectory: "state", GitExecutable: "git",
+			}, policy)
+			if module != nil || err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("constructed module, error = %v, %v; want %q", module, err, test.want)
+			}
+			if store.saves != 0 {
+				t.Fatalf("state mutations during refused construction = %d, want 0", store.saves)
+			}
+		})
+	}
+}
+
+func TestBuildRefusesWaitingForMergeProgressBeforePlanning(t *testing.T) {
+	policy := testPolicy()
+	policy.EligibleStatuses = append(policy.EligibleStatuses, scheduler.StatusWaitingForMerge)
+	policy.ProgressStatus = scheduler.StatusWaitingForMerge
+
+	_, err := Build(policy, Snapshot{Run: scheduler.Run{Status: scheduler.StatusWaitingForMerge}})
+	if err == nil || !strings.Contains(err.Error(), "cannot use waiting-for-merge as its progress state") {
+		t.Fatalf("planning error = %v", err)
 	}
 }
 
