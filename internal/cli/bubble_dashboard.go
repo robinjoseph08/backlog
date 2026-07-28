@@ -467,9 +467,14 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshViewport(m.currentSelection())
 	}
 
+	previousOffset := m.viewport.YOffset()
 	if m.navigateViewport(msg) {
 		if !dashboardAttentionJump(msg) {
-			m.selectViewportAnchor()
+			if m.selectKeyboardNavigationAnchor(msg, previousOffset) {
+				m.refreshViewport(m.currentSelection())
+			} else {
+				m.selectViewportAnchor()
+			}
 		}
 		if m.clearVisibleAttention() {
 			m.refreshViewport(m.currentSelection())
@@ -635,6 +640,57 @@ func (m *bubbleDashboardModel) selectViewportAnchor() {
 		selected = anchor.identity
 	}
 	m.selectedAnchor = selected
+}
+
+func (m *bubbleDashboardModel) selectKeyboardNavigationAnchor(msg tea.Msg, previousOffset int) bool {
+	key, ok := msg.(tea.KeyPressMsg)
+	if !ok || len(m.layout.anchors) == 0 {
+		return false
+	}
+
+	current := -1
+	for index, anchor := range m.layout.anchors {
+		if anchor.identity == m.selectedAnchor {
+			current = index
+			break
+		}
+	}
+
+	var target int
+	switch key.String() {
+	case "home", "g":
+		target = 0
+	case "end", "G":
+		target = len(m.layout.anchors) - 1
+	case "down", "j":
+		if m.viewport.YOffset() != previousOffset {
+			return false
+		}
+		target = min(len(m.layout.anchors)-1, current+1)
+	case "up", "k":
+		if m.viewport.YOffset() != previousOffset {
+			return false
+		}
+		if current < 0 {
+			target = 0
+		} else {
+			target = max(0, current-1)
+		}
+	case "pgdown", "f":
+		if m.viewport.YOffset() != previousOffset {
+			return false
+		}
+		target = len(m.layout.anchors) - 1
+	case "pgup", "b":
+		if m.viewport.YOffset() != previousOffset {
+			return false
+		}
+		target = 0
+	default:
+		return false
+	}
+	m.selectedAnchor = m.layout.anchors[target].identity
+	return true
 }
 
 func (m *bubbleDashboardModel) navigateViewport(msg tea.Msg) bool {

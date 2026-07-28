@@ -204,6 +204,45 @@ func TestBubbleDashboardViewportSupportsDocumentedKeyboardNavigation(t *testing.
 	}
 }
 
+func TestBubbleDashboardKeyboardNavigationSelectsCollapsedSectionWhenContentFits(t *testing.T) {
+	now := time.Date(2026, 7, 28, 14, 0, 0, 0, time.UTC)
+	completedAt := now.Add(-time.Minute)
+	active := scheduler.Run{Issue: 69, IssueTitle: "Active Run", RunID: "active", Status: scheduler.StatusClaimed, StartedAt: now.Add(-time.Hour)}
+	completion := scheduler.Run{Issue: 68, IssueTitle: "Reachable Completion", RunID: "completion", Status: scheduler.StatusMerged, StartedAt: now.Add(-2 * time.Hour), CompletedAt: &completedAt}
+	current := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1,
+		Runs:   []scheduler.Run{active, completion},
+		Leases: []scheduler.Lease{{LeaseID: active.RunID, Issue: active.Issue, RunID: active.RunID}},
+	}
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 23})
+	updated, _ := model.Update(dashboardConfiguredMsg{initial: current, source: &dashboardTestSource{current: current}})
+	model = updated.(bubbleDashboardModel)
+	if model.viewport.YOffset() != 0 || !model.viewport.AtBottom() {
+		t.Fatalf("test dashboard content did not fit at offset zero: offset=%d bottom=%t", model.viewport.YOffset(), model.viewport.AtBottom())
+	}
+
+	updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
+	model = updated.(bubbleDashboardModel)
+	if want := dashboardSectionAnchor("Attention Required"); model.selectedAnchor != want {
+		t.Fatalf("Down selected %q, want next anchor %q", model.selectedAnchor, want)
+	}
+	if model.viewport.YOffset() != 0 {
+		t.Fatalf("Down scrolled fitting content to offset %d", model.viewport.YOffset())
+	}
+
+	updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnd}))
+	model = updated.(bubbleDashboardModel)
+	section := dashboardSectionAnchor("Recent Completions")
+	if model.selectedAnchor != section {
+		t.Fatalf("End selected %q, want collapsed section %q", model.selectedAnchor, section)
+	}
+	updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	model = updated.(bubbleDashboardModel)
+	if !model.expansionOverrides[section] || !strings.Contains(model.viewport.GetContent(), completion.IssueTitle) {
+		t.Fatalf("Enter did not expand keyboard-selected Recent Completions:\n%s", model.viewport.GetContent())
+	}
+}
+
 func TestBubbleDashboardMouseWheelScrollsWithoutClickHandling(t *testing.T) {
 	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: time.Now}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 60, Height: 12})
 	for index := range 30 {
