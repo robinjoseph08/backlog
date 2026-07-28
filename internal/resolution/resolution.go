@@ -25,16 +25,17 @@ func Policy(selector string) retirement.Policy {
 			scheduler.StatusNeedsHuman, scheduler.StatusResetting,
 			scheduler.StatusResolvingExternally, scheduler.StatusResolvedExternally,
 		},
-		CanTransition:         canTransition,
-		Explanation:           Explanation,
-		ExplanationAction:     "explain External Resolution",
-		Labels:                retirement.LabelOutcome{Remove: []string{"in-progress", "ready-for-agent"}},
-		ProgressStatus:        scheduler.StatusResolvingExternally,
-		TerminalStatus:        scheduler.StatusResolvedExternally,
-		RecordMissingLogWarn:  true,
-		RequireClosureReason:  true,
-		AllowMergedCompletion: true,
-		VerifyHistoricalOnly:  true,
+		CanTransition:              canTransition,
+		Explanation:                Explanation,
+		ExplanationAction:          "explain External Resolution",
+		Labels:                     retirement.LabelOutcome{Remove: []string{"in-progress", "ready-for-agent"}},
+		ProgressStatus:             scheduler.StatusResolvingExternally,
+		TerminalStatus:             scheduler.StatusResolvedExternally,
+		RecordMissingLogWarn:       true,
+		RequireClosureReason:       true,
+		AllowMergedCompletion:      true,
+		VerifyHistoricalOnly:       true,
+		MarkProgressBeforeMutation: true,
 		FinalizeMetadata: func(run *scheduler.Run, snapshot retirement.Snapshot, now time.Time) {
 			run.ResolvedExternallyAt = &now
 			run.ClosureReason = snapshot.Issue.ClosureReason
@@ -66,23 +67,6 @@ func validateSnapshot(snapshot retirement.Snapshot) error {
 	}
 	if snapshot.Issue.ClosureReason != "completed" && snapshot.Issue.ClosureReason != "not-planned" {
 		return fmt.Errorf("issue #%d has unsupported or unavailable GitHub closure reason %q", snapshot.Issue.Number, snapshot.Issue.ClosureReason)
-	}
-	for _, pull := range snapshot.PullRequests {
-		if pull.State != retirement.PullRequestMerged {
-			return fmt.Errorf("External Resolution currently requires owned artifacts to be absent; pull request #%d remains %s", pull.Number, pull.State)
-		}
-	}
-	if snapshot.RemoteBranch.Present {
-		return fmt.Errorf("External Resolution currently requires owned artifacts to be absent; remote branch %s remains", snapshot.RemoteBranch.Name)
-	}
-	if snapshot.Worktree.Present {
-		return fmt.Errorf("External Resolution currently requires owned artifacts to be absent; worktree %s remains", snapshot.Worktree.Path)
-	}
-	if snapshot.LocalBranch.Present {
-		return fmt.Errorf("External Resolution currently requires owned artifacts to be absent; local branch %s remains", snapshot.LocalBranch.Name)
-	}
-	if snapshot.Session.Present {
-		return fmt.Errorf("External Resolution currently requires owned artifacts to be absent; active Pi session %s remains", snapshot.Session.ID)
 	}
 	return nil
 }

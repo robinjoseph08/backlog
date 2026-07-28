@@ -104,52 +104,111 @@ func TestPolicyRefusesOpenAndUnsupportedClosureState(t *testing.T) {
 	}
 }
 
-func TestPolicyRefusesArtifactRichRunsWithoutPlanningDestructiveActions(t *testing.T) {
-	base := retirement.Snapshot{
-		Run:   scheduler.Run{Issue: 42, RunID: "run", Status: scheduler.StatusFailed, Branch: "agent/run", Worktree: "/state/worktrees/run", WorkerMode: scheduler.WorkerModePrint},
+func TestPolicyPlansCompleteOwnedArtifactRetirementInSafeOrder(t *testing.T) {
+	commit := strings.Repeat("a", 40)
+	snapshot := retirement.Snapshot{
+		Run: scheduler.Run{
+			Issue: 42, RunID: "run", Status: scheduler.StatusFailed,
+			Branch: "agent/run", Worktree: "/state/worktrees/run", WorkerMode: scheduler.WorkerModeRPC,
+			SessionID: "backlog-run", SessionDir: "/state/sessions/run",
+		},
+		Lease: scheduler.Lease{LeaseID: "lease", Issue: 42, RunID: "run"},
+		Issue: retirement.Issue{
+			Number: 42, URL: "https://github.com/acme/widgets/issues/42", ClosureReason: "completed",
+			Labels: []string{"in-progress", "ready-for-agent", "needs-info", "spec"},
+		},
+		PullRequests: []retirement.PullRequest{{
+			Number: 9, URL: "https://github.com/acme/widgets/pull/9", Branch: "agent/run", Commit: commit,
+			State: retirement.PullRequestOpen, AutoMergeArmed: true,
+		}},
+		RemoteBranch: retirement.Branch{Name: "agent/run", Commit: commit, Present: true},
+		LocalBranch:  retirement.Branch{Name: "agent/run", Commit: commit, Present: true},
+		Worktree:     retirement.Worktree{Path: "/state/worktrees/run", Branch: "agent/run", Commit: commit, Present: true},
+		Session: retirement.Session{
+			ID: "backlog-run", Dir: "/state/sessions/run", ArchiveDir: "/state/history/sessions/run", Present: true,
+		},
+	}
+
+	plan, err := retirement.Build(Policy("run"), snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var actions []string
+	for _, action := range plan.Actions {
+		actions = append(actions, action.String())
+	}
+	want := []string{
+		"mark Run run resolving-externally while retaining Lease lease",
+		"disable auto-merge for pull request #9 (https://github.com/acme/widgets/pull/9)",
+		"explain External Resolution on pull request #9 (https://github.com/acme/widgets/pull/9)",
+		"close unmerged pull request #9 (https://github.com/acme/widgets/pull/9)",
+		"delete remote branch agent/run at " + commit,
+		"remove local worktree /state/worktrees/run for agent/run at " + commit,
+		"delete local branch agent/run at " + commit,
+		"archive Pi session backlog-run from /state/sessions/run to /state/history/sessions/run",
+		"remove issue label in-progress from https://github.com/acme/widgets/issues/42",
+		"remove issue label ready-for-agent from https://github.com/acme/widgets/issues/42",
+		"mark Run run resolved-externally and release Lease lease",
+	}
+	if strings.Join(actions, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("actions = %q, want %q", actions, want)
+	}
+	if strings.Contains(strings.Join(actions, "\n"), "needs-info") || strings.Contains(strings.Join(actions, "\n"), "spec") {
+		t.Fatalf("plan mutates preserved labels: %q", actions)
+	}
+}
+
+func TestWaitingForMergePlansDurableProgressBeforeDisarming(t *testing.T) {
+	commit := strings.Repeat("a", 40)
+	snapshot := retirement.Snapshot{
+		Run: scheduler.Run{
+			Issue: 42, RunID: "run", Status: scheduler.StatusWaitingForMerge, Branch: "agent/run",
+			PullRequest: "https://github.com/acme/widgets/pull/9",
+		},
 		Lease: scheduler.Lease{LeaseID: "lease", Issue: 42, RunID: "run"},
 		Issue: retirement.Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", ClosureReason: "completed"},
+		PullRequests: []retirement.PullRequest{{
+			Number: 9, URL: "https://github.com/acme/widgets/pull/9", Branch: "agent/run", Commit: commit,
+			State: retirement.PullRequestOpen, AutoMergeArmed: true,
+		}},
 	}
+	plan, err := retirement.Build(Policy("run"), snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Actions) < 2 || !strings.Contains(plan.Actions[0].String(), "resolving-externally") || !strings.Contains(plan.Actions[1].String(), "disable auto-merge") {
+		t.Fatalf("waiting-for-merge action order = %#v", plan.Actions)
+	}
+}
+
+func TestPolicyTreatsAlreadyRetiredArtifactsAsSatisfied(t *testing.T) {
 	commit := strings.Repeat("a", 40)
-	tests := []struct {
-		name   string
-		mutate func(*retirement.Snapshot)
-		want   string
-	}{
-		{name: "open pull request", mutate: func(snapshot *retirement.Snapshot) {
-			snapshot.PullRequests = []retirement.PullRequest{{Number: 9, URL: "https://github.com/acme/widgets/pull/9", Branch: "agent/run", Commit: commit, State: retirement.PullRequestOpen}}
-		}, want: "pull request #9 remains open"},
-		{name: "closed pull request", mutate: func(snapshot *retirement.Snapshot) {
-			snapshot.PullRequests = []retirement.PullRequest{{Number: 9, URL: "https://github.com/acme/widgets/pull/9", Branch: "agent/run", Commit: commit, State: retirement.PullRequestClosed}}
-		}, want: "pull request #9 remains closed"},
-		{name: "remote branch", mutate: func(snapshot *retirement.Snapshot) {
-			snapshot.RemoteBranch = retirement.Branch{Name: "agent/run", Commit: commit, Present: true}
-		}, want: "remote branch agent/run remains"},
-		{name: "worktree", mutate: func(snapshot *retirement.Snapshot) {
-			snapshot.Worktree = retirement.Worktree{Path: "/state/worktrees/run", Branch: "agent/run", Commit: commit, Present: true}
-		}, want: "worktree /state/worktrees/run remains"},
-		{name: "local branch", mutate: func(snapshot *retirement.Snapshot) {
-			snapshot.LocalBranch = retirement.Branch{Name: "agent/run", Commit: commit, Present: true}
-		}, want: "local branch agent/run remains"},
-		{name: "active Pi session", mutate: func(snapshot *retirement.Snapshot) {
-			snapshot.Run.WorkerMode = scheduler.WorkerModeRPC
-			snapshot.Run.SessionID = "backlog-run"
-			snapshot.Run.SessionDir = "/state/sessions/run"
-			snapshot.Session = retirement.Session{ID: "backlog-run", Dir: "/state/sessions/run", ArchiveDir: "/state/history/sessions/run", Present: true}
-		}, want: "active Pi session backlog-run remains"},
+	snapshot := retirement.Snapshot{
+		Run: scheduler.Run{
+			Issue: 42, RunID: "run", Status: scheduler.StatusResolvingExternally,
+			Branch: "agent/run", Worktree: "/state/worktrees/run", WorkerMode: scheduler.WorkerModeRPC,
+			SessionID: "backlog-run", SessionDir: "/state/sessions/run",
+		},
+		Lease: scheduler.Lease{LeaseID: "lease", Issue: 42, RunID: "run"},
+		Issue: retirement.Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", ClosureReason: "completed"},
+		PullRequests: []retirement.PullRequest{{
+			Number: 9, URL: "https://github.com/acme/widgets/pull/9", Branch: "agent/run", Commit: commit,
+			State: retirement.PullRequestClosed, Explained: true,
+		}},
+		RemoteBranch: retirement.Branch{Name: "agent/run"},
+		LocalBranch:  retirement.Branch{Name: "agent/run"},
+		Worktree:     retirement.Worktree{Path: "/state/worktrees/run", Branch: "agent/run"},
+		Session: retirement.Session{
+			ID: "backlog-run", Dir: "/state/sessions/run", ArchiveDir: "/state/history/sessions/run", Archived: true,
+		},
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			snapshot := base
-			test.mutate(&snapshot)
-			plan, err := retirement.Build(Policy("run"), snapshot)
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("Build() = plan %#v, error %v; want refusal containing %q", plan, err, test.want)
-			}
-			if len(plan.Actions) != 0 {
-				t.Fatalf("refused artifact-rich plan contains actions: %#v", plan.Actions)
-			}
-		})
+
+	plan, err := retirement.Build(Policy("run"), snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Actions) != 1 || !strings.Contains(plan.Actions[0].String(), "resolved-externally") {
+		t.Fatalf("already-retired actions = %#v", plan.Actions)
 	}
 }
 
@@ -195,8 +254,19 @@ func TestOnlyRecordedExpectedPullRequestCanPlanCompletion(t *testing.T) {
 			}
 
 			snapshot.PullRequests = []retirement.PullRequest{expectedPull}
-			if plan, err := retirement.Build(Policy("run"), snapshot); err == nil || !strings.Contains(err.Error(), "pull request #9 remains "+string(expectedState)) || plan.TerminalState == scheduler.StatusMerged {
+			plan, err := retirement.Build(Policy("run"), snapshot)
+			if err != nil || plan.TerminalState != scheduler.StatusResolvedExternally {
 				t.Fatalf("unmerged expected pull request plan = %#v, error = %v", plan, err)
+			}
+			joined := make([]string, len(plan.Actions))
+			for index, action := range plan.Actions {
+				joined[index] = action.String()
+			}
+			if expectedState == retirement.PullRequestOpen && (!strings.Contains(strings.Join(joined, "\n"), "explain External Resolution") || !strings.Contains(strings.Join(joined, "\n"), "close unmerged pull request")) {
+				t.Fatalf("open expected pull request retirement actions = %q", joined)
+			}
+			if expectedState == retirement.PullRequestClosed && strings.Contains(strings.Join(joined, "\n"), "close unmerged pull request") {
+				t.Fatalf("closed expected pull request planned closure again: %q", joined)
 			}
 		})
 	}

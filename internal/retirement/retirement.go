@@ -258,7 +258,7 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 		action := plan.Actions[0]
 		switch action.kind {
 		case actionMarkProgress:
-			if plan.Snapshot.Run.Status == scheduler.StatusWaitingForMerge {
+			if plan.Snapshot.Run.Status == scheduler.StatusWaitingForMerge && !e.policy.MarkProgressBeforeMutation {
 				if err := verifyWaitingForMergeDisarmed(plan); err != nil {
 					return err
 				}
@@ -277,10 +277,17 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return fmt.Errorf("pull request #%d is not ready for auto-merge disablement", action.pullRequest)
 			}
 			if err := e.github.DisablePullRequestAutoMerge(ctx, before.Snapshot.Repository, pull.Number); err != nil {
-				return fmt.Errorf("disable auto-merge for pull request #%d: %w", pull.Number, err)
+				mutationErr := fmt.Errorf("disable auto-merge for pull request #%d: %w", pull.Number, err)
+				if completed, completionErr := e.completeLateMerge(ctx); completed {
+					return completionErr
+				}
+				return mutationErr
 			}
 			after, err := e.inspect(ctx)
 			if err != nil {
+				return err
+			}
+			if completed, err := e.completeMergedPlan(ctx, after); completed {
 				return err
 			}
 			if err := e.verifyGitHubIdentityContinuity(approved.Snapshot, after.Snapshot); err != nil {
@@ -300,10 +307,17 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return fmt.Errorf("pull request #%d is not ready for the %s explanation", action.pullRequest, e.policy.Operation)
 			}
 			if err := e.github.CommentOnPullRequest(ctx, before.Snapshot.Repository, pull.Number, e.policy.Explanation(before.Snapshot.Run)); err != nil {
-				return fmt.Errorf("%s on pull request #%d: %w", e.policy.ExplanationAction, pull.Number, err)
+				mutationErr := fmt.Errorf("%s on pull request #%d: %w", e.policy.ExplanationAction, pull.Number, err)
+				if completed, completionErr := e.completeLateMerge(ctx); completed {
+					return completionErr
+				}
+				return mutationErr
 			}
 			after, err := e.inspect(ctx)
 			if err != nil {
+				return err
+			}
+			if completed, err := e.completeMergedPlan(ctx, after); completed {
 				return err
 			}
 			if err := e.verifyGitHubIdentityContinuity(approved.Snapshot, after.Snapshot); err != nil {
@@ -323,10 +337,17 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return fmt.Errorf("pull request #%d is not ready for safe closure", action.pullRequest)
 			}
 			if err := e.github.ClosePullRequest(ctx, before.Snapshot.Repository, pull.Number); err != nil {
-				return fmt.Errorf("close unmerged pull request #%d: %w", pull.Number, err)
+				mutationErr := fmt.Errorf("close unmerged pull request #%d: %w", pull.Number, err)
+				if completed, completionErr := e.completeLateMerge(ctx); completed {
+					return completionErr
+				}
+				return mutationErr
 			}
 			after, err := e.inspect(ctx)
 			if err != nil {
+				return err
+			}
+			if completed, err := e.completeMergedPlan(ctx, after); completed {
 				return err
 			}
 			if err := e.verifyGitHubIdentityContinuity(approved.Snapshot, after.Snapshot); err != nil {
@@ -349,6 +370,9 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			if err != nil {
 				return err
 			}
+			if completed, err := e.completeMergedPlan(ctx, after); completed {
+				return err
+			}
 			if after.Snapshot.RemoteBranch.Present {
 				return fmt.Errorf("owned remote branch %s is still present after deletion", branch.Name)
 			}
@@ -366,6 +390,9 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			}
 			after, err := e.inspect(ctx)
 			if err != nil {
+				return err
+			}
+			if completed, err := e.completeMergedPlan(ctx, after); completed {
 				return err
 			}
 			if after.Snapshot.Worktree.Present {
@@ -387,6 +414,9 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			if err != nil {
 				return err
 			}
+			if completed, err := e.completeMergedPlan(ctx, after); completed {
+				return err
+			}
 			if after.Snapshot.LocalBranch.Present {
 				return fmt.Errorf("owned local branch %s is still present after deletion", branch.Name)
 			}
@@ -401,6 +431,9 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			}
 			after, err := e.inspect(ctx)
 			if err != nil {
+				return err
+			}
+			if completed, err := e.completeMergedPlan(ctx, after); completed {
 				return err
 			}
 			if after.Snapshot.Session.Present || !after.Snapshot.Session.Archived {
@@ -418,6 +451,9 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			if err != nil {
 				return err
 			}
+			if completed, err := e.completeMergedPlan(ctx, after); completed {
+				return err
+			}
 			if err := verifyLabelMutation(before.Snapshot.Issue.Labels, after.Snapshot.Issue.Labels, "", action.label); err != nil {
 				return err
 			}
@@ -431,6 +467,9 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			}
 			after, err := e.inspect(ctx)
 			if err != nil {
+				return err
+			}
+			if completed, err := e.completeMergedPlan(ctx, after); completed {
 				return err
 			}
 			if err := verifyLabelMutation(before.Snapshot.Issue.Labels, after.Snapshot.Issue.Labels, action.label, ""); err != nil {
@@ -748,6 +787,24 @@ func verifyLabelMutation(before, after []string, added, removed string) error {
 	return fmt.Errorf("issue label mutation did not satisfy its verified postcondition: labels changed from %s to %s", formatLabels(before), formatLabels(after))
 }
 
+func (e Service) completeLateMerge(ctx context.Context) (bool, error) {
+	fresh, err := e.inspect(ctx)
+	if err != nil {
+		return false, nil
+	}
+	return e.completeMergedPlan(ctx, fresh)
+}
+
+func (e Service) completeMergedPlan(ctx context.Context, plan Plan) (bool, error) {
+	if !e.policy.AllowMergedCompletion || plan.TerminalState != scheduler.StatusMerged {
+		return false, nil
+	}
+	if len(plan.Actions) != 1 || plan.Actions[0].kind != actionFinalizeCompletion {
+		return true, errors.New("merged expected pull request did not produce an executable Completion plan")
+	}
+	return true, e.finalizeCompletion(ctx, plan, plan.Actions[0].pullRequest)
+}
+
 func (e Service) markProgress() error {
 	current, _, err := e.store.Preview()
 	if err != nil {
@@ -851,6 +908,9 @@ func (e Service) finalize(ctx context.Context, verified Plan) error {
 	}
 	fresh, err := e.inspect(ctx)
 	if err != nil {
+		return err
+	}
+	if completed, err := e.completeMergedPlan(ctx, fresh); completed {
 		return err
 	}
 	if !executablePlansEqual(verified, fresh) {

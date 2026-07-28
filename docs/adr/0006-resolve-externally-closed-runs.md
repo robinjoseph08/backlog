@@ -10,8 +10,7 @@ Backlog will recognize External Resolution when GitHub verifies that an issue is
 
 The consequences below describe the accepted end-state architecture. Delivery is staged:
 
-- The current issue #81 slice provides only explicit `backlog resolve` for artifact-free Runs. It refuses resolution while any owned unmerged pull request, remote or local branch, worktree, or active Pi session remains.
-- Issue #82 adds complete owned-artifact retirement to the explicit command.
+- The explicit `backlog resolve` command provides complete owned-artifact retirement.
 - Issue #83 adds automatic reconciliation at Runner startup and during watch reconciliation.
 - Issue #84 adds automatic reconciliation after Worker settlement.
 
