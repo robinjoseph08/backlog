@@ -1005,6 +1005,54 @@ func TestBubbleDashboardConstrainedChromeKeepsRequiredLifecycleInformation(t *te
 	}
 }
 
+func TestBubbleDashboardShortNarrowChromePrioritizesHealthAndAttention(t *testing.T) {
+	metadata := dashboardProjectionMetadata{
+		repository: "acme/widgets",
+		capacity:   dashboardCapacity{configured: true, used: 1, available: 2, total: 3},
+		healthy:    1,
+		anomalous:  2,
+	}
+	header := strings.Split(minimalDashboardHeader(metadata, 3, 0), "\n")[1:]
+	footer := strings.Split(minimalDashboardFooter(strings.Join([]string{
+		"Runner stage: Running",
+		"Next Ctrl-C: start Drain and stop Admission",
+		dashboardNavigationHelp,
+	}, "\n")), "\n")
+	chrome := dashboardChromeLines(header, footer, 0, dashboardRunning, dashboardStyler{}, 24, 7)
+	plain := strings.Join(append(append([]string(nil), chrome.top...), chrome.bottom...), "\n")
+	normalized := strings.Join(strings.Fields(plain), " ")
+	for _, want := range []string{"Health:1 healthy, 2 anomalous", "Attention:3"} {
+		if !strings.Contains(normalized, want) {
+			t.Fatalf("short narrow dashboard chrome omitted %q:\n%s", want, plain)
+		}
+	}
+}
+
+func TestBubbleDashboardAdaptiveNavigationIncludesEnterGuidance(t *testing.T) {
+	footer := []string{
+		"Runner stage: Running",
+		"Next Ctrl-C: start Drain and stop Admission",
+		dashboardNavigationHelp,
+	}
+	chrome := dashboardChromeLines(
+		[]string{
+			"Repository: acme/widgets",
+			"Worker capacity: 1 used | 2 available | 3 total",
+			"Worker health: 1 healthy, 0 anomalous",
+		},
+		footer,
+		0,
+		dashboardRunning,
+		dashboardStyler{},
+		50,
+		7,
+	)
+	fixedFooter := strings.Join(chrome.bottom, "\n")
+	if !strings.Contains(fixedFooter, "N:jk/fb Pg H/E gG a Enter") {
+		t.Fatalf("adaptive navigation omitted Enter guidance: %#v", chrome)
+	}
+}
+
 func TestBubbleDashboardConstrainedFallbackKeepsGuidanceInFixedFooter(t *testing.T) {
 	footer := []string{
 		"Runner stage: Running",
@@ -1024,7 +1072,7 @@ func TestBubbleDashboardConstrainedFallbackKeepsGuidanceInFixedFooter(t *testing
 		t.Fatal("constrained dashboard moved fixed-footer guidance above the body")
 	}
 	fixedFooter := strings.Join(chrome.bottom, "\n")
-	for _, want := range []string{"^C:start Drain and stop Admission", "N:jk/fb Pg H/E gG a"} {
+	for _, want := range []string{"^C:start Drain and stop Admission", "N:jk/fb Pg H/E gG a Enter"} {
 		if !strings.Contains(fixedFooter, want) {
 			t.Fatalf("constrained fixed footer omitted %q: %#v", want, chrome)
 		}

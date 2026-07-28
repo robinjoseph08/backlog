@@ -564,10 +564,11 @@ func (m *bubbleDashboardModel) toggleExpansion() {
 
 func minimalDashboardHeader(metadata dashboardProjectionMetadata, attention, pending int) string {
 	health := fmt.Sprintf("%d healthy, %d anomalous", metadata.healthy, metadata.anomalous)
-	status := fmt.Sprintf("R:%s | %s | Health:%s | Attention:%d", metadata.repository, metadata.capacity.compact(), health, attention)
+	status := fmt.Sprintf("Health:%s | Attention:%d", health, attention)
 	if pending > 0 {
 		status += fmt.Sprintf(" | New:%d", pending)
 	}
+	status += fmt.Sprintf(" | R:%s | %s", metadata.repository, metadata.capacity.compact())
 	return "Backlog: " + metadata.repository + "\n" + status
 }
 
@@ -812,7 +813,7 @@ func dashboardChromeLines(header, footer []string, pendingAttention int, stage d
 	footerGroups := dashboardChromeGroups(lifecycle)
 	compactNavigation := append([]string(nil), footer...)
 	if len(compactNavigation) > 2 {
-		compactNavigation[2] = "N:jk/fb Pg H/E gG a"
+		compactNavigation[2] = "N:jk/fb Pg H/E gG a Enter"
 	}
 	compactNavigation = styledDashboardFooterItems(compactNavigation, stage, styler)
 	compactHeader := styledDashboardHeaderItems(compactDashboardHeader(header), pendingAttention, true, styler)
