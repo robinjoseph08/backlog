@@ -105,6 +105,10 @@ func MainWithTerminal(ctx context.Context, args []string, dependencies TerminalD
 		commandCtx, stop := cancelContextOnSignal(ctx, terminal.Signals)
 		defer stop()
 		err = acknowledgeCommand(commandCtx, args[1:], stdout, stderr)
+	case "resolve":
+		commandCtx, stop := cancelContextOnSignal(ctx, terminal.Signals)
+		defer stop()
+		err = resolveCommand(commandCtx, args[1:], stdout, stderr)
 	case "reset":
 		commandCtx, stop := cancelContextOnSignal(ctx, terminal.Signals)
 		defer stop()
@@ -705,6 +709,7 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "  backlog follow <run-id|positive-issue-number> [--raw] [flags]")
 	fmt.Fprintln(writer, "  backlog acknowledge <run-id|positive-issue-number>... [flags]")
 	fmt.Fprintln(writer, "  backlog acknowledge --all [flags]")
+	fmt.Fprintln(writer, "  backlog resolve <run-id|positive-issue-number> [--dry-run | --yes] [flags]")
 	fmt.Fprintln(writer, "  backlog reset <issue-number> [--dry-run | --yes] [flags]")
 	fmt.Fprintln(writer, "  backlog retry <issue-number> [--dry-run | --yes] [flags]  (deprecated alias for reset)")
 	fmt.Fprintln(writer, "")
@@ -715,6 +720,7 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "  Restarting run resumes verified Suspended Runs before admitting new Candidates.")
 	fmt.Fprintln(writer, "  Reset retires verified artifacts, archives active Pi sessions, preserves logs and Run history,")
 	fmt.Fprintln(writer, "  restores Candidate labels, and releases the Lease only after all postconditions pass.")
+	fmt.Fprintln(writer, "  Resolve recognizes a supported GitHub closure without claiming Run Completion or restoring Candidate state.")
 	fmt.Fprintln(writer, "  Acknowledge records presentation-only review of eligible Historical Run outcomes.")
 	fmt.Fprintln(writer, "")
 	fmt.Fprintln(writer, "Exit statuses:")
@@ -723,7 +729,7 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "  SIGTERM suspension exits 143, including later force escalation.")
 	fmt.Fprintln(writer, "")
 	fmt.Fprintln(writer, "Upgrade limits:")
-	fmt.Fprintln(writer, "  Runner startup and successful lifecycle mutations migrate version 1 and version 2 state to version 3.")
+	fmt.Fprintln(writer, "  Runner startup and successful lifecycle mutations migrate versions 1 through 3 state to version 4.")
 	fmt.Fprintln(writer, "  Passive inspection previews supported legacy state; legacy print-mode Runs cannot Resume.")
 	fmt.Fprintln(writer, "  State written by a newer unsupported version is refused.")
 }

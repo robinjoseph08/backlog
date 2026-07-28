@@ -8,16 +8,18 @@ import (
 type Status string
 
 const (
-	StatusClaimed         Status = "claimed"
-	StatusWorktreeReady   Status = "worktree-ready"
-	StatusRunning         Status = "running"
-	StatusWaitingForMerge Status = "waiting-for-merge"
-	StatusSuspended       Status = "suspended"
-	StatusResetting       Status = "resetting"
-	StatusReset           Status = "reset"
-	StatusMerged          Status = "merged"
-	StatusFailed          Status = "failed"
-	StatusNeedsHuman      Status = "needs-human"
+	StatusClaimed             Status = "claimed"
+	StatusWorktreeReady       Status = "worktree-ready"
+	StatusRunning             Status = "running"
+	StatusWaitingForMerge     Status = "waiting-for-merge"
+	StatusSuspended           Status = "suspended"
+	StatusResetting           Status = "resetting"
+	StatusReset               Status = "reset"
+	StatusResolvingExternally Status = "resolving-externally"
+	StatusResolvedExternally  Status = "resolved-externally"
+	StatusMerged              Status = "merged"
+	StatusFailed              Status = "failed"
+	StatusNeedsHuman          Status = "needs-human"
 )
 
 type WorkerMode string
@@ -54,34 +56,37 @@ type ContinuationBoundary struct {
 }
 
 type Run struct {
-	Issue           int                   `json:"issue"`
-	IssueTitle      string                `json:"issueTitle,omitempty"`
-	IssueURL        string                `json:"issueUrl,omitempty"`
-	RunID           string                `json:"runId"`
-	Status          Status                `json:"status"`
-	WorkerMode      WorkerMode            `json:"workerMode"`
-	PID             int                   `json:"pid,omitempty"`
-	ProcessIdentity string                `json:"processIdentity,omitempty"`
-	Branch          string                `json:"branch,omitempty"`
-	Worktree        string                `json:"worktree,omitempty"`
-	SessionName     string                `json:"sessionName,omitempty"`
-	SessionID       string                `json:"sessionId,omitempty"`
-	SessionDir      string                `json:"sessionDir,omitempty"`
-	Continuation    *ContinuationBoundary `json:"continuation,omitempty"`
-	ResumePending   bool                  `json:"resumePending,omitempty"`
-	LogPath         string                `json:"logPath,omitempty"`
-	StderrPath      string                `json:"stderrPath,omitempty"`
-	WorkerLogOpen   bool                  `json:"workerLogOpen,omitempty"`
-	CleanupPending  bool                  `json:"cleanupPending,omitempty"`
-	PullRequest     string                `json:"pullRequest,omitempty"`
-	Error           string                `json:"error,omitempty"`
-	StartedAt       time.Time             `json:"startedAt"`
-	WorkerStartedAt time.Time             `json:"workerStartedAt,omitempty"`
-	SuspendingAt    *time.Time            `json:"suspendingAt,omitempty"`
-	SuspendedAt     *time.Time            `json:"suspendedAt,omitempty"`
-	UpdatedAt       time.Time             `json:"updatedAt"`
-	CompletedAt     *time.Time            `json:"completedAt,omitempty"`
-	AcknowledgedAt  *time.Time            `json:"acknowledgedAt,omitempty"`
+	Issue                int                   `json:"issue"`
+	IssueTitle           string                `json:"issueTitle,omitempty"`
+	IssueURL             string                `json:"issueUrl,omitempty"`
+	RunID                string                `json:"runId"`
+	Status               Status                `json:"status"`
+	WorkerMode           WorkerMode            `json:"workerMode"`
+	PID                  int                   `json:"pid,omitempty"`
+	ProcessIdentity      string                `json:"processIdentity,omitempty"`
+	Branch               string                `json:"branch,omitempty"`
+	Worktree             string                `json:"worktree,omitempty"`
+	SessionName          string                `json:"sessionName,omitempty"`
+	SessionID            string                `json:"sessionId,omitempty"`
+	SessionDir           string                `json:"sessionDir,omitempty"`
+	Continuation         *ContinuationBoundary `json:"continuation,omitempty"`
+	ResumePending        bool                  `json:"resumePending,omitempty"`
+	LogPath              string                `json:"logPath,omitempty"`
+	StderrPath           string                `json:"stderrPath,omitempty"`
+	WorkerLogOpen        bool                  `json:"workerLogOpen,omitempty"`
+	CleanupPending       bool                  `json:"cleanupPending,omitempty"`
+	PullRequest          string                `json:"pullRequest,omitempty"`
+	Error                string                `json:"error,omitempty"`
+	StartedAt            time.Time             `json:"startedAt"`
+	WorkerStartedAt      time.Time             `json:"workerStartedAt,omitempty"`
+	SuspendingAt         *time.Time            `json:"suspendingAt,omitempty"`
+	SuspendedAt          *time.Time            `json:"suspendedAt,omitempty"`
+	UpdatedAt            time.Time             `json:"updatedAt"`
+	CompletedAt          *time.Time            `json:"completedAt,omitempty"`
+	AcknowledgedAt       *time.Time            `json:"acknowledgedAt,omitempty"`
+	ResolvedExternallyAt *time.Time            `json:"resolvedExternallyAt,omitempty"`
+	ClosureReason        string                `json:"closureReason,omitempty"`
+	DiagnosticWarning    string                `json:"diagnosticWarning,omitempty"`
 }
 
 type Lease struct {

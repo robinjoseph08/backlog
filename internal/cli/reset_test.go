@@ -1277,6 +1277,34 @@ func TestCompiledResetFinalizesArtifactFreeRun(t *testing.T) {
 	}
 }
 
+func TestCompiledResetRecoversInterruptedExternalResolution(t *testing.T) {
+	t.Parallel()
+
+	fixture := newArtifactFreeResetFixture(t, []string{"ready-for-agent", "spec"})
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.Runs[0].Status = scheduler.StatusResolvingExternally
+	if err := fixture.store.Save(current); err != nil {
+		t.Fatal(err)
+	}
+
+	binary := buildExecutable(t, t.TempDir())
+	command := exec.Command(binary, fixture.args("reset", "--yes")...)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("compiled Reset recovery: %v\n%s", err, output)
+	}
+	current, err = fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusReset || len(current.Leases) != 0 || strings.Join(fixture.labels(t), ",") != "ready-for-agent,spec" {
+		t.Fatalf("interrupted External Resolution recovery state = %#v, labels = %v", current, fixture.labels(t))
+	}
+}
+
 func TestCompiledResetReconcilesEveryManagedLabelCombination(t *testing.T) {
 	binary := buildExecutable(t, t.TempDir())
 	for _, labels := range [][]string{

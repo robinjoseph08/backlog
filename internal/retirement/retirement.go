@@ -125,6 +125,18 @@ func (e Service) inspect(ctx context.Context) (Plan, error) {
 	if err != nil {
 		return Plan{}, err
 	}
+	if e.policy.RequireClosureReason {
+		closure, closureErr := e.github.IssueClosure(ctx, repository.Slug, run.Issue)
+		if closureErr != nil {
+			return Plan{}, closureErr
+		}
+		if closure.Open {
+			issueResource.State = "open"
+		} else {
+			issueResource.State = "closed"
+		}
+		issueResource.ClosureReason = closure.Reason
+	}
 	remoteBranch, err := inspectRemoteBranch(ctx, e.gitExecutable, e.repositoryRoot, run.Branch)
 	if err != nil {
 		return Plan{}, err
@@ -140,7 +152,10 @@ func (e Service) inspect(ctx context.Context) (Plan, error) {
 	snapshot := Snapshot{
 		Repository: repository.Slug,
 		Run:        run, Lease: lease,
-		Issue:        Issue{Number: issueResource.Number, URL: issueResource.URL, Open: issueResource.State == "open", Labels: issueResource.Labels},
+		Issue: Issue{
+			Number: issueResource.Number, URL: issueResource.URL, Open: issueResource.State == "open",
+			ClosureReason: issueResource.ClosureReason, Labels: issueResource.Labels,
+		},
 		RemoteBranch: remoteBranch, LocalBranch: localBranch, Worktree: localWorktree, Session: session,
 		WorkerSummary: absentWorkerSummary(run),
 	}
@@ -423,6 +438,8 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			}
 		case actionFinalize:
 			return e.finalize(ctx, plan)
+		case actionFinalizeCompletion:
+			return e.finalizeCompletion(ctx, plan, action.pullRequest)
 		default:
 			return fmt.Errorf("%s Plan contains an unknown action", e.policy.Operation)
 		}
@@ -475,6 +492,9 @@ func (e Service) verifyGitHubIdentityContinuity(expected, actual Snapshot) error
 	}
 	if expected.Run.RunID != actual.Run.RunID || expected.Lease != actual.Lease {
 		return fmt.Errorf("Run or Lease identity changed while %s Run artifacts", e.policy.ProgressStatus)
+	}
+	if expected.Issue.Number != actual.Issue.Number || expected.Issue.URL != actual.Issue.URL || expected.Issue.Open != actual.Issue.Open || expected.Issue.ClosureReason != actual.Issue.ClosureReason {
+		return fmt.Errorf("issue identity, state, or closure reason changed while %s Run artifacts", e.policy.ProgressStatus)
 	}
 	expectedPulls := make(map[int]PullRequest, len(expected.PullRequests))
 	for _, pull := range expected.PullRequests {
@@ -756,6 +776,73 @@ func (e Service) markProgress() error {
 	return e.store.Save(current)
 }
 
+func (e Service) finalizeCompletion(ctx context.Context, verified Plan, pullNumber int) error {
+	fresh, err := e.inspect(ctx)
+	if err != nil {
+		return err
+	}
+	if !executablePlansEqual(verified, fresh) || len(fresh.Actions) != 1 || fresh.Actions[0].kind != actionFinalizeCompletion {
+		return fmt.Errorf("%s Plan changed immediately before recording Completion", e.policy.Operation)
+	}
+	pull, found := pullRequestByNumber(fresh.Snapshot.PullRequests, pullNumber)
+	if !found || pull.State != PullRequestMerged || fresh.Snapshot.Issue.Open {
+		return errors.New("expected merged pull request and closed issue were not freshly verified for Completion")
+	}
+	current, _, err := e.store.Preview()
+	if err != nil {
+		return err
+	}
+	run, lease, err := e.policy.SelectRun(current)
+	if err != nil {
+		return err
+	}
+	if run.RunID != fresh.Snapshot.Run.RunID || lease != fresh.Snapshot.Lease || lease.LeaseID == "" {
+		return errors.New("Run or Lease changed before recording Completion")
+	}
+	if !scheduler.CanTransition(run.Status, scheduler.StatusMerged) {
+		return fmt.Errorf("Run status %s cannot transition to merged Completion", run.Status)
+	}
+	now := time.Now().UTC()
+	for index := range current.Runs {
+		if current.Runs[index].RunID == run.RunID {
+			current.Runs[index].Status = scheduler.StatusMerged
+			current.Runs[index].PullRequest = pull.URL
+			current.Runs[index].CompletedAt = &now
+			current.Runs[index].UpdatedAt = now
+			current.Runs[index].PID = 0
+			current.Runs[index].ProcessIdentity = ""
+			current.Runs[index].WorkerLogOpen = false
+			current.Runs[index].CleanupPending = fresh.Snapshot.Worktree.Present || fresh.Snapshot.LocalBranch.Present
+			current.Runs[index].Error = ""
+			break
+		}
+	}
+	for index := range current.Leases {
+		if current.Leases[index] == lease {
+			current.Leases = append(current.Leases[:index], current.Leases[index+1:]...)
+			break
+		}
+	}
+	if err := e.store.Save(current); err != nil {
+		return fmt.Errorf("atomically record Completion and release Lease: %w", err)
+	}
+	persisted, _, err := e.store.Preview()
+	if err != nil {
+		return err
+	}
+	for _, lease := range persisted.Leases {
+		if lease.RunID == run.RunID {
+			return fmt.Errorf("Completion Run %s still has Lease %s", run.RunID, lease.LeaseID)
+		}
+	}
+	for _, persistedRun := range persisted.Runs {
+		if persistedRun.RunID == run.RunID && persistedRun.Status == scheduler.StatusMerged && persistedRun.PullRequest == pull.URL && persistedRun.CompletedAt != nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("Completion for Run %s was not durably recorded", run.RunID)
+}
+
 func (e Service) finalize(ctx context.Context, verified Plan) error {
 	if verified.Snapshot.Session.Archived {
 		if err := syncArchivedSession(verified.Snapshot.Session, e.stateDirectory, e.filesystemSync); err != nil {
@@ -800,12 +887,20 @@ func (e Service) finalize(ctx context.Context, verified Plan) error {
 		return fmt.Errorf("Run status %s cannot transition to %s", run.Status, e.policy.TerminalStatus)
 	}
 	now := time.Now().UTC()
+	finalized := run
+	finalized.Status = e.policy.TerminalStatus
+	finalized.WorkerLogOpen = false
+	finalized.UpdatedAt = now
+	finalized.CompletedAt = &now
+	if e.policy.RecordMissingLogWarn {
+		finalized.DiagnosticWarning = missingLogWarning(run)
+	}
+	if e.policy.FinalizeMetadata != nil {
+		e.policy.FinalizeMetadata(&finalized, verified.Snapshot, now)
+	}
 	for index := range current.Runs {
 		if current.Runs[index].RunID == run.RunID {
-			current.Runs[index].Status = e.policy.TerminalStatus
-			current.Runs[index].WorkerLogOpen = false
-			current.Runs[index].UpdatedAt = now
-			current.Runs[index].CompletedAt = &now
+			current.Runs[index] = finalized
 			break
 		}
 	}
@@ -822,7 +917,27 @@ func (e Service) finalize(ctx context.Context, verified Plan) error {
 	if err != nil {
 		return fmt.Errorf("verify finalized %s state: %w", e.policy.Operation, err)
 	}
-	return e.verifyFinalState(persisted, run)
+	return e.verifyFinalState(persisted, finalized)
+}
+
+func missingLogWarning(run scheduler.Run) string {
+	var missing []string
+	for _, log := range []struct {
+		name string
+		path string
+	}{{"Worker JSONL log", run.LogPath}, {"Worker standard-error log", run.StderrPath}} {
+		if log.path == "" {
+			continue
+		}
+		info, err := os.Lstat(log.path)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			missing = append(missing, fmt.Sprintf("%s %s", log.name, log.path))
+		}
+	}
+	if len(missing) == 0 {
+		return ""
+	}
+	return "Recorded diagnostics unavailable at External Resolution: " + strings.Join(missing, "; ")
 }
 
 func (e Service) verifyOwnedFinalState(snapshot Snapshot) error {
@@ -1401,6 +1516,9 @@ func printPlan(writer io.Writer, plan Plan) {
 	issueState := "closed"
 	if snapshot.Issue.Open {
 		issueState = "open"
+	}
+	if snapshot.Issue.ClosureReason != "" {
+		issueState += "; closure reason: " + snapshot.Issue.ClosureReason
 	}
 	fmt.Fprintf(writer, "Issue: %s (%s; labels: %s)\n", snapshot.Issue.URL, issueState, formatLabels(snapshot.Issue.Labels))
 	fmt.Fprintf(writer, "Worker: %s\n", snapshot.WorkerSummary)

@@ -1361,7 +1361,8 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 			continue
 		}
 		switch run.Status {
-		case scheduler.StatusMerged, scheduler.StatusFailed, scheduler.StatusNeedsHuman, scheduler.StatusResetting, scheduler.StatusReset:
+		case scheduler.StatusMerged, scheduler.StatusFailed, scheduler.StatusNeedsHuman, scheduler.StatusResetting, scheduler.StatusReset,
+			scheduler.StatusResolvingExternally, scheduler.StatusResolvedExternally:
 			continue
 		case scheduler.StatusRunning:
 			if run.PID > 0 && r.PIDAlive(run.PID) {

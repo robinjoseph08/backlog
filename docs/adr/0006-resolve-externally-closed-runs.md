@@ -6,6 +6,17 @@ status: accepted
 
 Backlog will recognize External Resolution when GitHub verifies that an issue is closed but the Run's expected pull request does not establish Completion. External Resolution retires the incomplete Run without restoring the issue as a Candidate, without claiming the Run completed the issue, and without reducing the operation to presentation-only Outcome Acknowledgment.
 
+## Rollout status
+
+The consequences below describe the accepted end-state architecture. Delivery is staged:
+
+- The current issue #81 slice provides only explicit `backlog resolve` for artifact-free Runs. It refuses resolution while any owned unmerged pull request, remote or local branch, worktree, or active Pi session remains.
+- Issue #82 adds complete owned-artifact retirement to the explicit command.
+- Issue #83 adds automatic reconciliation at Runner startup and during watch reconciliation.
+- Issue #84 adds automatic reconciliation after Worker settlement.
+
+Until those later slices land, the consequences below about artifact retirement and automatic Runner reconciliation are architectural decisions, not descriptions of currently available behavior.
+
 ## Consequences
 
 - An incomplete Run may enter `resolving-externally` while retaining its Lease, then become a Historical Run in `resolved-externally` after all active artifacts are verified retired. The outcome records when Backlog recognized the resolution and GitHub's issue closure reason.
