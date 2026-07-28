@@ -497,7 +497,7 @@ func (e Service) verifyGitHubIdentityContinuity(expected, actual Snapshot) error
 	if expected.Repository == "" || expected.Repository != actual.Repository {
 		return fmt.Errorf("repository identity changed while %s Run artifacts", e.policy.ProgressStatus)
 	}
-	if expected.Run.RunID != actual.Run.RunID || expected.Lease != actual.Lease {
+	if expected.Run.RunID != actual.Run.RunID || expected.Run.Branch != actual.Run.Branch || expected.Run.PullRequest != actual.Run.PullRequest || expected.Lease != actual.Lease {
 		return fmt.Errorf("Run or Lease identity changed while %s Run artifacts", e.policy.ProgressStatus)
 	}
 	if expected.Issue.Number != actual.Issue.Number || expected.Issue.URL != actual.Issue.URL || expected.Issue.Open != actual.Issue.Open || expected.Issue.ClosureReason != actual.Issue.ClosureReason {
@@ -507,14 +507,26 @@ func (e Service) verifyGitHubIdentityContinuity(expected, actual Snapshot) error
 	for _, pull := range expected.PullRequests {
 		expectedPulls[pull.Number] = pull
 	}
-	if len(expectedPulls) != len(actual.PullRequests) {
-		return fmt.Errorf("pull request identity set changed while %s GitHub artifacts", e.policy.ProgressStatus)
-	}
+	addedMergedPull := false
 	for _, pull := range actual.PullRequests {
 		owned, found := expectedPulls[pull.Number]
-		if !found || pull.URL != owned.URL || pull.Branch != owned.Branch || pull.Commit != owned.Commit {
-			return fmt.Errorf("pull request #%d branch or expected commit identity changed while %s", pull.Number, e.policy.ProgressStatus)
+		if found {
+			if pull.URL != owned.URL || pull.Branch != owned.Branch || pull.Commit != owned.Commit {
+				return fmt.Errorf("pull request #%d branch or expected commit identity changed while %s", pull.Number, e.policy.ProgressStatus)
+			}
+			continue
 		}
+		if addedMergedPull || expected.Run.PullRequest != "" || expected.Run.Branch == "" || pull.Branch != expected.Run.Branch || pull.State != PullRequestMerged {
+			return fmt.Errorf("pull request identity set changed while %s GitHub artifacts", e.policy.ProgressStatus)
+		}
+		addedMergedPull = true
+	}
+	expectedCount := len(expectedPulls)
+	if addedMergedPull {
+		expectedCount++
+	}
+	if expectedCount != len(actual.PullRequests) {
+		return fmt.Errorf("pull request identity set changed while %s GitHub artifacts", e.policy.ProgressStatus)
 	}
 	if err := verifyBranchIdentityContinuity("remote", expected.RemoteBranch, actual.RemoteBranch, expected.Run.RunID, e.policy.ProgressStatus); err != nil {
 		return err

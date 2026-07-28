@@ -168,9 +168,12 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 	if !foundRecorded {
 		return Plan{}, fmt.Errorf("recorded pull request %s was not found for Run branch %s", snapshot.Run.PullRequest, snapshot.Run.Branch)
 	}
-	if len(mergedPulls) != 0 && snapshot.Run.PullRequest != "" && snapshot.Run.Status != policy.TerminalStatus && policy.AllowMergedCompletion {
+	if len(mergedPulls) != 0 && snapshot.Run.Status != policy.TerminalStatus && policy.AllowMergedCompletion {
 		if snapshot.Issue.Open {
 			return Plan{}, fmt.Errorf("issue #%d is open; Completion requires a verified GitHub closure", snapshot.Issue.Number)
+		}
+		if snapshot.Run.PullRequest == "" && len(mergedPulls) != 1 {
+			return Plan{}, fmt.Errorf("Run %s has multiple merged pull requests on expected branch %s; Completion requires an unambiguous pull request", snapshot.Run.RunID, snapshot.Run.Branch)
 		}
 		merged := mergedPulls[len(mergedPulls)-1]
 		if snapshot.Run.PullRequest != "" {
