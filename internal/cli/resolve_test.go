@@ -1449,10 +1449,15 @@ exec `+quote(gh)+` "$@"
 	}
 }
 
-func TestResolveRecordsAndReportsCompletionFromMergedExpectedPullRequest(t *testing.T) {
-	for _, test := range []struct{ name, reasonJSON string }{
-		{name: "missing closure reason", reasonJSON: "null"},
-		{name: "future closure reason", reasonJSON: `"FUTURE"`},
+func TestResolveRecordsAndReportsCompletionFromMergedExpectedBranchPullRequest(t *testing.T) {
+	for _, test := range []struct {
+		name, reasonJSON string
+		status           scheduler.Status
+		recorded         bool
+	}{
+		{name: "missing closure reason", reasonJSON: "null", status: scheduler.StatusWaitingForMerge, recorded: true},
+		{name: "future closure reason", reasonJSON: `"FUTURE"`, status: scheduler.StatusWaitingForMerge, recorded: true},
+		{name: "discovered after Run failure", reasonJSON: `"COMPLETED"`, status: scheduler.StatusFailed},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newResolveFixture(t, []string{"in-progress", "spec"}, "COMPLETED")
@@ -1466,10 +1471,12 @@ func TestResolveRecordsAndReportsCompletionFromMergedExpectedPullRequest(t *test
 			if err := os.WriteFile(logPath, []byte("worker history\n"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			current.Runs[1].Status = scheduler.StatusWaitingForMerge
+			current.Runs[1].Status = test.status
 			current.Runs[1].Branch = branch
 			current.Runs[1].Worktree = filepath.Join(fixture.stateDir, "worktrees", "issue-42-run-42")
-			current.Runs[1].PullRequest = pullRequest
+			if test.recorded {
+				current.Runs[1].PullRequest = pullRequest
+			}
 			current.Runs[1].LogPath = logPath
 			current.Runs[1].WorkerLogOpen = true
 			if err := fixture.store.Save(current); err != nil {

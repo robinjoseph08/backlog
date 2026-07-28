@@ -13,7 +13,7 @@ import (
 )
 
 // Policy recognizes a GitHub-verified closure as External Resolution unless
-// the recorded expected pull request establishes Completion.
+// a merged pull request from the expected Run branch establishes Completion.
 func Policy(selector string) retirement.Policy {
 	return retirement.Policy{
 		Operation:        "External Resolution",
