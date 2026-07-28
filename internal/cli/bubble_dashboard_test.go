@@ -341,6 +341,7 @@ func TestBubbleDashboardMarksAndJumpsToNewOffscreenAttention(t *testing.T) {
 	current := navigationTestState(now, 8)
 	source := &dashboardTestSource{current: current}
 	model := configuredNavigationTestModel(t, now, current, source)
+	model.styler = newDashboardStyler(TerminalColorTrueColor, true)
 	selected := model.currentSelection()
 
 	attention := scheduler.Run{Issue: 100, IssueTitle: "Operator decision", RunID: "attention-new", Status: scheduler.StatusNeedsHuman, StartedAt: now, UpdatedAt: now, Error: "inspect outcome"}
@@ -352,9 +353,13 @@ func TestBubbleDashboardMarksAndJumpsToNewOffscreenAttention(t *testing.T) {
 	if got := model.currentSelection(); got.identity != selected.identity || got.relative != selected.relative {
 		t.Fatalf("new Attention moved selection from %#v to %#v", selected, got)
 	}
-	view := ansi.Strip(model.View().Content)
+	rendered := model.View().Content
+	view := ansi.Strip(rendered)
 	if !strings.Contains(view, "NEW ATTENTION (1): press a") {
 		t.Fatalf("fixed header did not mark offscreen Attention:\n%s", view)
+	}
+	if want := model.styler.attention.Render("NEW ATTENTION (1): press a"); !strings.Contains(rendered, want) {
+		t.Fatalf("offscreen Attention marker did not use Attention styling: %q", rendered)
 	}
 	for _, want := range []string{"Next Ctrl-C:", "Nav:", "a:Attention"} {
 		if !strings.Contains(view, want) {
@@ -655,6 +660,7 @@ func TestBubbleDashboardConstrainedFallbackKeepsGuidanceInFixedFooter(t *testing
 	chrome := dashboardChromeLines(
 		[]string{"Repository: acme/widgets", "Worker capacity: 1 used | 2 available | 3 total"},
 		footer,
+		0,
 		dashboardRunning,
 		dashboardStyler{},
 		120,

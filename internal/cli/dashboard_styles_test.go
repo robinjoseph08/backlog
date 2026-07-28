@@ -165,7 +165,7 @@ func TestDashboardConstrainedChromeKeepsMetadataMuted(t *testing.T) {
 		{name: "compact", width: 80, metadata: "R:acme/widgets", capacity: "W:1u/2a/3t", lifecycle: "S:Draining", nextInterrupt: "^C:request suspension"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			chrome := dashboardChromeLines(header, footer, dashboardDraining, styler, test.width, 1)
+			chrome := dashboardChromeLines(header, footer, 0, dashboardDraining, styler, test.width, 1)
 			got := strings.Join(append(append([]string(nil), chrome.top...), chrome.bottom...), "\n")
 			for _, want := range []string{
 				styler.metadata.Render(test.metadata),
@@ -176,6 +176,27 @@ func TestDashboardConstrainedChromeKeepsMetadataMuted(t *testing.T) {
 				if !strings.Contains(got, want) {
 					t.Fatalf("constrained chrome omitted semantic span %q: %q", ansi.Strip(want), got)
 				}
+			}
+		})
+	}
+}
+
+func TestDashboardOffscreenAttentionIndicatorUsesAttentionStyle(t *testing.T) {
+	styler := newDashboardStyler(TerminalColorTrueColor, true)
+	for _, test := range []struct {
+		name    string
+		header  string
+		compact bool
+		notice  string
+	}{
+		{name: "full", header: "Repository: acme/widgets", notice: "NEW ATTENTION (2): press a"},
+		{name: "compact", header: "R:acme/widgets", compact: true, notice: "! (2): press a"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := styledDashboardHeaderItems([]string{test.header}, 2, test.compact, styler)[0]
+			want := styler.metadata.Render(test.header) + styler.metadata.Render(" | ") + styler.attention.Render(test.notice)
+			if got != want {
+				t.Fatalf("offscreen Attention header = %q, want metadata and Attention spans %q", got, want)
 			}
 		})
 	}

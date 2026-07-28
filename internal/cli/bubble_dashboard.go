@@ -493,7 +493,7 @@ type dashboardSelection struct {
 
 func (m *bubbleDashboardModel) refreshViewport(selection dashboardSelection) {
 	header, layout, footer, stage := m.dashboard.renderPartsWithLayout(m.dashboard.now(), m.styler)
-	m.header = dashboardHeaderWithAttention(header, len(m.attentionPending))
+	m.header = header
 	m.footer = footer + "\n" + dashboardNavigationHelp
 	m.layout = layout
 	m.stage = stage
@@ -507,17 +507,6 @@ func (m *bubbleDashboardModel) refreshViewport(selection dashboardSelection) {
 		}
 	}
 	m.selectViewportAnchor()
-}
-
-func dashboardHeaderWithAttention(header string, pending int) string {
-	if pending == 0 {
-		return header
-	}
-	lines := strings.Split(header, "\n")
-	if len(lines) > 1 {
-		lines[1] += fmt.Sprintf(" | NEW ATTENTION (%d): press a", pending)
-	}
-	return strings.Join(lines, "\n")
 }
 
 func (m *bubbleDashboardModel) resizeViewport() {
@@ -706,7 +695,7 @@ type dashboardFrame struct {
 
 func (m bubbleDashboardModel) dashboardFrame() dashboardFrame {
 	headerLines := strings.SplitN(m.header, "\n", 3)
-	chrome := dashboardChromeLines(headerLines[1:], strings.Split(m.footer, "\n"), m.stage, m.styler, m.width, m.height)
+	chrome := dashboardChromeLines(headerLines[1:], strings.Split(m.footer, "\n"), len(m.attentionPending), m.stage, m.styler, m.width, m.height)
 	chromeHeight := len(chrome.top) + len(chrome.bottom)
 	titleHeight := 0
 	if chromeHeight+1 < m.height {
@@ -730,7 +719,7 @@ type dashboardChrome struct {
 	bottom []string
 }
 
-func dashboardChromeLines(header, footer []string, stage dashboardStage, styler dashboardStyler, width, height int) dashboardChrome {
+func dashboardChromeLines(header, footer []string, pendingAttention int, stage dashboardStage, styler dashboardStyler, width, height int) dashboardChrome {
 	if width <= 0 || height <= 0 {
 		return dashboardChrome{}
 	}
@@ -738,7 +727,7 @@ func dashboardChromeLines(header, footer []string, stage dashboardStage, styler 
 	if height >= 3 {
 		chromeLimit--
 	}
-	metadata := styledDashboardChromeItems(header, dashboardSemanticMetadata, styler)
+	metadata := styledDashboardHeaderItems(header, pendingAttention, false, styler)
 	lifecycle := styledDashboardFooterItems(footer, stage, styler)
 	headerGroups := dashboardChromeGroups(metadata)
 	footerGroups := dashboardChromeGroups(lifecycle)
@@ -747,7 +736,7 @@ func dashboardChromeLines(header, footer []string, stage dashboardStage, styler 
 		compactNavigation[2] = "N:jk/fb Pg H/E gG a"
 	}
 	compactNavigation = styledDashboardFooterItems(compactNavigation, stage, styler)
-	compactHeader := styledDashboardChromeItems(compactDashboardHeader(header), dashboardSemanticMetadata, styler)
+	compactHeader := styledDashboardHeaderItems(compactDashboardHeader(header), pendingAttention, true, styler)
 	compactFooter := styledDashboardFooterItems(compactDashboardFooter(footer), stage, styler)
 	candidates := []dashboardChrome{
 		{top: wrapDashboardChrome(headerGroups, width), bottom: wrapDashboardChrome(footerGroups, width)},
@@ -755,8 +744,9 @@ func dashboardChromeLines(header, footer []string, stage dashboardStage, styler 
 		{top: wrapDashboardChrome([][]string{metadata}, width), bottom: wrapDashboardChrome([][]string{lifecycle}, width)},
 		{top: wrapDashboardChrome([][]string{compactHeader}, width), bottom: wrapDashboardChrome([][]string{compactFooter}, width)},
 		// A one-line terminal cannot have distinct header and footer rows. Keep
-		// the whole compact chrome in the footer row so lifecycle guidance and
-		// navigation are never moved above the scrollable body.
+		// the whole chrome in the footer row, preferring full labels when width
+		// permits and compact labels otherwise.
+		{bottom: wrapDashboardChrome([][]string{append(append([]string(nil), metadata...), lifecycle...)}, width)},
 		{bottom: wrapDashboardChrome([][]string{append(append([]string(nil), compactHeader...), compactFooter...)}, width)},
 	}
 	for _, candidate := range candidates {
@@ -802,7 +792,6 @@ func compactDashboardHeader(header []string) []string {
 			line = compactDashboardCapacity(line)
 		} else {
 			line = strings.Replace(line, "Repository: ", "R:", 1)
-			line = strings.Replace(line, " | NEW ATTENTION ", " | ! ", 1)
 		}
 		compact = append(compact, line)
 	}
@@ -827,11 +816,19 @@ func compactFooterLine(footer []string, index int) string {
 	return footer[index]
 }
 
-func styledDashboardChromeItems(items []string, semantic dashboardSemantic, styler dashboardStyler) []string {
+func styledDashboardHeaderItems(items []string, pendingAttention int, compact bool, styler dashboardStyler) []string {
 	styled := make([]string, len(items))
 	for index, item := range items {
-		styled[index] = styler.render(semantic, item)
+		styled[index] = styler.render(dashboardSemanticMetadata, item)
 	}
+	if pendingAttention == 0 || len(styled) == 0 {
+		return styled
+	}
+	notice := fmt.Sprintf("NEW ATTENTION (%d): press a", pendingAttention)
+	if compact {
+		notice = fmt.Sprintf("! (%d): press a", pendingAttention)
+	}
+	styled[0] += styler.render(dashboardSemanticMetadata, " | ") + styler.render(dashboardSemanticAttention, notice)
 	return styled
 }
 
