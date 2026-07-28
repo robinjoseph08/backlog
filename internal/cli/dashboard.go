@@ -800,7 +800,7 @@ func (d *liveDashboard) renderResponsiveParts(now time.Time, options responsiveD
 
 	projection := d.project(current, stage, now)
 	body := dashboardBodyBuilder{}
-	body.renderAdmission(admission, diagnosticsOpen, stage, now, options.styler)
+	body.renderResponsiveAdmission(admission, diagnosticsOpen, stage, now, options)
 	body.renderResponsiveSection(statusActive, "Active Runs", projection.sections[statusActive], now, options, false)
 	body.renderResponsiveSection(statusAttention, "Attention Required", projection.sections[statusAttention], now, options, false)
 	body.renderResponsiveSection(statusOutcomes, "Outcomes to Acknowledge", projection.sections[statusOutcomes], now, options, false)
@@ -809,6 +809,32 @@ func (d *liveDashboard) renderResponsiveParts(now time.Time, options responsiveD
 		body.renderResponsiveMessages(messages, options)
 	}
 	return projection, dashboardBodyLayout{text: body.body.String(), anchors: body.anchors, attention: projection.attention}, stage
+}
+
+func (b *dashboardBodyBuilder) renderResponsiveAdmission(admission dashboardAdmission, diagnosticsOpen bool, stage dashboardStage, now time.Time, options responsiveDashboardOptions) {
+	b.separate()
+	identity := dashboardSectionAnchor("Admission health")
+	b.anchor(identity)
+	marker := "  "
+	if options.selected == identity {
+		marker = "> "
+	}
+	expanded := options.expanded(identity, true)
+	heading := marker + "Admission health"
+	if !expanded {
+		heading += " [collapsed]"
+	}
+	semantic := dashboardAdmissionSemantic(admission)
+	b.write(options.styler.render(semantic, truncateDashboardContent(heading, options.width)) + "\n")
+
+	var content strings.Builder
+	if expanded {
+		renderAdmissionDetails(&content, admission, diagnosticsOpen, stage, now, options.styler)
+	} else {
+		renderCompactAdmissionStatus(&content, admission, stage, now, options)
+		renderAdmissionDiagnosticsState(&content, admission.failures, diagnosticsOpen, options.styler, options.width)
+	}
+	b.write(content.String())
 }
 
 func (b *dashboardBodyBuilder) renderResponsiveSection(section statusSection, name string, runs []statusRun, now time.Time, options responsiveDashboardOptions, completions bool) {
@@ -1113,14 +1139,22 @@ func cloneDashboardAdmission(admission dashboardAdmission) dashboardAdmission {
 }
 
 func renderAdmissionHealth(output *strings.Builder, admission dashboardAdmission, diagnosticsOpen bool, stage dashboardStage, now time.Time, styler dashboardStyler) {
-	semantic := dashboardSemanticMetadata
-	if admission.degraded {
-		semantic = dashboardSemanticWarning
-	} else if admission.snapshotComplete {
-		semantic = dashboardSemanticActive
-	}
 	output.WriteByte('\n')
-	writeDashboardStyledLine(output, styler, semantic, "Admission health")
+	writeDashboardStyledLine(output, styler, dashboardAdmissionSemantic(admission), "Admission health")
+	renderAdmissionDetails(output, admission, diagnosticsOpen, stage, now, styler)
+}
+
+func dashboardAdmissionSemantic(admission dashboardAdmission) dashboardSemantic {
+	if admission.degraded {
+		return dashboardSemanticWarning
+	}
+	if admission.snapshotComplete {
+		return dashboardSemanticActive
+	}
+	return dashboardSemanticMetadata
+}
+
+func renderAdmissionDetails(output *strings.Builder, admission dashboardAdmission, diagnosticsOpen bool, stage dashboardStage, now time.Time, styler dashboardStyler) {
 	if admission.degraded {
 		noun := "failures"
 		if admission.consecutiveFailures == 1 {
@@ -1164,11 +1198,48 @@ func renderAdmissionHealth(output *strings.Builder, admission dashboardAdmission
 		}
 		writeDashboardStyledLine(output, styler, dashboardSemanticActive, health)
 	}
-	if diagnosticsOpen {
-		renderAdmissionDiagnosticsStyled(output, admission.failures, styler)
-	} else {
-		writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, fmt.Sprintf("  Diagnostics: closed (d to open; %d recent)", len(admission.failures)))
+	renderAdmissionDiagnosticsState(output, admission.failures, diagnosticsOpen, styler, 0)
+}
+
+func renderCompactAdmissionStatus(output *strings.Builder, admission dashboardAdmission, stage dashboardStage, now time.Time, options responsiveDashboardOptions) {
+	semantic := dashboardAdmissionSemantic(admission)
+	line := "  Admission: checking | Candidate snapshot not yet complete"
+	if admission.degraded {
+		noun := "failures"
+		if admission.consecutiveFailures == 1 {
+			noun = "failure"
+		}
+		line = fmt.Sprintf("  Admission: DEGRADED | %d consecutive %s", admission.consecutiveFailures, noun)
+		if operation := plainStatusValue(string(admission.operation)); operation != "" {
+			line += " | " + operation
+			if admission.issue != nil {
+				line += fmt.Sprintf(" #%d", *admission.issue)
+			}
+		}
+		if cause := plainStatusValue(admission.cause); cause != "" {
+			line += " | Cause: " + cause
+		}
+		if stage == dashboardRunning {
+			line += " | Next retry: " + admissionRetryCountdown(admission.retryAt, now)
+		} else {
+			line += " | Retry: stopped"
+		}
+	} else if admission.snapshotComplete {
+		line = "  Admission: healthy"
 	}
+	writeDashboardStyledLine(output, options.styler, semantic, truncateDashboardContent(line, options.width))
+}
+
+func renderAdmissionDiagnosticsState(output *strings.Builder, failures []runner.CandidateDiscoveryFailed, diagnosticsOpen bool, styler dashboardStyler, width int) {
+	if diagnosticsOpen {
+		renderAdmissionDiagnosticsStyled(output, failures, styler)
+		return
+	}
+	line := fmt.Sprintf("  Diagnostics: closed (d to open; %d recent)", len(failures))
+	if width > 0 {
+		line = truncateDashboardContent(line, width)
+	}
+	writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, line)
 }
 
 func writeDashboardStyledLine(output *strings.Builder, styler dashboardStyler, semantic dashboardSemantic, line string) {

@@ -202,7 +202,7 @@ esac
 	if _, err := writeInput.Write([]byte("g")); err != nil {
 		t.Fatalf("return to Admission after retries: %v", err)
 	}
-	waitForDashboardScreen(t, &stdout, 100, 12, "2 consecutive failures")
+	waitForDashboardScreen(t, &stdout, "2 consecutive failures")
 	closedOutput := stdout.String()
 	if !strings.Contains(closedOutput, "Admission health") || !strings.Contains(closedOutput, "DEGRADED") || !strings.Contains(closedOutput, "Diagnostics: closed") {
 		t.Fatalf("automatic dashboard did not render closed Admission health: %q", closedOutput)
@@ -220,16 +220,16 @@ esac
 	if _, err := writeInput.Write([]byte("G")); err != nil {
 		t.Fatalf("jump to bottom of existing dashboard sections: %v", err)
 	}
-	waitForDashboardScreen(t, &stdout, 100, 12, "Diagnostic: retained outcome evidence")
+	waitForDashboardScreen(t, &stdout, "Diagnostic: retained outcome evidence")
 	if _, err := writeInput.Write([]byte("b")); err != nil {
 		t.Fatalf("page to existing outcome section: %v", err)
 	}
-	waitForDashboardScreen(t, &stdout, 100, 12, "Outcomes to Acknowledge")
+	waitForDashboardScreen(t, &stdout, "Outcomes to Acknowledge")
 
 	if _, err := writeInput.Write([]byte("g")); err != nil {
 		t.Fatalf("return to Admission: %v", err)
 	}
-	waitForDashboardScreen(t, &stdout, 100, 12, "Admission: DEGRADED")
+	waitForDashboardScreen(t, &stdout, "Admission: DEGRADED")
 	if _, err := writeInput.Write([]byte{0x03}); err != nil {
 		t.Fatalf("start Drain: %v", err)
 	}
@@ -272,8 +272,9 @@ func waitForDashboardOutputAfter(t *testing.T, output *synchronizedBuffer, offse
 	t.Fatalf("dashboard output after byte %d never contained %q: %q", offset, want, output.String())
 }
 
-func waitForDashboardScreen(t *testing.T, output *synchronizedBuffer, width, height int, want string) {
+func waitForDashboardScreen(t *testing.T, output *synchronizedBuffer, want string) {
 	t.Helper()
+	const width, height = 100, 12
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if visible := terminalScreenText(output.String(), width, height); strings.Contains(visible, want) {

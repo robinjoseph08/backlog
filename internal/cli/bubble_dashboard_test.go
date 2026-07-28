@@ -992,6 +992,79 @@ func TestBubbleDashboardQueueBoundsOnlyOptionalOutput(t *testing.T) {
 	}
 }
 
+func TestBubbleDashboardAdmissionExpansionRemainsUsefulAndResponsive(t *testing.T) {
+	now := time.Date(2026, 7, 28, 14, 0, 30, 0, time.UTC)
+	model := newBubbleDashboardModel(
+		context.Background(),
+		PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}},
+		newBubbleDashboardSession(time.Now),
+		TerminalDimensions{Width: 180, Height: 18},
+	)
+	issue := 70
+	model.dashboard.operationalEvent(runner.CandidateDiscoveryFailed{
+		Operation:  runner.CandidateDiscoveryInspect,
+		Issue:      &issue,
+		Err:        errors.New("gh issue view 70: retained diagnostic evidence"),
+		Cause:      "upstream API temporarily unavailable",
+		OccurredAt: now.Add(-30 * time.Second), RetryAt: now.Add(30 * time.Second),
+		ConsecutiveFailures: 3,
+	})
+	admission := dashboardSectionAnchor("Admission health")
+	model.selectedAnchor = admission
+	model.refreshViewport(dashboardSelection{identity: admission, relative: model.dashboardBodyStart(), valid: true})
+
+	expanded := model.viewport.GetContent()
+	for _, want := range []string{"> Admission health", "First failure:", "Operation: inspect candidate", "Cause: upstream API temporarily unavailable"} {
+		if !strings.Contains(expanded, want) {
+			t.Fatalf("expanded selected Admission omitted %q:\n%s", want, expanded)
+		}
+	}
+
+	updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	model = updated.(bubbleDashboardModel)
+	collapsed := model.viewport.GetContent()
+	for _, want := range []string{"> Admission health [collapsed]", "Admission: DEGRADED | 3 consecutive failures", "inspect candidate #70", "Cause: upstream API temporarily unavailable", "Diagnostics: closed"} {
+		if !strings.Contains(collapsed, want) {
+			t.Fatalf("collapsed selected Admission omitted %q:\n%s", want, collapsed)
+		}
+	}
+	for _, hidden := range []string{"First failure:", "Latest failure:", "    Operation:"} {
+		if strings.Contains(collapsed, hidden) {
+			t.Fatalf("collapsed Admission retained expanded field %q:\n%s", hidden, collapsed)
+		}
+	}
+
+	updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}))
+	model = updated.(bubbleDashboardModel)
+	if body := model.viewport.GetContent(); !strings.Contains(body, "> Admission health [collapsed]") || !strings.Contains(body, "retained diagnostic evidence") {
+		t.Fatalf("collapsed Admission made Diagnostics inaccessible:\n%s", body)
+	}
+	updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}))
+	model = updated.(bubbleDashboardModel)
+
+	updated, _ = model.Update(tea.WindowSizeMsg{Width: 32, Height: 11})
+	model = updated.(bubbleDashboardModel)
+	narrow := model.viewport.GetContent()
+	for _, line := range []string{
+		dashboardContentLine(t, narrow, "Admission health"),
+		dashboardContentLine(t, narrow, "Admission: DEGRADED"),
+		dashboardContentLine(t, narrow, "Diagnostics:"),
+	} {
+		if width := ansi.StringWidth(line); width > 32 {
+			t.Fatalf("collapsed Admission line width = %d, want at most 32: %q", width, line)
+		}
+	}
+	if !strings.Contains(narrow, "> Admission health [collapsed]") || !strings.Contains(narrow, "Admission: DEGRADED") {
+		t.Fatalf("narrow collapsed Admission lost its selected degraded summary:\n%s", narrow)
+	}
+
+	updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	model = updated.(bubbleDashboardModel)
+	if body := model.viewport.GetContent(); !strings.Contains(body, "> Admission health") || strings.Contains(body, "Admission health [collapsed]") || !strings.Contains(body, "upstream API temporarily unavailable") {
+		t.Fatalf("narrow Admission did not restore complete expanded details for wrapping:\n%s", body)
+	}
+}
+
 func TestBubbleDashboardResponsiveDensityAndSelectedDetails(t *testing.T) {
 	now := time.Date(2026, 7, 28, 14, 0, 0, 0, time.UTC)
 	logPath := t.TempDir() + "/responsive.jsonl"
