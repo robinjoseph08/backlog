@@ -22,7 +22,7 @@ import (
 
 const (
 	dashboardOutputUpdateLimit = 64
-	dashboardNavigationHelp    = "Nav: ↑↓/jk PgUp/Dn/f/b Home/End g/G a:Attention Enter:Details"
+	dashboardNavigationHelp    = "Nav: ↑↓/jk PgUp/Dn/f/b Home/End g/G a:Attention Enter:Toggle"
 )
 
 type dashboardConfiguredMsg struct {
@@ -452,7 +452,7 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.refreshViewport(selection)
 	enteredRoomy := previousDensity != dashboardDensityRoomy && dashboardDensityForHeight(m.height) == dashboardDensityRoomy
 	if configured || enteredRoomy {
-		m.ensureRoomyRunSelection()
+		m.ensureRunSelection()
 	}
 	if configured {
 		m.attentionKnown = cloneDashboardIdentities(m.layout.attention)
@@ -529,10 +529,7 @@ func (m *bubbleDashboardModel) refreshViewport(selection dashboardSelection) {
 	m.selectViewportAnchor()
 }
 
-func (m *bubbleDashboardModel) ensureRoomyRunSelection() {
-	if dashboardDensityForHeight(m.height) != dashboardDensityRoomy {
-		return
-	}
+func (m *bubbleDashboardModel) ensureRunSelection() {
 	if strings.HasPrefix(m.selectedAnchor, "run:") {
 		for _, anchor := range m.layout.anchors {
 			if anchor.identity == m.selectedAnchor {

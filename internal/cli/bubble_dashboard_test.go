@@ -727,6 +727,10 @@ func TestBubbleDashboardResponsiveDensityAndSelectedDetails(t *testing.T) {
 	if !strings.Contains(constrainedBody, "Recent Completions (1) [collapsed]") || strings.Contains(constrainedBody, completion.IssueTitle) {
 		t.Fatalf("12-23 row layout did not collapse Recent Completions:\n%s", constrainedBody)
 	}
+	constrainedView := ansi.Strip(constrained.View().Content)
+	if !strings.Contains(constrainedView, "Enter:Toggle") || strings.Contains(constrainedView, "Enter:Details") {
+		t.Fatalf("dashboard footer did not describe Enter for Runs and sections:\n%s", constrainedView)
+	}
 
 	minimal := newModel(11)
 	minimalView := ansi.Strip(minimal.View().Content)
@@ -734,6 +738,15 @@ func TestBubbleDashboardResponsiveDensityAndSelectedDetails(t *testing.T) {
 		if !strings.Contains(minimalView, want) {
 			t.Fatalf("sub-12-row layout omitted %q:\n%s", want, minimalView)
 		}
+	}
+	activeAnchor := dashboardRunAnchor(active.RunID)
+	if minimal.selectedAnchor != activeAnchor {
+		t.Fatalf("minimal initial selection = %q, want active Run %q", minimal.selectedAnchor, active.RunID)
+	}
+	updated, _ := minimal.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	minimal = updated.(bubbleDashboardModel)
+	if !minimal.expansionOverrides[activeAnchor] {
+		t.Fatal("minimal initial Enter did not expand the selected Run")
 	}
 }
 
@@ -752,6 +765,28 @@ func TestBubbleDashboardSelectsRunDetailsWhenResizedFromMediumToRoomy(t *testing
 	}
 	if !strings.Contains(model.viewport.GetContent(), "Run: run-0") {
 		t.Fatalf("roomy resize did not show selected Run details:\n%s", model.viewport.GetContent())
+	}
+}
+
+func TestBubbleDashboardPreservesSelectedRunWhenResizedToMinimal(t *testing.T) {
+	now := time.Date(2026, 7, 28, 14, 0, 0, 0, time.UTC)
+	current := navigationTestState(now, 4)
+	model := configuredNavigationTestModel(t, now, current, &dashboardTestSource{current: current})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 64, Height: 24})
+	model = updated.(bubbleDashboardModel)
+
+	selected := dashboardRunAnchor("run-2")
+	model.selectedAnchor = selected
+	model.refreshViewport(dashboardSelection{identity: selected, relative: model.dashboardBodyStart(), valid: true})
+	updated, _ = model.Update(tea.WindowSizeMsg{Width: 64, Height: 11})
+	model = updated.(bubbleDashboardModel)
+
+	if model.selectedAnchor != selected {
+		t.Fatalf("minimal resize selection = %q, want %q", model.selectedAnchor, selected)
+	}
+	view := ansi.Strip(model.View().Content)
+	if !strings.Contains(view, "> #3") {
+		t.Fatalf("minimal resize did not keep the non-first selected Run visible:\n%s", view)
 	}
 }
 
