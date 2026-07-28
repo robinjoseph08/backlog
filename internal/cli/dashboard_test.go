@@ -345,9 +345,11 @@ esac
 			case <-time.After(2 * time.Second):
 				t.Fatal("terminal runner did not finish shutdown")
 			}
+			output := stdout.String()
+			visible := terminalScreenText(output, 80, 24)
 			for _, want := range test.wantOutput {
-				if !strings.Contains(stdout.String(), want) {
-					t.Fatalf("dashboard shutdown output missing %q: %q", want, stdout.String())
+				if !strings.Contains(visible, want) {
+					t.Fatalf("dashboard shutdown screen missing %q:\n%s\nraw output: %q", want, visible, output)
 				}
 			}
 		})
