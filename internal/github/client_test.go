@@ -224,7 +224,7 @@ case "$*" in
     printf '%s\n' '[[],[{"body":"existing comment"}]]' ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
 esac`)
-	issue, pulls, err := (Client{Executable: gh}).ResetResources(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
+	issue, pulls, err := (Client{Executable: gh}).OwnedRunResources(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,7 +249,7 @@ case "$*" in
     printf '%s\n' '[{"number":100,"url":"https://github.com/other/widgets/pull/100","state":"OPEN","mergedAt":null,"autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-42-run","headRepositoryOwner":{"login":"other"},"headRepository":{"nameWithOwner":"other/widgets"}}]' ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
 esac`)
-	_, _, err := (Client{Executable: gh}).ResetResources(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
+	_, _, err := (Client{Executable: gh}).OwnedRunResources(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
 	if err == nil || !strings.Contains(err.Error(), "mismatched") {
 		t.Fatalf("error = %v", err)
 	}
@@ -336,7 +336,7 @@ case "$*" in
   "pr list "*) printf '%s\n' '`+test.pull+`' ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
 esac`)
-			_, _, err := (Client{Executable: gh}).ResetResources(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
+			_, _, err := (Client{Executable: gh}).OwnedRunResources(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("error = %v, want %q", err, test.want)
 			}
@@ -368,7 +368,7 @@ case "$*" in
   "api "*) printf '%s\n' '`+test.comments+`' ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
 esac`)
-			_, _, err := (Client{Executable: gh}).ResetResources(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
+			_, _, err := (Client{Executable: gh}).OwnedRunResources(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
 			if err == nil || !strings.Contains(err.Error(), "comment") {
 				t.Fatalf("error = %v", err)
 			}
@@ -394,7 +394,7 @@ case "$*" in
     printf ']\n' ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
 esac`)
-	_, _, err := (Client{Executable: gh}).ResetResources(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
+	_, _, err := (Client{Executable: gh}).OwnedRunResources(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
 	if err == nil || !strings.Contains(err.Error(), "inspection limit") {
 		t.Fatalf("error = %v", err)
 	}

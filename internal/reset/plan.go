@@ -1,78 +1,31 @@
-// Package reset derives read-only Reset Plans from conclusively inspected Run resources.
+// Package reset supplies Reset lifecycle policy to the shared owned Run
+// retirement module.
 package reset
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
+	"github.com/robinjoseph08/backlog/internal/retirement"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
+	"github.com/robinjoseph08/backlog/internal/state"
 )
 
-type PullRequestState string
+type PullRequestState = retirement.PullRequestState
 
 const (
-	PullRequestOpen   PullRequestState = "open"
-	PullRequestClosed PullRequestState = "closed"
-	PullRequestMerged PullRequestState = "merged"
+	PullRequestOpen   = retirement.PullRequestOpen
+	PullRequestClosed = retirement.PullRequestClosed
+	PullRequestMerged = retirement.PullRequestMerged
 )
 
-type Issue struct {
-	Number int
-	URL    string
-	Open   bool
-	Labels []string
-}
-
-type PullRequest struct {
-	Number         int
-	URL            string
-	Branch         string
-	Commit         string
-	State          PullRequestState
-	AutoMergeArmed bool
-	ResetCommented bool
-}
-
-type Branch struct {
-	Name    string
-	Commit  string
-	Present bool
-}
-
-type Worktree struct {
-	Path    string
-	Branch  string
-	Commit  string
-	Present bool
-}
-
-type Session struct {
-	ID         string
-	Dir        string
-	ArchiveDir string
-	Present    bool
-	Archived   bool
-}
-
-// Snapshot contains only known-present or known-absent resources. Inspectors
-// return an error rather than constructing a Snapshot when any state is unknown.
-type Snapshot struct {
-	Run           scheduler.Run
-	Lease         scheduler.Lease
-	Issue         Issue
-	PullRequests  []PullRequest
-	RemoteBranch  Branch
-	LocalBranch   Branch
-	Worktree      Worktree
-	Session       Session
-	WorkerSummary string
-}
-
-type Plan struct {
-	Snapshot Snapshot
-	Actions  []string
-}
+type Issue = retirement.Issue
+type PullRequest = retirement.PullRequest
+type Branch = retirement.Branch
+type Worktree = retirement.Worktree
+type Session = retirement.Session
+type Snapshot = retirement.Snapshot
+type Plan = retirement.Plan
 
 var humanWorkflowLabels = map[string]struct{}{
 	"needs-triage":    {},
@@ -81,200 +34,83 @@ var humanWorkflowLabels = map[string]struct{}{
 	"wontfix":         {},
 }
 
-// Build refuses unsafe resource combinations and orders only mutations whose
-// postconditions are not already satisfied.
-func Build(snapshot Snapshot) (Plan, error) {
-	if err := validateIdentity(snapshot); err != nil {
-		return Plan{}, err
+// Policy defines Reset eligibility, explanation wording, managed label outcome,
+// terminal state, and diagnostic requirements. Artifact rules remain owned by
+// retirement.Service.
+func Policy(issue int) retirement.Policy {
+	return retirement.Policy{
+		Operation:        "Reset",
+		SelectRun:        func(current state.State) (scheduler.Run, scheduler.Lease, error) { return selectRun(current, issue) },
+		ValidateSnapshot: validateSnapshot,
+		EligibleStatuses: []scheduler.Status{
+			scheduler.StatusClaimed, scheduler.StatusWorktreeReady, scheduler.StatusRunning,
+			scheduler.StatusWaitingForMerge, scheduler.StatusFailed, scheduler.StatusSuspended,
+			scheduler.StatusNeedsHuman, scheduler.StatusResetting, scheduler.StatusReset,
+		},
+		Explanation:       Explanation,
+		ExplanationAction: "explain Reset",
+		Labels: retirement.LabelOutcome{
+			Remove: []string{"in-progress"},
+			Add:    []string{"ready-for-agent"},
+		},
+		ProgressStatus:     scheduler.StatusResetting,
+		TerminalStatus:     scheduler.StatusReset,
+		RequireDurableLogs: true,
 	}
-	if snapshot.Run.Status == scheduler.StatusMerged {
-		return Plan{}, fmt.Errorf("Run %s is merged; merged work cannot be Reset", snapshot.Run.RunID)
-	}
-	labels := make(map[string]struct{}, len(snapshot.Issue.Labels))
-	for _, label := range snapshot.Issue.Labels {
-		normalized := strings.ToLower(label)
-		labels[normalized] = struct{}{}
-		if _, blocks := humanWorkflowLabels[normalized]; blocks {
-			return Plan{}, fmt.Errorf("issue #%d has human workflow label %q", snapshot.Issue.Number, label)
-		}
-	}
+}
 
-	pullRequests := append([]PullRequest(nil), snapshot.PullRequests...)
-	sort.Slice(pullRequests, func(i, j int) bool { return pullRequests[i].Number < pullRequests[j].Number })
-	foundRecorded := snapshot.Run.PullRequest == ""
-	pullNumbers := make(map[int]struct{}, len(pullRequests))
-	pullURLs := make(map[string]struct{}, len(pullRequests))
-	for _, pull := range pullRequests {
-		if pull.Number <= 0 || pull.URL == "" || pull.Branch != snapshot.Run.Branch || strings.TrimSpace(pull.Commit) == "" {
-			return Plan{}, fmt.Errorf("Run %s has a pull request with incomplete or mismatched branch identity", snapshot.Run.RunID)
+func validateSnapshot(snapshot retirement.Snapshot) error {
+	for _, label := range snapshot.Issue.Labels {
+		if _, blocks := humanWorkflowLabels[strings.ToLower(label)]; blocks {
+			return fmt.Errorf("issue #%d has human workflow label %q", snapshot.Issue.Number, label)
 		}
-		if _, duplicate := pullNumbers[pull.Number]; duplicate {
-			return Plan{}, fmt.Errorf("Run %s has duplicate pull request number #%d", snapshot.Run.RunID, pull.Number)
-		}
-		if _, duplicate := pullURLs[pull.URL]; duplicate {
-			return Plan{}, fmt.Errorf("Run %s has duplicate pull request URL %s", snapshot.Run.RunID, pull.URL)
-		}
-		pullNumbers[pull.Number] = struct{}{}
-		pullURLs[pull.URL] = struct{}{}
-		if pull.URL == snapshot.Run.PullRequest {
-			foundRecorded = true
-		}
-		if pull.State == PullRequestMerged {
-			return Plan{}, fmt.Errorf("pull request #%d is merged; merged work cannot be Reset", pull.Number)
-		}
-		if pull.State != PullRequestOpen && pull.State != PullRequestClosed {
-			return Plan{}, fmt.Errorf("pull request #%d has unknown state %q", pull.Number, pull.State)
-		}
-		if pull.State == PullRequestClosed && pull.AutoMergeArmed {
-			return Plan{}, fmt.Errorf("closed pull request #%d has uncertain auto-merge state", pull.Number)
-		}
-	}
-	if !foundRecorded {
-		return Plan{}, fmt.Errorf("recorded pull request %s was not found for Run branch %s", snapshot.Run.PullRequest, snapshot.Run.Branch)
 	}
 	if !snapshot.Issue.Open {
-		return Plan{}, fmt.Errorf("issue #%d is closed without verified Completion; refusing unexplained closure", snapshot.Issue.Number)
+		return fmt.Errorf("issue #%d is closed without verified Completion; refusing unexplained closure", snapshot.Issue.Number)
 	}
-
-	plan := Plan{Snapshot: snapshot}
-	planning := snapshot
-	planning.PullRequests = pullRequests
-	hasOpenPullRequest := false
-	for _, pull := range pullRequests {
-		if pull.State == PullRequestOpen {
-			hasOpenPullRequest = true
-			break
-		}
-	}
-	_, hasInProgress := labels["in-progress"]
-	_, hasReadyForAgent := labels["ready-for-agent"]
-	needsProgress := hasOpenPullRequest || snapshot.RemoteBranch.Present || snapshot.LocalBranch.Present ||
-		snapshot.Worktree.Present || snapshot.Session.Present || hasInProgress || !hasReadyForAgent
-	if needsProgress && planning.Run.Status != scheduler.StatusResetting && planning.Run.Status != scheduler.StatusWaitingForMerge && planning.Run.Status != scheduler.StatusReset {
-		plan.Actions = append(plan.Actions, fmt.Sprintf("mark Run %s resetting while retaining Lease %s", snapshot.Run.RunID, snapshot.Lease.LeaseID))
-		planning.Run.Status = scheduler.StatusResetting
-	}
-	for {
-		pull, found := NextPullRequestForReset(planning)
-		if planning.Run.Status == scheduler.StatusWaitingForMerge && (!found || !pull.AutoMergeArmed) {
-			plan.Actions = append(plan.Actions, fmt.Sprintf("mark Run %s resetting while retaining Lease %s", snapshot.Run.RunID, snapshot.Lease.LeaseID))
-			planning.Run.Status = scheduler.StatusResetting
-			continue
-		}
-		if !found {
-			break
-		}
-		for index := range planning.PullRequests {
-			if planning.PullRequests[index].Number != pull.Number {
-				continue
-			}
-			switch {
-			case pull.AutoMergeArmed:
-				plan.Actions = append(plan.Actions, fmt.Sprintf("disable auto-merge for pull request #%d (%s)", pull.Number, pull.URL))
-				planning.PullRequests[index].AutoMergeArmed = false
-				if planning.Run.Status == scheduler.StatusWaitingForMerge {
-					plan.Actions = append(plan.Actions, fmt.Sprintf("mark Run %s resetting while retaining Lease %s", snapshot.Run.RunID, snapshot.Lease.LeaseID))
-					planning.Run.Status = scheduler.StatusResetting
-				}
-			case !pull.ResetCommented:
-				plan.Actions = append(plan.Actions, fmt.Sprintf("explain Reset on pull request #%d (%s)", pull.Number, pull.URL))
-				planning.PullRequests[index].ResetCommented = true
-			default:
-				plan.Actions = append(plan.Actions, fmt.Sprintf("close unmerged pull request #%d (%s)", pull.Number, pull.URL))
-				planning.PullRequests[index].State = PullRequestClosed
-			}
-			break
-		}
-	}
-	if snapshot.RemoteBranch.Present {
-		plan.Actions = append(plan.Actions, fmt.Sprintf("delete remote branch %s at %s", snapshot.RemoteBranch.Name, snapshot.RemoteBranch.Commit))
-	}
-	if snapshot.Worktree.Present {
-		plan.Actions = append(plan.Actions, fmt.Sprintf("remove local worktree %s for %s at %s", snapshot.Worktree.Path, snapshot.Worktree.Branch, snapshot.Worktree.Commit))
-	}
-	if snapshot.LocalBranch.Present {
-		plan.Actions = append(plan.Actions, fmt.Sprintf("delete local branch %s at %s", snapshot.LocalBranch.Name, snapshot.LocalBranch.Commit))
-	}
-	if snapshot.Session.Present {
-		plan.Actions = append(plan.Actions, fmt.Sprintf("archive Pi session %s from %s to %s", snapshot.Session.ID, snapshot.Session.Dir, snapshot.Session.ArchiveDir))
-	}
-	if _, present := labels["in-progress"]; present {
-		plan.Actions = append(plan.Actions, fmt.Sprintf("remove issue label in-progress from %s", snapshot.Issue.URL))
-	}
-	if _, present := labels["ready-for-agent"]; !present {
-		plan.Actions = append(plan.Actions, fmt.Sprintf("add issue label ready-for-agent to %s", snapshot.Issue.URL))
-	}
-	if snapshot.Run.Status != scheduler.StatusReset {
-		plan.Actions = append(plan.Actions, fmt.Sprintf("mark Run %s reset and release Lease %s", snapshot.Run.RunID, snapshot.Lease.LeaseID))
-	}
-	return plan, nil
+	return nil
 }
 
-// NextPullRequestForReset returns the owned open pull request targeted by the
-// next Reset action. A waiting-for-merge Run must handle its recorded pull
-// request before Reset can advance to the other pull requests for its branch.
+// Explanation is the exact durable pull request explanation used by Reset.
+func Explanation(run scheduler.Run) string {
+	return fmt.Sprintf("%s\nBacklog is resetting Run %s for issue #%d. This pull request is being closed as part of abandoning the incomplete Run.", CommentMarker(run.RunID), run.RunID, run.Issue)
+}
+
+func CommentMarker(runID string) string {
+	return "<!-- backlog-reset:" + runID + " -->"
+}
+
+// Build is the Reset planner facade retained for focused policy tests.
+func Build(snapshot Snapshot) (Plan, error) {
+	return retirement.Build(Policy(snapshot.Run.Issue), snapshot)
+}
+
 func NextPullRequestForReset(snapshot Snapshot) (PullRequest, bool) {
-	if snapshot.Run.Status == scheduler.StatusWaitingForMerge {
-		for _, pull := range snapshot.PullRequests {
-			if pull.URL == snapshot.Run.PullRequest {
-				return pull, pull.State == PullRequestOpen
-			}
-		}
-		return PullRequest{}, false
-	}
+	return retirement.NextPullRequest(snapshot)
+}
 
-	result := PullRequest{}
-	found := false
-	for _, pull := range snapshot.PullRequests {
-		if pull.State != PullRequestOpen {
+func selectRun(current state.State, issue int) (scheduler.Run, scheduler.Lease, error) {
+	for _, lease := range current.Leases {
+		if lease.Issue != issue {
 			continue
 		}
-		if !found || (pull.AutoMergeArmed && !result.AutoMergeArmed) || (pull.AutoMergeArmed == result.AutoMergeArmed && pull.Number < result.Number) {
-			result, found = pull, true
+		for _, run := range current.Runs {
+			if run.RunID == lease.RunID && run.Issue == issue {
+				return run, lease, nil
+			}
+		}
+		return scheduler.Run{}, scheduler.Lease{}, fmt.Errorf("Lease %s for issue #%d has an invalid Run reference", lease.LeaseID, issue)
+	}
+	for index := len(current.Runs) - 1; index >= 0; index-- {
+		run := current.Runs[index]
+		if run.Issue == issue && run.Status == scheduler.StatusReset {
+			for _, lease := range current.Leases {
+				if lease.RunID == run.RunID {
+					return scheduler.Run{}, scheduler.Lease{}, fmt.Errorf("reset Run %s still has old Lease %s", run.RunID, lease.LeaseID)
+				}
+			}
+			return run, scheduler.Lease{}, nil
 		}
 	}
-	return result, found
-}
-
-func validateIdentity(snapshot Snapshot) error {
-	run, lease, issue := snapshot.Run, snapshot.Lease, snapshot.Issue
-	if run.Issue <= 0 || run.RunID == "" || issue.URL == "" {
-		return fmt.Errorf("Reset Run or issue identity is incomplete")
-	}
-	if issue.Number != run.Issue {
-		return fmt.Errorf("Run %s and issue identity do not match", run.RunID)
-	}
-	if run.Status == scheduler.StatusReset {
-		if lease.LeaseID != "" || lease.Issue != 0 || lease.RunID != "" {
-			return fmt.Errorf("reset Run %s still has an active Lease", run.RunID)
-		}
-	} else if lease.LeaseID == "" || lease.Issue != run.Issue || lease.RunID != run.RunID {
-		return fmt.Errorf("Run %s, Lease %s, and issue identity do not match", run.RunID, lease.LeaseID)
-	}
-	if err := validateBranch(snapshot.RemoteBranch, run.Branch, "remote"); err != nil {
-		return err
-	}
-	if err := validateBranch(snapshot.LocalBranch, run.Branch, "local"); err != nil {
-		return err
-	}
-	if snapshot.Worktree.Present && (snapshot.Worktree.Path != run.Worktree || snapshot.Worktree.Branch != run.Branch || snapshot.Worktree.Commit == "") {
-		return fmt.Errorf("local worktree identity does not match Run %s", run.RunID)
-	}
-	if (snapshot.Session.Present || snapshot.Session.Archived) && (snapshot.Session.ID != run.SessionID || snapshot.Session.Dir != run.SessionDir || snapshot.Session.ArchiveDir == "") {
-		return fmt.Errorf("Pi session identity does not match Run %s", run.RunID)
-	}
-	if snapshot.Session.Present && snapshot.Session.Archived {
-		return fmt.Errorf("Pi session %s is present in both active and historical storage", run.SessionID)
-	}
-	return nil
-}
-
-func validateBranch(branch Branch, expected, location string) error {
-	if !branch.Present {
-		return nil
-	}
-	if branch.Name == "" || branch.Name != expected || strings.TrimSpace(branch.Commit) == "" {
-		return fmt.Errorf("%s branch identity does not match Run branch %q", location, expected)
-	}
-	return nil
+	return scheduler.Run{}, scheduler.Lease{}, fmt.Errorf("issue #%d has no active Lease or historical reset Run", issue)
 }
