@@ -2132,6 +2132,31 @@ func TestRunnerDrainCancellationDoesNotEraseRecoveredWorkerPID(t *testing.T) {
 	}
 }
 
+func TestRunnerStartupPreservesResolvingExternallyRunAndLease(t *testing.T) {
+	t.Parallel()
+
+	initial := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs: []scheduler.Run{{
+			Issue: 1, RunID: "resolving", Status: scheduler.StatusResolvingExternally, WorkerMode: scheduler.WorkerModePrint,
+			Branch: "agent/issue-1-resolving", Error: "retained diagnostic",
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "resolving", Issue: 1, RunID: "resolving"}},
+	}
+	github := &fakeGitHub{}
+	store := &memoryStore{value: cloneState(initial)}
+	runner := testRunner(github, newFakeWorkers(), store, 1)
+
+	assertInterventionRequired(t, runner.Run(context.Background()), 1)
+	got := store.LoadValue()
+	if !reflect.DeepEqual(got.Runs, initial.Runs) || !reflect.DeepEqual(got.Leases, initial.Leases) {
+		t.Fatalf("resolving Run or Lease changed during Runner startup: got %#v, want %#v", got, initial)
+	}
+	if branches := github.completionBranchSnapshot(); len(branches) != 0 {
+		t.Fatalf("resolving Run triggered GitHub Completion lookup: %q", branches)
+	}
+}
+
 func TestRunnerLeavesResettingRunForResetReconciliation(t *testing.T) {
 	t.Parallel()
 

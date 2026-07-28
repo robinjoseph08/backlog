@@ -114,6 +114,21 @@ func TestResolveDryRunAndCancellationDoNotMigrateBindOrMutate(t *testing.T) {
 	}
 }
 
+func TestResolveClosureInspectionFailureDoesNotMutateStateOrLabels(t *testing.T) {
+	fixture := newResolveFixture(t, []string{"in-progress", "ready-for-agent", "spec"}, "FUTURE")
+	beforeState := fileDigest(t, fixture.store.Path)
+	beforeGitHub := fileDigest(t, fixture.githubState)
+
+	var stdout, stderr bytes.Buffer
+	err := resolveCommandWithInput(context.Background(), fixture.args("run-42", "--yes"), strings.NewReader(""), false, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), `unsupported closure reason "FUTURE"`) {
+		t.Fatalf("Resolve closure inspection error = %v, stderr=%q, stdout=%q", err, stderr.String(), stdout.String())
+	}
+	if fileDigest(t, fixture.store.Path) != beforeState || fileDigest(t, fixture.githubState) != beforeGitHub {
+		t.Fatal("closure inspection failure changed Run state or GitHub labels")
+	}
+}
+
 func TestCompiledResolveDryRunAndInteractiveCancellation(t *testing.T) {
 	binary := buildExecutable(t, t.TempDir())
 	t.Run("dry run", func(t *testing.T) {
@@ -393,7 +408,8 @@ func TestCompiledResolveMigratesV3AndStatusAndFollowExposeResolution(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if migrated.Version != state.CurrentVersion || len(migrated.Runs) != 2 || migrated.Runs[0].Error != "older history" || migrated.Runs[1].Status != scheduler.StatusResolvedExternally {
+	if migrated.Version != state.CurrentVersion || len(migrated.Runs) != 2 || migrated.Runs[0].Error != "older history" ||
+		migrated.Runs[1].Status != scheduler.StatusResolvedExternally || migrated.Runs[1].ResolvedExternallyAt == nil {
 		t.Fatalf("compiled v3 migration changed existing state: %#v", migrated)
 	}
 
@@ -422,7 +438,14 @@ func TestCompiledResolveMigratesV3AndStatusAndFollowExposeResolution(t *testing.
 	if err != nil {
 		t.Fatalf("compiled Follow: %v\n%s", err, followOutput)
 	}
-	if !strings.Contains(string(followOutput), "External Resolution:") || !strings.Contains(string(followOutput), "Diagnostic warning:") {
-		t.Fatalf("compiled Follow = %s", followOutput)
+	resolvedAt := migrated.Runs[1].ResolvedExternallyAt.UTC().Format(time.RFC3339)
+	for _, want := range []string{
+		"External Resolution: " + resolvedAt + " | GitHub closure reason: completed",
+		"Retained diagnostic: retained diagnostic",
+		"Diagnostic warning:",
+	} {
+		if !strings.Contains(string(followOutput), want) {
+			t.Fatalf("compiled Follow missing %q: %s", want, followOutput)
+		}
 	}
 }
