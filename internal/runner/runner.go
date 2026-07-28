@@ -659,17 +659,30 @@ func (r *Runner) Run(ctx context.Context) error {
 					}
 				}
 			}
+			unverifiedSettledExit := completion.result.Settled && !closedBeforeReconciliation && !closed.GroupExited && r.suspensionExit.Load() == 0
 			if !closedBeforeReconciliation && draining {
 				settledControlErr := closed.ControlErr
-				if !closed.GroupExited && r.suspensionExit.Load() == 0 {
+				if unverifiedSettledExit {
 					settledControlErr = errors.Join(settledControlErr, fmt.Errorf("settled Worker process-group exit was not verified for issue #%d", completion.issue))
 					settledControlErr = errors.Join(settledControlErr, r.retainUnverifiedWorker(&current, completedRun, settledControlErr.Error(), closed))
 				}
 				if settledControlErr != nil {
 					drainOperationalErr = errors.Join(drainOperationalErr, settledControlErr)
 				}
+			} else if unverifiedSettledExit {
+				message := fmt.Sprintf("settled Worker process-group exit was not verified for issue #%d", completion.issue)
+				if closed.ControlErr != nil {
+					message += ": " + closed.ControlErr.Error()
+				}
+				if err := r.retainUnverifiedWorker(&current, completedRun, message, closed); err != nil {
+					// This completion was already consumed and Close returned, so it
+					// cannot participate in shutdownOwned's completion wait again.
+					delete(localWorkers, completion.issue)
+					shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after unverified Worker settlement; worktree retained")
+					return errors.Join(err, shutdownErr)
+				}
 			}
-			if closedBeforeReconciliation || closed.GroupExited || draining && r.suspensionExit.Load() == 0 {
+			if closedBeforeReconciliation || closed.GroupExited || draining && r.suspensionExit.Load() == 0 || unverifiedSettledExit {
 				delete(localWorkers, completion.issue)
 			}
 			if draining && len(localWorkers) > 0 {
@@ -697,6 +710,21 @@ func (r *Runner) Run(ctx context.Context) error {
 				}
 				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after an RPC finalization error; worktree retained")
 				return errors.Join(err, shutdownErr)
+			}
+			if completion.result.Settled && closed.GroupExited && workerLogIsClosed(closed) {
+				if err := r.reconcileAfterWorkerSettlementWithinLifecycle(ctx, &current, runID); err != nil {
+					if r.suspensionExit.Load() != 0 {
+						r.suspensionFailed.Store(true)
+						r.suspensionProgressEvent("stopping post-settlement reconciliation at the shared deadline", len(localWorkers), "Suspension: post-settlement reconciliation stopped at the shared deadline: %v", err)
+						continue
+					}
+					if draining {
+						drainOperationalErr = errors.Join(drainOperationalErr, err)
+						continue
+					}
+					shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after post-settlement reconciliation failed; worktree retained")
+					return errors.Join(err, shutdownErr)
+				}
 			}
 		case <-candidateRetry:
 			candidateRetry = nil
@@ -1546,51 +1574,106 @@ func (r *Runner) reconcileExternalResolutions(ctx context.Context, current *stat
 		if _, isOwned := owned[run.Issue]; isOwned || run.Status == scheduler.StatusMerged || run.Status == scheduler.StatusReset || run.Status == scheduler.StatusResolvedExternally {
 			continue
 		}
-
-		attempted, resolutionErr := r.ExternalResolution.Reconcile(ctx, run)
-		if attempted {
-			persisted, err := r.Store.Load()
-			if err != nil {
-				return fmt.Errorf("reload state after automatic External Resolution for Run %s: %w", run.RunID, err)
-			}
-			*current = persisted
+		if err := r.reconcileExternalResolution(ctx, current, run); err != nil {
+			return err
 		}
-		if resolutionErr != nil && ctx.Err() != nil {
+	}
+	return nil
+}
+
+func (r *Runner) reconcileAfterWorkerSettlementWithinLifecycle(ctx context.Context, current *state.State, runID string) error {
+	reconciliationCtx, cancel := r.suspensionAwareCleanupContext(ctx)
+	defer cancel()
+	return r.reconcileAfterWorkerSettlement(reconciliationCtx, current, runID)
+}
+
+// reconcileAfterWorkerSettlement runs only after normal Worker settlement,
+// process-group exit, and durable log closure. It gives the expected branch one
+// final Completion check before complete External Resolution may release the
+// Run's Lease.
+func (r *Runner) reconcileAfterWorkerSettlement(ctx context.Context, current *state.State, runID string) error {
+	if r.ExternalResolution == nil {
+		return nil
+	}
+	run := findRun(current.Runs, runID)
+	active := findActiveRun(current, run.Issue)
+	if run.RunID == "" || active.RunID != runID || run.Status == scheduler.StatusMerged || run.Status == scheduler.StatusResolvedExternally {
+		return nil
+	}
+	if run.WorkerLogOpen {
+		return fmt.Errorf("post-settlement reconciliation for Run %s started before durable Worker log closure", runID)
+	}
+
+	outcome, err := r.GitHub.Completion(ctx, r.Config.Repo, run.Issue, run.Branch)
+	if err != nil {
+		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if !attempted || resolutionErr == nil {
-			continue
-		}
-
-		updated := findRun(current.Runs, run.RunID)
-		active := findActiveRun(current, run.Issue)
-		if updated.RunID != "" && updated.Issue == run.Issue && active.RunID == "" &&
-			(updated.Status == scheduler.StatusResolvedExternally || updated.Status == scheduler.StatusMerged) {
-			continue
-		}
-		if updated.RunID == "" || active.RunID != run.RunID {
-			return fmt.Errorf("automatic External Resolution for Run %s failed after its Lease changed: %w", run.RunID, resolutionErr)
-		}
-		if scheduler.IsActive(updated.Status) {
-			transitionStatus(&updated, scheduler.StatusNeedsHuman)
-		}
-		refusalDiagnostic := fmt.Sprintf("automatic External Resolution refused: %v", resolutionErr)
-		previousDiagnostic := strings.TrimSpace(updated.Error)
-		switch {
-		case previousDiagnostic == "":
-			updated.Error = refusalDiagnostic
-		case previousDiagnostic == refusalDiagnostic || strings.HasSuffix(previousDiagnostic, "; "+refusalDiagnostic):
-			updated.Error = previousDiagnostic
-		default:
-			updated.Error = previousDiagnostic + "; " + refusalDiagnostic
-		}
-		updated.UpdatedAt = r.Now().UTC()
-		replaceRun(current, updated)
+		r.needsHuman(current, run.Issue, fmt.Sprintf("recheck GitHub Completion after Worker settlement: %v", err))
 		if err := r.Store.Save(*current); err != nil {
-			return fmt.Errorf("persist automatic External Resolution diagnostic for Run %s: %w", run.RunID, err)
+			return fmt.Errorf("persist failed post-settlement Completion check for issue #%d: %w", run.Issue, err)
 		}
-		r.runLifecycleEvent(RunLifecycleNeedsHuman, "automatic External Resolution for issue #%d requires attention: %v", run.Issue, resolutionErr)
+		return nil
 	}
+	if outcome.Merged && outcome.IssueClosed {
+		if err := r.applyOutcome(ctx, current, run, outcome, true, true); err != nil {
+			return err
+		}
+		if err := r.Store.Save(*current); err != nil {
+			return fmt.Errorf("persist post-settlement Completion for issue #%d: %w", run.Issue, err)
+		}
+		return nil
+	}
+	return r.reconcileExternalResolution(ctx, current, run)
+}
+
+func (r *Runner) reconcileExternalResolution(ctx context.Context, current *state.State, run scheduler.Run) error {
+	if r.ExternalResolution == nil {
+		return nil
+	}
+	attempted, resolutionErr := r.ExternalResolution.Reconcile(ctx, run)
+	if attempted {
+		persisted, err := r.Store.Load()
+		if err != nil {
+			return fmt.Errorf("reload state after automatic External Resolution for Run %s: %w", run.RunID, err)
+		}
+		*current = persisted
+	}
+	if resolutionErr != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if !attempted || resolutionErr == nil {
+		return nil
+	}
+
+	updated := findRun(current.Runs, run.RunID)
+	active := findActiveRun(current, run.Issue)
+	if updated.RunID != "" && updated.Issue == run.Issue && active.RunID == "" &&
+		(updated.Status == scheduler.StatusResolvedExternally || updated.Status == scheduler.StatusMerged) {
+		return nil
+	}
+	if updated.RunID == "" || active.RunID != run.RunID {
+		return fmt.Errorf("automatic External Resolution for Run %s failed after its Lease changed: %w", run.RunID, resolutionErr)
+	}
+	if scheduler.IsActive(updated.Status) {
+		transitionStatus(&updated, scheduler.StatusNeedsHuman)
+	}
+	refusalDiagnostic := fmt.Sprintf("automatic External Resolution refused: %v", resolutionErr)
+	previousDiagnostic := strings.TrimSpace(updated.Error)
+	switch {
+	case previousDiagnostic == "":
+		updated.Error = refusalDiagnostic
+	case previousDiagnostic == refusalDiagnostic || strings.HasSuffix(previousDiagnostic, "; "+refusalDiagnostic):
+		updated.Error = previousDiagnostic
+	default:
+		updated.Error = previousDiagnostic + "; " + refusalDiagnostic
+	}
+	updated.UpdatedAt = r.Now().UTC()
+	replaceRun(current, updated)
+	if err := r.Store.Save(*current); err != nil {
+		return fmt.Errorf("persist automatic External Resolution diagnostic for Run %s: %w", run.RunID, err)
+	}
+	r.runLifecycleEvent(RunLifecycleNeedsHuman, "automatic External Resolution for issue #%d requires attention: %v", run.Issue, resolutionErr)
 	return nil
 }
 
