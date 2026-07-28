@@ -615,8 +615,14 @@ func TestCommandHelpExitsSuccessfully(t *testing.T) {
 	if exit := Main(context.Background(), []string{"resolve", "--help"}, &stdout, &stderr); exit != 0 {
 		t.Fatalf("resolve help exit = %d, stderr = %q", exit, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "run-id|positive-issue-number") || !strings.Contains(stderr.String(), "--yes") {
-		t.Fatalf("resolve help = %q", stderr.String())
+	resolveHelp := stderr.String()
+	for _, text := range []string{"run-id|positive-issue-number", "--yes", "owned unmerged pull requests", "remote", "local branches", "worktrees", "active Pi sessions are absent"} {
+		if !strings.Contains(resolveHelp, text) {
+			t.Fatalf("resolve help omitted %q: %q", text, resolveHelp)
+		}
+	}
+	if strings.Contains(resolveHelp, "retire owned artifacts") {
+		t.Fatalf("resolve help claims unsupported artifact retirement: %q", resolveHelp)
 	}
 
 	stdout.Reset()

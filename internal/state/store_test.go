@@ -77,6 +77,26 @@ func TestFileStorePreviewDoesNotPersistV1Migration(t *testing.T) {
 	}
 }
 
+func TestFileStoreReportsV4TargetWhenV1MigrationPersistenceFails(t *testing.T) {
+	t.Parallel()
+
+	directory := t.TempDir()
+	path := filepath.Join(directory, "state.json")
+	legacy := `{"version":1,"runs":[{"issue":1,"runId":"failed","status":"failed"}]}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(directory, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(directory, 0o700)
+
+	_, err := (FileStore{Path: path}).Load()
+	if err == nil || !strings.Contains(err.Error(), "persist version 4 state migration") {
+		t.Fatalf("V1 migration persistence error = %v", err)
+	}
+}
+
 func TestFileStoreMigratesV1WithoutLosingRunArtifacts(t *testing.T) {
 	t.Parallel()
 

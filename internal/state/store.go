@@ -127,7 +127,7 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 		}
 		if persistMigration {
 			if err := s.Save(value); err != nil {
-				return State{}, false, fmt.Errorf("persist version 3 state migration: %w", err)
+				return State{}, false, fmt.Errorf("persist version 4 state migration: %w", err)
 			}
 		}
 		return value, true, nil
