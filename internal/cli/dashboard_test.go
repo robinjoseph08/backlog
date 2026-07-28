@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -274,6 +275,47 @@ func TestDashboardMessageLimitPrioritizesOnlyShutdownEvents(t *testing.T) {
 	}
 	if _, ok := visible[oldestOperational]; ok {
 		t.Fatalf("ordinary typed operational event retained shutdown priority: %#v", visible[oldestOperational])
+	}
+}
+
+func TestDashboardReconcilesOperationalSemanticsInBothDeliveryOrders(t *testing.T) {
+	occurredAt := time.Date(2026, 7, 28, 1, 0, 0, 0, time.UTC)
+	event := runner.CandidateDiscoveryFailed{
+		OccurredAt: occurredAt,
+		RetryAt:    occurredAt.Add(time.Second),
+		Err:        errors.New("candidate source unavailable"),
+	}
+	message := normalizedDashboardMessage(runner.FormatOperationalEvent(event))
+
+	for _, eventFirst := range []bool{false, true} {
+		name := "output first"
+		if eventFirst {
+			name = "event first"
+		}
+		t.Run(name, func(t *testing.T) {
+			dashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, time.Now)
+			if eventFirst {
+				dashboard.operationalEvent(event)
+				dashboard.recordMessage(message)
+			} else {
+				dashboard.recordMessage(message)
+				dashboard.operationalEvent(event)
+			}
+
+			if len(dashboard.messages) != 1 {
+				t.Fatalf("reconciled message history = %#v, want one typed occurrence", dashboard.messages)
+			}
+			stored := dashboard.messages[0]
+			if stored.text != message || stored.semantic != dashboardSemanticWarning || !stored.shutdown || stored.shutdownPriority || !stored.plainMatched {
+				t.Fatalf("reconciled operational message = %#v", stored)
+			}
+			if _, exists := dashboard.messageOccurrences[message]; exists {
+				t.Fatal("reconciled plain occurrence remained tracked")
+			}
+			if _, exists := dashboard.shutdownOccurrences[message]; exists {
+				t.Fatal("reconciled typed occurrence remained tracked")
+			}
+		})
 	}
 }
 

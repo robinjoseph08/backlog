@@ -24,15 +24,18 @@ func TestDashboardStylingUsesTypedRunSemanticsWithoutChangingLabels(t *testing.T
 		{run: scheduler.Run{Issue: 3, IssueTitle: "Suspended work", Status: scheduler.StatusSuspended, StartedAt: now.Add(-3 * time.Minute)}, observation: runObservation{process: followObservation{workerLiveness: "absent", workerLivenessState: workerLivenessAbsent}}},
 	}
 	attention := []statusRun{{run: scheduler.Run{Issue: 4, IssueTitle: "Fatal work", Status: scheduler.StatusNeedsHuman, Error: "Worker exited without a verified outcome", StartedAt: now.Add(-4 * time.Minute)}, observation: runObservation{process: followObservation{workerLiveness: "different dead wording", workerLivenessState: workerLivenessDead}}}}
+	outcomes := []statusRun{{run: scheduler.Run{Issue: 7, IssueTitle: "Unacknowledged failure", Status: scheduler.StatusFailed, StartedAt: now.Add(-6 * time.Minute)}, observation: runObservation{process: followObservation{workerLiveness: "absent", workerLivenessState: workerLivenessAbsent}}}}
 	completedAt := now.Add(-time.Minute)
 	completions := []statusRun{{run: scheduler.Run{Issue: 5, IssueTitle: "Completed work", Status: scheduler.StatusMerged, PullRequest: "https://example.test/5", StartedAt: now.Add(-5 * time.Minute), CompletedAt: &completedAt}}}
 
 	var styled, plain strings.Builder
 	renderDashboardSection(&styled, statusActive, "Active Runs", active, now, styler)
 	renderDashboardSection(&styled, statusAttention, "Attention Required", attention, now, styler)
+	renderDashboardSection(&styled, statusOutcomes, "Outcomes to Acknowledge", outcomes, now, styler)
 	renderDashboardCompletions(&styled, completions, now, styler)
 	renderDashboardSection(&plain, statusActive, "Active Runs", active, now, dashboardStyler{})
 	renderDashboardSection(&plain, statusAttention, "Attention Required", attention, now, dashboardStyler{})
+	renderDashboardSection(&plain, statusOutcomes, "Outcomes to Acknowledge", outcomes, now, dashboardStyler{})
 	renderDashboardCompletions(&plain, completions, now, dashboardStyler{})
 	got := styled.String()
 	if stripped := ansi.Strip(got); stripped != plain.String() {
@@ -47,7 +50,12 @@ func TestDashboardStylingUsesTypedRunSemanticsWithoutChangingLabels(t *testing.T
 		styler.warning.Render("    State: waiting-for-merge"),
 		styler.warning.Render("  #3  Suspended work"),
 		styler.attention.Render("Attention Required (1)"),
+		styler.attention.Render("  #4  Fatal work"),
+		styler.attention.Render("    State: needs-human"),
 		styler.attention.Render("    Diagnostic: Worker exited without a verified outcome"),
+		styler.attention.Render("Outcomes to Acknowledge (1)"),
+		styler.attention.Render("  #7  Unacknowledged failure"),
+		styler.attention.Render("    State: failed"),
 		styler.completion.Render("  #5  Completed work"),
 		styler.metadata.Render(" | Elapsed: 1m0s | "),
 	} {
