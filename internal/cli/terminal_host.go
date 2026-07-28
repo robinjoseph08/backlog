@@ -129,6 +129,7 @@ type presentationEventQueue struct {
 	events                    []runner.OperationalEvent
 	inFlight                  int
 	evictedFailureOccurrences map[string]int
+	evictedFailureOrder       []string
 	wake                      chan struct{}
 }
 
@@ -141,13 +142,13 @@ func (q *presentationEventQueue) publish(event runner.OperationalEvent) {
 	switch typed := event.(type) {
 	case runner.CandidateDiscoveryFailed:
 		key := presentationFailureKey(typed)
-		if occurrences := q.evictedFailureOccurrences[key]; occurrences > 0 {
+		if occurrences := takeBoundedAdmissionOccurrences(q.evictedFailureOccurrences, &q.evictedFailureOrder, key); occurrences > 0 {
 			typed.Occurrences = presentationFailureOccurrences(typed) + occurrences
-			delete(q.evictedFailureOccurrences, key)
 			event = typed
 		}
 	case runner.CandidateDiscoveryRecovered:
 		clear(q.evictedFailureOccurrences)
+		q.evictedFailureOrder = nil
 	}
 	q.events = append(q.events, event)
 	for presentationAdmissionFailureCount(q.events) > presentationAdmissionFailureLimit {
@@ -187,7 +188,7 @@ func oldestPresentationAdmissionFailure(events []runner.OperationalEvent) int {
 // trades a terminal shutdown result for optional progress.
 func presentationEventEvictionIndex(events []runner.OperationalEvent) int {
 	for index, event := range events {
-		if presentationEventIsTerminal(event) {
+		if presentationEventIsTerminal(event) || presentationEventIsLatestAdmissionTransition(events, index) {
 			continue
 		}
 		if presentationEventIsSuperseded(events, index) {
@@ -195,11 +196,31 @@ func presentationEventEvictionIndex(events []runner.OperationalEvent) int {
 		}
 	}
 	for index, event := range events {
-		if !presentationEventIsTerminal(event) {
+		if !presentationEventIsTerminal(event) && !presentationEventIsLatestAdmissionTransition(events, index) {
+			return index
+		}
+	}
+	for index := range events {
+		if !presentationEventIsLatestAdmissionTransition(events, index) {
 			return index
 		}
 	}
 	return 0
+}
+
+func presentationEventIsLatestAdmissionTransition(events []runner.OperationalEvent, index int) bool {
+	switch events[index].(type) {
+	case runner.CandidateDiscoveryFailed, runner.CandidateDiscoveryRecovered:
+	default:
+		return false
+	}
+	for _, later := range events[index+1:] {
+		switch later.(type) {
+		case runner.CandidateDiscoveryFailed, runner.CandidateDiscoveryRecovered:
+			return false
+		}
+	}
+	return true
 }
 
 func presentationEventIsSuperseded(events []runner.OperationalEvent, index int) bool {
@@ -270,10 +291,12 @@ func (q *presentationEventQueue) preserveFailureOccurrences(index int) {
 			return
 		}
 	}
-	if q.evictedFailureOccurrences == nil {
-		q.evictedFailureOccurrences = make(map[string]int)
-	}
-	q.evictedFailureOccurrences[key] += presentationFailureOccurrences(evicted)
+	q.evictedFailureOccurrences = retainBoundedAdmissionOccurrences(
+		q.evictedFailureOccurrences,
+		&q.evictedFailureOrder,
+		key,
+		presentationFailureOccurrences(evicted),
+	)
 }
 
 func presentationFailureOccurrences(failure runner.CandidateDiscoveryFailed) int {

@@ -249,6 +249,30 @@ func TestRunnerRetainsAtMostTwentyFullAdmissionDiagnostics(t *testing.T) {
 	}
 }
 
+func TestRunnerBoundsLightweightAdmissionIdentitiesWhileRetainingRecentRecurrence(t *testing.T) {
+	var counts map[string]int
+	var order []string
+	counts = retainOperationalFailureOccurrences(counts, &order, "recurring cause", 1)
+	for identity := 1; identity <= 200; identity++ {
+		counts = retainOperationalFailureOccurrences(counts, &order, fmt.Sprintf("distinct cause %d", identity), 1)
+	}
+	if occurrences := takeOperationalFailureOccurrences(counts, &order, "recurring cause"); occurrences != 1 {
+		t.Fatalf("recurring cause after 200 identities = %d occurrences, want 1 retained occurrence", occurrences)
+	}
+
+	for identity := 201; identity <= operationalAggregationIdentityLimit+400; identity++ {
+		counts = retainOperationalFailureOccurrences(counts, &order, fmt.Sprintf("distinct cause %d", identity), 1)
+	}
+	counts = retainOperationalFailureOccurrences(counts, &order, "current recurring cause", 1)
+	counts = retainOperationalFailureOccurrences(counts, &order, "current recurring cause", 1)
+	if identities := len(counts); identities > operationalAggregationIdentityLimit {
+		t.Fatalf("lightweight Runner identities = %d, want at most %d", identities, operationalAggregationIdentityLimit)
+	}
+	if occurrences := counts["current recurring cause"]; occurrences != 2 {
+		t.Fatalf("current recurring cause = %d occurrences, want 2", occurrences)
+	}
+}
+
 func TestRunnerPreservesAdmissionOccurrencesAcrossSlowDeliveryAndClearsOnRecovery(t *testing.T) {
 	runner := &Runner{}
 	deliveryStarted := make(chan struct{})

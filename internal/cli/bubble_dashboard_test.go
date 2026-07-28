@@ -355,6 +355,81 @@ func TestBubbleDashboardPreservesSelectedRunAcrossAdmissionChanges(t *testing.T)
 	assertStable("recovery", dashboardOperationalMsg{event: runner.CandidateDiscoveryRecovered{OccurredAt: now.Add(time.Second), Failures: 1}}, "Admission: healthy | Recovered")
 }
 
+func TestBubbleDashboardPreservesDownstreamSelectionAcrossStyledDiagnosticsChanges(t *testing.T) {
+	profiles := []struct {
+		name    string
+		profile TerminalColorProfile
+	}{
+		{name: "no color", profile: TerminalColorNone},
+		{name: "ANSI", profile: TerminalColorANSI},
+		{name: "ANSI 256", profile: TerminalColorANSI256},
+		{name: "true color", profile: TerminalColorTrueColor},
+	}
+	for _, test := range profiles {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+			current := navigationTestState(now, 10)
+			model := configuredNavigationTestModel(t, now, current, &dashboardTestSource{current: current})
+			model.styler = newDashboardStyler(test.profile, true)
+			for failure := 1; failure <= dashboardDiagnosticLimit; failure++ {
+				updated, _ := model.Update(dashboardOperationalMsg{event: runner.CandidateDiscoveryFailed{
+					Operation: runner.CandidateDiscoveryList,
+					Err:       fmt.Errorf("gh issue list: long diagnostic %02d %s", failure, strings.Repeat("wrapped evidence ", 8)),
+					Cause:     "connection refused", FirstFailureAt: now,
+					OccurredAt: now.Add(time.Duration(failure) * time.Second), RetryAt: now.Add(time.Minute),
+					ConsecutiveFailures: failure, Occurrences: 1,
+				}})
+				model = updated.(bubbleDashboardModel)
+			}
+			updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}))
+			model = updated.(bubbleDashboardModel)
+
+			selected := dashboardRunAnchor("run-5")
+			line, exists := model.anchorVisualLine(selected)
+			if !exists {
+				t.Fatalf("selected downstream Run anchor %q missing", selected)
+			}
+			model.viewport.SetYOffset(line)
+			model.selectViewportAnchor()
+			wantSelection := model.currentSelection()
+			if !wantSelection.valid || wantSelection.identity != selected {
+				t.Fatalf("selected anchor = %#v, want %q", wantSelection, selected)
+			}
+
+			assertStable := func(name string, msg tea.Msg) {
+				t.Helper()
+				beforeLine := dashboardVisibleLine(t, model.View().Content, "Navigation Run 5")
+				updated, _ := model.Update(msg)
+				model = updated.(bubbleDashboardModel)
+				selection := model.currentSelection()
+				if !selection.valid || selection.identity != selected {
+					t.Fatalf("%s selection = %#v, want identity %q", name, selection, selected)
+				}
+				wantLine := max(beforeLine, model.dashboardBodyStart())
+				if got := dashboardVisibleLine(t, model.View().Content, "Navigation Run 5"); got != wantLine {
+					t.Fatalf("%s moved selected downstream Run from screen line %d to %d, want %d", name, beforeLine, got, wantLine)
+				}
+			}
+
+			assertStable("narrow resize", tea.WindowSizeMsg{Width: 44, Height: 24})
+			assertStable("wide resize", tea.WindowSizeMsg{Width: 120, Height: 24})
+			assertStable("new failure", dashboardOperationalMsg{event: runner.CandidateDiscoveryFailed{
+				Operation: runner.CandidateDiscoveryList,
+				Err:       errors.New("gh issue list: latest diagnostic after navigation"), Cause: "connection refused",
+				FirstFailureAt: now, OccurredAt: now.Add(21 * time.Second), RetryAt: now.Add(time.Minute),
+				ConsecutiveFailures: 21, Occurrences: 1,
+			}})
+			if body := ansi.Strip(model.viewport.GetContent()); !strings.Contains(body, "latest diagnostic after navigation") || strings.Contains(body, "long diagnostic 01") {
+				t.Fatalf("bounded Diagnostics did not retain the latest twenty entries:\n%s", body)
+			}
+			assertStable("drawer close", tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}))
+			if body := ansi.Strip(model.viewport.GetContent()); strings.Contains(body, "latest diagnostic after navigation") || !strings.Contains(body, "Diagnostics: closed") {
+				t.Fatalf("closed Diagnostics retained full evidence:\n%s", body)
+			}
+		})
+	}
+}
+
 func TestBubbleDashboardPreservesSelectedSectionAcrossLiveProjectionChanges(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	current := navigationTestState(now, 5)

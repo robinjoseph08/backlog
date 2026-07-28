@@ -380,9 +380,11 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var commands []tea.Cmd
 	trackAttention := false
 	configured := false
+	keepSelectionVisible := false
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = max(1, msg.Width), max(1, msg.Height)
+		keepSelectionVisible = true
 	case tea.BackgroundColorMsg:
 		m.styler = newDashboardStyler(m.colorProfile, msg.IsDark())
 	case tea.KeyPressMsg:
@@ -446,7 +448,7 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.dashboard.recordMessage(msg.err.Error())
 	}
 
-	m.refreshViewport(selection)
+	m.refreshViewportWithVisibility(selection, keepSelectionVisible)
 	if configured {
 		m.attentionKnown = cloneDashboardIdentities(m.layout.attention)
 		clear(m.attentionPending)
@@ -504,6 +506,10 @@ type dashboardSelection struct {
 }
 
 func (m *bubbleDashboardModel) refreshViewport(selection dashboardSelection) {
+	m.refreshViewportWithVisibility(selection, false)
+}
+
+func (m *bubbleDashboardModel) refreshViewportWithVisibility(selection dashboardSelection, keepSelectionVisible bool) {
 	header, layout, footer, stage := m.dashboard.renderPartsWithLayout(m.dashboard.now(), m.styler)
 	m.header = header
 	m.footer = footer + "\n" + dashboardNavigationHelp
@@ -513,7 +519,12 @@ func (m *bubbleDashboardModel) refreshViewport(selection dashboardSelection) {
 	m.viewport.SetContent(layout.text)
 	if selection.valid {
 		if line, exists := m.anchorVisualLine(selection.identity); exists {
-			m.viewport.SetYOffset(m.dashboardBodyStart() + line - selection.relative)
+			frame := m.dashboardFrame()
+			relative := selection.relative
+			if keepSelectionVisible && frame.bodyHeight > 0 {
+				relative = max(frame.bodyStart, min(relative, frame.bodyStart+frame.bodyHeight-1))
+			}
+			m.viewport.SetYOffset(frame.bodyStart + line - relative)
 			m.selectedAnchor = selection.identity
 			return
 		}

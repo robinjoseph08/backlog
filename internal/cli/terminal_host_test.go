@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -105,6 +107,26 @@ func TestPresentationEventQueueBoundsIgnoredConsumer(t *testing.T) {
 	}
 }
 
+func TestPresentationEventQueueBoundsLightweightAdmissionIdentities(t *testing.T) {
+	queue := newPresentationEventQueue()
+	for failure := 1; failure <= admissionAggregationIdentityLimit+presentationAdmissionFailureLimit+100; failure++ {
+		queue.publish(runner.CandidateDiscoveryFailed{
+			Operation:   runner.CandidateDiscoveryList,
+			Cause:       fmt.Sprintf("distinct cause %d", failure),
+			Occurrences: 1,
+		})
+	}
+
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	if identities := len(queue.evictedFailureOccurrences); identities > admissionAggregationIdentityLimit {
+		t.Fatalf("lightweight presentation identities = %d, want at most %d", identities, admissionAggregationIdentityLimit)
+	}
+	if failures := presentationAdmissionFailureCount(queue.events); failures != presentationAdmissionFailureLimit {
+		t.Fatalf("queued failure records = %d, want %d", failures, presentationAdmissionFailureLimit)
+	}
+}
+
 func TestPresentationEventQueuePreservesOrderedShutdownAndTerminalDeliveryForSlowConsumer(t *testing.T) {
 	queue := newPresentationEventQueue()
 	for failure := 1; failure <= presentationEventLimit*4; failure++ {
@@ -154,6 +176,75 @@ func TestPresentationEventQueuePreservesOrderedShutdownAndTerminalDeliveryForSlo
 		if !ok || shutdown.Stage != stage {
 			t.Fatalf("shutdown delivery %d = %#v, want stage %s", index, events[len(events)-4+index], stage)
 		}
+	}
+}
+
+func TestPresentationEventQueuePreservesLatestAdmissionTransitionUnderLifecyclePressure(t *testing.T) {
+	firstFailure := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	queue := newPresentationEventQueue()
+	dashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, time.Now)
+	queue.publish(runner.CandidateDiscoveryFailed{
+		Operation: runner.CandidateDiscoveryList, Cause: "recurring cause", Err: errors.New("old full diagnostic"),
+		FirstFailureAt: firstFailure, OccurredAt: firstFailure, ConsecutiveFailures: 1, Occurrences: 1,
+	})
+	event, err := queue.next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dashboard.operationalEvent(event)
+	queue.complete()
+
+	recoveredAt := firstFailure.Add(time.Minute)
+	queue.publish(runner.CandidateDiscoveryRecovered{OccurredAt: recoveredAt, Failures: 1})
+	for lifecycle := 0; lifecycle < presentationEventLimit+8; lifecycle++ {
+		queue.publish(runner.RunLifecycleEvent{Stage: runner.RunLifecycleClaimed, Message: fmt.Sprintf("Run %d claimed", lifecycle)})
+	}
+	queue.mu.Lock()
+	recoveryRetained := false
+	for _, queued := range queue.events {
+		if _, ok := queued.(runner.CandidateDiscoveryRecovered); ok {
+			recoveryRetained = true
+			break
+		}
+	}
+	queue.mu.Unlock()
+	if !recoveryRetained {
+		t.Fatal("latest Admission recovery was evicted by lifecycle pressure")
+	}
+
+	freshFailure := recoveredAt.Add(time.Minute)
+	queue.publish(runner.CandidateDiscoveryFailed{
+		Operation: runner.CandidateDiscoveryList, Cause: "recurring cause", Err: errors.New("fresh full diagnostic"),
+		FirstFailureAt: freshFailure, OccurredAt: freshFailure, RetryAt: freshFailure.Add(time.Minute),
+		ConsecutiveFailures: 1, Occurrences: 1,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for {
+		event, err := queue.next(ctx)
+		if errors.Is(err, context.Canceled) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		dashboard.operationalEvent(event)
+		queue.complete()
+	}
+
+	_, body, _ := dashboard.renderParts(freshFailure)
+	for _, want := range []string{
+		"Admission: DEGRADED | 1 consecutive failure",
+		"First failure: 2026-07-28T12:02:00Z",
+		"Latest failure: 2026-07-28T12:02:00Z",
+		"Cause: recurring cause",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("fresh Admission episode missing %q after queue pressure:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "Equivalent failures:") {
+		t.Fatalf("fresh Admission episode joined stale equivalent counts:\n%s", body)
 	}
 }
 

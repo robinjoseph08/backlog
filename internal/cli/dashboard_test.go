@@ -642,6 +642,27 @@ func TestDashboardAggregatesRecurringAdmissionFailureAfterManyDistinctCauses(t *
 		t.Fatalf("lightweight aggregation counts = %d, want one for every episode identity", count)
 	}
 
+	for failure := 203; failure <= admissionAggregationIdentityLimit+500; failure++ {
+		dashboard.operationalEvent(runner.CandidateDiscoveryFailed{
+			Operation: runner.CandidateDiscoveryList, Cause: fmt.Sprintf("later varying cause %d", failure),
+			OccurredAt: time.Unix(int64(failure), 0), ConsecutiveFailures: failure, Occurrences: 1,
+		})
+	}
+	for occurrence := 1; occurrence <= 2; occurrence++ {
+		dashboard.operationalEvent(runner.CandidateDiscoveryFailed{
+			Operation: runner.CandidateDiscoveryList, Cause: "current recurring cause",
+			OccurredAt:          time.Unix(int64(admissionAggregationIdentityLimit+500+occurrence), 0),
+			ConsecutiveFailures: admissionAggregationIdentityLimit + 500 + occurrence, Occurrences: 1,
+		})
+	}
+	if count := len(dashboard.admission.equivalentFailures); count > admissionAggregationIdentityLimit {
+		t.Fatalf("bounded lightweight aggregation identities = %d, want at most %d", count, admissionAggregationIdentityLimit)
+	}
+	_, body, _ = dashboard.renderParts(time.Unix(int64(admissionAggregationIdentityLimit+502), 0))
+	if !strings.Contains(body, "Cause: current recurring cause | Equivalent failures: 2") {
+		t.Fatalf("current recurring cause lost its bounded aggregate:\n%s", body)
+	}
+
 	dashboard.operationalEvent(runner.CandidateDiscoveryRecovered{OccurredAt: time.Unix(203, 0), Failures: 202})
 	if dashboard.admission.equivalentFailures != nil {
 		t.Fatalf("recovery retained episode aggregation counts: %#v", dashboard.admission.equivalentFailures)
