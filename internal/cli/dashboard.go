@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -64,6 +65,7 @@ type liveDashboard struct {
 	observations        map[string]dashboardActivityObservation
 	pendingOutput       bytes.Buffer
 	err                 error
+	hyperlinks          bool
 
 	updates chan struct{}
 	stop    chan struct{}
@@ -720,16 +722,25 @@ type dashboardBodyAnchor struct {
 	line     int
 }
 
+type dashboardRunResources struct {
+	issueURL       string
+	pullRequestURL string
+}
+
 type dashboardBodyLayout struct {
 	text      string
 	anchors   []dashboardBodyAnchor
 	attention map[string]struct{}
+	resources map[string]dashboardRunResources
 }
 
 type dashboardBodyBuilder struct {
-	body    strings.Builder
-	line    int
-	anchors []dashboardBodyAnchor
+	body       strings.Builder
+	line       int
+	anchors    []dashboardBodyAnchor
+	repository string
+	hyperlinks bool
+	resources  map[string]dashboardRunResources
 }
 
 func (b *dashboardBodyBuilder) separate() {
@@ -859,7 +870,9 @@ func (d *liveDashboard) renderResponsiveParts(now time.Time, options responsiveD
 	d.mu.Unlock()
 
 	projection := d.project(current, stage, now)
-	body := dashboardBodyBuilder{}
+	body := dashboardBodyBuilder{
+		repository: current.Repo, hyperlinks: d.hyperlinks, resources: make(map[string]dashboardRunResources),
+	}
 	body.renderResponsiveAdmission(admission, diagnosticsOpen, stage, now, options)
 	body.renderResponsiveSection(statusActive, "Active Runs", projection.sections[statusActive], now, options, false)
 	body.renderResponsiveSection(statusAttention, "Attention Required", projection.sections[statusAttention], now, options, false)
@@ -868,7 +881,9 @@ func (d *liveDashboard) renderResponsiveParts(now time.Time, options responsiveD
 	if len(messages) > 0 {
 		body.renderResponsiveMessages(messages, options)
 	}
-	return projection, dashboardBodyLayout{text: body.body.String(), anchors: body.anchors, attention: projection.attention}, stage
+	return projection, dashboardBodyLayout{
+		text: body.body.String(), anchors: body.anchors, attention: projection.attention, resources: body.resources,
+	}, stage
 }
 
 func (b *dashboardBodyBuilder) renderResponsiveAdmission(admission dashboardAdmission, diagnosticsOpen bool, stage dashboardStage, now time.Time, options responsiveDashboardOptions) {
@@ -927,12 +942,12 @@ func (b *dashboardBodyBuilder) renderResponsiveSection(section statusSection, na
 		if options.selected == identity {
 			marker = "> "
 		}
-		line := truncateDashboardContent(marker+compactDashboardRun(observed, now, completions, options.width-ansi.StringWidth(marker)), options.width)
+		line := truncateDashboardContent(marker+b.compactDashboardRun(observed, now, completions, options.width-ansi.StringWidth(marker)), options.width)
 		b.write(options.styler.render(dashboardRunSemantic(observed, section), line) + "\n")
 		if options.expanded(identity, false) {
-			details := expandedDashboardRun(observed, now)
+			details := b.expandedDashboardRun(observed, now)
 			if completions {
-				details = expandedDashboardCompletion(observed.run, now)
+				details = b.expandedDashboardCompletion(observed.run, now)
 			}
 			b.write(options.styler.render(dashboardSemanticMetadata, details))
 		}
@@ -962,9 +977,17 @@ func (b *dashboardBodyBuilder) renderResponsiveMessages(messages []dashboardMess
 }
 
 func compactDashboardRun(observed statusRun, now time.Time, completion bool, width int) string {
+	return (*dashboardBodyBuilder)(nil).compactDashboardRun(observed, now, completion, width)
+}
+
+func (b *dashboardBodyBuilder) compactDashboardRun(observed statusRun, now time.Time, completion bool, width int) string {
 	run := observed.run
 	parts := []string{fmt.Sprintf("#%d", run.Issue)}
-	if pullRequest := dashboardPullRequestIdentity(run.PullRequest); pullRequest != "" {
+	pullRequest := dashboardPullRequestIdentity(run.PullRequest)
+	if b != nil {
+		pullRequest = b.pullRequestIdentity(run)
+	}
+	if pullRequest != "" {
 		parts = append(parts, pullRequest)
 	}
 	progress := summarizeRunProgress(run, observed.observation.metrics, now)
@@ -979,6 +1002,9 @@ func compactDashboardRun(observed statusRun, now time.Time, completion bool, wid
 		detailReserve = width / 3
 	}
 	parts[0] = compactDashboardIssueIdentity(run, parts, width, detailReserve)
+	if b != nil {
+		parts[0] = b.issueIdentity(run, parts[0])
+	}
 	if completion {
 		if progress.elapsed != "n/a" {
 			parts = append(parts, "Elapsed: "+progress.elapsed)
@@ -1039,6 +1065,111 @@ func dashboardPullRequestIdentity(value string) string {
 	return "PR: " + value
 }
 
+func (b *dashboardBodyBuilder) issueIdentity(run scheduler.Run, label string) string {
+	issueURL, ok := dashboardIssueURL(b.repository, run)
+	if ok {
+		resources := b.resources[dashboardRunAnchor(run.RunID)]
+		resources.issueURL = issueURL
+		if b.resources != nil {
+			b.resources[dashboardRunAnchor(run.RunID)] = resources
+		}
+		if b.hyperlinks {
+			return dashboardHyperlink(issueURL, label)
+		}
+	}
+	return label
+}
+
+func (b *dashboardBodyBuilder) pullRequestIdentity(run scheduler.Run) string {
+	if strings.TrimSpace(run.PullRequest) == "" {
+		return ""
+	}
+	if b.repository == "" {
+		return dashboardPullRequestIdentity(run.PullRequest)
+	}
+	if number, pullRequestURL, ok := dashboardPullRequestURL(b.repository, run.PullRequest); ok {
+		resources := b.resources[dashboardRunAnchor(run.RunID)]
+		resources.pullRequestURL = pullRequestURL
+		if b.resources != nil {
+			b.resources[dashboardRunAnchor(run.RunID)] = resources
+		}
+		label := fmt.Sprintf("PR #%d", number)
+		if b.hyperlinks {
+			label = dashboardHyperlink(pullRequestURL, label)
+		}
+		return label
+	}
+	return "PR: " + plainStatusValue(run.PullRequest)
+}
+
+func dashboardHyperlink(target, label string) string {
+	return "\x1b]8;;" + target + "\x1b\\" + label + "\x1b]8;;\x1b\\"
+}
+
+func dashboardIssueURL(repository string, run scheduler.Run) (string, bool) {
+	if run.Issue <= 0 {
+		return "", false
+	}
+	if run.IssueURL != "" {
+		if dashboardResourceURLMatches(run.IssueURL, repository, "issues", run.Issue) {
+			return run.IssueURL, true
+		}
+		return "", false
+	}
+	if !validDashboardRepository(repository) {
+		return "", false
+	}
+	return fmt.Sprintf("https://github.com/%s/issues/%d", repository, run.Issue), true
+}
+
+func dashboardPullRequestURL(repository, rawURL string) (int, string, bool) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "github.com") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawPath != "" || !validDashboardRepository(repository) {
+		return 0, "", false
+	}
+	prefix := "/" + repository + "/pull/"
+	if len(parsed.Path) <= len(prefix) || !strings.EqualFold(parsed.Path[:len(prefix)], prefix) {
+		return 0, "", false
+	}
+	numberText := strings.TrimSuffix(parsed.Path[len(prefix):], "/")
+	if strings.Contains(numberText, "/") {
+		return 0, "", false
+	}
+	number, err := strconv.Atoi(numberText)
+	if err != nil || number <= 0 || strconv.Itoa(number) != numberText {
+		return 0, "", false
+	}
+	return number, rawURL, true
+}
+
+func dashboardResourceURLMatches(rawURL, repository, resource string, number int) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "github.com") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawPath != "" || !validDashboardRepository(repository) {
+		return false
+	}
+	expected := fmt.Sprintf("/%s/%s/%d", repository, resource, number)
+	return strings.EqualFold(strings.TrimSuffix(parsed.Path, "/"), expected)
+}
+
+func validDashboardRepository(repository string) bool {
+	parts := strings.Split(repository, "/")
+	if len(parts) != 2 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+		for _, character := range part {
+			if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || strings.ContainsRune("_.-", character) {
+				continue
+			}
+			return false
+		}
+	}
+	return true
+}
+
 func dashboardRunExpectsWorker(run scheduler.Run) bool {
 	return run.Status == scheduler.StatusRunning
 }
@@ -1078,7 +1209,7 @@ func dashboardLivenessPromotions(observed statusRun) []string {
 	return promoted
 }
 
-func expandedDashboardRun(observed statusRun, now time.Time) string {
+func (b *dashboardBodyBuilder) expandedDashboardRun(observed statusRun, now time.Time) string {
 	run := observed.run
 	progress := summarizeRunProgress(run, observed.observation.metrics, now)
 	var details strings.Builder
@@ -1086,7 +1217,7 @@ func expandedDashboardRun(observed statusRun, now time.Time) string {
 	if issueURL := plainStatusValue(run.IssueURL); issueURL != "" {
 		fmt.Fprintf(&details, "    Issue URL: %s\n", issueURL)
 	}
-	if pullRequest := dashboardPullRequestIdentity(run.PullRequest); pullRequest != "" {
+	if pullRequest := b.plainPullRequestIdentity(run); pullRequest != "" {
 		fmt.Fprintf(&details, "    Pull request: %s\n", pullRequest)
 	}
 	fmt.Fprintf(&details, "    Run: %s\n", plainStatusValue(run.RunID))
@@ -1110,7 +1241,17 @@ func expandedDashboardRun(observed statusRun, now time.Time) string {
 	return details.String()
 }
 
-func expandedDashboardCompletion(run scheduler.Run, now time.Time) string {
+func (b *dashboardBodyBuilder) plainPullRequestIdentity(run scheduler.Run) string {
+	if strings.TrimSpace(run.PullRequest) == "" {
+		return ""
+	}
+	if number, _, ok := dashboardPullRequestURL(b.repository, run.PullRequest); ok {
+		return fmt.Sprintf("PR #%d", number)
+	}
+	return "PR: " + plainStatusValue(run.PullRequest)
+}
+
+func (b *dashboardBodyBuilder) expandedDashboardCompletion(run scheduler.Run, now time.Time) string {
 	progress := summarizeRunProgress(run, followMetrics{}, now)
 	completed := "n/a"
 	if run.CompletedAt != nil && !run.CompletedAt.IsZero() {
@@ -1118,7 +1259,7 @@ func expandedDashboardCompletion(run scheduler.Run, now time.Time) string {
 	}
 	var details strings.Builder
 	fmt.Fprintf(&details, "    Issue: %s\n", dashboardIssueIdentity(run))
-	if pullRequest := dashboardPullRequestIdentity(run.PullRequest); pullRequest != "" {
+	if pullRequest := b.plainPullRequestIdentity(run); pullRequest != "" {
 		fmt.Fprintf(&details, "    Pull request: %s\n", pullRequest)
 	}
 	fmt.Fprintf(&details, "    Elapsed: %s\n", progress.elapsed)
@@ -1155,7 +1296,9 @@ func (d *liveDashboard) renderPartsFor(current state.State, messages []dashboard
 
 func (d *liveDashboard) renderPartsForWithLayout(current state.State, messages []dashboardMessage, stage dashboardStage, now time.Time, styler dashboardStyler) (string, dashboardBodyLayout, string) {
 	projection := d.project(current, stage, now)
-	body := dashboardBodyBuilder{}
+	body := dashboardBodyBuilder{
+		repository: current.Repo, hyperlinks: d.hyperlinks, resources: make(map[string]dashboardRunResources),
+	}
 	d.mu.Lock()
 	admission := cloneDashboardAdmission(d.admission)
 	diagnosticsOpen := d.diagnosticsOpen
@@ -1173,7 +1316,9 @@ func (d *liveDashboard) renderPartsForWithLayout(current state.State, messages [
 			body.write(styler.render(message.semantic, "  "+message.text) + "\n")
 		}
 	}
-	return projection.header, dashboardBodyLayout{text: body.body.String(), anchors: body.anchors, attention: projection.attention}, projection.footer
+	return projection.header, dashboardBodyLayout{
+		text: body.body.String(), anchors: body.anchors, attention: projection.attention, resources: body.resources,
+	}, projection.footer
 }
 
 func (b *dashboardBodyBuilder) renderAdmission(admission dashboardAdmission, diagnosticsOpen bool, stage dashboardStage, now time.Time, styler dashboardStyler) {
@@ -1456,8 +1601,8 @@ func (d *liveDashboard) observeActivity(run scheduler.Run) followMetrics {
 	return cached.metrics
 }
 
-func renderDashboardCompletions(output *strings.Builder, runs []statusRun, now time.Time, styler dashboardStyler) {
-	body := dashboardBodyBuilder{}
+func renderDashboardCompletions(output *strings.Builder, repository string, runs []statusRun, now time.Time, styler dashboardStyler) {
+	body := dashboardBodyBuilder{repository: repository, resources: make(map[string]dashboardRunResources)}
 	body.renderCompletions(runs, now, styler)
 	_, _ = output.WriteString("\n" + body.body.String())
 }
@@ -1475,14 +1620,11 @@ func (b *dashboardBodyBuilder) renderCompletions(runs []statusRun, now time.Time
 	for _, observed := range runs[:visible] {
 		run := observed.run
 		b.anchor(dashboardRunAnchor(run.RunID))
-		identity := fmt.Sprintf("#%d", run.Issue)
-		if title := plainStatusValue(run.IssueTitle); title != "" {
-			identity += "  " + title
-		}
+		identity := b.issueIdentity(run, dashboardIssueIdentity(run))
 		progress := summarizeRunProgress(run, followMetrics{}, now)
 		line := styler.render(dashboardSemanticCompletion, "  "+identity)
-		if run.PullRequest != "" {
-			line += styler.render(dashboardSemanticMetadata, " | PR: "+plainStatusValue(run.PullRequest))
+		if pullRequest := b.pullRequestIdentity(run); pullRequest != "" {
+			line += styler.render(dashboardSemanticMetadata, " | "+pullRequest)
 		}
 		completed := "n/a"
 		if run.CompletedAt != nil && !run.CompletedAt.IsZero() {
@@ -1515,18 +1657,19 @@ func (b *dashboardBodyBuilder) renderSection(section statusSection, name string,
 	for _, observed := range runs {
 		run := observed.run
 		b.anchor(dashboardRunAnchor(run.RunID))
-		identity := fmt.Sprintf("#%d", run.Issue)
-		if title := plainStatusValue(run.IssueTitle); title != "" {
-			identity += "  " + title
-		}
+		identity := b.issueIdentity(run, dashboardIssueIdentity(run))
 		progress := summarizeRunProgress(run, observed.observation.metrics, now)
-		b.write(styler.render(dashboardRunSemantic(observed, section), "  "+identity) + "\n")
-		if run.IssueURL != "" {
+		line := styler.render(dashboardRunSemantic(observed, section), "  "+identity)
+		if pullRequest := b.pullRequestIdentity(run); pullRequest != "" {
+			line += styler.render(dashboardSemanticMetadata, " | "+pullRequest)
+		}
+		b.write(line + "\n")
+		if !b.hyperlinks && run.IssueURL != "" {
 			line := "    Issue: " + plainStatusValue(run.IssueURL)
 			b.write(styler.render(dashboardSemanticMetadata, line) + "\n")
 		}
 		state := "    State: " + displayedRunState(run, observed.observation.process)
-		line := styler.render(dashboardRunSemantic(observed, section), state)
+		line = styler.render(dashboardRunSemantic(observed, section), state)
 		line += styler.render(dashboardSemanticMetadata, " | Elapsed: "+progress.elapsed+" | ")
 		liveness := "Worker liveness: " + plainStatusValue(observed.observation.process.workerLiveness)
 		line += styler.render(dashboardLivenessSemantic(observed), liveness)

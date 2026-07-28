@@ -24,6 +24,21 @@ import (
 	"github.com/robinjoseph08/backlog/internal/worktree"
 )
 
+func TestURLOpenerExecutableUsesPlatformDefault(t *testing.T) {
+	for _, test := range []struct {
+		goos string
+		want string
+	}{
+		{goos: "darwin", want: "open"},
+		{goos: "linux", want: "xdg-open"},
+		{goos: "freebsd", want: "xdg-open"},
+	} {
+		if got := urlOpenerExecutable(test.goos); got != test.want {
+			t.Fatalf("URL opener for %s = %q, want %q", test.goos, got, test.want)
+		}
+	}
+}
+
 func TestRunnerHostOrdersExternalAndPresentationSignalsThroughOneIngress(t *testing.T) {
 	external := make(chan os.Signal, 2)
 	external <- os.Interrupt

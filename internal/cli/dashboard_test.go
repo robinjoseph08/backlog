@@ -1647,7 +1647,7 @@ func TestRenderDashboardCompletionsUsesOneLineRowsAndVerifiedCompletionTime(t *t
 		}},
 	}
 	var output strings.Builder
-	renderDashboardCompletions(&output, runs, now, dashboardStyler{})
+	renderDashboardCompletions(&output, "owner/repo", runs, now, dashboardStyler{})
 	want := "\nRecent Completions (2)\n" +
 		"  #42  Populated metadata | PR: https://github.com/acme/widgets/pull/42 | Elapsed: 30m0s | Completed: 30m0s ago\n" +
 		"  #42  Legacy completion | PR: https://github.com/acme/widgets/pull/41 | Elapsed: 1h0m0s | Completed: n/a\n"
