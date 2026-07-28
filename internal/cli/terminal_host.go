@@ -581,14 +581,18 @@ func environmentColorProfile() TerminalColorProfile {
 	return TerminalColorANSI
 }
 
+func urlOpenerExecutable(goos string) string {
+	if goos == "darwin" {
+		return "open"
+	}
+	return "xdg-open"
+}
+
 func openURL(ctx context.Context, url string) error {
-	executable := "xdg-open"
-	if runtime.GOOS == "darwin" {
-		executable = "open"
-	}
-	command := exec.CommandContext(ctx, executable, url)
-	if err := command.Start(); err != nil {
-		return err
-	}
-	return command.Process.Release()
+	return runURLOpener(ctx, urlOpenerExecutable(runtime.GOOS), url)
+}
+
+func runURLOpener(ctx context.Context, executable, url string) error {
+	// #nosec G204: the executable is a fixed platform choice and the URL is one argument, not shell input.
+	return exec.CommandContext(ctx, executable, url).Run()
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -40,6 +41,314 @@ func TestBubbleDashboardModelResizesViewportAroundFixedLifecycleChrome(t *testin
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 36, Height: 8})
 	model = updated.(bubbleDashboardModel)
 	assertBubbleDashboardFits(t, model, 36, 8)
+}
+
+func TestBubbleDashboardLinksSafeIssueIdentitiesAndPullRequests(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	completedAt := now.Add(-time.Minute)
+	current := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1,
+		Runs: []scheduler.Run{
+			{
+				Issue: 12, IssueTitle: "Current issue", IssueURL: "https://github.com/acme/widgets/issues/12",
+				RunID: "current", Status: scheduler.StatusWaitingForMerge, PullRequest: "https://github.com/acme/widgets/pull/112", StartedAt: now.Add(-time.Hour),
+			},
+			{
+				Issue: 13, IssueTitle: "Historical issue", RunID: "historical", Status: scheduler.StatusFailed,
+				PullRequest: "https://github.com/acme/widgets/pull/not-a-number\x1b]8;;https://attacker.test", StartedAt: now.Add(-2 * time.Hour), UpdatedAt: now,
+			},
+			{
+				Issue: 14, IssueTitle: "Malformed issue URL", IssueURL: "javascript:alert(1)",
+				RunID: "malformed-issue", Status: scheduler.StatusMerged, PullRequest: "https://github.com/acme/widgets/pull/114",
+				StartedAt: now.Add(-3 * time.Hour), CompletedAt: &completedAt,
+			},
+		},
+		Leases: []scheduler.Lease{{LeaseID: "current", Issue: 12, RunID: "current"}},
+	}
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{
+		Now: func() time.Time { return now },
+	}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 160, Height: 24})
+	updated, _ := model.Update(dashboardConfiguredMsg{initial: current, source: &dashboardTestSource{current: current}})
+	model = updated.(bubbleDashboardModel)
+	body := model.viewport.GetContent()
+	for _, want := range []string{
+		"\x1b]8;;https://github.com/acme/widgets/issues/12\x1b\\#12  Current issue\x1b]8;;\x1b\\ | \x1b]8;;https://github.com/acme/widgets/pull/112\x1b\\PR #112\x1b]8;;\x1b\\",
+		"\x1b]8;;https://github.com/acme/widgets/issues/13\x1b\\#13\x1b]8;;\x1b\\",
+		"PR: https://github.com/acme/widgets/pull/not-a-number",
+		"#14  Malformed issue URL | \x1b]8;;https://github.com/acme/widgets/pull/114\x1b\\PR #114\x1b]8;;\x1b\\",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("linked dashboard body missing %q:\n%q", want, body)
+		}
+	}
+	if strings.Contains(body, "\x1b]8;;javascript:") || strings.Contains(body, "PR #not-a-number") || strings.Contains(body, "https://attacker.test") {
+		t.Fatalf("unsafe resource metadata became a hyperlink, leaked an attacker target, or guessed a PR number:\n%q", body)
+	}
+
+	for _, width := range []int{160, 24} {
+		if width != 160 {
+			updated, _ = model.Update(tea.WindowSizeMsg{Width: width, Height: 24})
+			model = updated.(bubbleDashboardModel)
+		}
+		rendered := model.View().Content
+		for _, target := range []string{
+			"\x1b]8;;https://github.com/acme/widgets/issues/12\x1b\\",
+			"\x1b]8;;https://github.com/acme/widgets/pull/112\x1b\\",
+		} {
+			if !strings.Contains(rendered, target) {
+				t.Fatalf("%d-column rendered view stripped linked target %q:\n%q", width, target, rendered)
+			}
+		}
+		for _, line := range strings.Split(rendered, "\n") {
+			opens := strings.Count(line, "\x1b]8;;https://")
+			closes := strings.Count(line, "\x1b]8;;\x1b\\")
+			if opens != closes {
+				t.Fatalf("%d-column rendered row has %d OSC 8 opens and %d closes: %q", width, opens, closes, line)
+			}
+		}
+	}
+}
+
+func TestBubbleDashboardKeyboardOpensSelectedIssueAndPullRequestAsynchronously(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	current := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1,
+		Runs: []scheduler.Run{{
+			Issue: 12, IssueTitle: "Open resources", IssueURL: "https://github.com/acme/widgets/issues/12",
+			RunID: "current", Status: scheduler.StatusWaitingForMerge, PullRequest: "https://github.com/acme/widgets/pull/112", StartedAt: now.Add(-time.Hour),
+		}},
+		Leases: []scheduler.Lease{{LeaseID: "current", Issue: 12, RunID: "current"}},
+	}
+	type openInvocation struct {
+		target   string
+		deadline time.Time
+	}
+	opened := make(chan openInvocation, 1)
+	release := make(chan struct{})
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{
+		Now: func() time.Time { return now },
+		OpenURL: func(ctx context.Context, target string) error {
+			deadline, hasDeadline := ctx.Deadline()
+			if !hasDeadline {
+				return errors.New("opener context has no deadline")
+			}
+			opened <- openInvocation{target: target, deadline: deadline}
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 16})
+	updated, _ := model.Update(dashboardConfiguredMsg{initial: current, source: &dashboardTestSource{current: current}})
+	model = updated.(bubbleDashboardModel)
+	line, exists := model.anchorVisualLine(dashboardRunAnchor("current"))
+	if !exists {
+		t.Fatal("selected Run anchor missing")
+	}
+	model.viewport.SetYOffset(line)
+	model.selectViewportAnchor()
+	if command := model.openSelectedURL(dashboardRunAnchor("current"), dashboardResourceKind(255)); command != nil {
+		t.Fatal("unknown resource kind selected the issue URL")
+	}
+
+	for _, test := range []struct {
+		key  rune
+		want string
+	}{
+		{key: 'o', want: "https://github.com/acme/widgets/issues/12"},
+		{key: 'p', want: "https://github.com/acme/widgets/pull/112"},
+	} {
+		key := tea.KeyPressMsg(tea.Key{Code: test.key, Text: string(test.key)})
+		updated, command := model.Update(key)
+		model = updated.(bubbleDashboardModel)
+		if command == nil {
+			t.Fatalf("%c did not return an asynchronous opener command", test.key)
+		}
+		select {
+		case invocation := <-opened:
+			t.Fatalf("%c invoked opener inside Update: %#v", test.key, invocation)
+		default:
+		}
+
+		result := make(chan tea.Msg, 1)
+		go func() { result <- command() }()
+		var invocation openInvocation
+		select {
+		case invocation = <-opened:
+		case <-time.After(time.Second):
+			t.Fatalf("%c asynchronous opener did not start", test.key)
+		}
+		if invocation.target != test.want {
+			t.Fatalf("%c opened %q, want %q", test.key, invocation.target, test.want)
+		}
+		remaining := time.Until(invocation.deadline)
+		if remaining <= 0 || remaining > dashboardURLOpenTimeout {
+			t.Fatalf("%c opener deadline remaining = %s, want within (0, %s]", test.key, remaining, dashboardURLOpenTimeout)
+		}
+		updated, repeated := model.Update(key)
+		model = updated.(bubbleDashboardModel)
+		if repeated != nil {
+			t.Fatalf("%c key repeat started another opener while one was in flight", test.key)
+		}
+
+		release <- struct{}{}
+		var message tea.Msg
+		select {
+		case message = <-result:
+		case <-time.After(time.Second):
+			t.Fatalf("%c asynchronous opener did not finish", test.key)
+		}
+		openResult, ok := message.(dashboardOpenURLResultMsg)
+		if !ok || openResult.err != nil {
+			t.Fatalf("%c opener result = %#v", test.key, message)
+		}
+		updated, _ = model.Update(openResult)
+		model = updated.(bubbleDashboardModel)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	model.ctx = ctx
+	updated, command := model.Update(tea.KeyPressMsg(tea.Key{Code: 'o', Text: "o"}))
+	model = updated.(bubbleDashboardModel)
+	cancel()
+	result := command().(dashboardOpenURLResultMsg)
+	if !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("canceled opener result = %#v, want context cancellation", result)
+	}
+}
+
+func TestBubbleDashboardKeyboardOpensSynthesizedIssueOnlyAndRejectsMalformedResources(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	current := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 3,
+		Runs: []scheduler.Run{
+			{Issue: 13, IssueTitle: "Historical issue", RunID: "historical", Status: scheduler.StatusFailed, StartedAt: now.Add(-time.Hour)},
+			{Issue: 14, IssueTitle: "Malformed issue", IssueURL: "javascript:alert(1)", RunID: "malformed-issue", Status: scheduler.StatusRunning, StartedAt: now},
+			{
+				Issue: 15, IssueTitle: "Malformed pull request", IssueURL: "https://github.com/acme/widgets/issues/15",
+				RunID: "malformed-pr", Status: scheduler.StatusWaitingForMerge,
+				PullRequest: "https://github.com/acme/widgets/pull/not-a-number\x1b]8;;https://attacker.test", StartedAt: now,
+			},
+		},
+		Leases: []scheduler.Lease{
+			{LeaseID: "malformed-issue", Issue: 14, RunID: "malformed-issue"},
+			{LeaseID: "malformed-pr", Issue: 15, RunID: "malformed-pr"},
+		},
+	}
+	var opened []string
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{
+		Now: func() time.Time { return now },
+		OpenURL: func(_ context.Context, target string) error {
+			opened = append(opened, target)
+			return nil
+		},
+	}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 20})
+	updated, _ := model.Update(dashboardConfiguredMsg{initial: current, source: &dashboardTestSource{current: current}})
+	model = updated.(bubbleDashboardModel)
+
+	selectRun := func(runID string) {
+		t.Helper()
+		anchor := dashboardRunAnchor(runID)
+		if _, exists := model.anchorVisualLine(anchor); !exists {
+			t.Fatalf("Run %q anchor missing", runID)
+		}
+		model.selectedAnchor = anchor
+	}
+	selectRun("historical")
+	updated, command := model.Update(tea.KeyPressMsg(tea.Key{Code: 'o', Text: "o"}))
+	model = updated.(bubbleDashboardModel)
+	if command == nil {
+		t.Fatal("o did not open the synthesized historical issue URL")
+	}
+	result := command().(dashboardOpenURLResultMsg)
+	if result.err != nil {
+		t.Fatalf("synthesized historical issue opener result = %#v", result)
+	}
+	updated, _ = model.Update(result)
+	model = updated.(bubbleDashboardModel)
+	if !reflect.DeepEqual(opened, []string{"https://github.com/acme/widgets/issues/13"}) {
+		t.Fatalf("opened URLs = %q, want only synthesized historical issue URL", opened)
+	}
+
+	for _, test := range []struct {
+		runID string
+		key   rune
+	}{
+		{runID: "malformed-issue", key: 'o'},
+		{runID: "malformed-pr", key: 'p'},
+	} {
+		selectRun(test.runID)
+		updated, command = model.Update(tea.KeyPressMsg(tea.Key{Code: test.key, Text: string(test.key)}))
+		model = updated.(bubbleDashboardModel)
+		if command != nil {
+			t.Fatalf("%c returned an opener command for malformed metadata on %q", test.key, test.runID)
+		}
+	}
+	if len(opened) != 1 {
+		t.Fatalf("malformed metadata reached the opener: %q", opened)
+	}
+}
+
+func TestBubbleDashboardURLFailureIsTemporaryDiagnosticOnly(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	current := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1,
+		Runs:   []scheduler.Run{{Issue: 12, RunID: "current", Status: scheduler.StatusClaimed, StartedAt: now}},
+		Leases: []scheduler.Lease{{LeaseID: "current", Issue: 12, RunID: "current"}},
+	}
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{
+		Now: func() time.Time { return now },
+		OpenURL: func(context.Context, string) error {
+			return errors.New("opener unavailable")
+		},
+	}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 2})
+	updated, _ := model.Update(dashboardConfiguredMsg{initial: current, source: &dashboardTestSource{current: current}})
+	model = updated.(bubbleDashboardModel)
+	line, _ := model.anchorVisualLine(dashboardRunAnchor("current"))
+	model.viewport.SetYOffset(line)
+	model.selectViewportAnchor()
+	before := cloneDashboardState(model.dashboard.current)
+
+	updated, command := model.Update(tea.KeyPressMsg(tea.Key{Code: 'o', Text: "o"}))
+	model = updated.(bubbleDashboardModel)
+	result := command().(dashboardOpenURLResultMsg)
+	updated, expiry := model.Update(result)
+	model = updated.(bubbleDashboardModel)
+	if expiry == nil || !strings.Contains(ansi.Strip(model.View().Content), "Open issue failed: opener unavailable") {
+		t.Fatalf("opener failure did not become a temporary diagnostic:\n%s", ansi.Strip(model.View().Content))
+	}
+	if !reflect.DeepEqual(model.dashboard.current, before) {
+		t.Fatal("URL opener failure altered Runner state projection")
+	}
+	firstDiagnosticID := model.urlDiagnosticID
+	updated, newerExpiry := model.Update(dashboardOpenURLResultMsg{resource: dashboardIssueResource, err: errors.New("newer opener failure")})
+	model = updated.(bubbleDashboardModel)
+	if newerExpiry == nil || !strings.Contains(ansi.Strip(model.View().Content), "Open issue failed: newer opener failure") {
+		t.Fatalf("newer opener failure did not replace the diagnostic:\n%s", ansi.Strip(model.View().Content))
+	}
+	updated, _ = model.Update(dashboardURLDiagnosticExpiredMsg{id: firstDiagnosticID})
+	model = updated.(bubbleDashboardModel)
+	if !strings.Contains(ansi.Strip(model.View().Content), "newer opener failure") {
+		t.Fatal("older diagnostic timer cleared the newer diagnostic")
+	}
+	updated, _ = model.Update(dashboardURLDiagnosticExpiredMsg{id: model.urlDiagnosticID})
+	model = updated.(bubbleDashboardModel)
+	if strings.Contains(ansi.Strip(model.View().Content), "newer opener failure") {
+		t.Fatal("newer URL opener diagnostic did not expire")
+	}
+
+	updated, command = model.Update(tea.KeyPressMsg(tea.Key{Code: 'p', Text: "p"}))
+	model = updated.(bubbleDashboardModel)
+	if command != nil {
+		t.Fatal("p attempted to open an unavailable pull request")
+	}
+	model.control.Terminal.OpenURL = nil
+	_, command = model.Update(tea.KeyPressMsg(tea.Key{Code: 'o', Text: "o"}))
+	if result := command().(dashboardOpenURLResultMsg); result.err == nil || result.err.Error() != "URL opener unavailable" {
+		t.Fatalf("missing URL opener result = %#v", result)
+	}
 }
 
 func assertBubbleDashboardFits(t *testing.T, model bubbleDashboardModel, width, height int) {
@@ -309,12 +618,44 @@ func TestBubbleDashboardKeyboardNavigationSelectsCollapsedSectionWhenContentFits
 }
 
 func TestBubbleDashboardMouseWheelScrollsWithoutClickHandling(t *testing.T) {
-	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: time.Now}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 60, Height: 12})
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	run := scheduler.Run{
+		Issue: 71, IssueTitle: "Linked resource row", IssueURL: "https://github.com/acme/widgets/issues/71",
+		RunID: "linked", Status: scheduler.StatusWaitingForMerge, PullRequest: "https://github.com/acme/widgets/pull/171", StartedAt: now,
+	}
+	current := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1,
+		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+	}
+	opened := 0
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{
+		Now: func() time.Time { return now },
+		OpenURL: func(context.Context, string) error {
+			opened++
+			return nil
+		},
+	}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 60, Height: 12})
+	updated, _ := model.Update(dashboardConfiguredMsg{initial: current, source: &dashboardTestSource{current: current}})
+	model = updated.(bubbleDashboardModel)
+	anchor := dashboardRunAnchor(run.RunID)
+	line, exists := model.anchorVisualLine(anchor)
+	if !exists || !model.visualLineVisible(line) || !strings.Contains(model.View().Content, "\x1b]8;;"+run.IssueURL) {
+		t.Fatalf("linked Run row is not visible for click coverage:\n%q", model.View().Content)
+	}
+	selection, offset := model.selectedAnchor, model.viewport.YOffset()
+	rowY := model.dashboardBodyStart() + line - offset
+	updated, command := model.Update(tea.MouseClickMsg{Button: tea.MouseLeft, X: 4, Y: rowY})
+	model = updated.(bubbleDashboardModel)
+	if command != nil || opened != 0 || model.selectedAnchor != selection || model.viewport.YOffset() != offset {
+		t.Fatalf("application handled linked-row mouse click: command nil = %t, opens = %d, selection = %q, offset = %d", command == nil, opened, model.selectedAnchor, model.viewport.YOffset())
+	}
+
 	for index := range 30 {
 		model.dashboard.recordMessage(fmt.Sprintf("event line %02d", index))
 	}
-	updated, _ := model.Update(dashboardElapsedMsg(time.Now()))
+	updated, _ = model.Update(dashboardElapsedMsg(now))
 	model = updated.(bubbleDashboardModel)
+	model.viewport.GotoTop()
 	updated, _ = model.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
 	model = updated.(bubbleDashboardModel)
 	if got := model.viewport.YOffset(); got != model.viewport.MouseWheelDelta {
@@ -324,14 +665,6 @@ func TestBubbleDashboardMouseWheelScrollsWithoutClickHandling(t *testing.T) {
 	model = updated.(bubbleDashboardModel)
 	if !model.viewport.AtTop() {
 		t.Fatalf("mouse wheel up did not return viewport to top; offset = %d", model.viewport.YOffset())
-	}
-	updated, _ = model.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
-	model = updated.(bubbleDashboardModel)
-	offset := model.viewport.YOffset()
-	updated, command := model.Update(tea.MouseClickMsg{Button: tea.MouseLeft, X: 1, Y: 1})
-	model = updated.(bubbleDashboardModel)
-	if command != nil || model.viewport.YOffset() != offset {
-		t.Fatalf("application handled mouse click: command nil = %t, offset = %d, want %d", command == nil, model.viewport.YOffset(), offset)
 	}
 	if model.View().MouseMode != tea.MouseModeCellMotion {
 		t.Fatal("dashboard did not request terminal mouse wheel events")
@@ -1200,7 +1533,7 @@ func TestBubbleDashboardResponsiveDensityAndSelectedDetails(t *testing.T) {
 		}
 	}
 	for _, omitted := range []string{active.IssueURL, active.RunID, "tokens", "Worker liveness", "PID"} {
-		if strings.Contains(activeRow, omitted) {
+		if strings.Contains(ansi.Strip(activeRow), omitted) {
 			t.Fatalf("roomy compact Active row included %q: %q", omitted, activeRow)
 		}
 	}

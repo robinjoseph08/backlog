@@ -22,8 +22,10 @@ import (
 
 const (
 	dashboardOutputUpdateLimit     = 64
-	dashboardNavigationHelp        = "Nav: d:Diagnostics ↑↓/jk PgUp/Dn/f/b Home/End g/G a:Attention Enter:Toggle"
-	dashboardCompactNavigationHelp = "N:jk/fb Pg H/E gG a d Ent"
+	dashboardURLOpenTimeout        = 15 * time.Second
+	dashboardURLDiagnosticTimeout  = 5 * time.Second
+	dashboardNavigationHelp        = "Nav: d:Diagnostics ↑↓/jk PgUp/Dn/f/b Home/End g/G a:Attention o:Issue p:PR Enter:Toggle"
+	dashboardCompactNavigationHelp = "N:jk/fb op a d Ent"
 )
 
 type dashboardConfiguredMsg struct {
@@ -35,6 +37,11 @@ type dashboardStateMsg state.State
 type dashboardOutputMsg string
 type dashboardOperationalMsg struct{ event runner.OperationalEvent }
 type dashboardInterruptResultMsg struct{ err error }
+type dashboardOpenURLResultMsg struct {
+	resource dashboardResourceKind
+	err      error
+}
+type dashboardURLDiagnosticExpiredMsg struct{ id uint64 }
 type dashboardElapsedMsg time.Time
 type dashboardActivityMsg time.Time
 type dashboardQueueStoppedMsg struct{ err error }
@@ -318,6 +325,9 @@ type bubbleDashboardModel struct {
 	interruptsWaiting int
 	pendingFlushes    []dashboardFlushMsg
 	flushAfter        func(time.Duration) <-chan time.Time
+	urlOpenInFlight   bool
+	urlDiagnostic     string
+	urlDiagnosticID   uint64
 	startup           *atomic.Bool
 }
 
@@ -330,9 +340,11 @@ func newBubbleDashboardModel(ctx context.Context, control PresentationControl, s
 	}
 	view.SoftWrap = true
 	view.FillHeight = true
+	dashboard := newLiveDashboard(io.Discard, nil, empty, control.Terminal.Now)
+	dashboard.hyperlinks = true
 	model := bubbleDashboardModel{
 		ctx: ctx, control: control, session: session,
-		dashboard: newLiveDashboard(io.Discard, nil, empty, control.Terminal.Now),
+		dashboard: dashboard,
 		viewport:  view, width: dimensions.Width, height: dimensions.Height,
 		attentionKnown: make(map[string]struct{}), attentionPending: make(map[string]struct{}),
 		colorProfile: profile, styler: newDashboardFallbackStyler(profile),
@@ -416,9 +428,41 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.dashboard.moveDiagnosticPage(-1)
 		case ".":
 			m.dashboard.moveDiagnosticPage(1)
+		case "o":
+			if !m.urlOpenInFlight {
+				if command := m.openSelectedURL(selection.identity, dashboardIssueResource); command != nil {
+					m.urlOpenInFlight = true
+					commands = append(commands, command)
+				}
+			}
+		case "p":
+			if !m.urlOpenInFlight {
+				if command := m.openSelectedURL(selection.identity, dashboardPullRequestResource); command != nil {
+					m.urlOpenInFlight = true
+					commands = append(commands, command)
+				}
+			}
 		}
 		if msg.String() == "enter" {
 			m.toggleExpansion()
+		}
+	case dashboardOpenURLResultMsg:
+		m.urlOpenInFlight = false
+		if msg.err != nil {
+			m.urlDiagnosticID++
+			id := m.urlDiagnosticID
+			resource, ok := msg.resource.label()
+			if !ok {
+				resource = "resource"
+			}
+			m.urlDiagnostic = fmt.Sprintf("Open %s failed: %s", resource, plainStatusValue(strings.TrimSpace(msg.err.Error())))
+			commands = append(commands, tea.Tick(dashboardURLDiagnosticTimeout, func(time.Time) tea.Msg {
+				return dashboardURLDiagnosticExpiredMsg{id: id}
+			}))
+		}
+	case dashboardURLDiagnosticExpiredMsg:
+		if msg.id == m.urlDiagnosticID {
+			m.urlDiagnostic = ""
 		}
 	case dashboardInterruptResultMsg:
 		if m.interruptsWaiting > 0 {
@@ -516,6 +560,25 @@ func (m bubbleDashboardModel) interrupt() tea.Cmd {
 	return func() tea.Msg { return dashboardInterruptResultMsg{err: m.control.Interrupt(m.ctx)} }
 }
 
+func (m bubbleDashboardModel) openSelectedURL(identity string, resource dashboardResourceKind) tea.Cmd {
+	resources, exists := m.layout.resources[identity]
+	if !exists {
+		return nil
+	}
+	target, validResource := resources.target(resource)
+	if !validResource || target == "" {
+		return nil
+	}
+	return func() tea.Msg {
+		if m.control.Terminal.OpenURL == nil {
+			return dashboardOpenURLResultMsg{resource: resource, err: errors.New("URL opener unavailable")}
+		}
+		ctx, cancel := context.WithTimeout(m.ctx, dashboardURLOpenTimeout)
+		defer cancel()
+		return dashboardOpenURLResultMsg{resource: resource, err: m.control.Terminal.OpenURL(ctx, target)}
+	}
+}
+
 func (m *bubbleDashboardModel) renderPendingFlushes() []tea.Cmd {
 	if m.control.operationalEvents != nil && !m.control.operationalEvents.idle() {
 		return nil
@@ -563,12 +626,16 @@ func (m *bubbleDashboardModel) refreshViewportWithVisibility(selection dashboard
 	if m.revealSelectedCompletion(selection, projection, layout) {
 		projection, layout, stage = m.dashboard.renderResponsiveParts(m.dashboard.now(), options)
 	}
+	footer := projection.footer + "\n" + dashboardNavigationHelp
+	if m.urlDiagnostic != "" {
+		footer += "\n" + m.urlDiagnostic
+	}
 	if density == dashboardDensityMinimal {
 		m.header = minimalDashboardHeader(projection.metadata, len(layout.attention), 0)
-		m.footer = minimalDashboardFooter(projection.footer + "\n" + dashboardNavigationHelp)
+		m.footer = minimalDashboardFooter(footer)
 	} else {
 		m.header = projection.header
-		m.footer = projection.footer + "\n" + dashboardNavigationHelp
+		m.footer = footer
 	}
 	m.layout = layout
 	m.stage = stage
@@ -968,12 +1035,31 @@ func dashboardChromeLines(header, footer []string, pendingAttention int, stage d
 	}
 
 	// When not all chrome can fit, spend the available rows on the fixed footer
-	// before retaining header details. Keep next-interrupt guidance and
-	// navigation in separately allocated rows whenever the terminal permits it.
+	// before retaining header details. Supplemental footer diagnostics come
+	// first so a temporary error remains visible, followed by next-interrupt
+	// guidance and navigation in separately allocated rows when space permits.
 	next, navigation := compactFooterLine(compactFooter, 1), compactFooterLine(compactFooter, 2)
-	bottom := wrapDashboardChrome([][]string{{next, navigation}}, width)
+	supplemental := strings.Join(compactFooter[min(3, len(compactFooter)):], " | ")
+	priorityFooter := []string{next, navigation}
+	if supplemental != "" {
+		priorityFooter = append([]string{supplemental}, priorityFooter...)
+	}
+	bottom := wrapDashboardChrome([][]string{priorityFooter}, width)
 	if len(bottom) > chromeLimit && chromeLimit >= 2 {
-		bottom = []string{fitDashboardLine(next, width), fitDashboardLine(navigation, width)}
+		if supplemental == "" {
+			bottom = []string{fitDashboardLine(next, width), fitDashboardLine(navigation, width)}
+		} else if chromeLimit == 2 {
+			bottom = []string{
+				fitDashboardLine(supplemental, width),
+				fitDashboardLine(strings.Join([]string{next, navigation}, " | "), width),
+			}
+		} else {
+			bottom = []string{
+				fitDashboardLine(supplemental, width),
+				fitDashboardLine(next, width),
+				fitDashboardLine(navigation, width),
+			}
+		}
 	}
 	if len(bottom) > chromeLimit {
 		bottom = bottom[:chromeLimit]

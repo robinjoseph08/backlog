@@ -32,6 +32,36 @@ func (s *dashboardTestSource) Preview() (state.State, bool, error) {
 
 func (s *dashboardTestSource) RunnerSupervised() (bool, error) { return true, nil }
 
+func TestDashboardResourceURLsShareCanonicalTrustValidation(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		resource   dashboardResourceKind
+		rawURL     string
+		wantNumber int
+		wantOK     bool
+	}{
+		{name: "issue", resource: dashboardIssueResource, rawURL: "https://github.com/acme/widgets/issues/12", wantNumber: 12, wantOK: true},
+		{name: "pull request with trailing slash", resource: dashboardPullRequestResource, rawURL: "https://github.com/acme/widgets/pull/112/", wantNumber: 112, wantOK: true},
+		{name: "wrong host", resource: dashboardIssueResource, rawURL: "https://example.test/acme/widgets/issues/12"},
+		{name: "wrong repository", resource: dashboardPullRequestResource, rawURL: "https://github.com/other/widgets/pull/112"},
+		{name: "query", resource: dashboardIssueResource, rawURL: "https://github.com/acme/widgets/issues/12?tab=activity"},
+		{name: "extra path", resource: dashboardPullRequestResource, rawURL: "https://github.com/acme/widgets/pull/112/files"},
+		{name: "noncanonical number", resource: dashboardIssueResource, rawURL: "https://github.com/acme/widgets/issues/012"},
+		{name: "unknown resource", resource: dashboardResourceKind(255), rawURL: "https://github.com/acme/widgets/issues/12"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			number, ok := dashboardResourceURLNumber(test.rawURL, "acme/widgets", test.resource)
+			if number != test.wantNumber || ok != test.wantOK {
+				t.Fatalf("trusted resource = (%d, %t), want (%d, %t)", number, ok, test.wantNumber, test.wantOK)
+			}
+		})
+	}
+
+	if _, ok := dashboardIssueURL("acme/widgets", scheduler.Run{Issue: 12, IssueURL: "https://github.com/acme/widgets/issues/13"}); ok {
+		t.Fatal("issue URL for a different issue number was trusted")
+	}
+}
+
 func lastDashboardFrame(output string) string {
 	const redraw = "\x1b[H\x1b[2J"
 	if index := strings.LastIndex(output, redraw); index >= 0 {
@@ -58,6 +88,17 @@ func TestRunOutputSelectionUsesTerminalCapabilityAndPlainOverride(t *testing.T) 
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			repository := initializeFollowRepository(t)
+			stateDir := t.TempDir()
+			run := scheduler.Run{
+				Issue: 71, IssueTitle: "Linked retained run", IssueURL: "https://github.com/acme/widgets/issues/71",
+				RunID: "retained-71", Status: scheduler.StatusNeedsHuman, WorkerMode: scheduler.WorkerModePrint,
+			}
+			if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{
+				Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
+				Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+			}); err != nil {
+				t.Fatal(err)
+			}
 			gh := writeExecutable(t, `#!/bin/sh
 set -eu
 case "$*" in
@@ -68,28 +109,32 @@ case "$*" in
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
 `)
-			args := []string{"run", "--repo-dir", repository, "--state-dir", t.TempDir(), "--poll", "5ms", "--gh", gh}
+			args := []string{"run", "--repo-dir", repository, "--state-dir", stateDir, "--poll", "5ms", "--gh", gh}
 			if test.plain {
 				args = append(args, "--plain")
 			}
 			var stdout, stderr bytes.Buffer
 			exit := MainWithSignalsAndTerminal(context.Background(), args, &stdout, &stderr, nil, func(io.Writer) bool { return test.terminal })
-			if exit != 0 {
-				t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+			if exit != 1 {
+				t.Fatalf("exit = %d, want retained-intervention exit 1; stderr = %q", exit, stderr.String())
 			}
-			if strings.Contains(stdout.String(), "\x1b[") != test.wantANSI {
-				t.Fatalf("ANSI presence = %t, want %t: %q", strings.Contains(stdout.String(), "\x1b["), test.wantANSI, stdout.String())
+			output := stdout.String()
+			if strings.Contains(output, "\x1b[") != test.wantANSI {
+				t.Fatalf("ANSI presence = %t, want %t: %q", strings.Contains(output, "\x1b["), test.wantANSI, output)
 			}
-			if !strings.Contains(stdout.String(), test.wantOutput) {
-				t.Fatalf("stdout missing %q: %q", test.wantOutput, stdout.String())
+			for _, want := range []string{test.wantOutput, "#71  Linked retained run", run.IssueURL} {
+				if !strings.Contains(output, want) {
+					t.Fatalf("stdout missing %q: %q", want, output)
+				}
 			}
 			if test.wantANSI {
-				output := stdout.String()
 				restore := strings.Index(output, "\x1b[?1049l")
 				summary := strings.Index(output, "Final aggregate summary")
 				if strings.Count(output, "\x1b[?1049h") != 1 || strings.Count(output, "\x1b[?1049l") != 1 || strings.Count(output, "\x1b[?25l") != 1 || strings.Count(output, "\x1b[?25h") != 1 || restore < 0 || summary < restore {
 					t.Fatalf("Bubble Tea did not restore the screen and cursor before the summary: %q", output)
 				}
+			} else if strings.Contains(output, "\x1b") {
+				t.Fatalf("plain or redirected retained-Run output contains terminal controls: %q", output)
 			}
 		})
 	}
@@ -204,9 +249,17 @@ esac
 		t.Fatalf("return to Admission after retries: %v", err)
 	}
 	waitForDashboardScreen(t, &stdout, "2 consecutive failures")
+	if visible := terminalScreenText(stdout.String(), 100, 12); !strings.Contains(visible, "Admission health") || !strings.Contains(visible, "DEGRADED") {
+		t.Fatalf("automatic dashboard did not render degraded Admission health:\n%s", visible)
+	}
+	if _, err := writeInput.Write([]byte("j")); err != nil {
+		t.Fatalf("reveal closed Diagnostics below Admission details: %v", err)
+	}
+	waitForDashboardScreen(t, &stdout, "Diagnostics: closed")
 	closedOutput := stdout.String()
-	if !strings.Contains(closedOutput, "Admission health") || !strings.Contains(closedOutput, "DEGRADED") || !strings.Contains(closedOutput, "Diagnostics: closed") {
-		t.Fatalf("automatic dashboard did not render closed Admission health: %q", closedOutput)
+	closedVisible := terminalScreenText(closedOutput, 100, 12)
+	if !strings.Contains(closedVisible, "DEGRADED") || !strings.Contains(closedVisible, "Diagnostics: closed") {
+		t.Fatalf("automatic dashboard did not render closed Admission Diagnostics:\n%s", closedVisible)
 	}
 	if strings.Contains(closedOutput, "retained stderr evidence") || strings.Contains(closedOutput, "Operational messages") || strings.Contains(closedOutput, "candidate discovery failed; admission paused") {
 		t.Fatalf("closed automatic dashboard exposed full evidence or duplicated Admission as operational rows: %q", closedOutput)
@@ -1647,7 +1700,7 @@ func TestRenderDashboardCompletionsUsesOneLineRowsAndVerifiedCompletionTime(t *t
 		}},
 	}
 	var output strings.Builder
-	renderDashboardCompletions(&output, runs, now, dashboardStyler{})
+	renderDashboardCompletions(&output, "owner/repo", runs, now, dashboardStyler{})
 	want := "\nRecent Completions (2)\n" +
 		"  #42  Populated metadata | PR: https://github.com/acme/widgets/pull/42 | Elapsed: 30m0s | Completed: 30m0s ago\n" +
 		"  #42  Legacy completion | PR: https://github.com/acme/widgets/pull/41 | Elapsed: 1h0m0s | Completed: n/a\n"

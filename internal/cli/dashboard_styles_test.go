@@ -33,11 +33,11 @@ func TestDashboardStylingUsesTypedRunSemanticsWithoutChangingLabels(t *testing.T
 	renderDashboardSection(&styled, statusActive, "Active Runs", active, now, styler)
 	renderDashboardSection(&styled, statusAttention, "Attention Required", attention, now, styler)
 	renderDashboardSection(&styled, statusOutcomes, "Outcomes to Acknowledge", outcomes, now, styler)
-	renderDashboardCompletions(&styled, completions, now, styler)
+	renderDashboardCompletions(&styled, "owner/repo", completions, now, styler)
 	renderDashboardSection(&plain, statusActive, "Active Runs", active, now, dashboardStyler{})
 	renderDashboardSection(&plain, statusAttention, "Attention Required", attention, now, dashboardStyler{})
 	renderDashboardSection(&plain, statusOutcomes, "Outcomes to Acknowledge", outcomes, now, dashboardStyler{})
-	renderDashboardCompletions(&plain, completions, now, dashboardStyler{})
+	renderDashboardCompletions(&plain, "owner/repo", completions, now, dashboardStyler{})
 	got := styled.String()
 	if stripped := ansi.Strip(got); stripped != plain.String() {
 		t.Fatalf("styling changed semantic labels:\n%s", stripped)
