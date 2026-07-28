@@ -211,9 +211,10 @@ esac
 	}
 	waitForDashboardScreen(t, &stdout, 100, 12, "Outcomes to Acknowledge")
 
-	if _, err := writeInput.Write([]byte(strings.Repeat("k", 100))); err != nil {
+	if _, err := writeInput.Write([]byte("g")); err != nil {
 		t.Fatalf("return to Admission: %v", err)
 	}
+	waitForDashboardScreen(t, &stdout, 100, 12, "Admission: DEGRADED")
 	if _, err := writeInput.Write([]byte{0x03}); err != nil {
 		t.Fatalf("start Drain: %v", err)
 	}
