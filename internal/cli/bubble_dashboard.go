@@ -37,7 +37,7 @@ type dashboardOutputMsg string
 type dashboardOperationalMsg struct{ event runner.OperationalEvent }
 type dashboardInterruptResultMsg struct{ err error }
 type dashboardOpenURLResultMsg struct {
-	resource string
+	resource dashboardResourceKind
 	err      error
 }
 type dashboardURLDiagnosticExpiredMsg struct{ id uint64 }
@@ -427,11 +427,11 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case ".":
 			m.dashboard.moveDiagnosticPage(1)
 		case "o":
-			if command := m.openSelectedURL(selection.identity, "issue"); command != nil {
+			if command := m.openSelectedURL(selection.identity, dashboardIssueResource); command != nil {
 				commands = append(commands, command)
 			}
 		case "p":
-			if command := m.openSelectedURL(selection.identity, "pull request"); command != nil {
+			if command := m.openSelectedURL(selection.identity, dashboardPullRequestResource); command != nil {
 				commands = append(commands, command)
 			}
 		}
@@ -442,7 +442,11 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.urlDiagnosticID++
 			id := m.urlDiagnosticID
-			m.urlDiagnostic = fmt.Sprintf("Open %s failed: %s", msg.resource, plainStatusValue(strings.TrimSpace(msg.err.Error())))
+			resource, ok := msg.resource.label()
+			if !ok {
+				resource = "resource"
+			}
+			m.urlDiagnostic = fmt.Sprintf("Open %s failed: %s", resource, plainStatusValue(strings.TrimSpace(msg.err.Error())))
 			commands = append(commands, tea.Tick(dashboardURLDiagnosticTimeout, func(time.Time) tea.Msg {
 				return dashboardURLDiagnosticExpiredMsg{id: id}
 			}))
@@ -547,16 +551,13 @@ func (m bubbleDashboardModel) interrupt() tea.Cmd {
 	return func() tea.Msg { return dashboardInterruptResultMsg{err: m.control.Interrupt(m.ctx)} }
 }
 
-func (m bubbleDashboardModel) openSelectedURL(identity, resource string) tea.Cmd {
+func (m bubbleDashboardModel) openSelectedURL(identity string, resource dashboardResourceKind) tea.Cmd {
 	resources, exists := m.layout.resources[identity]
 	if !exists {
 		return nil
 	}
-	target := resources.issueURL
-	if resource == "pull request" {
-		target = resources.pullRequestURL
-	}
-	if target == "" {
+	target, validResource := resources.target(resource)
+	if !validResource || target == "" {
 		return nil
 	}
 	return func() tea.Msg {

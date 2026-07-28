@@ -589,10 +589,10 @@ func urlOpenerExecutable(goos string) string {
 }
 
 func openURL(ctx context.Context, url string) error {
+	return runURLOpener(ctx, urlOpenerExecutable(runtime.GOOS), url)
+}
+
+func runURLOpener(ctx context.Context, executable, url string) error {
 	// #nosec G204: the executable is a fixed platform choice and the URL is one argument, not shell input.
-	command := exec.CommandContext(ctx, urlOpenerExecutable(runtime.GOOS), url)
-	if err := command.Start(); err != nil {
-		return err
-	}
-	return command.Process.Release()
+	return exec.CommandContext(ctx, executable, url).Run()
 }

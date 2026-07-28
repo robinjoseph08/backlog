@@ -32,6 +32,36 @@ func (s *dashboardTestSource) Preview() (state.State, bool, error) {
 
 func (s *dashboardTestSource) RunnerSupervised() (bool, error) { return true, nil }
 
+func TestDashboardResourceURLsShareCanonicalTrustValidation(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		resource   dashboardResourceKind
+		rawURL     string
+		wantNumber int
+		wantOK     bool
+	}{
+		{name: "issue", resource: dashboardIssueResource, rawURL: "https://github.com/acme/widgets/issues/12", wantNumber: 12, wantOK: true},
+		{name: "pull request with trailing slash", resource: dashboardPullRequestResource, rawURL: "https://github.com/acme/widgets/pull/112/", wantNumber: 112, wantOK: true},
+		{name: "wrong host", resource: dashboardIssueResource, rawURL: "https://example.test/acme/widgets/issues/12"},
+		{name: "wrong repository", resource: dashboardPullRequestResource, rawURL: "https://github.com/other/widgets/pull/112"},
+		{name: "query", resource: dashboardIssueResource, rawURL: "https://github.com/acme/widgets/issues/12?tab=activity"},
+		{name: "extra path", resource: dashboardPullRequestResource, rawURL: "https://github.com/acme/widgets/pull/112/files"},
+		{name: "noncanonical number", resource: dashboardIssueResource, rawURL: "https://github.com/acme/widgets/issues/012"},
+		{name: "unknown resource", resource: dashboardResourceKind(255), rawURL: "https://github.com/acme/widgets/issues/12"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			number, ok := dashboardResourceURLNumber(test.rawURL, "acme/widgets", test.resource)
+			if number != test.wantNumber || ok != test.wantOK {
+				t.Fatalf("trusted resource = (%d, %t), want (%d, %t)", number, ok, test.wantNumber, test.wantOK)
+			}
+		})
+	}
+
+	if _, ok := dashboardIssueURL("acme/widgets", scheduler.Run{Issue: 12, IssueURL: "https://github.com/acme/widgets/issues/13"}); ok {
+		t.Fatal("issue URL for a different issue number was trusted")
+	}
+}
+
 func lastDashboardFrame(output string) string {
 	const redraw = "\x1b[H\x1b[2J"
 	if index := strings.LastIndex(output, redraw); index >= 0 {

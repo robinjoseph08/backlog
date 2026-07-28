@@ -722,9 +722,49 @@ type dashboardBodyAnchor struct {
 	line     int
 }
 
+type dashboardResourceKind uint8
+
+const (
+	dashboardIssueResource dashboardResourceKind = iota + 1
+	dashboardPullRequestResource
+)
+
+func (resource dashboardResourceKind) label() (string, bool) {
+	switch resource {
+	case dashboardIssueResource:
+		return "issue", true
+	case dashboardPullRequestResource:
+		return "pull request", true
+	default:
+		return "", false
+	}
+}
+
+func (resource dashboardResourceKind) pathSegment() (string, bool) {
+	switch resource {
+	case dashboardIssueResource:
+		return "issues", true
+	case dashboardPullRequestResource:
+		return "pull", true
+	default:
+		return "", false
+	}
+}
+
 type dashboardRunResources struct {
 	issueURL       string
 	pullRequestURL string
+}
+
+func (resources dashboardRunResources) target(resource dashboardResourceKind) (string, bool) {
+	switch resource {
+	case dashboardIssueResource:
+		return resources.issueURL, true
+	case dashboardPullRequestResource:
+		return resources.pullRequestURL, true
+	default:
+		return "", false
+	}
 }
 
 type dashboardBodyLayout struct {
@@ -1111,7 +1151,8 @@ func dashboardIssueURL(repository string, run scheduler.Run) (string, bool) {
 		return "", false
 	}
 	if run.IssueURL != "" {
-		if dashboardResourceURLMatches(run.IssueURL, repository, "issues", run.Issue) {
+		number, ok := dashboardResourceURLNumber(run.IssueURL, repository, dashboardIssueResource)
+		if ok && number == run.Issue {
 			return run.IssueURL, true
 		}
 		return "", false
@@ -1123,32 +1164,35 @@ func dashboardIssueURL(repository string, run scheduler.Run) (string, bool) {
 }
 
 func dashboardPullRequestURL(repository, rawURL string) (int, string, bool) {
-	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "github.com") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawPath != "" || !validDashboardRepository(repository) {
-		return 0, "", false
-	}
-	prefix := "/" + repository + "/pull/"
-	if len(parsed.Path) <= len(prefix) || !strings.EqualFold(parsed.Path[:len(prefix)], prefix) {
-		return 0, "", false
-	}
-	numberText := strings.TrimSuffix(parsed.Path[len(prefix):], "/")
-	if strings.Contains(numberText, "/") {
-		return 0, "", false
-	}
-	number, err := strconv.Atoi(numberText)
-	if err != nil || number <= 0 || strconv.Itoa(number) != numberText {
+	number, ok := dashboardResourceURLNumber(rawURL, repository, dashboardPullRequestResource)
+	if !ok {
 		return 0, "", false
 	}
 	return number, rawURL, true
 }
 
-func dashboardResourceURLMatches(rawURL, repository, resource string, number int) bool {
-	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "github.com") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawPath != "" || !validDashboardRepository(repository) {
-		return false
+func dashboardResourceURLNumber(rawURL, repository string, resource dashboardResourceKind) (int, bool) {
+	pathSegment, ok := resource.pathSegment()
+	if !ok || !validDashboardRepository(repository) {
+		return 0, false
 	}
-	expected := fmt.Sprintf("/%s/%s/%d", repository, resource, number)
-	return strings.EqualFold(strings.TrimSuffix(parsed.Path, "/"), expected)
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "github.com") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawPath != "" {
+		return 0, false
+	}
+	prefix := fmt.Sprintf("/%s/%s/", repository, pathSegment)
+	if len(parsed.Path) <= len(prefix) || !strings.EqualFold(parsed.Path[:len(prefix)], prefix) {
+		return 0, false
+	}
+	numberText := strings.TrimSuffix(parsed.Path[len(prefix):], "/")
+	if strings.Contains(numberText, "/") {
+		return 0, false
+	}
+	number, err := strconv.Atoi(numberText)
+	if err != nil || number <= 0 || strconv.Itoa(number) != numberText {
+		return 0, false
+	}
+	return number, true
 }
 
 func validDashboardRepository(repository string) bool {

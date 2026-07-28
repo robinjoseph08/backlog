@@ -112,6 +112,9 @@ func TestBubbleDashboardKeyboardOpensSelectedIssueAndPullRequest(t *testing.T) {
 	}
 	model.viewport.SetYOffset(line)
 	model.selectViewportAnchor()
+	if command := model.openSelectedURL(dashboardRunAnchor("current"), dashboardResourceKind(255)); command != nil {
+		t.Fatal("unknown resource kind selected the issue URL")
+	}
 
 	for _, test := range []struct {
 		key  rune

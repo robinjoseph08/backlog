@@ -39,6 +39,21 @@ func TestURLOpenerExecutableUsesPlatformDefault(t *testing.T) {
 	}
 }
 
+func TestRunURLOpenerReportsProcessExitFailureAndCancellation(t *testing.T) {
+	opener := writeExecutable(t, "#!/bin/sh\nexit 23\n")
+	err := runURLOpener(context.Background(), opener, "https://github.com/acme/widgets/issues/12")
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ExitCode() != 23 {
+		t.Fatalf("URL opener failure = %v, want exit code 23", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := runURLOpener(ctx, opener, "https://github.com/acme/widgets/issues/12"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled URL opener = %v, want context cancellation", err)
+	}
+}
+
 func TestRunnerHostOrdersExternalAndPresentationSignalsThroughOneIngress(t *testing.T) {
 	external := make(chan os.Signal, 2)
 	external <- os.Interrupt
