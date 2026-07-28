@@ -14,6 +14,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/robinjoseph08/backlog/internal/activity"
 	"github.com/robinjoseph08/backlog/internal/runner"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
@@ -34,7 +35,7 @@ func TestBubbleDashboardModelResizesViewportAroundFixedLifecycleChrome(t *testin
 		model.dashboard.recordMessage("operational event " + strings.Repeat("x", index))
 	}
 
-	assertBubbleDashboardFits(t, model, 48, 10, 5)
+	assertBubbleDashboardFits(t, model, 48, 10, 4)
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 36, Height: 8})
 	model = updated.(bubbleDashboardModel)
 	assertBubbleDashboardFits(t, model, 36, 8, 1)
@@ -42,6 +43,8 @@ func TestBubbleDashboardModelResizesViewportAroundFixedLifecycleChrome(t *testin
 
 func assertBubbleDashboardFits(t *testing.T, model bubbleDashboardModel, width, height, viewportHeight int) {
 	t.Helper()
+	model.refreshViewport(model.currentSelection())
+	frame := model.dashboardFrame()
 	view := model.View()
 	if !view.AltScreen {
 		t.Fatal("dashboard view did not request the alternate screen")
@@ -61,8 +64,14 @@ func assertBubbleDashboardFits(t *testing.T, model bubbleDashboardModel, width, 
 			t.Fatalf("fixed dashboard chrome omitted %q after resize:\n%s", want, plain)
 		}
 	}
-	if model.viewport.Height() != viewportHeight || model.viewport.Width() != width {
-		t.Fatalf("viewport size = %dx%d, want %dx%d", model.viewport.Width(), model.viewport.Height(), width, viewportHeight)
+	if frame.bodyHeight != viewportHeight || model.viewport.Height() != frame.bodyHeight || model.viewport.Width() != width {
+		t.Fatalf("frame body and viewport size = %d and %dx%d, want %d and %dx%d", frame.bodyHeight, model.viewport.Width(), model.viewport.Height(), viewportHeight, width, viewportHeight)
+	}
+	if frame.bodyHeight > 0 {
+		body := strings.Split(ansi.Strip(model.viewport.View()), "\n")
+		if frame.bodyStart >= len(lines) || strings.TrimSpace(lines[frame.bodyStart]) != strings.TrimSpace(body[0]) {
+			t.Fatalf("rendered body does not start at derived line %d:\n%s", frame.bodyStart, plain)
+		}
 	}
 }
 
@@ -137,26 +146,345 @@ func TestBubbleDashboardTogglesAdmissionDiagnosticsWithDWithoutScrolling(t *test
 	}
 }
 
-func TestBubbleDashboardViewportSupportsKeyboardScrolling(t *testing.T) {
-	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: time.Now}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 60, Height: 9})
-	for range 30 {
-		model.dashboard.recordMessage("event line")
+func TestBubbleDashboardViewportSupportsDocumentedKeyboardNavigation(t *testing.T) {
+	newModel := func() bubbleDashboardModel {
+		model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: time.Now}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 60, Height: 12})
+		for index := range 30 {
+			model.dashboard.recordMessage(fmt.Sprintf("event line %02d", index))
+		}
+		updated, _ := model.Update(dashboardElapsedMsg(time.Now()))
+		return updated.(bubbleDashboardModel)
 	}
-	model.View()
-	for range 5 {
-		updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: 'j', Text: "j"}))
-		model = updated.(bubbleDashboardModel)
+	press := func(model bubbleDashboardModel, key tea.Key) bubbleDashboardModel {
+		updated, _ := model.Update(tea.KeyPressMsg(key))
+		return updated.(bubbleDashboardModel)
 	}
-	if model.viewport.YOffset() == 0 {
-		t.Fatal("j key did not scroll the viewport body")
+
+	for _, test := range []struct {
+		name      string
+		key       tea.Key
+		startPage bool
+		wantPage  bool
+		wantTop   bool
+		wantDelta int
+	}{
+		{name: "down arrow", key: tea.Key{Code: tea.KeyDown}, wantDelta: 1},
+		{name: "j", key: tea.Key{Code: 'j', Text: "j"}, wantDelta: 1},
+		{name: "page down", key: tea.Key{Code: tea.KeyPgDown}, wantPage: true},
+		{name: "f", key: tea.Key{Code: 'f', Text: "f"}, wantPage: true},
+		{name: "up arrow", key: tea.Key{Code: tea.KeyUp}, startPage: true, wantDelta: -1},
+		{name: "k", key: tea.Key{Code: 'k', Text: "k"}, startPage: true, wantDelta: -1},
+		{name: "page up", key: tea.Key{Code: tea.KeyPgUp}, startPage: true, wantTop: true},
+		{name: "b", key: tea.Key{Code: 'b', Text: "b"}, startPage: true, wantTop: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			model := newModel()
+			page := model.viewport.Height()
+			start := 0
+			if test.startPage {
+				start = page
+				model.viewport.SetYOffset(start)
+			}
+			want := start + test.wantDelta
+			if test.wantPage {
+				want += page
+			}
+			if test.wantTop {
+				want = 0
+			}
+			model = press(model, test.key)
+			if got := model.viewport.YOffset(); got != want {
+				t.Fatalf("%s offset = %d, want %d (page height %d)", test.name, got, want, page)
+			}
+		})
 	}
-	for range 2 {
-		updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyPgUp}))
-		model = updated.(bubbleDashboardModel)
+	for _, test := range []struct {
+		name   string
+		bottom tea.Key
+		top    tea.Key
+	}{
+		{name: "Home and End", bottom: tea.Key{Code: tea.KeyEnd}, top: tea.Key{Code: tea.KeyHome}},
+		{name: "g and G", bottom: tea.Key{Code: 'G', Text: "G"}, top: tea.Key{Code: 'g', Text: "g"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			model := press(newModel(), test.bottom)
+			if !model.viewport.AtBottom() {
+				t.Fatalf("%s bottom key stopped at offset %d", test.name, model.viewport.YOffset())
+			}
+			model = press(model, test.top)
+			if !model.viewport.AtTop() {
+				t.Fatalf("%s top key stopped at offset %d", test.name, model.viewport.YOffset())
+			}
+		})
 	}
+}
+
+func TestBubbleDashboardMouseWheelScrollsWithoutClickHandling(t *testing.T) {
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: time.Now}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 60, Height: 12})
+	for index := range 30 {
+		model.dashboard.recordMessage(fmt.Sprintf("event line %02d", index))
+	}
+	updated, _ := model.Update(dashboardElapsedMsg(time.Now()))
+	model = updated.(bubbleDashboardModel)
+	updated, _ = model.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+	model = updated.(bubbleDashboardModel)
+	if got := model.viewport.YOffset(); got != model.viewport.MouseWheelDelta {
+		t.Fatalf("mouse wheel down offset = %d, want %d", got, model.viewport.MouseWheelDelta)
+	}
+	updated, _ = model.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	model = updated.(bubbleDashboardModel)
 	if !model.viewport.AtTop() {
-		t.Fatalf("page-up did not return viewport to top; offset = %d", model.viewport.YOffset())
+		t.Fatalf("mouse wheel up did not return viewport to top; offset = %d", model.viewport.YOffset())
 	}
+	updated, _ = model.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+	model = updated.(bubbleDashboardModel)
+	offset := model.viewport.YOffset()
+	updated, command := model.Update(tea.MouseClickMsg{Button: tea.MouseLeft, X: 1, Y: 1})
+	model = updated.(bubbleDashboardModel)
+	if command != nil || model.viewport.YOffset() != offset {
+		t.Fatalf("application handled mouse click: command nil = %t, offset = %d, want %d", command == nil, model.viewport.YOffset(), offset)
+	}
+	if model.View().MouseMode != tea.MouseModeCellMotion {
+		t.Fatal("dashboard did not request terminal mouse wheel events")
+	}
+}
+
+func TestBubbleDashboardPreservesSelectedRunAcrossLiveProjectionChanges(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	current := navigationTestState(now, 7)
+	logPath := t.TempDir() + "/selected.jsonl"
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	current.Runs[4].LogPath = logPath
+	writeActivityEntries(t, activity.PathForLog(logPath), activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: now.Add(-time.Second), Kind: "turn",
+		Description: "Worker turn completed", TurnDelta: 1,
+	})
+	source := &dashboardTestSource{current: current}
+	model := configuredNavigationTestModel(t, now, current, source)
+	selected := dashboardRunAnchor("run-4")
+	line, exists := model.anchorVisualLine(selected)
+	if !exists {
+		t.Fatalf("selected Run anchor %q missing", selected)
+	}
+	model.viewport.SetYOffset(line + 1)
+	model.selectViewportAnchor()
+	if model.selectedAnchor != selected {
+		t.Fatalf("selected anchor = %q, want %q", model.selectedAnchor, selected)
+	}
+	wantRelative := model.currentSelection().relative
+	if wantRelative == model.dashboardBodyStart() {
+		t.Fatal("selected Run test did not start within the Run body")
+	}
+	wantScreenLine := dashboardVisibleLine(t, model.View().Content, "State: claimed")
+
+	assertStable := func(name string, msg tea.Msg) {
+		t.Helper()
+		updated, _ := model.Update(msg)
+		model = updated.(bubbleDashboardModel)
+		selection := model.currentSelection()
+		if !selection.valid || selection.identity != selected || selection.relative != wantRelative {
+			t.Fatalf("%s selection = %#v, want identity %q at relative line %d", name, selection, selected, wantRelative)
+		}
+		if got := dashboardVisibleLine(t, model.View().Content, "State: claimed"); got != wantScreenLine {
+			t.Fatalf("%s moved selected Run body from screen line %d to %d", name, wantScreenLine, got)
+		}
+	}
+	assertStable("elapsed tick", dashboardElapsedMsg(now.Add(time.Second)))
+	writeActivityEntries(t, activity.PathForLog(logPath), activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: now, Kind: "tool", Description: "Tool edit started",
+		Operation: "edit", OperationChanged: true,
+	})
+	assertStable("Activity refresh", dashboardActivityMsg(now.Add(time.Second)))
+	if body := model.viewport.GetContent(); !strings.Contains(body, "Deepest operation: edit") {
+		t.Fatalf("Activity refresh did not change selected Run content:\n%s", body)
+	}
+	assertStable("unchanged state save", dashboardStateMsg(current))
+
+	older := scheduler.Run{Issue: 99, IssueTitle: "Earlier new Run", RunID: "run-new", Status: scheduler.StatusClaimed, StartedAt: now.Add(-2 * time.Hour)}
+	current.Runs = append(current.Runs, older)
+	current.Leases = append(current.Leases, scheduler.Lease{LeaseID: older.RunID, Issue: older.Issue, RunID: older.RunID})
+	source.current = current
+	assertStable("new Run", dashboardStateMsg(current))
+
+	completedAt := now
+	current.Runs[0].Status = scheduler.StatusMerged
+	current.Runs[0].CompletedAt = &completedAt
+	current.Runs[0].UpdatedAt = completedAt
+	current.Leases = current.Leases[1:]
+	source.current = current
+	assertStable("Completion", dashboardStateMsg(current))
+}
+
+func TestBubbleDashboardPreservesSelectedSectionAcrossLiveProjectionChanges(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	current := navigationTestState(now, 5)
+	source := &dashboardTestSource{current: current}
+	model := configuredNavigationTestModel(t, now, current, source)
+	selected := dashboardSectionAnchor("Attention Required")
+	line, exists := model.anchorVisualLine(selected)
+	if !exists {
+		t.Fatalf("selected section anchor %q missing", selected)
+	}
+	model.viewport.SetYOffset(line)
+	model.selectViewportAnchor()
+	if model.selectedAnchor != selected {
+		t.Fatalf("selected anchor = %q, want %q", model.selectedAnchor, selected)
+	}
+	wantRelative := model.currentSelection().relative
+	wantScreenLine := dashboardVisibleLine(t, model.View().Content, "Attention Required")
+
+	assertStable := func(name string) {
+		t.Helper()
+		updated, _ := model.Update(dashboardStateMsg(current))
+		model = updated.(bubbleDashboardModel)
+		selection := model.currentSelection()
+		if !selection.valid || selection.identity != selected || selection.relative != wantRelative {
+			t.Fatalf("%s selection = %#v, want identity %q at relative line %d", name, selection, selected, wantRelative)
+		}
+		if got := dashboardVisibleLine(t, model.View().Content, "Attention Required"); got != wantScreenLine {
+			t.Fatalf("%s moved selected section from screen line %d to %d", name, wantScreenLine, got)
+		}
+	}
+
+	older := scheduler.Run{Issue: 99, IssueTitle: "Earlier new Run", RunID: "run-new", Status: scheduler.StatusClaimed, StartedAt: now.Add(-2 * time.Hour)}
+	current.Runs = append(current.Runs, older)
+	current.Leases = append(current.Leases, scheduler.Lease{LeaseID: older.RunID, Issue: older.Issue, RunID: older.RunID})
+	source.current = current
+	assertStable("new Run")
+
+	completedAt := now
+	current.Runs[0].Status = scheduler.StatusMerged
+	current.Runs[0].CompletedAt = &completedAt
+	current.Runs[0].UpdatedAt = completedAt
+	current.Leases = current.Leases[1:]
+	source.current = current
+	assertStable("Completion")
+}
+
+func TestBubbleDashboardMarksAndJumpsToNewOffscreenAttention(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	current := navigationTestState(now, 8)
+	source := &dashboardTestSource{current: current}
+	model := configuredNavigationTestModel(t, now, current, source)
+	selected := model.currentSelection()
+
+	attention := scheduler.Run{Issue: 100, IssueTitle: "Operator decision", RunID: "attention-new", Status: scheduler.StatusNeedsHuman, StartedAt: now, UpdatedAt: now, Error: "inspect outcome"}
+	current.Runs = append(current.Runs, attention)
+	current.Leases = append(current.Leases, scheduler.Lease{LeaseID: attention.RunID, Issue: attention.Issue, RunID: attention.RunID})
+	source.current = current
+	updated, _ := model.Update(dashboardStateMsg(current))
+	model = updated.(bubbleDashboardModel)
+	if got := model.currentSelection(); got.identity != selected.identity || got.relative != selected.relative {
+		t.Fatalf("new Attention moved selection from %#v to %#v", selected, got)
+	}
+	view := ansi.Strip(model.View().Content)
+	if !strings.Contains(view, "NEW ATTENTION (1): press a") {
+		t.Fatalf("fixed header did not mark offscreen Attention:\n%s", view)
+	}
+	for _, want := range []string{"Next Ctrl-C:", "Nav:", "a:Attention"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("fixed footer omitted %q:\n%s", want, view)
+		}
+	}
+
+	updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: 'a', Text: "a"}))
+	model = updated.(bubbleDashboardModel)
+	if model.selectedAnchor != dashboardRunAnchor(attention.RunID) {
+		t.Fatalf("Attention jump selected %q, want Run %q", model.selectedAnchor, attention.RunID)
+	}
+	line, _ := model.anchorVisualLine(model.selectedAnchor)
+	if !model.visualLineVisible(line) || strings.Contains(ansi.Strip(model.View().Content), "NEW ATTENTION") {
+		t.Fatal("Attention jump did not reveal and clear the new-Attention marker")
+	}
+}
+
+func TestBubbleDashboardClearsPendingAttentionWhenRefreshRevealsRun(t *testing.T) {
+	for _, refresh := range []string{"resize", "state update"} {
+		t.Run(refresh, func(t *testing.T) {
+			now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+			current := navigationTestState(now, 8)
+			source := &dashboardTestSource{current: current}
+			model := configuredNavigationTestModel(t, now, current, source)
+			if refresh == "state update" {
+				updated, _ := model.Update(tea.WindowSizeMsg{Width: 64, Height: 17})
+				model = updated.(bubbleDashboardModel)
+			}
+			attention := scheduler.Run{Issue: 100, IssueTitle: "Operator decision", RunID: "attention-new", Status: scheduler.StatusNeedsHuman, StartedAt: now, UpdatedAt: now, Error: "inspect outcome"}
+			current.Runs = append(current.Runs, attention)
+			current.Leases = append(current.Leases, scheduler.Lease{LeaseID: attention.RunID, Issue: attention.Issue, RunID: attention.RunID})
+			source.current = current
+			updated, _ := model.Update(dashboardStateMsg(current))
+			model = updated.(bubbleDashboardModel)
+			if _, pending := model.attentionPending[attention.RunID]; !pending {
+				t.Fatal("new offscreen Attention was not marked pending")
+			}
+
+			switch refresh {
+			case "resize":
+				updated, _ = model.Update(tea.WindowSizeMsg{Width: 64, Height: 80})
+			case "state update":
+				current.Runs = []scheduler.Run{attention}
+				current.Leases = []scheduler.Lease{{LeaseID: attention.RunID, Issue: attention.Issue, RunID: attention.RunID}}
+				source.current = current
+				updated, _ = model.Update(dashboardStateMsg(current))
+			}
+			model = updated.(bubbleDashboardModel)
+			line, exists := model.anchorVisualLine(dashboardRunAnchor(attention.RunID))
+			if !exists || !model.visualLineVisible(line) {
+				t.Fatal("refresh did not reveal the pending Attention Run")
+			}
+			if _, pending := model.attentionPending[attention.RunID]; pending || strings.Contains(ansi.Strip(model.View().Content), "NEW ATTENTION") {
+				t.Fatal("visible Attention remained marked pending after refresh")
+			}
+		})
+	}
+}
+
+func TestBubbleDashboardQIsUnassigned(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	current := navigationTestState(now, 4)
+	model := configuredNavigationTestModel(t, now, current, &dashboardTestSource{current: current})
+	before := model.currentSelection()
+	offset := model.viewport.YOffset()
+	stage := model.dashboard.stage
+	updated, command := model.Update(tea.KeyPressMsg(tea.Key{Code: 'q', Text: "q"}))
+	model = updated.(bubbleDashboardModel)
+	if command != nil || model.viewport.YOffset() != offset || model.currentSelection() != before || model.dashboard.stage != stage || model.interruptsWaiting != 0 {
+		t.Fatalf("q changed dashboard behavior: command nil=%t offset=%d selection=%#v stage=%d interrupts=%d", command == nil, model.viewport.YOffset(), model.currentSelection(), model.dashboard.stage, model.interruptsWaiting)
+	}
+}
+
+func navigationTestState(now time.Time, count int) state.State {
+	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: count + 2}
+	for index := range count {
+		run := scheduler.Run{
+			Issue: index + 1, IssueTitle: fmt.Sprintf("Navigation Run %d", index), RunID: fmt.Sprintf("run-%d", index),
+			Status: scheduler.StatusClaimed, StartedAt: now.Add(time.Duration(index-count) * time.Minute),
+		}
+		current.Runs = append(current.Runs, run)
+		current.Leases = append(current.Leases, scheduler.Lease{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID})
+	}
+	return current
+}
+
+func configuredNavigationTestModel(t *testing.T, now time.Time, current state.State, source *dashboardTestSource) bubbleDashboardModel {
+	t.Helper()
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 64, Height: 14})
+	updated, _ := model.Update(dashboardConfiguredMsg{initial: current, source: source})
+	return updated.(bubbleDashboardModel)
+}
+
+func dashboardVisibleLine(t *testing.T, view, content string) int {
+	t.Helper()
+	for line, rendered := range strings.Split(ansi.Strip(view), "\n") {
+		if strings.Contains(rendered, content) {
+			return line
+		}
+	}
+	t.Fatalf("dashboard view omitted %q:\n%s", content, ansi.Strip(view))
+	return -1
 }
 
 func TestBubbleDashboardRawCtrlCUsesOrderedRunnerIngress(t *testing.T) {
@@ -329,9 +657,23 @@ func TestBubbleDashboardConstrainedChromeKeepsRequiredLifecycleInformation(t *te
 		model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: time.Now}}, newBubbleDashboardSession(time.Now), dimensions)
 		model.dashboard.update(current)
 		plain := ansi.Strip(model.View().Content)
-		for _, want := range []string{"acme/widgets", "Worker capacity:", "Runner stage:", "Next Ctrl-C:"} {
-			if !strings.Contains(plain, want) {
-				t.Fatalf("%dx%d dashboard omitted %q:\n%s", dimensions.Width, dimensions.Height, want, plain)
+		for _, expected := range []struct {
+			name     string
+			variants []string
+		}{
+			{name: "repository", variants: []string{"acme/widgets"}},
+			{name: "Worker capacity", variants: []string{"Worker capacity:", "W:"}},
+			{name: "Runner stage", variants: []string{"Runner stage:", "S:"}},
+			{name: "next Ctrl-C", variants: []string{"Next Ctrl-C:", "^C:"}},
+			{name: "navigation", variants: []string{"Nav:", "N:"}},
+			{name: "f/b shortcuts", variants: []string{"f/b", "fb"}},
+		} {
+			found := false
+			for _, variant := range expected.variants {
+				found = found || strings.Contains(plain, variant)
+			}
+			if !found {
+				t.Fatalf("%dx%d dashboard omitted %s:\n%s", dimensions.Width, dimensions.Height, expected.name, plain)
 			}
 		}
 		lines := strings.Split(plain, "\n")
@@ -342,6 +684,29 @@ func TestBubbleDashboardConstrainedChromeKeepsRequiredLifecycleInformation(t *te
 			if lipgloss.Width(line) > dimensions.Width {
 				t.Fatalf("%dx%d dashboard overflowed with %q", dimensions.Width, dimensions.Height, line)
 			}
+		}
+	}
+}
+
+func TestBubbleDashboardConstrainedFallbackKeepsGuidanceInFixedFooter(t *testing.T) {
+	footer := []string{
+		"Runner stage: Running",
+		"Next Ctrl-C: start Drain and stop Admission",
+		dashboardNavigationHelp,
+	}
+	chrome := dashboardChromeLines(
+		[]string{"Repository: acme/widgets", "Worker capacity: 1 used | 2 available | 3 total"},
+		footer,
+		120,
+		2,
+	)
+	if len(chrome.bottom) == 0 {
+		t.Fatal("constrained dashboard moved fixed-footer guidance above the body")
+	}
+	fixedFooter := strings.Join(chrome.bottom, "\n")
+	for _, want := range []string{"Next Ctrl-C: start Drain and stop Admission", "Nav: ↑↓/jk PgUp/Dn/f/b Home/End g/G a:Attention"} {
+		if !strings.Contains(fixedFooter, want) {
+			t.Fatalf("constrained fixed footer omitted %q: %#v", want, chrome)
 		}
 	}
 }

@@ -20,7 +20,10 @@ import (
 	"github.com/robinjoseph08/backlog/internal/state"
 )
 
-const dashboardOutputUpdateLimit = 64
+const (
+	dashboardOutputUpdateLimit = 64
+	dashboardNavigationHelp    = "Nav: ↑↓/jk PgUp/Dn/f/b Home/End g/G a:Attention"
+)
 
 type dashboardConfiguredMsg struct {
 	initial state.State
@@ -293,6 +296,13 @@ type bubbleDashboardModel struct {
 	viewport  viewport.Model
 	width     int
 	height    int
+	header    string
+	footer    string
+	layout    dashboardBodyLayout
+
+	selectedAnchor   string
+	attentionKnown   map[string]struct{}
+	attentionPending map[string]struct{}
 
 	interruptsWaiting int
 	pendingFlushes    []dashboardFlushMsg
@@ -308,9 +318,11 @@ func newBubbleDashboardModel(ctx context.Context, control PresentationControl, s
 		ctx: ctx, control: control, session: session,
 		dashboard: newLiveDashboard(io.Discard, nil, empty, control.Terminal.Now),
 		viewport:  view, width: dimensions.Width, height: dimensions.Height,
+		attentionKnown: make(map[string]struct{}), attentionPending: make(map[string]struct{}),
 		startup: &atomic.Bool{},
 	}
-	model.resizeViewport()
+	model.refreshViewport(dashboardSelection{})
+	model.selectViewportAnchor()
 	return model
 }
 
@@ -353,8 +365,10 @@ func dashboardActivityTick() tea.Cmd {
 }
 
 func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	selection := m.currentSelection()
 	var commands []tea.Cmd
-	forwardToViewport := true
+	trackAttention := false
+	configured := false
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = max(1, msg.Width), max(1, msg.Height)
@@ -368,7 +382,6 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(commands...)
 		case "d":
 			m.dashboard.toggleDiagnostics()
-			forwardToViewport = false
 		}
 	case dashboardInterruptResultMsg:
 		if m.interruptsWaiting > 0 {
@@ -386,9 +399,11 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case dashboardConfiguredMsg:
 		m.dashboard.source = msg.source
 		m.dashboard.update(msg.initial)
+		configured = true
 		commands = append(commands, m.waitForSessionUpdate())
 	case dashboardStateMsg:
 		m.dashboard.update(state.State(msg))
+		trackAttention = true
 		commands = append(commands, m.waitForSessionUpdate())
 	case dashboardOutputMsg:
 		m.dashboard.recordMessage(string(msg))
@@ -417,14 +432,25 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.dashboard.recordMessage(msg.err.Error())
 	}
-	m.resizeViewport()
-	_, body, _ := m.dashboard.renderParts(m.dashboard.now())
-	m.viewport.SetContent(body)
-	if forwardToViewport {
-		updated, command := m.viewport.Update(msg)
-		m.viewport = updated
-		if command != nil {
-			commands = append(commands, command)
+
+	m.refreshViewport(selection)
+	if configured {
+		m.attentionKnown = cloneDashboardIdentities(m.layout.attention)
+		clear(m.attentionPending)
+	} else if trackAttention {
+		markerChanged := m.trackNewAttention()
+		if markerChanged {
+			m.refreshViewport(m.currentSelection())
+		}
+	}
+	if m.clearVisibleAttention() {
+		m.refreshViewport(m.currentSelection())
+	}
+
+	if m.navigateViewport(msg) {
+		m.selectViewportAnchor()
+		if m.clearVisibleAttention() {
+			m.refreshViewport(m.currentSelection())
 		}
 	}
 	return m, tea.Batch(commands...)
@@ -458,47 +484,239 @@ func dashboardFlushDelay(dashboard *liveDashboard, now time.Time) time.Duration 
 	return delay
 }
 
-func (m *bubbleDashboardModel) resizeViewport() {
-	header, _, footer := m.dashboard.renderParts(m.dashboard.now())
-	headerLines := strings.SplitN(header, "\n", 3)
-	chrome := dashboardChromeLines(headerLines[1:], strings.Split(footer, "\n"), m.width, m.height)
-	chromeHeight := len(chrome.top) + len(chrome.bottom)
-	titleHeight := 0
-	if chromeHeight < m.height {
-		titleHeight = 1
+type dashboardSelection struct {
+	identity string
+	relative int
+	valid    bool
+}
+
+func (m *bubbleDashboardModel) refreshViewport(selection dashboardSelection) {
+	header, layout, footer := m.dashboard.renderPartsWithLayout(m.dashboard.now())
+	m.header = dashboardHeaderWithAttention(header, len(m.attentionPending))
+	m.footer = footer + "\n" + dashboardNavigationHelp
+	m.layout = layout
+	m.resizeViewport()
+	m.viewport.SetContent(layout.text)
+	if selection.valid {
+		if line, exists := m.anchorVisualLine(selection.identity); exists {
+			m.viewport.SetYOffset(m.dashboardBodyStart() + line - selection.relative)
+			m.selectedAnchor = selection.identity
+			return
+		}
 	}
+	m.selectViewportAnchor()
+}
+
+func dashboardHeaderWithAttention(header string, pending int) string {
+	if pending == 0 {
+		return header
+	}
+	lines := strings.Split(header, "\n")
+	if len(lines) > 1 {
+		lines[1] += fmt.Sprintf(" | NEW ATTENTION (%d): press a", pending)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *bubbleDashboardModel) resizeViewport() {
+	frame := m.dashboardFrame()
 	m.viewport.SetWidth(m.width)
-	m.viewport.SetHeight(max(0, m.height-chromeHeight-titleHeight))
+	m.viewport.SetHeight(frame.bodyHeight)
+}
+
+func (m bubbleDashboardModel) currentSelection() dashboardSelection {
+	if m.selectedAnchor == "" {
+		return dashboardSelection{}
+	}
+	line, exists := m.anchorVisualLine(m.selectedAnchor)
+	if !exists {
+		return dashboardSelection{}
+	}
+	return dashboardSelection{
+		identity: m.selectedAnchor,
+		relative: m.dashboardBodyStart() + line - m.viewport.YOffset(),
+		valid:    true,
+	}
+}
+
+func (m bubbleDashboardModel) dashboardBodyStart() int {
+	return m.dashboardFrame().bodyStart
+}
+
+func (m bubbleDashboardModel) anchorVisualLine(identity string) (int, bool) {
+	for _, anchor := range m.layout.anchors {
+		if anchor.identity == identity {
+			return dashboardVisualLine(m.layout.text, anchor.line, m.viewport.Width()), true
+		}
+	}
+	return 0, false
+}
+
+func dashboardVisualLine(body string, target, width int) int {
+	width = max(1, width)
+	lines := strings.Split(body, "\n")
+	target = min(target, len(lines))
+	visual := 0
+	for _, line := range lines[:target] {
+		visual += max(1, (ansi.StringWidth(line)+width-1)/width)
+	}
+	return visual
+}
+
+func (m *bubbleDashboardModel) selectViewportAnchor() {
+	if len(m.layout.anchors) == 0 {
+		m.selectedAnchor = ""
+		return
+	}
+	offset := m.viewport.YOffset()
+	selected := m.layout.anchors[0].identity
+	for _, anchor := range m.layout.anchors {
+		if dashboardVisualLine(m.layout.text, anchor.line, m.viewport.Width()) > offset {
+			break
+		}
+		selected = anchor.identity
+	}
+	m.selectedAnchor = selected
+}
+
+func (m *bubbleDashboardModel) navigateViewport(msg tea.Msg) bool {
+	switch msg := msg.(type) {
+	case tea.KeyPressMsg:
+		switch msg.String() {
+		case "down", "j":
+			m.viewport.ScrollDown(1)
+		case "up", "k":
+			m.viewport.ScrollUp(1)
+		case "pgdown", "f":
+			m.viewport.PageDown()
+		case "pgup", "b":
+			m.viewport.PageUp()
+		case "home", "g":
+			m.viewport.GotoTop()
+		case "end", "G":
+			m.viewport.GotoBottom()
+		case "a":
+			m.jumpToAttention()
+		default:
+			return false
+		}
+		return true
+	case tea.MouseWheelMsg:
+		updated, _ := m.viewport.Update(msg)
+		m.viewport = updated
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *bubbleDashboardModel) jumpToAttention() {
+	identity := dashboardSectionAnchor("Attention Required")
+	for _, anchor := range m.layout.anchors {
+		if !strings.HasPrefix(anchor.identity, "run:") {
+			continue
+		}
+		runID := strings.TrimPrefix(anchor.identity, "run:")
+		if _, pending := m.attentionPending[runID]; pending {
+			identity = anchor.identity
+			break
+		}
+	}
+	if line, exists := m.anchorVisualLine(identity); exists {
+		m.viewport.SetYOffset(line)
+		m.selectedAnchor = identity
+	}
+}
+
+func cloneDashboardIdentities(identities map[string]struct{}) map[string]struct{} {
+	cloned := make(map[string]struct{}, len(identities))
+	for identity := range identities {
+		cloned[identity] = struct{}{}
+	}
+	return cloned
+}
+
+func (m *bubbleDashboardModel) trackNewAttention() bool {
+	before := len(m.attentionPending)
+	for runID := range m.attentionPending {
+		if _, exists := m.layout.attention[runID]; !exists {
+			delete(m.attentionPending, runID)
+		}
+	}
+	for runID := range m.layout.attention {
+		if _, known := m.attentionKnown[runID]; known {
+			continue
+		}
+		if line, exists := m.anchorVisualLine(dashboardRunAnchor(runID)); exists && !m.visualLineVisible(line) {
+			m.attentionPending[runID] = struct{}{}
+		}
+	}
+	m.attentionKnown = cloneDashboardIdentities(m.layout.attention)
+	return before != len(m.attentionPending)
+}
+
+func (m bubbleDashboardModel) visualLineVisible(line int) bool {
+	return line >= m.viewport.YOffset() && line < m.viewport.YOffset()+m.viewport.Height()
+}
+
+func (m *bubbleDashboardModel) clearVisibleAttention() bool {
+	before := len(m.attentionPending)
+	for runID := range m.attentionPending {
+		if line, exists := m.anchorVisualLine(dashboardRunAnchor(runID)); exists && m.visualLineVisible(line) {
+			delete(m.attentionPending, runID)
+		}
+	}
+	return before != len(m.attentionPending)
 }
 
 func (m bubbleDashboardModel) View() tea.View {
-	header, body, footer := m.dashboard.renderParts(m.dashboard.now())
-	headerLines := strings.SplitN(header, "\n", 3)
-	chrome := dashboardChromeLines(headerLines[1:], strings.Split(footer, "\n"), m.width, m.height)
-	chromeHeight := len(chrome.top) + len(chrome.bottom)
+	// Keep direct projection updates visible to callers that render without a
+	// preceding Bubble Tea message. The program's normal path already refreshes
+	// in Update, so this local copy does not alter navigation state.
+	m.refreshViewport(m.currentSelection())
+	frame := m.dashboardFrame()
 
 	lines := make([]string, 0, m.height)
-	titleHeight := 0
-	if chromeHeight < m.height {
-		lines = append(lines, lipgloss.NewStyle().Bold(true).Render(headerLines[0]))
-		titleHeight = 1
+	if frame.titleHeight > 0 {
+		lines = append(lines, lipgloss.NewStyle().Bold(true).Render(frame.title))
 	}
-	lines = append(lines, chrome.top...)
-	bodyHeight := max(0, m.height-chromeHeight-titleHeight)
-	if bodyHeight > 0 {
-		view := m.viewport
-		view.SetWidth(m.width)
-		view.SetHeight(bodyHeight)
-		view.SetContent(body)
-		lines = append(lines, strings.Split(view.View(), "\n")...)
+	lines = append(lines, frame.chrome.top...)
+	if frame.bodyHeight > 0 {
+		lines = append(lines, strings.Split(m.viewport.View(), "\n")...)
 	}
-	lines = append(lines, chrome.bottom...)
+	lines = append(lines, frame.chrome.bottom...)
 	for index := range lines {
 		lines[index] = fitDashboardLine(lines[index], m.width)
 	}
 	view := tea.NewView(strings.Join(lines, "\n"))
 	view.AltScreen = true
+	view.MouseMode = tea.MouseModeCellMotion
 	return view
+}
+
+type dashboardFrame struct {
+	title       string
+	titleHeight int
+	chrome      dashboardChrome
+	bodyStart   int
+	bodyHeight  int
+}
+
+func (m bubbleDashboardModel) dashboardFrame() dashboardFrame {
+	headerLines := strings.SplitN(m.header, "\n", 3)
+	chrome := dashboardChromeLines(headerLines[1:], strings.Split(m.footer, "\n"), m.width, m.height)
+	chromeHeight := len(chrome.top) + len(chrome.bottom)
+	titleHeight := 0
+	if chromeHeight+1 < m.height {
+		titleHeight = 1
+	}
+	return dashboardFrame{
+		title:       headerLines[0],
+		titleHeight: titleHeight,
+		chrome:      chrome,
+		bodyStart:   titleHeight + len(chrome.top),
+		bodyHeight:  max(0, m.height-chromeHeight-titleHeight),
+	}
 }
 
 type dashboardChrome struct {
@@ -510,28 +728,94 @@ func dashboardChromeLines(header, footer []string, width, height int) dashboardC
 	if width <= 0 || height <= 0 {
 		return dashboardChrome{}
 	}
+	chromeLimit := height
+	if height >= 3 {
+		chromeLimit--
+	}
+	headerGroups := dashboardChromeGroups(header)
+	footerGroups := dashboardChromeGroups(footer)
+	compactNavigation := append([]string(nil), footer...)
+	if len(compactNavigation) > 2 {
+		compactNavigation[2] = "N:jk/fb Pg H/E gG a"
+	}
+	compactHeader := compactDashboardHeader(header)
+	compactFooter := compactDashboardFooter(footer)
 	candidates := []dashboardChrome{
-		{top: wrapDashboardChrome([][]string{{header[0]}, {header[1]}}, width), bottom: wrapDashboardChrome([][]string{{footer[0]}, {footer[1]}}, width)},
-		{top: wrapDashboardChrome([][]string{{header[0], header[1]}}, width), bottom: wrapDashboardChrome([][]string{{footer[0], footer[1]}}, width)},
-		{top: wrapDashboardChrome([][]string{{header[0], header[1], footer[0], footer[1]}}, width)},
+		{top: wrapDashboardChrome(headerGroups, width), bottom: wrapDashboardChrome(footerGroups, width)},
+		{top: wrapDashboardChrome(headerGroups, width), bottom: wrapDashboardChrome(dashboardChromeGroups(compactNavigation), width)},
+		{top: wrapDashboardChrome([][]string{header}, width), bottom: wrapDashboardChrome([][]string{footer}, width)},
+		{top: wrapDashboardChrome([][]string{compactHeader}, width), bottom: wrapDashboardChrome([][]string{compactFooter}, width)},
+		// A one-line terminal cannot have distinct header and footer rows. Keep
+		// the whole compact chrome in the footer row so lifecycle guidance and
+		// navigation are never moved above the scrollable body.
+		{bottom: wrapDashboardChrome([][]string{append(append([]string(nil), compactHeader...), compactFooter...)}, width)},
 	}
 	for _, candidate := range candidates {
-		if len(candidate.top)+len(candidate.bottom) <= height {
+		if len(candidate.top)+len(candidate.bottom) <= chromeLimit {
 			return candidate
 		}
 	}
 
-	compact := []string{
-		strings.Replace(header[0], "Repository: ", "R:", 1),
-		compactDashboardCapacity(header[1]),
-		strings.Replace(footer[0], "Runner stage: ", "S:", 1),
-		strings.Replace(footer[1], "Next Ctrl-C: ", "^C:", 1),
+	// When not all chrome can fit, spend the available rows on the fixed footer
+	// before retaining header details. Keep next-interrupt guidance and
+	// navigation in separately allocated rows whenever the terminal permits it.
+	next, navigation := compactFooterLine(compactFooter, 1), compactFooterLine(compactFooter, 2)
+	bottom := wrapDashboardChrome([][]string{{next, navigation}}, width)
+	if len(bottom) > chromeLimit && chromeLimit >= 2 {
+		bottom = []string{fitDashboardLine(next, width), fitDashboardLine(navigation, width)}
 	}
-	lines := wrapDashboardChrome([][]string{compact}, width)
-	if len(lines) > height {
-		lines = lines[:height]
+	if len(bottom) > chromeLimit {
+		bottom = bottom[:chromeLimit]
 	}
-	return dashboardChrome{top: lines}
+	remaining := chromeLimit - len(bottom)
+	if remaining > 0 {
+		top := wrapDashboardChrome([][]string{append(compactHeader, compactFooterLine(compactFooter, 0))}, width)
+		if len(top) > remaining {
+			top = top[:remaining]
+		}
+		return dashboardChrome{top: top, bottom: bottom}
+	}
+	return dashboardChrome{bottom: bottom}
+}
+
+func dashboardChromeGroups(lines []string) [][]string {
+	groups := make([][]string, 0, len(lines))
+	for _, line := range lines {
+		groups = append(groups, []string{line})
+	}
+	return groups
+}
+
+func compactDashboardHeader(header []string) []string {
+	compact := make([]string, 0, len(header))
+	for _, line := range header {
+		if strings.HasPrefix(line, "Worker capacity: ") {
+			line = compactDashboardCapacity(line)
+		} else {
+			line = strings.Replace(line, "Repository: ", "R:", 1)
+			line = strings.Replace(line, " | NEW ATTENTION ", " | ! ", 1)
+		}
+		compact = append(compact, line)
+	}
+	return compact
+}
+
+func compactDashboardFooter(footer []string) []string {
+	compact := make([]string, 0, len(footer))
+	for _, line := range footer {
+		line = strings.Replace(line, "Runner stage: ", "S:", 1)
+		line = strings.Replace(line, "Next Ctrl-C: ", "^C:", 1)
+		line = strings.Replace(line, dashboardNavigationHelp, "N:jk/fb Pg H/E gG a", 1)
+		compact = append(compact, line)
+	}
+	return compact
+}
+
+func compactFooterLine(footer []string, index int) string {
+	if index >= len(footer) {
+		return ""
+	}
+	return footer[index]
 }
 
 func wrapDashboardChrome(groups [][]string, width int) []string {
