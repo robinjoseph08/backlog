@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -2076,24 +2077,39 @@ func TestBubbleDashboardFailureRestoresTerminalBeforeStaticErrorResult(t *testin
 
 type ptyPresentationInput struct {
 	*os.File
-	closed chan struct{}
-	once   atomic.Bool
+	readFinished chan struct{}
+	finishOnce   sync.Once
 }
 
 func newPTYPresentationInput(file *os.File) *ptyPresentationInput {
-	return &ptyPresentationInput{File: file, closed: make(chan struct{})}
+	return &ptyPresentationInput{File: file, readFinished: make(chan struct{})}
 }
 
-func (r *ptyPresentationInput) Read([]byte) (int, error) {
-	<-r.closed
+func (r *ptyPresentationInput) Read(content []byte) (int, error) {
+	defer r.finishOnce.Do(func() { close(r.readFinished) })
+	if len(content) == 0 {
+		return 0, nil
+	}
+	if _, err := r.File.Read(content[:1]); err != nil {
+		return 0, err
+	}
 	return 0, io.EOF
 }
 
-func (r *ptyPresentationInput) Close() error {
-	if r.once.CompareAndSwap(false, true) {
-		close(r.closed)
+func (r *ptyPresentationInput) Close() error { return nil }
+
+// Bubble Tea v2.0.8's kill path closes its cancelreader without waiting for
+// the input loop. Finish all PTY descriptor access before tests induce it.
+func finishPTYPresentationInput(ctx context.Context, primary *os.File, input *ptyPresentationInput) error {
+	if _, err := primary.Write([]byte{0}); err != nil {
+		return fmt.Errorf("make PTY input readable: %w", err)
 	}
-	return nil
+	select {
+	case <-input.readFinished:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("finish PTY presentation input: %w", ctx.Err())
+	}
 }
 
 type ptyPresentationOutput struct {
@@ -2148,6 +2164,7 @@ func TestBubbleDashboardPostStartFailuresRestorePTYStateBeforeStaticErrorResult(
 				t.Fatal(err)
 			}
 			output := newPTYPresentationOutput(terminal)
+			input := newPTYPresentationInput(terminal)
 			go func() { _, _ = io.Copy(io.Discard, primary) }()
 
 			now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
@@ -2162,7 +2179,7 @@ func TestBubbleDashboardPostStartFailuresRestorePTYStateBeforeStaticErrorResult(
 			}
 			session := newBubbleDashboardSession(clock)
 			host := runnerHost{terminal: TerminalDependencies{
-				Input: newPTYPresentationInput(terminal), Output: output,
+				Input: input, Output: output,
 				Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
 				ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
 				Now:          clock,
@@ -2179,6 +2196,9 @@ func TestBubbleDashboardPostStartFailuresRestorePTYStateBeforeStaticErrorResult(
 				case <-output.enteredAlternateScreen:
 				case <-ctx.Done():
 					return ctx.Err()
+				}
+				if inputErr := finishPTYPresentationInput(ctx, primary, input); inputErr != nil {
+					return inputErr
 				}
 				if test.modelPanic {
 					panicEnabled.Store(true)
@@ -2260,13 +2280,14 @@ exec sleep 30
 		t.Fatal(err)
 	}
 	output := newPTYPresentationOutput(terminal)
+	input := newPTYPresentationInput(terminal)
 	go func() { _, _ = io.Copy(io.Discard, primary) }()
 	externalSignals := make(chan os.Signal)
 	var stderr bytes.Buffer
 	done := make(chan int, 1)
 	go func() {
 		done <- MainWithTerminal(context.Background(), []string{"run", "--git", git}, TerminalDependencies{
-			Input: newPTYPresentationInput(terminal), Output: output, ErrorOutput: &stderr,
+			Input: input, Output: output, ErrorOutput: &stderr,
 			IsTerminal: func() bool { return true },
 			Dimensions: func() (TerminalDimensions, error) {
 				return TerminalDimensions{Width: 80, Height: 24}, nil
@@ -2280,6 +2301,11 @@ exec sleep 30
 	case <-output.enteredAlternateScreen:
 	case <-time.After(10 * time.Second):
 		t.Fatal("default dashboard did not enter the alternate screen during blocked setup")
+	}
+	inputCtx, cancelInput := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInput()
+	if err := finishPTYPresentationInput(inputCtx, primary, input); err != nil {
+		t.Fatal(err)
 	}
 	for stage := 1; stage <= 3; stage++ {
 		select {
