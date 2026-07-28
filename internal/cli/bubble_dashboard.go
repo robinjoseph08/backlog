@@ -440,6 +440,9 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshViewport(m.currentSelection())
 		}
 	}
+	if m.clearVisibleAttention() {
+		m.refreshViewport(m.currentSelection())
+	}
 
 	if m.navigateViewport(msg) {
 		m.selectViewportAnchor()

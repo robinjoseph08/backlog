@@ -229,13 +229,16 @@ func TestBubbleDashboardPreservesSelectedRunAcrossLiveProjectionChanges(t *testi
 	if !exists {
 		t.Fatalf("selected Run anchor %q missing", selected)
 	}
-	model.viewport.SetYOffset(line)
+	model.viewport.SetYOffset(line + 1)
 	model.selectViewportAnchor()
 	if model.selectedAnchor != selected {
 		t.Fatalf("selected anchor = %q, want %q", model.selectedAnchor, selected)
 	}
 	wantRelative := model.currentSelection().relative
-	wantScreenLine := dashboardVisibleLine(t, model.View().Content, "Navigation Run 4")
+	if wantRelative == model.dashboardBodyStart() {
+		t.Fatal("selected Run test did not start within the Run body")
+	}
+	wantScreenLine := dashboardVisibleLine(t, model.View().Content, "State: claimed")
 
 	assertStable := func(name string, msg tea.Msg) {
 		t.Helper()
@@ -245,8 +248,8 @@ func TestBubbleDashboardPreservesSelectedRunAcrossLiveProjectionChanges(t *testi
 		if !selection.valid || selection.identity != selected || selection.relative != wantRelative {
 			t.Fatalf("%s selection = %#v, want identity %q at relative line %d", name, selection, selected, wantRelative)
 		}
-		if got := dashboardVisibleLine(t, model.View().Content, "Navigation Run 4"); got != wantScreenLine {
-			t.Fatalf("%s moved selected Run from screen line %d to %d", name, wantScreenLine, got)
+		if got := dashboardVisibleLine(t, model.View().Content, "State: claimed"); got != wantScreenLine {
+			t.Fatalf("%s moved selected Run body from screen line %d to %d", name, wantScreenLine, got)
 		}
 	}
 	assertStable("elapsed tick", dashboardElapsedMsg(now.Add(time.Second)))
@@ -273,6 +276,52 @@ func TestBubbleDashboardPreservesSelectedRunAcrossLiveProjectionChanges(t *testi
 	current.Leases = current.Leases[1:]
 	source.current = current
 	assertStable("Completion", dashboardStateMsg(current))
+}
+
+func TestBubbleDashboardPreservesSelectedSectionAcrossLiveProjectionChanges(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	current := navigationTestState(now, 5)
+	source := &dashboardTestSource{current: current}
+	model := configuredNavigationTestModel(t, now, current, source)
+	selected := dashboardSectionAnchor("Attention Required")
+	line, exists := model.anchorVisualLine(selected)
+	if !exists {
+		t.Fatalf("selected section anchor %q missing", selected)
+	}
+	model.viewport.SetYOffset(line)
+	model.selectViewportAnchor()
+	if model.selectedAnchor != selected {
+		t.Fatalf("selected anchor = %q, want %q", model.selectedAnchor, selected)
+	}
+	wantRelative := model.currentSelection().relative
+	wantScreenLine := dashboardVisibleLine(t, model.View().Content, "Attention Required")
+
+	assertStable := func(name string) {
+		t.Helper()
+		updated, _ := model.Update(dashboardStateMsg(current))
+		model = updated.(bubbleDashboardModel)
+		selection := model.currentSelection()
+		if !selection.valid || selection.identity != selected || selection.relative != wantRelative {
+			t.Fatalf("%s selection = %#v, want identity %q at relative line %d", name, selection, selected, wantRelative)
+		}
+		if got := dashboardVisibleLine(t, model.View().Content, "Attention Required"); got != wantScreenLine {
+			t.Fatalf("%s moved selected section from screen line %d to %d", name, wantScreenLine, got)
+		}
+	}
+
+	older := scheduler.Run{Issue: 99, IssueTitle: "Earlier new Run", RunID: "run-new", Status: scheduler.StatusClaimed, StartedAt: now.Add(-2 * time.Hour)}
+	current.Runs = append(current.Runs, older)
+	current.Leases = append(current.Leases, scheduler.Lease{LeaseID: older.RunID, Issue: older.Issue, RunID: older.RunID})
+	source.current = current
+	assertStable("new Run")
+
+	completedAt := now
+	current.Runs[0].Status = scheduler.StatusMerged
+	current.Runs[0].CompletedAt = &completedAt
+	current.Runs[0].UpdatedAt = completedAt
+	current.Leases = current.Leases[1:]
+	source.current = current
+	assertStable("Completion")
 }
 
 func TestBubbleDashboardMarksAndJumpsToNewOffscreenAttention(t *testing.T) {
@@ -309,6 +358,44 @@ func TestBubbleDashboardMarksAndJumpsToNewOffscreenAttention(t *testing.T) {
 	line, _ := model.anchorVisualLine(model.selectedAnchor)
 	if !model.visualLineVisible(line) || strings.Contains(ansi.Strip(model.View().Content), "NEW ATTENTION") {
 		t.Fatal("Attention jump did not reveal and clear the new-Attention marker")
+	}
+}
+
+func TestBubbleDashboardClearsPendingAttentionWhenRefreshRevealsRun(t *testing.T) {
+	for _, refresh := range []string{"resize", "state update"} {
+		t.Run(refresh, func(t *testing.T) {
+			now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+			current := navigationTestState(now, 8)
+			source := &dashboardTestSource{current: current}
+			model := configuredNavigationTestModel(t, now, current, source)
+			attention := scheduler.Run{Issue: 100, IssueTitle: "Operator decision", RunID: "attention-new", Status: scheduler.StatusNeedsHuman, StartedAt: now, UpdatedAt: now, Error: "inspect outcome"}
+			current.Runs = append(current.Runs, attention)
+			current.Leases = append(current.Leases, scheduler.Lease{LeaseID: attention.RunID, Issue: attention.Issue, RunID: attention.RunID})
+			source.current = current
+			updated, _ := model.Update(dashboardStateMsg(current))
+			model = updated.(bubbleDashboardModel)
+			if _, pending := model.attentionPending[attention.RunID]; !pending {
+				t.Fatal("new offscreen Attention was not marked pending")
+			}
+
+			switch refresh {
+			case "resize":
+				updated, _ = model.Update(tea.WindowSizeMsg{Width: 64, Height: 80})
+			case "state update":
+				current.Runs = []scheduler.Run{attention}
+				current.Leases = []scheduler.Lease{{LeaseID: attention.RunID, Issue: attention.Issue, RunID: attention.RunID}}
+				source.current = current
+				updated, _ = model.Update(dashboardStateMsg(current))
+			}
+			model = updated.(bubbleDashboardModel)
+			line, exists := model.anchorVisualLine(dashboardRunAnchor(attention.RunID))
+			if !exists || !model.visualLineVisible(line) {
+				t.Fatal("refresh did not reveal the pending Attention Run")
+			}
+			if _, pending := model.attentionPending[attention.RunID]; pending || strings.Contains(ansi.Strip(model.View().Content), "NEW ATTENTION") {
+				t.Fatal("visible Attention remained marked pending after refresh")
+			}
+		})
 	}
 }
 
