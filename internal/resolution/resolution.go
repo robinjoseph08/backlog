@@ -66,6 +66,23 @@ func validateSnapshot(snapshot retirement.Snapshot) error {
 	if snapshot.Issue.ClosureReason != "completed" && snapshot.Issue.ClosureReason != "not-planned" {
 		return fmt.Errorf("issue #%d has unsupported or unavailable GitHub closure reason %q", snapshot.Issue.Number, snapshot.Issue.ClosureReason)
 	}
+	for _, pull := range snapshot.PullRequests {
+		if pull.State != retirement.PullRequestMerged {
+			return fmt.Errorf("External Resolution currently requires owned artifacts to be absent; pull request #%d remains %s", pull.Number, pull.State)
+		}
+	}
+	if snapshot.RemoteBranch.Present {
+		return fmt.Errorf("External Resolution currently requires owned artifacts to be absent; remote branch %s remains", snapshot.RemoteBranch.Name)
+	}
+	if snapshot.Worktree.Present {
+		return fmt.Errorf("External Resolution currently requires owned artifacts to be absent; worktree %s remains", snapshot.Worktree.Path)
+	}
+	if snapshot.LocalBranch.Present {
+		return fmt.Errorf("External Resolution currently requires owned artifacts to be absent; local branch %s remains", snapshot.LocalBranch.Name)
+	}
+	if snapshot.Session.Present {
+		return fmt.Errorf("External Resolution currently requires owned artifacts to be absent; active Pi session %s remains", snapshot.Session.ID)
+	}
 	return nil
 }
 

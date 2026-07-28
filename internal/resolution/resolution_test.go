@@ -52,6 +52,55 @@ func TestPolicyRefusesOpenAndUnsupportedClosureState(t *testing.T) {
 	}
 }
 
+func TestPolicyRefusesArtifactRichRunsWithoutPlanningDestructiveActions(t *testing.T) {
+	base := retirement.Snapshot{
+		Run:   scheduler.Run{Issue: 42, RunID: "run", Status: scheduler.StatusFailed, Branch: "agent/run", Worktree: "/state/worktrees/run", WorkerMode: scheduler.WorkerModePrint},
+		Lease: scheduler.Lease{LeaseID: "lease", Issue: 42, RunID: "run"},
+		Issue: retirement.Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", ClosureReason: "completed"},
+	}
+	commit := strings.Repeat("a", 40)
+	tests := []struct {
+		name   string
+		mutate func(*retirement.Snapshot)
+		want   string
+	}{
+		{name: "open pull request", mutate: func(snapshot *retirement.Snapshot) {
+			snapshot.PullRequests = []retirement.PullRequest{{Number: 9, URL: "https://github.com/acme/widgets/pull/9", Branch: "agent/run", Commit: commit, State: retirement.PullRequestOpen}}
+		}, want: "pull request #9 remains open"},
+		{name: "closed pull request", mutate: func(snapshot *retirement.Snapshot) {
+			snapshot.PullRequests = []retirement.PullRequest{{Number: 9, URL: "https://github.com/acme/widgets/pull/9", Branch: "agent/run", Commit: commit, State: retirement.PullRequestClosed}}
+		}, want: "pull request #9 remains closed"},
+		{name: "remote branch", mutate: func(snapshot *retirement.Snapshot) {
+			snapshot.RemoteBranch = retirement.Branch{Name: "agent/run", Commit: commit, Present: true}
+		}, want: "remote branch agent/run remains"},
+		{name: "worktree", mutate: func(snapshot *retirement.Snapshot) {
+			snapshot.Worktree = retirement.Worktree{Path: "/state/worktrees/run", Branch: "agent/run", Commit: commit, Present: true}
+		}, want: "worktree /state/worktrees/run remains"},
+		{name: "local branch", mutate: func(snapshot *retirement.Snapshot) {
+			snapshot.LocalBranch = retirement.Branch{Name: "agent/run", Commit: commit, Present: true}
+		}, want: "local branch agent/run remains"},
+		{name: "active Pi session", mutate: func(snapshot *retirement.Snapshot) {
+			snapshot.Run.WorkerMode = scheduler.WorkerModeRPC
+			snapshot.Run.SessionID = "backlog-run"
+			snapshot.Run.SessionDir = "/state/sessions/run"
+			snapshot.Session = retirement.Session{ID: "backlog-run", Dir: "/state/sessions/run", ArchiveDir: "/state/history/sessions/run", Present: true}
+		}, want: "active Pi session backlog-run remains"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := base
+			test.mutate(&snapshot)
+			plan, err := retirement.Build(Policy("run"), snapshot)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Build() = plan %#v, error %v; want refusal containing %q", plan, err, test.want)
+			}
+			if len(plan.Actions) != 0 {
+				t.Fatalf("refused artifact-rich plan contains actions: %#v", plan.Actions)
+			}
+		})
+	}
+}
+
 func TestMergedExpectedPullRequestPlansCompletion(t *testing.T) {
 	snapshot := retirement.Snapshot{
 		Run:          scheduler.Run{Issue: 42, RunID: "run", Status: scheduler.StatusWaitingForMerge, PullRequest: "https://github.com/acme/widgets/pull/9", Branch: "agent/run"},
