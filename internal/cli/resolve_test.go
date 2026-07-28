@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -400,13 +401,246 @@ func TestResolveRequiresYesNonInteractivelyAndCompiledExecutableRefusesRunnerLoc
 		t.Fatal(err)
 	}
 	defer lock.Release()
-	command := exec.Command(binary, append([]string{"resolve"}, fixture.args("42", "--yes")...)...)
-	output, err := command.CombinedOutput()
-	if err == nil || !strings.Contains(string(output), "Runner owns repository coordination") {
-		t.Fatalf("compiled lock error = %v\n%s", err, output)
+	for _, mode := range []struct {
+		name string
+		args []string
+	}{
+		{name: "confirmed", args: fixture.args("42", "--yes")},
+		{name: "dry-run", args: fixture.args("42", "--dry-run")},
+		{name: "interactive", args: fixture.args("42")},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			command := exec.Command(binary, append([]string{"resolve"}, mode.args...)...)
+			output, commandErr := command.CombinedOutput()
+			if commandErr == nil || !strings.Contains(string(output), "Runner owns repository coordination") || !strings.Contains(string(output), "supervising Runner handles automatic reconciliation at startup and during watch polling once the Run has no Owned Worker") {
+				t.Fatalf("compiled lock error = %v\n%s", commandErr, output)
+			}
+		})
 	}
 	if fileDigest(t, fixture.store.Path) != beforeState || fileDigest(t, fixture.githubState) != beforeGitHub {
 		t.Fatal("compiled lock refusal changed state")
+	}
+}
+
+type automaticArtifactResolveFixture struct {
+	githubArtifactResetFixture
+	worktree, sessionDir, archiveDir string
+}
+
+func newAutomaticArtifactResolveFixture(t *testing.T, issueState string) automaticArtifactResolveFixture {
+	t.Helper()
+	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusFailed, false, false, false)
+	worktree := filepath.Join(fixture.stateDir, "worktrees", "issue-42-run-github")
+	if err := os.MkdirAll(filepath.Dir(worktree), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, fixture.repository, "worktree", "add", "-b", fixture.branch, worktree, "origin/"+fixture.branch)
+	sessionDir := filepath.Join(fixture.stateDir, "sessions", "run-github")
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionDir, "session.jsonl"), []byte(fmt.Sprintf("{\"type\":\"session\",\"id\":%q,\"cwd\":%q}\n", "backlog-run-github", worktree)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.Runs[0].WorkerMode = scheduler.WorkerModeRPC
+	current.Runs[0].Worktree = worktree
+	current.Runs[0].SessionID = "backlog-run-github"
+	current.Runs[0].SessionDir = sessionDir
+	current.Runs[0].Error = "retained automatic-resolution diagnostic"
+	if err := fixture.store.Save(current); err != nil {
+		t.Fatal(err)
+	}
+	fixture.updateGitHubState(t, fmt.Sprintf(`.issue=%q | .labels=["in-progress","ready-for-agent","spec"]`, issueState))
+	return automaticArtifactResolveFixture{
+		githubArtifactResetFixture: fixture,
+		worktree:                   worktree, sessionDir: sessionDir,
+		archiveDir: filepath.Join(fixture.stateDir, "history", "sessions", "run-github"),
+	}
+}
+
+func automaticArtifactResolveGitHub(t *testing.T, fixture automaticArtifactResolveFixture, candidateChecked string) string {
+	t.Helper()
+	return writeExecutable(t, `#!/bin/sh
+set -eu
+state=`+quote(fixture.githubState)+`
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    labels=$(jq -c '[.labels[] | {name:.}]' "$state")
+    issue_state=$(jq -r .issue "$state")
+    printf '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"%s","labels":%s}\n' "$issue_state" "$labels" ;;
+  "issue view 42 --repo acme/widgets --json number,url,state,stateReason")
+    jq -c '{number:42,url:"https://github.com/acme/widgets/issues/42",state:.issue,stateReason:(if .issue == "CLOSED" then "COMPLETED" else null end)}' "$state" ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
+    touch `+quote(candidateChecked)+`; printf '%s\n' '[]' ;;
+  "issue edit 42 --repo acme/widgets --remove-label in-progress")
+    temporary="$state.tmp"; jq '.labels |= map(select(. != "in-progress"))' "$state" > "$temporary"; mv "$temporary" "$state" ;;
+  "issue edit 42 --repo acme/widgets --remove-label ready-for-agent")
+    temporary="$state.tmp"; jq '.labels |= map(select(. != "ready-for-agent"))' "$state" > "$temporary"; mv "$temporary" "$state" ;;
+  *) exec `+quote(fixture.gh)+` "$@" ;;
+esac
+`)
+}
+
+func TestCompiledRunStartupResumesPartialExternalResolutionBeforeCandidateAdmission(t *testing.T) {
+	fixture := newAutomaticArtifactResolveFixture(t, "CLOSED")
+	partial, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	partial.Runs[0].Status = scheduler.StatusResolvingExternally
+	if err := fixture.store.Save(partial); err != nil {
+		t.Fatal(err)
+	}
+	fixture.updateGitHubState(t, fmt.Sprintf(`.auto=false | .comments=[%q]`, resolution.Explanation(partial.Runs[0])))
+
+	candidateChecked := filepath.Join(t.TempDir(), "candidate-checked")
+	gh := automaticArtifactResolveGitHub(t, fixture, candidateChecked)
+	workerStarted := filepath.Join(t.TempDir(), "worker-started")
+	pi := writeExecutable(t, "#!/bin/sh\ntouch "+quote(workerStarted)+"\nexit 9\n")
+	binary := buildExecutable(t, t.TempDir())
+	command := exec.Command(binary, "run", "--plain", "--repo-dir", fixture.repository, "--state-dir", fixture.stateDir,
+		"--max-workers", "1", "--git", fixture.git, "--gh", gh, "--pi", pi)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("compiled startup partial External Resolution: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(candidateChecked); err != nil {
+		t.Fatalf("Candidate Admission did not run after External Resolution: %v", err)
+	}
+	if _, err := os.Stat(workerStarted); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("External Resolution created a replacement Worker: %v", err)
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.Leases) != 0 || current.Runs[0].Status != scheduler.StatusResolvedExternally || current.Runs[0].Error != "retained automatic-resolution diagnostic" {
+		t.Fatalf("startup partial External Resolution state = %#v", current)
+	}
+	if calls, err := os.ReadFile(fixture.githubCalls); err != nil || string(calls) != "close\n" {
+		t.Fatalf("partial startup repeated completed pull request actions: calls=%q err=%v", calls, err)
+	}
+	if _, err := os.Stat(fixture.worktree); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("startup partial External Resolution retained worktree: %v", err)
+	}
+	if _, err := os.Stat(fixture.sessionDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("startup partial External Resolution retained active session: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(fixture.archiveDir, "session.jsonl")); err != nil {
+		t.Fatalf("startup partial External Resolution did not archive session: %v", err)
+	}
+	if output, err := exec.Command("git", "-C", fixture.repository, "show-ref", "--verify", "--quiet", "refs/heads/"+fixture.branch).CombinedOutput(); err == nil {
+		t.Fatalf("startup partial External Resolution retained local branch: %s", output)
+	}
+	if branch, err := inspectRemoteBranch(context.Background(), fixture.git, fixture.repository, fixture.branch); err != nil || branch.Present {
+		t.Fatalf("startup partial External Resolution remote branch = %#v, %v", branch, err)
+	}
+	labelsData, err := os.ReadFile(fixture.githubState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var githubState struct {
+		PullRequest string   `json:"pr"`
+		Labels      []string `json:"labels"`
+	}
+	if err := json.Unmarshal(labelsData, &githubState); err != nil {
+		t.Fatal(err)
+	}
+	if githubState.PullRequest != "CLOSED" || strings.Join(githubState.Labels, ",") != "spec" {
+		t.Fatalf("startup partial External Resolution GitHub state = %#v", githubState)
+	}
+}
+
+func TestCompiledRunWatchUsesCompleteExternalResolutionDuringPolling(t *testing.T) {
+	fixture := newAutomaticArtifactResolveFixture(t, "OPEN")
+	beforeState, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeGitHub := fileDigest(t, fixture.githubState)
+	beforeLocalBranch := strings.TrimSpace(gitOutput(t, fixture.repository, "rev-parse", "refs/heads/"+fixture.branch))
+	beforeRemoteBranch := strings.TrimSpace(gitOutput(t, fixture.repository, "rev-parse", "refs/remotes/origin/"+fixture.branch))
+	beforeWorktree := fileDigest(t, filepath.Join(fixture.worktree, "owned"))
+	beforeSession := fileDigest(t, filepath.Join(fixture.sessionDir, "session.jsonl"))
+
+	polled := filepath.Join(t.TempDir(), "candidate-polled")
+	gh := automaticArtifactResolveGitHub(t, fixture, polled)
+	workerStarted := filepath.Join(t.TempDir(), "worker-started")
+	pi := writeExecutable(t, "#!/bin/sh\ntouch "+quote(workerStarted)+"\nexit 9\n")
+	binary := buildExecutable(t, t.TempDir())
+	command := exec.Command(binary, "run", "--watch", "--plain", "--repo-dir", fixture.repository, "--state-dir", fixture.stateDir,
+		"--max-workers", "1", "--poll", "10ms", "--git", fixture.git, "--gh", gh, "--pi", pi)
+	var output bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = &output
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitForFile(t, polled)
+
+	openState, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(openState, beforeState) {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatalf("open issue polling changed Run, Lease, or diagnostics: got %#v, want %#v", openState, beforeState)
+	}
+	if fileDigest(t, fixture.githubState) != beforeGitHub ||
+		strings.TrimSpace(gitOutput(t, fixture.repository, "rev-parse", "refs/heads/"+fixture.branch)) != beforeLocalBranch ||
+		strings.TrimSpace(gitOutput(t, fixture.repository, "rev-parse", "refs/remotes/origin/"+fixture.branch)) != beforeRemoteBranch ||
+		fileDigest(t, filepath.Join(fixture.worktree, "owned")) != beforeWorktree ||
+		fileDigest(t, filepath.Join(fixture.sessionDir, "session.jsonl")) != beforeSession {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatal("open issue polling changed labels or owned artifacts")
+	}
+	if _, err := os.Stat(fixture.archiveDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("open issue polling archived the active session: %v", err)
+	}
+	if calls, err := os.ReadFile(fixture.githubCalls); err == nil && len(calls) != 0 {
+		t.Fatalf("open issue polling mutated the pull request: %q", calls)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(workerStarted); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("open issue polling launched a Worker: %v", err)
+	}
+
+	fixture.updateGitHubState(t, `.issue="CLOSED"`)
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		current, loadErr := fixture.store.Load()
+		if loadErr == nil && len(current.Leases) == 0 && current.Runs[0].Status == scheduler.StatusResolvedExternally {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	current, err := fixture.store.Load()
+	if err != nil || len(current.Leases) != 0 || current.Runs[0].Status != scheduler.StatusResolvedExternally {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatalf("compiled watch did not complete External Resolution: state=%#v err=%v output=%s", current, err, output.String())
+	}
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err != nil {
+		t.Fatalf("compiled watch Drain after External Resolution: %v\n%s", err, output.String())
+	}
+	labelsData, err := os.ReadFile(fixture.githubState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(labelsData), "in-progress") || strings.Contains(string(labelsData), "ready-for-agent") || !strings.Contains(string(labelsData), "spec") {
+		t.Fatalf("compiled watch managed labels = %s", labelsData)
+	}
+	if _, err := os.Stat(workerStarted); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("watch External Resolution launched a Worker: %v", err)
 	}
 }
 

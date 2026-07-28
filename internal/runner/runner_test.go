@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -2132,6 +2133,311 @@ func TestRunnerDrainCancellationDoesNotEraseRecoveredWorkerPID(t *testing.T) {
 	}
 }
 
+func TestRunnerStartupAutomaticallyResolvesBeforeAdmissionAndNaturalExhaustion(t *testing.T) {
+	t.Parallel()
+
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs:   []scheduler.Run{{Issue: 1, RunID: "partial", Status: scheduler.StatusResolvingExternally, WorkerMode: scheduler.WorkerModePrint}},
+		Leases: []scheduler.Lease{{LeaseID: "partial", Issue: 1, RunID: "partial"}},
+	}}
+	github := &fakeGitHub{candidatesFunc: func(context.Context) ([]scheduler.Candidate, error) {
+		current := store.LoadValue()
+		if len(current.Leases) != 0 || current.Runs[0].Status != scheduler.StatusResolvedExternally {
+			return nil, errors.New("Candidate Admission ran before automatic External Resolution persisted")
+		}
+		return nil, nil
+	}}
+	runner := testRunner(github, newFakeWorkers(), store, 1)
+	runner.ExternalResolution = externalResolutionFunc(func(_ context.Context, run scheduler.Run) (bool, error) {
+		current := store.LoadValue()
+		resolved := findRun(current.Runs, run.RunID)
+		resolved.Status = scheduler.StatusResolvedExternally
+		resolved.Error = ""
+		resolvedAt := time.Now().UTC()
+		resolved.ResolvedExternallyAt = &resolvedAt
+		resolved.ClosureReason = "completed"
+		replaceRun(&current, resolved)
+		removeLease(&current, run.RunID)
+		return true, store.Save(current)
+	})
+	var summary state.State
+	runner.FinalSummary = func(current state.State) error {
+		summary = cloneState(current)
+		return nil
+	}
+
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatalf("automatic startup External Resolution: %v", err)
+	}
+	if len(summary.Leases) != 0 || summary.Runs[0].Status != scheduler.StatusResolvedExternally {
+		t.Fatalf("final summary used stale pre-resolution state: %#v", summary)
+	}
+	if workers := runner.Workers.(*fakeWorkers).startedSnapshot(); len(workers) != 0 {
+		t.Fatalf("External Resolution created a replacement Worker: %v", workers)
+	}
+}
+
+func TestRunnerReloadsAutomaticResolutionProgressBeforeReturningCancellation(t *testing.T) {
+	t.Parallel()
+
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs:   []scheduler.Run{{Issue: 6, RunID: "failed", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint}},
+		Leases: []scheduler.Lease{{LeaseID: "failed", Issue: 6, RunID: "failed"}},
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+		persisted := store.LoadValue()
+		partial := findRun(persisted.Runs, "failed")
+		partial.Status = scheduler.StatusResolvingExternally
+		partial.Error = "durable partial External Resolution progress"
+		replaceRun(&persisted, partial)
+		if err := store.Save(persisted); err != nil {
+			return true, err
+		}
+		cancel()
+		return true, context.Canceled
+	})
+	current := store.LoadValue()
+
+	err := runner.reconcileExternalResolutions(ctx, &current, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("automatic External Resolution cancellation = %v", err)
+	}
+	if got := findRun(current.Runs, "failed"); got.Status != scheduler.StatusResolvingExternally || got.Error != "durable partial External Resolution progress" {
+		t.Fatalf("reloaded partial External Resolution = %#v", got)
+	}
+	if err := store.Save(current); err != nil {
+		t.Fatal(err)
+	}
+	if got := findRun(store.LoadValue().Runs, "failed"); got.Status != scheduler.StatusResolvingExternally || got.Error != "durable partial External Resolution progress" {
+		t.Fatalf("shutdown persistence overwrote partial External Resolution = %#v", got)
+	}
+}
+
+func TestRunnerWatchAutomaticallyResolvesClosureDuringPoll(t *testing.T) {
+	t.Parallel()
+
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs:   []scheduler.Run{{Issue: 2, RunID: "failed", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint}},
+		Leases: []scheduler.Lease{{LeaseID: "failed", Issue: 2, RunID: "failed"}},
+	}}
+	var calls atomic.Int32
+	resolved := make(chan struct{})
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+	runner.Config.Watch = true
+	runner.ExternalResolution = externalResolutionFunc(func(_ context.Context, run scheduler.Run) (bool, error) {
+		if calls.Add(1) == 1 {
+			return true, errors.New("issue reopened during verification")
+		}
+		current := store.LoadValue()
+		retired := findRun(current.Runs, run.RunID)
+		retired.Status = scheduler.StatusResolvedExternally
+		at := time.Now().UTC()
+		retired.ResolvedExternallyAt = &at
+		retired.ClosureReason = "not-planned"
+		replaceRun(&current, retired)
+		removeLease(&current, run.RunID)
+		if err := store.Save(current); err != nil {
+			return true, err
+		}
+		close(resolved)
+		return true, nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	select {
+	case <-resolved:
+		cancel()
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("watch reconciliation did not discover issue closure")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("watch shutdown after External Resolution: %v", err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusResolvedExternally || len(got.Leases) != 0 {
+		t.Fatalf("watch External Resolution state = %#v", got)
+	}
+}
+
+func TestRunnerNeverAutomaticallyResolvesRunWithOwnedWorker(t *testing.T) {
+	t.Parallel()
+
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs:   []scheduler.Run{{Issue: 5, RunID: "running", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModeRPC, PID: 100, ProcessIdentity: "identity-100"}},
+		Leases: []scheduler.Lease{{LeaseID: "running", Issue: 5, RunID: "running"}},
+	}}
+	var calls atomic.Int32
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+		calls.Add(1)
+		return true, errors.New("must not inspect an Owned Worker")
+	})
+	current := store.LoadValue()
+	if err := runner.reconcile(context.Background(), &current, map[int]WorkerProcess{5: nil}); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 0 || current.Runs[0].Status != scheduler.StatusRunning || len(current.Leases) != 1 {
+		t.Fatalf("Owned Worker entered automatic External Resolution: calls=%d state=%#v", calls.Load(), current)
+	}
+}
+
+func TestRunnerAcceptsFinalizedAutomaticResolutionAfterVerificationReadFailure(t *testing.T) {
+	t.Parallel()
+
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs:   []scheduler.Run{{Issue: 7, RunID: "partial", Status: scheduler.StatusResolvingExternally, WorkerMode: scheduler.WorkerModePrint}},
+		Leases: []scheduler.Lease{{LeaseID: "partial", Issue: 7, RunID: "partial"}},
+	}}
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+		persisted := store.LoadValue()
+		resolved := findRun(persisted.Runs, "partial")
+		resolved.Status = scheduler.StatusResolvedExternally
+		resolvedAt := time.Now().UTC()
+		resolved.ResolvedExternallyAt = &resolvedAt
+		resolved.ClosureReason = "completed"
+		replaceRun(&persisted, resolved)
+		removeLease(&persisted, resolved.RunID)
+		if err := store.Save(persisted); err != nil {
+			return true, err
+		}
+		return true, errors.New("verify finalized External Resolution state: injected preview failure")
+	})
+	current := store.LoadValue()
+
+	if err := runner.reconcileExternalResolutions(context.Background(), &current, nil); err != nil {
+		t.Fatalf("accept persisted terminal External Resolution: %v", err)
+	}
+	got := findRun(current.Runs, "partial")
+	if got.Status != scheduler.StatusResolvedExternally || got.ResolvedExternallyAt == nil || got.ClosureReason != "completed" || len(current.Leases) != 0 {
+		t.Fatalf("persisted terminal External Resolution = %#v / %#v", got, current.Leases)
+	}
+}
+
+func TestRunnerRetainsLeaseAndAdoptsPersistedProgressWhenAutomaticResolutionIsRefused(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name           string
+		persist        bool
+		wantStatus     scheduler.Status
+		wantWorktree   string
+		wantDiagnostic string
+	}{
+		{
+			name: "active Run requires intervention", wantStatus: scheduler.StatusNeedsHuman, wantWorktree: "/tmp/run-3",
+			wantDiagnostic: "earlier failure; automatic External Resolution refused: remote branch liveness is unknown",
+		},
+		{
+			name: "durable partial progress is adopted", persist: true, wantStatus: scheduler.StatusResolvingExternally,
+			wantDiagnostic: "durable partial cleanup; automatic External Resolution refused: remote branch liveness is unknown",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &memoryStore{value: state.State{
+				Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+				Runs: []scheduler.Run{{
+					Issue: 3, RunID: "partial", Status: scheduler.StatusWaitingForMerge, WorkerMode: scheduler.WorkerModePrint,
+					Worktree: "/tmp/run-3", Error: "earlier failure",
+				}},
+				Leases: []scheduler.Lease{{LeaseID: "partial", Issue: 3, RunID: "partial"}},
+			}}
+			runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+			runner.Output = io.Discard
+			runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+				if test.persist {
+					persisted := store.LoadValue()
+					persisted.Runs[0].Status = scheduler.StatusResolvingExternally
+					persisted.Runs[0].Worktree = ""
+					persisted.Runs[0].Error = "durable partial cleanup"
+					if err := store.Save(persisted); err != nil {
+						return true, err
+					}
+				}
+				return true, errors.New("remote branch liveness is unknown")
+			})
+			current := store.LoadValue()
+
+			if err := runner.reconcileExternalResolutions(context.Background(), &current, nil); err != nil {
+				t.Fatalf("refused automatic External Resolution: %v", err)
+			}
+			got := store.LoadValue()
+			if got.Runs[0].Status != test.wantStatus || len(got.Leases) != 1 || got.Runs[0].Worktree != test.wantWorktree || got.Runs[0].Error != test.wantDiagnostic {
+				t.Fatalf("refused automatic External Resolution = %#v, want status %s, worktree %q, diagnostic %q", got, test.wantStatus, test.wantWorktree, test.wantDiagnostic)
+			}
+		})
+	}
+}
+
+func TestRunnerReportsAutomaticResolutionStatePersistenceFailures(t *testing.T) {
+	base := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs:   []scheduler.Run{{Issue: 4, RunID: "failed", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint}},
+		Leases: []scheduler.Lease{{LeaseID: "failed", Issue: 4, RunID: "failed"}},
+	}
+	tests := []struct {
+		name      string
+		configure func(*memoryStore, *Runner)
+		want      string
+	}{
+		{
+			name: "initial snapshot", want: "persist runner state before automatic External Resolution",
+			configure: func(store *memoryStore, runner *Runner) {
+				store.failAtSave = 1
+				runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) { return false, nil })
+			},
+		},
+		{
+			name: "outcome reload", want: "reload state after automatic External Resolution",
+			configure: func(store *memoryStore, runner *Runner) {
+				store.failAtLoad = 2
+				runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) { return true, nil })
+			},
+		},
+		{
+			name: "refusal diagnostic", want: "persist automatic External Resolution diagnostic",
+			configure: func(store *memoryStore, runner *Runner) {
+				store.failAtSave = 2
+				runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+					return true, errors.New("unsafe cleanup")
+				})
+			},
+		},
+		{
+			name: "Lease changed", want: "failed after its Lease changed",
+			configure: func(store *memoryStore, runner *Runner) {
+				runner.ExternalResolution = externalResolutionFunc(func(_ context.Context, run scheduler.Run) (bool, error) {
+					current := store.LoadValue()
+					removeLease(&current, run.RunID)
+					if err := store.Save(current); err != nil {
+						return true, err
+					}
+					return true, errors.New("late refusal")
+				})
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &memoryStore{value: cloneState(base)}
+			runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+			test.configure(store, runner)
+			if err := runner.Run(context.Background()); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("automatic resolution persistence error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestRunnerStartupPreservesResolvingExternallyRunAndLease(t *testing.T) {
 	t.Parallel()
 
@@ -4199,6 +4505,12 @@ func cloneState(value state.State) state.State {
 type candidateResult struct {
 	candidates []scheduler.Candidate
 	err        error
+}
+
+type externalResolutionFunc func(context.Context, scheduler.Run) (bool, error)
+
+func (f externalResolutionFunc) Reconcile(ctx context.Context, run scheduler.Run) (bool, error) {
+	return f(ctx, run)
 }
 
 type fakeGitHub struct {

@@ -11,18 +11,18 @@ Backlog will recognize External Resolution when GitHub verifies that an issue is
 The consequences below describe the accepted end-state architecture. Delivery is staged:
 
 - The explicit `backlog resolve` command provides complete owned-artifact retirement.
-- Issue #83 adds automatic reconciliation at Runner startup and during watch reconciliation.
+- Runner startup and watch reconciliation automatically use that complete retirement behavior for incomplete leased Runs with no Owned Worker.
 - Issue #84 adds automatic reconciliation after Worker settlement.
 
-Complete explicit artifact retirement is current behavior. Until those later slices land, the consequences below about automatic Runner reconciliation remain architectural decisions rather than descriptions of currently available behavior.
+Complete explicit retirement and automatic startup and watch reconciliation for Runs with no Owned Worker are current behavior. The consequence below about reconciliation immediately after Worker settlement remains an architectural decision until issue #84 lands.
 
 ## Consequences
 
 - An incomplete Run may enter `resolving-externally` while retaining its Lease, then become a Historical Run in `resolved-externally` after all active artifacts are verified retired. The outcome records when Backlog recognized the resolution and GitHub's issue closure reason.
 - A merged expected pull request and closed issue always become Completion, even when discovered during External Resolution.
-- A supervising Runner checks incomplete leased Runs at startup, after Worker settlement, and during watch reconciliation. It performs the complete External Resolution automatically only when GitHub verifies that the issue is closed with a supported closure reason.
+- Currently, a supervising Runner checks incomplete leased Runs with no Owned Worker at startup and during watch reconciliation. Issue #84 will add the check immediately after Worker settlement. Each check performs the complete External Resolution automatically only when GitHub verifies that the issue is closed with a supported closure reason.
 - Backlog never terminates a Worker because an issue closed. A live or potentially live Worker prevents External Resolution until process-group absence is proven.
-- `backlog resolve <run-id|positive-issue-number>` provides explicit dry-run, interactive, and `--yes` operation when no Runner is active. It refuses during active Runner supervision and explains that the Runner will reconcile the closed issue. Backlog will not add a separate resolution-request control plane.
+- `backlog resolve <run-id|positive-issue-number>` provides explicit dry-run, interactive, and `--yes` operation when no Runner is active. It refuses during active Runner supervision and explains that the supervising Runner handles automatic reconciliation at startup and during watch polling once the Run has no Owned Worker. Backlog will not add a separate resolution-request control plane.
 - External Resolution uses Reset's fail-closed ownership and idempotency model. It disables auto-merge, explains and closes owned unmerged pull requests, deletes owned remote and local branches, removes owned worktrees, and archives active Pi sessions when those actions remain necessary.
 - Conclusively absent branches, worktrees, and active sessions are already retired. Already archived sessions are also satisfied. Changed, mismatched, or unknown artifacts stop resolution with the Lease retained.
 - Existing diagnostic logs and Run history are preserved. Missing recorded logs add a historical warning but do not retain active ownership solely to preserve unavailable diagnostics.

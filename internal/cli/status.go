@@ -254,7 +254,7 @@ func (p *statusPrinter) run(observed statusRun) {
 		p.printf("    Intervention: Reset is incomplete; rerun backlog reset; Worker not active\n")
 		p.printReason(run)
 	case scheduler.StatusResolvingExternally:
-		p.printf("    Intervention: External Resolution is incomplete; close the issue if needed and rerun backlog resolve, or Reset the Run with backlog reset; Worker not active\n")
+		p.printf("    Intervention: External Resolution is incomplete; close the issue if needed and rerun backlog resolve, or Reset the Run with backlog reset; a supervising Runner will retry at startup or during watch polling while no Owned Worker is present; Worker not active\n")
 		p.printReason(run)
 	case scheduler.StatusMerged:
 		p.printf("    Completion: verified merged; Worker not active\n")

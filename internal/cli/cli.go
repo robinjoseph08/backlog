@@ -19,6 +19,8 @@ import (
 
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
 	"github.com/robinjoseph08/backlog/internal/herdr"
+	"github.com/robinjoseph08/backlog/internal/resolution"
+	"github.com/robinjoseph08/backlog/internal/retirement"
 	"github.com/robinjoseph08/backlog/internal/runner"
 	"github.com/robinjoseph08/backlog/internal/state"
 	"github.com/robinjoseph08/backlog/internal/worker"
@@ -357,6 +359,14 @@ func runCommand(ctx context.Context, options runOptions, stdout io.Writer, signa
 		runnerOutput = dashboard
 		finalSummary = dashboard.captureFinalSummary
 	}
+	automaticResolution, err := resolution.NewAutomaticReconciler(retirement.Config{
+		Store: runnerRetirementStore{Store: runnerStore}, GitHub: *github,
+		RepositoryRoot: repositoryRoot, CommonDirectory: commonDirectory,
+		StateDirectory: resolvedStateDir, GitExecutable: options.gitExecutable,
+	}, repository.Slug)
+	if err != nil {
+		return err
+	}
 	backlogRunner := &runner.Runner{
 		Config: runner.Config{
 			Repo: repository.Slug, DefaultBranch: repository.DefaultBranch,
@@ -367,6 +377,7 @@ func runCommand(ctx context.Context, options runOptions, stdout io.Writer, signa
 		Store:                          runnerStore,
 		Worktrees:                      worktrees,
 		Workers:                        workerAdapter{supervisor: supervisor},
+		ExternalResolution:             automaticResolution,
 		Output:                         runnerOutput,
 		Signals:                        runnerSignals,
 		OnOperationalEvent:             onOperationalEvent,
@@ -415,6 +426,15 @@ func cancelContextOnSignal(ctx context.Context, signals <-chan os.Signal) (conte
 		close(done)
 		cancel()
 	}
+}
+
+type runnerRetirementStore struct {
+	runner.Store
+}
+
+func (s runnerRetirementStore) Preview() (state.State, bool, error) {
+	current, err := s.Load()
+	return current, false, err
 }
 
 type workerAdapter struct {

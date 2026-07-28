@@ -10,6 +10,15 @@ import (
 	"github.com/robinjoseph08/backlog/internal/state"
 )
 
+func TestNewAutomaticReconcilerRequiresRepositoryAndCompleteRetirementConfiguration(t *testing.T) {
+	if _, err := NewAutomaticReconciler(retirement.Config{}, ""); err == nil || !strings.Contains(err.Error(), "repository is empty") {
+		t.Fatalf("empty automatic repository error = %v", err)
+	}
+	if _, err := NewAutomaticReconciler(retirement.Config{}, "acme/widgets"); err == nil || !strings.Contains(err.Error(), "configuration is incomplete") {
+		t.Fatalf("incomplete automatic retirement error = %v", err)
+	}
+}
+
 func TestPolicyAcceptsSupportedClosureReasonsAndPreservesHumanLabels(t *testing.T) {
 	for _, reason := range []string{"completed", "not-planned"} {
 		snapshot := retirement.Snapshot{
