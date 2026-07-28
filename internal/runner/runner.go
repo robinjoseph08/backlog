@@ -660,6 +660,11 @@ func (r *Runner) Run(ctx context.Context) error {
 				}
 			}
 			unverifiedSettledExit := completion.result.Settled && !closedBeforeReconciliation && !closed.GroupExited && r.suspensionExit.Load() == 0
+			if unverifiedSettledExit {
+				// Retaining an unverified process group is already an incomplete
+				// suspension result, even if the signal arrives before local removal.
+				r.suspensionFailed.Store(true)
+			}
 			if !closedBeforeReconciliation && draining {
 				settledControlErr := closed.ControlErr
 				if unverifiedSettledExit {
@@ -711,7 +716,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after an RPC finalization error; worktree retained")
 				return errors.Join(err, shutdownErr)
 			}
-			if completion.result.Settled && closed.GroupExited && workerLogIsClosed(closed) {
+			if completion.result.Settled && closed.GroupExited && workerLogIsClosed(closed) && closed.Err == nil && closed.ControlErr == nil {
 				if err := r.reconcileAfterWorkerSettlementWithinLifecycle(ctx, &current, runID, issueClosed); err != nil {
 					if r.suspensionExit.Load() != 0 {
 						r.suspensionFailed.Store(true)

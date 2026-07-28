@@ -389,6 +389,11 @@ func TestRunnerFailsClosedWhenRPCOutputBreaksAfterSettlement(t *testing.T) {
 	workers := newFakeWorkers()
 	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
 	runner := testRunner(github, workers, store, 1)
+	var resolutionCalls atomic.Int32
+	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+		resolutionCalls.Add(1)
+		return true, errors.New("External Resolution must not override failed RPC stream validation")
+	})
 	worktrees := runner.Worktrees.(*fakeWorktrees)
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
@@ -409,6 +414,51 @@ func TestRunnerFailsClosedWhenRPCOutputBreaksAfterSettlement(t *testing.T) {
 	}
 	if len(got.Leases) != 1 || got.Leases[0].Issue != 10 {
 		t.Fatalf("Leases = %#v, want issue 10 retained", got.Leases)
+	}
+	if resolutionCalls.Load() != 0 || len(github.completionBranchSnapshot()) != 1 {
+		t.Fatalf("unsafe post-settlement reconciliation: resolutions=%d Completion checks=%d", resolutionCalls.Load(), len(github.completionBranchSnapshot()))
+	}
+}
+
+func TestRunnerPostSettlementCloseFailureSkipsExternalResolution(t *testing.T) {
+	var completionCalls atomic.Int32
+	github := &fakeGitHub{
+		candidates: []scheduler.Candidate{{Number: 14, CreatedAt: time.Now()}},
+		completionFunc: func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
+			if completionCalls.Add(1) == 1 {
+				return ghadapter.CompletionOutcome{IssueClosed: true, PRFound: true, PullRequest: "https://example.test/14", AutoMergeArmed: true}, nil
+			}
+			return ghadapter.CompletionOutcome{IssueClosed: true}, nil
+		},
+	}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+	var resolutionCalls atomic.Int32
+	runner.ExternalResolution = externalResolutionFunc(func(_ context.Context, run scheduler.Run) (bool, error) {
+		resolutionCalls.Add(1)
+		persisted := store.LoadValue()
+		resolved := findRun(persisted.Runs, run.RunID)
+		resolved.Status = scheduler.StatusResolvedExternally
+		replaceRun(&persisted, resolved)
+		removeLease(&persisted, run.RunID)
+		return true, store.Save(persisted)
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 14)
+	workers.setCloseResult(14, worker.Result{LogClosed: true, GroupExited: true, Err: errors.New("RPC close validation failed")})
+	workers.complete(14, worker.Result{ExitCode: 0})
+	assertInterventionRequired(t, <-done, 1)
+
+	got := store.LoadValue()
+	run := findRun(got.Runs, "run-14")
+	if completionCalls.Load() != 1 || resolutionCalls.Load() != 0 || run.Status != scheduler.StatusNeedsHuman || len(got.Leases) != 1 {
+		t.Fatalf("failed RPC close state = %#v, Completion checks=%d resolutions=%d", got, completionCalls.Load(), resolutionCalls.Load())
+	}
+	if runner.Worktrees.(*fakeWorktrees).cleanupCount() != 0 {
+		t.Fatal("failed RPC close started cleanup")
 	}
 }
 
@@ -2421,6 +2471,7 @@ func TestRunnerUncertainSettledProcessGroupRetainsLeaseWithoutResolution(t *test
 		completions: map[int]ghadapter.CompletionOutcome{8: {IssueClosed: true}},
 	}
 	workers := newFakeWorkers()
+	workers.startupCloseResult = worker.Result{LogClosed: true}
 	workers.settledCloseLeavesGroup = true
 	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
 	runner := testRunner(github, workers, store, 1)
@@ -2437,11 +2488,59 @@ func TestRunnerUncertainSettledProcessGroupRetainsLeaseWithoutResolution(t *test
 	assertInterventionRequired(t, <-done, 1)
 	got := store.LoadValue()
 	run := got.Runs[0]
-	if resolutionCalls.Load() != 0 || run.Status != scheduler.StatusNeedsHuman || run.PID != 1008 || run.ProcessIdentity == "" || len(got.Leases) != 1 {
-		t.Fatalf("uncertain process-group state = %#v, calls=%d", got, resolutionCalls.Load())
+	if resolutionCalls.Load() != 0 || run.Status != scheduler.StatusNeedsHuman || run.PID != 1008 || run.ProcessIdentity == "" || run.WorkerLogOpen || len(got.Leases) != 1 {
+		t.Fatalf("closed-log, live-process-group state = %#v, calls=%d", got, resolutionCalls.Load())
 	}
 	if runner.Worktrees.(*fakeWorktrees).cleanupCount() != 0 {
 		t.Fatal("uncertain process-group liveness started cleanup")
+	}
+}
+
+func TestRunnerSignalAfterUnverifiedSettledExitSnapshotReportsIncompleteSuspension(t *testing.T) {
+	github := &fakeGitHub{
+		candidates:  []scheduler.Candidate{{Number: 15, CreatedAt: time.Now()}},
+		completions: map[int]ghadapter.CompletionOutcome{15: {IssueClosed: true}},
+	}
+	workers := newFakeWorkers()
+	workers.startupCloseResult = worker.Result{LogClosed: true}
+	workers.settledCloseLeavesGroup = true
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	signals := make(chan os.Signal, 1)
+	runner := testRunner(github, workers, store, 1)
+	runner.Signals = signals
+	var resolutionCalls atomic.Int32
+	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+		resolutionCalls.Add(1)
+		return true, errors.New("must not resolve an unverified process group")
+	})
+	var signalOnce sync.Once
+	store.beforeSave = func(value state.State) {
+		run := findRun(value.Runs, "run-15")
+		if run.Status != scheduler.StatusNeedsHuman || run.PID != 1015 {
+			return
+		}
+		signalOnce.Do(func() {
+			signals <- syscall.SIGTERM
+			<-runner.suspensionEventReady
+		})
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 15)
+	workers.complete(15, worker.Result{ExitCode: 0})
+	err := <-done
+	var signalExit *SignalExit
+	if !errors.As(err, &signalExit) || signalExit.Code != 143 || signalExit.Cause == nil || !strings.Contains(signalExit.Cause.Error(), "continuation boundary") {
+		t.Fatalf("raced suspension result = %v, want incomplete signal exit 143", err)
+	}
+	got := store.LoadValue()
+	run := findRun(got.Runs, "run-15")
+	if run.Status != scheduler.StatusNeedsHuman || run.PID != 1015 || run.ProcessIdentity != "identity-1015" || len(got.Leases) != 1 || resolutionCalls.Load() != 0 {
+		t.Fatalf("raced unverified process-group state = %#v, resolutions=%d", got, resolutionCalls.Load())
+	}
+	if runner.Worktrees.(*fakeWorktrees).cleanupCount() != 0 {
+		t.Fatal("raced unverified process group started cleanup")
 	}
 }
 
@@ -4739,6 +4838,7 @@ type memoryStore struct {
 	failAtSave         int
 	failAtLoad         int
 	failSavesRemaining int
+	beforeSave         func(state.State)
 }
 
 func (s *memoryStore) Load() (state.State, error) {
@@ -4753,6 +4853,9 @@ func (s *memoryStore) Load() (state.State, error) {
 func (s *memoryStore) Save(value state.State) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.beforeSave != nil {
+		s.beforeSave(cloneState(value))
+	}
 	s.saveCount++
 	if s.failSavesRemaining > 0 || s.failAtSave > 0 && s.saveCount == s.failAtSave {
 		if s.failSavesRemaining > 0 {
