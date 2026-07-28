@@ -129,7 +129,6 @@ type presentationEventQueue struct {
 	events                    []runner.OperationalEvent
 	inFlight                  int
 	evictedFailureOccurrences map[string]int
-	evictedFailureOrder       []string
 	wake                      chan struct{}
 }
 
@@ -142,13 +141,12 @@ func (q *presentationEventQueue) publish(event runner.OperationalEvent) {
 	switch typed := event.(type) {
 	case runner.CandidateDiscoveryFailed:
 		key := presentationFailureKey(typed)
-		if occurrences := takeBoundedAdmissionOccurrences(q.evictedFailureOccurrences, &q.evictedFailureOrder, key); occurrences > 0 {
+		if occurrences := takeAdmissionOccurrences(q.evictedFailureOccurrences, key); occurrences > 0 {
 			typed.Occurrences = presentationFailureOccurrences(typed) + occurrences
 			event = typed
 		}
 	case runner.CandidateSnapshotCompleted, runner.CandidateDiscoveryRecovered:
 		clear(q.evictedFailureOccurrences)
-		q.evictedFailureOrder = nil
 	}
 	q.events = append(q.events, event)
 	for presentationAdmissionFailureCount(q.events) > presentationAdmissionFailureLimit {
@@ -291,9 +289,8 @@ func (q *presentationEventQueue) preserveFailureOccurrences(index int) {
 			return
 		}
 	}
-	q.evictedFailureOccurrences = retainBoundedAdmissionOccurrences(
+	q.evictedFailureOccurrences = retainAdmissionOccurrences(
 		q.evictedFailureOccurrences,
-		&q.evictedFailureOrder,
 		key,
 		presentationFailureOccurrences(evicted),
 	)

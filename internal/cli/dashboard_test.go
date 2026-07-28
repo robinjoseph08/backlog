@@ -681,57 +681,42 @@ func TestPresentationQueuePreservesRecurringAdmissionAggregateAfterEviction(t *t
 	}
 }
 
-func TestDashboardAggregatesRecurringAdmissionFailureAfterManyDistinctCauses(t *testing.T) {
+func TestDashboardAggregatesRecurringAdmissionFailureBeyondOneThousandDistinctCauses(t *testing.T) {
+	const distinctIdentities = 1024
 	dashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, time.Now)
 	firstCause := "recurring cause"
 	dashboard.operationalEvent(runner.CandidateDiscoveryFailed{
 		Operation: runner.CandidateDiscoveryList, Cause: firstCause,
 		OccurredAt: time.Unix(1, 0), ConsecutiveFailures: 1, Occurrences: 1,
 	})
-	for failure := 2; failure <= 201; failure++ {
+	for identity := 1; identity <= distinctIdentities; identity++ {
+		failure := identity + 1
 		dashboard.operationalEvent(runner.CandidateDiscoveryFailed{
-			Operation: runner.CandidateDiscoveryList, Cause: fmt.Sprintf("varying cause %d", failure),
+			Operation: runner.CandidateDiscoveryList, Cause: fmt.Sprintf("varying cause %d", identity),
 			OccurredAt: time.Unix(int64(failure), 0), ConsecutiveFailures: failure, Occurrences: 1,
 		})
 	}
+	latestFailure := distinctIdentities + 2
 	dashboard.operationalEvent(runner.CandidateDiscoveryFailed{
 		Operation: runner.CandidateDiscoveryList, Cause: firstCause,
-		OccurredAt: time.Unix(202, 0), ConsecutiveFailures: 202, Occurrences: 1,
+		OccurredAt: time.Unix(int64(latestFailure), 0), ConsecutiveFailures: latestFailure, Occurrences: 1,
 	})
 
-	header, body, footer := dashboard.renderParts(time.Unix(202, 0))
+	header, body, footer := dashboard.renderParts(time.Unix(int64(latestFailure), 0))
 	if !strings.Contains(header, "Backlog Run Dashboard") || !strings.Contains(footer, "Runner stage: Running") {
 		t.Fatalf("dashboard chrome = header %q, footer %q", header, footer)
 	}
 	if !strings.Contains(body, "Cause: recurring cause | Equivalent failures: 2") {
 		t.Fatalf("recurring failure lost its episode-wide aggregate:\n%s", body)
 	}
-	if count := len(dashboard.admission.equivalentFailures); count != 201 {
-		t.Fatalf("lightweight aggregation counts = %d, want one for every episode identity", count)
+	if count := len(dashboard.admission.equivalentFailures); count != distinctIdentities+1 {
+		t.Fatalf("lightweight aggregation identities = %d, want all %d episode identities", count, distinctIdentities+1)
+	}
+	if records := len(dashboard.admission.failures); records != dashboardDiagnosticLimit {
+		t.Fatalf("full diagnostic records = %d, want bounded latest %d", records, dashboardDiagnosticLimit)
 	}
 
-	for failure := 203; failure <= admissionAggregationIdentityLimit+500; failure++ {
-		dashboard.operationalEvent(runner.CandidateDiscoveryFailed{
-			Operation: runner.CandidateDiscoveryList, Cause: fmt.Sprintf("later varying cause %d", failure),
-			OccurredAt: time.Unix(int64(failure), 0), ConsecutiveFailures: failure, Occurrences: 1,
-		})
-	}
-	for occurrence := 1; occurrence <= 2; occurrence++ {
-		dashboard.operationalEvent(runner.CandidateDiscoveryFailed{
-			Operation: runner.CandidateDiscoveryList, Cause: "current recurring cause",
-			OccurredAt:          time.Unix(int64(admissionAggregationIdentityLimit+500+occurrence), 0),
-			ConsecutiveFailures: admissionAggregationIdentityLimit + 500 + occurrence, Occurrences: 1,
-		})
-	}
-	if count := len(dashboard.admission.equivalentFailures); count > admissionAggregationIdentityLimit {
-		t.Fatalf("bounded lightweight aggregation identities = %d, want at most %d", count, admissionAggregationIdentityLimit)
-	}
-	_, body, _ = dashboard.renderParts(time.Unix(int64(admissionAggregationIdentityLimit+502), 0))
-	if !strings.Contains(body, "Cause: current recurring cause | Equivalent failures: 2") {
-		t.Fatalf("current recurring cause lost its bounded aggregate:\n%s", body)
-	}
-
-	dashboard.operationalEvent(runner.CandidateDiscoveryRecovered{OccurredAt: time.Unix(203, 0), Failures: 202})
+	dashboard.operationalEvent(runner.CandidateDiscoveryRecovered{OccurredAt: time.Unix(int64(latestFailure+1), 0), Failures: latestFailure})
 	if dashboard.admission.equivalentFailures != nil {
 		t.Fatalf("recovery retained episode aggregation counts: %#v", dashboard.admission.equivalentFailures)
 	}

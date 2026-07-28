@@ -111,23 +111,32 @@ func TestPresentationEventQueueBoundsIgnoredConsumer(t *testing.T) {
 	}
 }
 
-func TestPresentationEventQueueBoundsLightweightAdmissionIdentities(t *testing.T) {
+func TestPresentationEventQueueRetainsExactCountsBeyondOneThousandIdentities(t *testing.T) {
+	const distinctIdentities = 1024
 	queue := newPresentationEventQueue()
-	for failure := 1; failure <= admissionAggregationIdentityLimit+presentationAdmissionFailureLimit+100; failure++ {
+	queue.publish(runner.CandidateDiscoveryFailed{
+		Operation: runner.CandidateDiscoveryList, Cause: "recurring cause", Occurrences: 1,
+	})
+	for identity := 1; identity <= distinctIdentities; identity++ {
 		queue.publish(runner.CandidateDiscoveryFailed{
-			Operation:   runner.CandidateDiscoveryList,
-			Cause:       fmt.Sprintf("distinct cause %d", failure),
-			Occurrences: 1,
+			Operation: runner.CandidateDiscoveryList, Cause: fmt.Sprintf("distinct cause %d", identity), Occurrences: 1,
 		})
 	}
+	queue.publish(runner.CandidateDiscoveryFailed{
+		Operation: runner.CandidateDiscoveryList, Cause: "recurring cause", Occurrences: 1,
+	})
 
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
-	if identities := len(queue.evictedFailureOccurrences); identities > admissionAggregationIdentityLimit {
-		t.Fatalf("lightweight presentation identities = %d, want at most %d", identities, admissionAggregationIdentityLimit)
+	if identities := len(queue.evictedFailureOccurrences); identities != distinctIdentities-presentationAdmissionFailureLimit+1 {
+		t.Fatalf("lightweight presentation identities = %d, want %d retained episode identities", identities, distinctIdentities-presentationAdmissionFailureLimit+1)
 	}
 	if failures := presentationAdmissionFailureCount(queue.events); failures != presentationAdmissionFailureLimit {
 		t.Fatalf("queued failure records = %d, want %d", failures, presentationAdmissionFailureLimit)
+	}
+	latest := queue.events[len(queue.events)-1].(runner.CandidateDiscoveryFailed)
+	if occurrences := presentationFailureOccurrences(latest); occurrences != 2 {
+		t.Fatalf("recurring cause after %d identities = %d occurrences, want 2", distinctIdentities, occurrences)
 	}
 }
 
@@ -223,10 +232,10 @@ func (composedBackpressureWorkers) Release(string) error { return nil }
 
 func TestAdmissionBackpressureComposesRunnerPresentationAndDashboardBounds(t *testing.T) {
 	const (
-		firstDistinct  = 260
-		secondDistinct = 260
+		firstDistinct  = 600
+		secondDistinct = 600
 	)
-	failures := make([]error, 0, firstDistinct+secondDistinct+5)
+	failures := make([]error, 0, firstDistinct+secondDistinct+3)
 	failure := func(cause string) error {
 		return &ghadapter.CandidateDiscoveryError{
 			Operation: ghadapter.CandidateDiscoveryList,
@@ -235,20 +244,12 @@ func TestAdmissionBackpressureComposesRunnerPresentationAndDashboardBounds(t *te
 		}
 	}
 	failures = append(failures, failure("recurring cause"))
-	for identity := 1; identity <= 250; identity++ {
-		failures = append(failures, failure(fmt.Sprintf("first distinct cause %d", identity)))
-	}
-	failures = append(failures, failure("recurring cause"))
-	for identity := 251; identity <= firstDistinct; identity++ {
+	for identity := 1; identity <= firstDistinct; identity++ {
 		failures = append(failures, failure(fmt.Sprintf("first distinct cause %d", identity)))
 	}
 	failures = append(failures, failure("recurring cause"))
 	firstWave := len(failures)
-	for identity := 1; identity <= 250; identity++ {
-		failures = append(failures, failure(fmt.Sprintf("second distinct cause %d", identity)))
-	}
-	failures = append(failures, failure("recurring cause"))
-	for identity := 251; identity <= secondDistinct; identity++ {
+	for identity := 1; identity <= secondDistinct; identity++ {
 		failures = append(failures, failure(fmt.Sprintf("second distinct cause %d", identity)))
 	}
 	failures = append(failures, failure("recurring cause"))
@@ -318,8 +319,8 @@ func TestAdmissionBackpressureComposesRunnerPresentationAndDashboardBounds(t *te
 	}
 	close(continueAfterWave)
 	<-recoveryDeliveryStarted
-	if got := delivered.Load(); got <= admissionAggregationIdentityLimit {
-		t.Fatalf("presentation deliveries before recovery = %d, want pressure beyond %d identities", got, admissionAggregationIdentityLimit)
+	if got := delivered.Load(); got <= firstDistinct {
+		t.Fatalf("presentation deliveries before recovery = %d, want pressure beyond %d identities", got, firstDistinct)
 	}
 
 	queue.mu.Lock()
@@ -341,11 +342,11 @@ func TestAdmissionBackpressureComposesRunnerPresentationAndDashboardBounds(t *te
 	if queuedFailures != presentationAdmissionFailureLimit {
 		t.Fatalf("presentation failure records = %d, want bounded %d", queuedFailures, presentationAdmissionFailureLimit)
 	}
-	if presentationIdentities == 0 || presentationIdentities > admissionAggregationIdentityLimit {
-		t.Fatalf("presentation lightweight identities = %d, want 1..%d under pressure", presentationIdentities, admissionAggregationIdentityLimit)
+	if presentationIdentities <= 256 {
+		t.Fatalf("presentation lightweight identities = %d, want exact episode state well beyond 256 under pressure", presentationIdentities)
 	}
-	if queueRecurring != 5 || !queueRecurringFirst.Equal(base.Add(time.Second)) {
-		t.Fatalf("presentation recurring failures = %d from %s, want 5 from %s", queueRecurring, queueRecurringFirst, base.Add(time.Second))
+	if queueRecurring != 3 || !queueRecurringFirst.Equal(base.Add(time.Second)) {
+		t.Fatalf("presentation recurring failures = %d from %s, want 3 from %s", queueRecurring, queueRecurringFirst, base.Add(time.Second))
 	}
 
 	close(releaseRecovery)
@@ -390,15 +391,11 @@ func TestAdmissionBackpressureComposesRunnerPresentationAndDashboardBounds(t *te
 			dashboard.mu.Lock()
 			key := string(runner.CandidateDiscoveryList) + "\x00recurring cause"
 			if dashboard.admission.consecutiveFailures != len(failures) ||
-				dashboard.admission.equivalentFailures[key] != 5 ||
+				dashboard.admission.equivalentFailures[key] != 3 ||
 				!dashboard.admission.firstFailure.Equal(base.Add(time.Second)) ||
 				!dashboard.admission.latestFailure.Equal(base.Add(time.Duration(len(failures))*time.Second)) {
 				dashboard.mu.Unlock()
 				t.Fatalf("dashboard old episode lost or doubled count/time: %#v", dashboard.admission)
-			}
-			if identities := len(dashboard.admission.equivalentFailures); identities > admissionAggregationIdentityLimit {
-				dashboard.mu.Unlock()
-				t.Fatalf("dashboard lightweight identities = %d, want at most %d", identities, admissionAggregationIdentityLimit)
 			}
 			dashboard.mu.Unlock()
 			sawRecovery = true
@@ -408,7 +405,7 @@ func TestAdmissionBackpressureComposesRunnerPresentationAndDashboardBounds(t *te
 		if sawRecovery {
 			dashboard.mu.Lock()
 			if _, recovered := event.(runner.CandidateDiscoveryRecovered); recovered &&
-				(dashboard.admission.degraded || !dashboard.admission.snapshotComplete || dashboard.admission.equivalentFailures != nil || len(dashboard.admission.equivalentOrder) != 0) {
+				(dashboard.admission.degraded || !dashboard.admission.snapshotComplete || dashboard.admission.equivalentFailures != nil) {
 				dashboard.mu.Unlock()
 				t.Fatalf("dashboard recovery did not reset episode state: %#v", dashboard.admission)
 			}
@@ -438,9 +435,9 @@ func TestAdmissionBackpressureComposesRunnerPresentationAndDashboardBounds(t *te
 			t.Fatalf("bounded composed delivery retained an expired latest diagnostic: %v", failure.Err)
 		}
 	}
-	if identities := len(dashboard.admission.equivalentFailures); identities > admissionAggregationIdentityLimit {
+	if identities := len(dashboard.admission.equivalentFailures); identities != 1 {
 		dashboard.mu.Unlock()
-		t.Fatalf("fresh dashboard identities = %d, want at most %d", identities, admissionAggregationIdentityLimit)
+		t.Fatalf("fresh dashboard identities = %d, want one fresh episode identity", identities)
 	}
 	dashboard.mu.Unlock()
 }

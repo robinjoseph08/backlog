@@ -116,14 +116,10 @@ type Runner struct {
 	operationalEventStopping        bool
 	operationalEvents               []OperationalEvent
 	operationalEvictedFailureCounts map[string]int
-	operationalEvictedFailureOrder  []string
 	candidateDiagnostics            candidateDiscoveryDiagnostics
 }
 
-const (
-	operationalAdmissionFailureLimit    = 20
-	operationalAggregationIdentityLimit = 256
-)
+const operationalAdmissionFailureLimit = 20
 
 type workerCompletion struct {
 	issue  int
@@ -2237,13 +2233,12 @@ func (r *Runner) enqueueOperationalEvent(event OperationalEvent) {
 	switch typed := event.(type) {
 	case CandidateDiscoveryFailed:
 		key := candidateDiscoveryFailureKey(typed)
-		if occurrences := takeOperationalFailureOccurrences(r.operationalEvictedFailureCounts, &r.operationalEvictedFailureOrder, key); occurrences > 0 {
+		if occurrences := takeOperationalFailureOccurrences(r.operationalEvictedFailureCounts, key); occurrences > 0 {
 			typed.Occurrences = candidateDiscoveryFailureOccurrences(typed) + occurrences
 			event = typed
 		}
 	case CandidateSnapshotCompleted, CandidateDiscoveryRecovered:
 		clear(r.operationalEvictedFailureCounts)
-		r.operationalEvictedFailureOrder = nil
 	}
 	r.operationalEvents = append(r.operationalEvents, event)
 	for operationalAdmissionFailureCount(r.operationalEvents) > operationalAdmissionFailureLimit {
@@ -2306,54 +2301,26 @@ func (r *Runner) preserveOperationalFailureOccurrences(index int) {
 	}
 	r.operationalEvictedFailureCounts = retainOperationalFailureOccurrences(
 		r.operationalEvictedFailureCounts,
-		&r.operationalEvictedFailureOrder,
 		key,
 		candidateDiscoveryFailureOccurrences(evicted),
 	)
 }
 
-func retainOperationalFailureOccurrences(counts map[string]int, order *[]string, key string, occurrences int) map[string]int {
+// operationalEvictedFailureCounts is lightweight, invocation-local episode
+// state. It retains one operation/cause counter per identity so aggregation is
+// exact; recovery clears it, while full diagnostic evidence remains bounded.
+func retainOperationalFailureOccurrences(counts map[string]int, key string, occurrences int) map[string]int {
 	if counts == nil {
-		counts = make(map[string]int, operationalAggregationIdentityLimit)
+		counts = make(map[string]int)
 	}
-	if _, exists := counts[key]; exists {
-		counts[key] += occurrences
-		touchOperationalFailureIdentity(order, key)
-		return counts
-	}
-	if len(counts) >= operationalAggregationIdentityLimit && len(*order) > 0 {
-		delete(counts, (*order)[0])
-		*order = (*order)[1:]
-	}
-	counts[key] = occurrences
-	*order = append(*order, key)
+	counts[key] += occurrences
 	return counts
 }
 
-func takeOperationalFailureOccurrences(counts map[string]int, order *[]string, key string) int {
-	occurrences, exists := counts[key]
-	if !exists {
-		return 0
-	}
+func takeOperationalFailureOccurrences(counts map[string]int, key string) int {
+	occurrences := counts[key]
 	delete(counts, key)
-	removeOperationalFailureIdentity(order, key)
 	return occurrences
-}
-
-func touchOperationalFailureIdentity(order *[]string, key string) {
-	removeOperationalFailureIdentity(order, key)
-	*order = append(*order, key)
-}
-
-func removeOperationalFailureIdentity(order *[]string, key string) {
-	for index, candidate := range *order {
-		if candidate != key {
-			continue
-		}
-		copy((*order)[index:], (*order)[index+1:])
-		*order = (*order)[:len(*order)-1]
-		return
-	}
 }
 
 func candidateDiscoveryFailureOccurrences(failure CandidateDiscoveryFailed) int {

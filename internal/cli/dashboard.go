@@ -90,16 +90,14 @@ type dashboardAdmission struct {
 	issue               *int
 	cause               string
 	equivalentFailures  map[string]int
-	equivalentOrder     []string
 	failures            []runner.CandidateDiscoveryFailed
 	recoveredAt         time.Time
 	recoveredFailures   int
 }
 
 const (
-	dashboardDiagnosticLimit          = 20
-	admissionAggregationIdentityLimit = 256
-	admissionRecoveryNotice           = 10 * time.Second
+	dashboardDiagnosticLimit = 20
+	admissionRecoveryNotice  = 10 * time.Second
 )
 
 type fileSignature struct {
@@ -356,7 +354,6 @@ func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
 		d.admission.degraded = false
 		d.admission.consecutiveFailures = 0
 		d.admission.equivalentFailures = nil
-		d.admission.equivalentOrder = nil
 		d.admission.recoveredAt = event.OccurredAt
 		d.admission.recoveredFailures = event.Failures
 		d.mu.Unlock()
@@ -422,7 +419,6 @@ func (d *liveDashboard) recordAdmissionFailureLocked(failure runner.CandidateDis
 			d.admission.firstFailure = failure.OccurredAt
 		}
 		d.admission.equivalentFailures = make(map[string]int)
-		d.admission.equivalentOrder = nil
 	}
 	d.admission.snapshotComplete = false
 	d.admission.degraded = true
@@ -435,55 +431,28 @@ func (d *liveDashboard) recordAdmissionFailureLocked(failure runner.CandidateDis
 	d.admission.recoveredAt = time.Time{}
 	d.admission.recoveredFailures = 0
 	key := string(failure.Operation) + "\x00" + cause
-	d.admission.equivalentFailures = retainBoundedAdmissionOccurrences(d.admission.equivalentFailures, &d.admission.equivalentOrder, key, presentationFailureOccurrences(failure))
+	d.admission.equivalentFailures = retainAdmissionOccurrences(d.admission.equivalentFailures, key, presentationFailureOccurrences(failure))
 	d.admission.failures = append(d.admission.failures, failure)
 	if len(d.admission.failures) > dashboardDiagnosticLimit {
 		d.admission.failures = append([]runner.CandidateDiscoveryFailed(nil), d.admission.failures[len(d.admission.failures)-dashboardDiagnosticLimit:]...)
 	}
 }
 
-func retainBoundedAdmissionOccurrences(counts map[string]int, order *[]string, key string, occurrences int) map[string]int {
+// Admission occurrence counts are lightweight degradation-episode state. They
+// retain every operation/cause identity for exact aggregation until recovery;
+// full diagnostic records remain independently bounded.
+func retainAdmissionOccurrences(counts map[string]int, key string, occurrences int) map[string]int {
 	if counts == nil {
-		counts = make(map[string]int, admissionAggregationIdentityLimit)
+		counts = make(map[string]int)
 	}
-	if _, exists := counts[key]; exists {
-		counts[key] += occurrences
-		touchAdmissionIdentity(order, key)
-		return counts
-	}
-	if len(counts) >= admissionAggregationIdentityLimit && len(*order) > 0 {
-		delete(counts, (*order)[0])
-		*order = (*order)[1:]
-	}
-	counts[key] = occurrences
-	*order = append(*order, key)
+	counts[key] += occurrences
 	return counts
 }
 
-func takeBoundedAdmissionOccurrences(counts map[string]int, order *[]string, key string) int {
-	occurrences, exists := counts[key]
-	if !exists {
-		return 0
-	}
+func takeAdmissionOccurrences(counts map[string]int, key string) int {
+	occurrences := counts[key]
 	delete(counts, key)
-	removeAdmissionIdentity(order, key)
 	return occurrences
-}
-
-func touchAdmissionIdentity(order *[]string, key string) {
-	removeAdmissionIdentity(order, key)
-	*order = append(*order, key)
-}
-
-func removeAdmissionIdentity(order *[]string, key string) {
-	for index, candidate := range *order {
-		if candidate != key {
-			continue
-		}
-		copy((*order)[index:], (*order)[index+1:])
-		*order = (*order)[:len(*order)-1]
-		return
-	}
 }
 
 func cloneIssue(issue *int) *int {
@@ -1131,7 +1100,6 @@ func (b *dashboardBodyBuilder) renderAdmission(admission dashboardAdmission, dia
 func cloneDashboardAdmission(admission dashboardAdmission) dashboardAdmission {
 	admission.issue = cloneIssue(admission.issue)
 	admission.failures = append([]runner.CandidateDiscoveryFailed(nil), admission.failures...)
-	admission.equivalentOrder = append([]string(nil), admission.equivalentOrder...)
 	if admission.equivalentFailures != nil {
 		groups := make(map[string]int, len(admission.equivalentFailures))
 		for key, count := range admission.equivalentFailures {

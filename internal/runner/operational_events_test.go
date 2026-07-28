@@ -289,27 +289,20 @@ func TestRunnerRetainsAtMostTwentyFullAdmissionDiagnostics(t *testing.T) {
 	}
 }
 
-func TestRunnerBoundsLightweightAdmissionIdentitiesWhileRetainingRecentRecurrence(t *testing.T) {
+func TestRunnerRetainsExactLightweightAdmissionCountsBeyondOneThousandIdentities(t *testing.T) {
+	const distinctIdentities = 1024
 	var counts map[string]int
-	var order []string
-	counts = retainOperationalFailureOccurrences(counts, &order, "recurring cause", 1)
-	for identity := 1; identity <= 200; identity++ {
-		counts = retainOperationalFailureOccurrences(counts, &order, fmt.Sprintf("distinct cause %d", identity), 1)
+	counts = retainOperationalFailureOccurrences(counts, "recurring cause", 1)
+	for identity := 1; identity <= distinctIdentities; identity++ {
+		counts = retainOperationalFailureOccurrences(counts, fmt.Sprintf("distinct cause %d", identity), 1)
 	}
-	if occurrences := takeOperationalFailureOccurrences(counts, &order, "recurring cause"); occurrences != 1 {
-		t.Fatalf("recurring cause after 200 identities = %d occurrences, want 1 retained occurrence", occurrences)
-	}
+	counts = retainOperationalFailureOccurrences(counts, "recurring cause", 1)
 
-	for identity := 201; identity <= operationalAggregationIdentityLimit+400; identity++ {
-		counts = retainOperationalFailureOccurrences(counts, &order, fmt.Sprintf("distinct cause %d", identity), 1)
+	if occurrences := takeOperationalFailureOccurrences(counts, "recurring cause"); occurrences != 2 {
+		t.Fatalf("recurring cause after %d identities = %d occurrences, want 2", distinctIdentities, occurrences)
 	}
-	counts = retainOperationalFailureOccurrences(counts, &order, "current recurring cause", 1)
-	counts = retainOperationalFailureOccurrences(counts, &order, "current recurring cause", 1)
-	if identities := len(counts); identities > operationalAggregationIdentityLimit {
-		t.Fatalf("lightweight Runner identities = %d, want at most %d", identities, operationalAggregationIdentityLimit)
-	}
-	if occurrences := counts["current recurring cause"]; occurrences != 2 {
-		t.Fatalf("current recurring cause = %d occurrences, want 2", occurrences)
+	if identities := len(counts); identities != distinctIdentities {
+		t.Fatalf("lightweight Runner identities = %d, want all %d episode identities", identities, distinctIdentities)
 	}
 }
 
