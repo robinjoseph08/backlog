@@ -111,7 +111,7 @@ func (s *bubbleDashboardSession) presentation(ctx context.Context, control Prese
 		model,
 		tea.WithContext(ctx),
 		tea.WithInput(control.Terminal.Input),
-		tea.WithOutput(monitoredOutput),
+		tea.WithOutput(monitoredOutput.writer()),
 		tea.WithWindowSize(dimensions.Width, dimensions.Height),
 		tea.WithColorProfile(bubbleColorProfile(model.colorProfile)),
 		tea.WithoutSignalHandler(),
@@ -149,7 +149,7 @@ func (s *bubbleDashboardSession) presentation(ctx context.Context, control Prese
 // This sequence is intentionally idempotent and is used only after a monitored
 // output failure forced that path.
 func restoreDashboardTerminal(output io.Writer) error {
-	_, err := io.WriteString(output, "\x1b[>4m\x1b[=0;1u\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1049l\x1b[?25h")
+	_, err := io.WriteString(output, "\x1b[?2026l\x1b[>4m\x1b[=0;1u\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1049l\x1b[?25h")
 	return err
 }
 
@@ -163,6 +163,37 @@ type presentationOutputMonitor struct {
 
 func newPresentationOutputMonitor(output io.Writer) *presentationOutputMonitor {
 	return &presentationOutputMonitor{output: output, failed: make(chan struct{})}
+}
+
+func (w *presentationOutputMonitor) writer() io.Writer {
+	file, ok := w.output.(interface {
+		io.ReadWriteCloser
+		Fd() uintptr
+	})
+	if !ok {
+		return w
+	}
+	return presentationTTYOutputMonitor{presentationOutputMonitor: w, file: file}
+}
+
+type presentationTTYOutputMonitor struct {
+	*presentationOutputMonitor
+	file interface {
+		io.ReadWriteCloser
+		Fd() uintptr
+	}
+}
+
+func (w presentationTTYOutputMonitor) Read(content []byte) (int, error) {
+	return w.file.Read(content)
+}
+
+func (w presentationTTYOutputMonitor) Close() error {
+	return w.file.Close()
+}
+
+func (w presentationTTYOutputMonitor) Fd() uintptr {
+	return w.file.Fd()
 }
 
 func (w *presentationOutputMonitor) Write(content []byte) (written int, resultErr error) {

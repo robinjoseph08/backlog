@@ -9,6 +9,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -2070,6 +2071,66 @@ func TestBubbleDashboardFailureRestoresTerminalBeforeStaticErrorResult(t *testin
 	}
 }
 
+func TestBubbleDashboardModelPanicAfterStartupRestoresTerminalBeforeStaticErrorResult(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	var panicEnabled atomic.Bool
+	var panicked atomic.Bool
+	clock := func() time.Time {
+		if panicEnabled.Load() {
+			panicked.Store(true)
+			panic("dashboard model panic")
+		}
+		return now
+	}
+	var output synchronizedBuffer
+	session := newBubbleDashboardSession(clock)
+	host := runnerHost{terminal: TerminalDependencies{
+		Input: strings.NewReader(""), Output: &output,
+		Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
+		ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+		Now:          clock,
+	}}
+	err := host.run(context.Background(), func(signals <-chan lifecycleSignal, _ func(runner.OperationalEvent)) error {
+		current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+		session.configure(current, &dashboardTestSource{current: current})
+		if startupErr := session.waitForStartup(context.Background()); startupErr != nil {
+			return startupErr
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for !strings.Contains(output.String(), "\x1b[?1049h") {
+			if time.Now().After(deadline) {
+				return errors.New("dashboard did not enter the alternate screen before model panic")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		panicEnabled.Store(true)
+		session.publish(dashboardElapsedMsg(now))
+		event := <-signals
+		if event.signal != syscall.SIGTERM {
+			t.Errorf("model panic signal = %v, want SIGTERM", event.signal)
+		}
+		event.accept()
+		return &runner.SignalExit{Code: 143}
+	}, session.presentation)
+
+	var failure *PresentationFailure
+	if !panicked.Load() || !errors.As(err, &failure) || !errors.Is(failure.Err, tea.ErrProgramPanic) {
+		t.Fatalf("post-start model panic result = %v, panicked = %t", err, panicked.Load())
+	}
+	panicEnabled.Store(false)
+	session.setResult(err)
+	if summaryErr := session.printFinalSummary(&output); summaryErr != nil {
+		t.Fatalf("static model-panic result: %v", summaryErr)
+	}
+
+	raw := output.String()
+	restore := strings.LastIndex(raw, "\x1b[?1049l")
+	summary := strings.Index(raw, "Final aggregate summary")
+	if restore < 0 || summary < restore || !strings.Contains(raw[summary:], "Final outcome: Error: presentation failed:") {
+		t.Fatalf("model panic static result was not printed after restoration: %q", raw)
+	}
+}
+
 type shortPresentationWriter struct{}
 
 func (shortPresentationWriter) Write(content []byte) (int, error) {
@@ -2091,6 +2152,62 @@ func TestPresentationOutputMonitorTreatsShortWriteAsOutputLoss(t *testing.T) {
 func TestRestoreDashboardTerminalReturnsOutputFailure(t *testing.T) {
 	if err := restoreDashboardTerminal(failingStatusWriter{}); err == nil || !strings.Contains(err.Error(), "status output failed") {
 		t.Fatalf("terminal restoration error = %v", err)
+	}
+}
+
+type synchronizedTerminalWriter struct {
+	visible      bytes.Buffer
+	pending      bytes.Buffer
+	synchronized bool
+}
+
+func (w *synchronizedTerminalWriter) Write(content []byte) (int, error) {
+	rest := string(content)
+	for rest != "" {
+		if w.synchronized {
+			reset := strings.Index(rest, ansi.ResetModeSynchronizedOutput)
+			if reset < 0 {
+				_, _ = w.pending.WriteString(rest)
+				break
+			}
+			_, _ = w.pending.WriteString(rest[:reset])
+			_, _ = w.visible.Write(w.pending.Bytes())
+			w.pending.Reset()
+			_, _ = w.visible.WriteString(ansi.ResetModeSynchronizedOutput)
+			w.synchronized = false
+			rest = rest[reset+len(ansi.ResetModeSynchronizedOutput):]
+			continue
+		}
+
+		set := strings.Index(rest, ansi.SetModeSynchronizedOutput)
+		if set < 0 {
+			_, _ = w.visible.WriteString(rest)
+			break
+		}
+		_, _ = w.visible.WriteString(rest[:set+len(ansi.SetModeSynchronizedOutput)])
+		w.synchronized = true
+		rest = rest[set+len(ansi.SetModeSynchronizedOutput):]
+	}
+	return len(content), nil
+}
+
+func TestRestoreDashboardTerminalReleasesInterruptedSynchronizedFrameBeforeStaticOutput(t *testing.T) {
+	output := &synchronizedTerminalWriter{}
+	_, _ = io.WriteString(output, ansi.SetModeSynchronizedOutput+"interrupted dashboard frame")
+	if !output.synchronized || output.pending.Len() == 0 {
+		t.Fatal("test terminal did not retain the interrupted synchronized frame")
+	}
+	if err := restoreDashboardTerminal(output); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.WriteString(output, "Final aggregate summary")
+
+	visible := output.visible.String()
+	reset := strings.Index(visible, ansi.ResetModeSynchronizedOutput)
+	restore := strings.Index(visible, "\x1b[?1049l")
+	summary := strings.Index(visible, "Final aggregate summary")
+	if output.synchronized || output.pending.Len() != 0 || reset < 0 || restore < reset || summary < restore {
+		t.Fatalf("interrupted synchronized frame retained restoration or static output: visible=%q pending=%q", visible, output.pending.String())
 	}
 }
 

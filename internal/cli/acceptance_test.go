@@ -1027,20 +1027,13 @@ while :; do sleep 1; done
 	}
 	waitForPseudoTerminalScreen(t, &output, 100, 28, "> Admission health")
 
-	beforeResize := len(output.String())
 	if err := pty.Setsize(terminal, &pty.Winsize{Rows: 10, Cols: 72}); err != nil {
 		t.Fatalf("resize pseudo-terminal: %v", err)
 	}
 	if err := command.Process.Signal(syscall.SIGWINCH); err != nil {
 		t.Fatalf("notify pseudo-terminal resize: %v", err)
 	}
-	resizeDeadline := time.Now().Add(5 * time.Second)
-	for len(output.String()) <= beforeResize && time.Now().Before(resizeDeadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if len(output.String()) <= beforeResize {
-		t.Fatal("dashboard emitted no update after pseudo-terminal resize")
-	}
+	waitForPseudoTerminalScreen(t, &output, 72, 10, "Backlog: acme/widgets")
 	if err := pty.Setsize(terminal, &pty.Winsize{Rows: 28, Cols: 100}); err != nil {
 		t.Fatalf("restore pseudo-terminal size: %v", err)
 	}
