@@ -775,6 +775,139 @@ func TestDashboardCloseShowsThatRunnerStopped(t *testing.T) {
 	}
 }
 
+func TestDashboardProjectsCurrentAndHistoricalRunsAcrossInvocations(t *testing.T) {
+	now := time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC)
+	started := now.Add(-4 * time.Hour)
+	identity, err := pidStartIdentity(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := []scheduler.Run{
+		{Issue: 3, IssueTitle: "Verified Worker", RunID: "active-c", Status: scheduler.StatusRunning, PID: os.Getpid(), ProcessIdentity: identity, StartedAt: started.Add(2 * time.Hour)},
+		{Issue: 2, IssueTitle: "Preparing second", RunID: "active-b", Status: scheduler.StatusClaimed, StartedAt: started.Add(time.Hour)},
+		{Issue: 1, IssueTitle: "Missing Worker", RunID: "active-a", Status: scheduler.StatusRunning, StartedAt: started.Add(3 * time.Hour)},
+		{Issue: 4, IssueTitle: "Preparing first", RunID: "active-a-tie", Status: scheduler.StatusWorktreeReady, StartedAt: started.Add(time.Hour)},
+		{Issue: 5, IssueTitle: "Waiting for merge", RunID: "active-d", Status: scheduler.StatusWaitingForMerge, StartedAt: started.Add(90 * time.Minute)},
+		{Issue: 6, IssueTitle: "Suspended continuation", RunID: "active-e", Status: scheduler.StatusSuspended, StartedAt: started.Add(150 * time.Minute)},
+	}
+	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 6, Runs: append([]scheduler.Run(nil), active...)}
+	for _, run := range active {
+		current.Leases = append(current.Leases, scheduler.Lease{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID})
+	}
+	for index := range 12 {
+		status := scheduler.StatusNeedsHuman
+		switch index {
+		case 0:
+			status = scheduler.StatusFailed
+		case 1:
+			status = scheduler.StatusResetting
+		}
+		run := scheduler.Run{
+			Issue: 100 + index, IssueTitle: fmt.Sprintf("Attention %02d", index), RunID: fmt.Sprintf("attention-%02d", index),
+			Status: status, StartedAt: started, UpdatedAt: now.Add(time.Duration(index) * time.Minute),
+		}
+		current.Runs = append(current.Runs, run)
+		current.Leases = append(current.Leases, scheduler.Lease{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID})
+	}
+	for index := range 12 {
+		updatedAt := now.Add(time.Duration(index) * time.Minute)
+		if index == 10 {
+			updatedAt = now.Add(11 * time.Minute)
+		}
+		status := scheduler.StatusFailed
+		if index == 0 {
+			status = scheduler.StatusNeedsHuman
+		}
+		current.Runs = append(current.Runs, scheduler.Run{
+			Issue: 200 + index, IssueTitle: fmt.Sprintf("Outcome %02d", index), RunID: fmt.Sprintf("outcome-%02d", index),
+			Status: status, StartedAt: started, UpdatedAt: updatedAt,
+		})
+	}
+	acknowledgedAt := now
+	current.Runs = append(current.Runs, scheduler.Run{
+		Issue: 299, IssueTitle: "Acknowledged outcome", RunID: "outcome-acknowledged", Status: scheduler.StatusNeedsHuman,
+		StartedAt: started, UpdatedAt: now.Add(time.Hour), AcknowledgedAt: &acknowledgedAt,
+	})
+	for index := range 12 {
+		completedAt := now.Add(time.Duration(index-12) * time.Minute)
+		if index == 10 {
+			completedAt = now.Add(-time.Minute)
+		}
+		current.Runs = append(current.Runs, scheduler.Run{
+			Issue: 300 + index, IssueTitle: fmt.Sprintf("Completion %02d", index), RunID: fmt.Sprintf("completion-%02d", index),
+			Status: scheduler.StatusMerged, PID: 999999, StartedAt: started, UpdatedAt: completedAt, CompletedAt: &completedAt,
+			PullRequest: fmt.Sprintf("https://github.com/acme/widgets/pull/%d", 300+index), LogPath: "/missing/worker.jsonl",
+		})
+	}
+
+	var output bytes.Buffer
+	dashboard := newLiveDashboard(&output, &dashboardTestSource{current: current}, current, func() time.Time { return now })
+	dashboard.redraw()
+	frame := lastDashboardFrame(output.String())
+	activeOutput := dashboardSectionOutput(t, frame, "Active Runs", "Attention Required")
+	for _, runID := range []string{"Missing Worker", "Preparing first", "Preparing second", "Waiting for merge", "Verified Worker", "Suspended continuation"} {
+		if !strings.Contains(activeOutput, runID) {
+			t.Fatalf("Active Runs omitted %q:\n%s", runID, activeOutput)
+		}
+	}
+	assertDashboardOrder(t, activeOutput, "Missing Worker", "Preparing first", "Preparing second", "Waiting for merge", "Verified Worker", "Suspended continuation")
+
+	attentionOutput := dashboardSectionOutput(t, frame, "Attention Required", "Outcomes to Acknowledge")
+	if !strings.Contains(attentionOutput, "Attention Required (12)") || strings.Count(attentionOutput, "Attention ") != 13 {
+		t.Fatalf("Attention Required did not retain every leased intervention-required Run:\n%s", attentionOutput)
+	}
+	outcomesOutput := dashboardSectionOutput(t, frame, "Outcomes to Acknowledge", "Recent Completions")
+	if !strings.Contains(outcomesOutput, "Outcomes to Acknowledge (12)") || strings.Contains(outcomesOutput, "Acknowledged outcome") {
+		t.Fatalf("historical outcome projection was incomplete:\n%s", outcomesOutput)
+	}
+	assertDashboardOrder(t, outcomesOutput, "Outcome 11", "Outcome 10", "Outcome 00")
+
+	completionsOutput := dashboardSectionOutput(t, frame, "Recent Completions", "")
+	for _, want := range []string{"Recent Completions (10)", "Completion 11", "Completion 10", "Completion 09", "7 more completions"} {
+		if !strings.Contains(completionsOutput, want) {
+			t.Fatalf("Recent Completions missing %q:\n%s", want, completionsOutput)
+		}
+	}
+	for _, hidden := range []string{"Completion 08", "Completion 01", "Completion 00"} {
+		if strings.Contains(completionsOutput, hidden) {
+			t.Fatalf("collapsed or old Completion %q was visible by default:\n%s", hidden, completionsOutput)
+		}
+	}
+	for _, verbose := range []string{"Worker liveness", "Activity age", "Turns:", "Observed tokens"} {
+		if strings.Contains(completionsOutput, verbose) {
+			t.Fatalf("compact Completion rows included %q:\n%s", verbose, completionsOutput)
+		}
+	}
+}
+
+func dashboardSectionOutput(t *testing.T, output, name, next string) string {
+	t.Helper()
+	start := strings.Index(output, name+" (")
+	if start < 0 {
+		t.Fatalf("dashboard section %q missing:\n%s", name, output)
+	}
+	if next == "" {
+		return output[start:]
+	}
+	end := strings.Index(output[start:], "\n"+next+" (")
+	if end < 0 {
+		t.Fatalf("dashboard section %q terminator %q missing:\n%s", name, next, output)
+	}
+	return output[start : start+end]
+}
+
+func assertDashboardOrder(t *testing.T, output string, values ...string) {
+	t.Helper()
+	previous := -1
+	for _, value := range values {
+		index := strings.Index(output, value)
+		if index < 0 || index <= previous {
+			t.Fatalf("dashboard values are not ordered as %q:\n%s", values, output)
+		}
+		previous = index
+	}
+}
+
 func TestDashboardKeepsTerminalRunsAndShutdownMessagesVisible(t *testing.T) {
 	now := time.Date(2026, 7, 26, 17, 0, 0, 0, time.UTC)
 	logPath := filepath.Join(t.TempDir(), "finished.jsonl")
@@ -813,8 +946,8 @@ func TestDashboardKeepsTerminalRunsAndShutdownMessagesVisible(t *testing.T) {
 	}
 	dashboard.redraw()
 	for _, want := range []string{
-		"Recently Finished (1)", "#42  Finished here", "Activity age: 10m0s (quiet)",
-		"Turns: Worker 1 | Subagent n/a", "Drain: admission stopped; 1 Worker remaining",
+		"Recent Completions (1)", "#42  Finished here | Elapsed: 59m59s | Completed: 1s ago",
+		"Drain: admission stopped; 1 Worker remaining",
 		"Draining: admission is stopped; next Ctrl-C suspends unfinished Runs",
 	} {
 		if !strings.Contains(output.String(), want) {
