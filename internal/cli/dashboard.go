@@ -338,6 +338,17 @@ func dashboardOperationalEventSemantic(event runner.OperationalEvent) dashboardS
 		return dashboardSemanticWarning
 	case runner.CandidateDiscoveryRecovered:
 		return dashboardSemanticActive
+	case runner.RunLifecycleEvent:
+		switch event.Stage {
+		case runner.RunLifecycleClaimed, runner.RunLifecycleStarted, runner.RunLifecycleResumed:
+			return dashboardSemanticActive
+		case runner.RunLifecycleCleanupCompleted, runner.RunLifecycleMerged:
+			return dashboardSemanticCompletion
+		case runner.RunLifecycleFailed, runner.RunLifecycleNeedsHuman:
+			return dashboardSemanticAttention
+		default:
+			return dashboardSemanticMetadata
+		}
 	case runner.ShutdownEvent:
 		if event.Result == runner.ShutdownResultFailure {
 			return dashboardSemanticAttention

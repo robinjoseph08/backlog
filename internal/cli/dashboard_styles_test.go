@@ -260,6 +260,13 @@ func TestDashboardOperationalMessagesUseTypedEventSemantics(t *testing.T) {
 	}{
 		{event: runner.CandidateDiscoveryFailed{}, semantic: dashboardSemanticWarning, style: styler.warning},
 		{event: runner.CandidateDiscoveryRecovered{}, semantic: dashboardSemanticActive, style: styler.active},
+		{event: runner.RunLifecycleEvent{Stage: runner.RunLifecycleClaimed}, semantic: dashboardSemanticActive, style: styler.active},
+		{event: runner.RunLifecycleEvent{Stage: runner.RunLifecycleStarted}, semantic: dashboardSemanticActive, style: styler.active},
+		{event: runner.RunLifecycleEvent{Stage: runner.RunLifecycleResumed}, semantic: dashboardSemanticActive, style: styler.active},
+		{event: runner.RunLifecycleEvent{Stage: runner.RunLifecycleCleanupCompleted}, semantic: dashboardSemanticCompletion, style: styler.completion},
+		{event: runner.RunLifecycleEvent{Stage: runner.RunLifecycleMerged}, semantic: dashboardSemanticCompletion, style: styler.completion},
+		{event: runner.RunLifecycleEvent{Stage: runner.RunLifecycleFailed}, semantic: dashboardSemanticAttention, style: styler.attention},
+		{event: runner.RunLifecycleEvent{Stage: runner.RunLifecycleNeedsHuman}, semantic: dashboardSemanticAttention, style: styler.attention},
 		{event: runner.ShutdownEvent{Stage: runner.ShutdownStageForceStopping, Message: "presentation wording changed"}, semantic: dashboardSemanticAttention, style: styler.attention},
 		{event: runner.ShutdownEvent{Stage: runner.ShutdownStageDrainComplete, Result: runner.ShutdownResultSuccess, Message: "presentation wording changed"}, semantic: dashboardSemanticCompletion, style: styler.completion},
 		{event: runner.ShutdownEvent{Stage: runner.ShutdownStageDrainComplete, Result: runner.ShutdownResultFailure, Message: "presentation wording changed"}, semantic: dashboardSemanticAttention, style: styler.attention},

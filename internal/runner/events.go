@@ -44,6 +44,29 @@ type CandidateDiscoveryRecovered struct {
 
 func (CandidateDiscoveryRecovered) operationalEvent() {}
 
+// RunLifecycleStage identifies a Run transition without requiring presentation
+// code to classify the compatible plain message.
+type RunLifecycleStage string
+
+const (
+	RunLifecycleClaimed          RunLifecycleStage = "claimed"
+	RunLifecycleStarted          RunLifecycleStage = "started"
+	RunLifecycleResumed          RunLifecycleStage = "resumed"
+	RunLifecycleCleanupCompleted RunLifecycleStage = "cleanup-completed"
+	RunLifecycleMerged           RunLifecycleStage = "merged"
+	RunLifecycleFailed           RunLifecycleStage = "failed"
+	RunLifecycleNeedsHuman       RunLifecycleStage = "needs-human"
+)
+
+// RunLifecycleEvent reports an important Run transition. Message preserves the
+// compatible append-only plain rendering while Stage supplies its semantic.
+type RunLifecycleEvent struct {
+	Stage   RunLifecycleStage
+	Message string
+}
+
+func (RunLifecycleEvent) operationalEvent() {}
+
 // ShutdownStage identifies the current stage of the staged shutdown lifecycle.
 type ShutdownStage string
 
@@ -108,6 +131,8 @@ func FormatOperationalEvent(event OperationalEvent) string {
 			noun = "failure"
 		}
 		return fmt.Sprintf("candidate discovery recovered; admission resumed after %d %s", event.Failures, noun)
+	case RunLifecycleEvent:
+		return event.Message
 	case ShutdownEvent:
 		return event.Message
 	default:
