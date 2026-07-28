@@ -29,6 +29,7 @@ type Policy struct {
 	AllowMergedCompletion      bool
 	VerifyHistoricalOnly       bool
 	MarkProgressBeforeMutation bool
+	RequireClosedExplanation   bool
 	FinalizeMetadata           func(*scheduler.Run, Snapshot, time.Time)
 }
 

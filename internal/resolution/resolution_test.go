@@ -265,8 +265,8 @@ func TestOnlyRecordedExpectedPullRequestCanPlanCompletion(t *testing.T) {
 			if expectedState == retirement.PullRequestOpen && (!strings.Contains(strings.Join(joined, "\n"), "explain External Resolution") || !strings.Contains(strings.Join(joined, "\n"), "close unmerged pull request")) {
 				t.Fatalf("open expected pull request retirement actions = %q", joined)
 			}
-			if expectedState == retirement.PullRequestClosed && strings.Contains(strings.Join(joined, "\n"), "close unmerged pull request") {
-				t.Fatalf("closed expected pull request planned closure again: %q", joined)
+			if expectedState == retirement.PullRequestClosed && (!strings.Contains(strings.Join(joined, "\n"), "explain External Resolution") || strings.Contains(strings.Join(joined, "\n"), "close unmerged pull request")) {
+				t.Fatalf("closed expected pull request actions = %q, want explanation without repeated closure", joined)
 			}
 		})
 	}

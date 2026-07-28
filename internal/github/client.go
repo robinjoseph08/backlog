@@ -393,7 +393,7 @@ func (c Client) OwnedRunResources(ctx context.Context, repo string, issueNumber 
 			Number: pull.Number, URL: pull.URL, Branch: pull.HeadRefName, Commit: pull.HeadRefOID,
 			State: state, Merged: merged, AutoMergeArmed: autoMergeArmed,
 		}
-		if state == "open" {
+		if state != "merged" {
 			comments, err := c.ownedPullRequestComments(ctx, repo, pull.Number)
 			if err != nil {
 				return OwnedRunIssue{}, nil, fmt.Errorf("inspect owned Run pull request #%d comments: %w", pull.Number, err)

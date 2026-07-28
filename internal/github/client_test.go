@@ -356,7 +356,7 @@ esac`)
 	}
 }
 
-func TestClientInspectsResetIssueLabelsAndOwnedPullRequests(t *testing.T) {
+func TestClientInspectsIssueLabelsAndCommentsOnEveryOwnedUnmergedPullRequest(t *testing.T) {
 	t.Parallel()
 
 	gh := fakeGH(t, `
@@ -364,9 +364,11 @@ case "$*" in
   "issue view 42 --repo acme/widgets --json number,url,state,labels")
     printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"},{"name":"spec"}]}' ;;
   "pr list --repo acme/widgets --state all --head agent/issue-42-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
-    printf '%s\n' '[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"OPEN","mergedAt":null,"autoMergeRequest":{"mergeMethod":"SQUASH"},"isDraft":false,"headRefName":"agent/issue-42-run","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+    printf '%s\n' '[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"OPEN","mergedAt":null,"autoMergeRequest":{"mergeMethod":"SQUASH"},"isDraft":false,"headRefName":"agent/issue-42-run","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}},{"number":101,"url":"https://github.com/acme/widgets/pull/101","state":"CLOSED","mergedAt":null,"autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-42-run","headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/100/comments?per_page=100 --paginate --slurp")
-    printf '%s\n' '[[],[{"body":"existing comment"}]]' ;;
+    printf '%s\n' '[[],[{"body":"open comment"}]]' ;;
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/101/comments?per_page=100 --paginate --slurp")
+    printf '%s\n' '[[{"body":"closed comment"}]]' ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
 esac`)
 	issue, pulls, err := (Client{Executable: gh}).OwnedRunResources(context.Background(), "acme/widgets", 42, "agent/issue-42-run")
@@ -376,9 +378,11 @@ esac`)
 	if issue.Number != 42 || issue.State != "open" || strings.Join(issue.Labels, ",") != "in-progress,spec" {
 		t.Fatalf("issue = %#v", issue)
 	}
-	if len(pulls) != 1 || pulls[0].Number != 100 || pulls[0].State != "open" || !pulls[0].AutoMergeArmed ||
+	if len(pulls) != 2 || pulls[0].Number != 100 || pulls[0].State != "open" || !pulls[0].AutoMergeArmed ||
 		pulls[0].Branch != "agent/issue-42-run" || pulls[0].Commit != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ||
-		strings.Join(pulls[0].Comments, ",") != "existing comment" {
+		strings.Join(pulls[0].Comments, ",") != "open comment" || pulls[1].Number != 101 || pulls[1].State != "closed" ||
+		pulls[1].AutoMergeArmed || pulls[1].Commit != "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" ||
+		strings.Join(pulls[1].Comments, ",") != "closed comment" {
 		t.Fatalf("pulls = %#v", pulls)
 	}
 }
