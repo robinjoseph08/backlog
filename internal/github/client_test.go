@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestClientDiscoversRepository(t *testing.T) {
@@ -191,8 +192,8 @@ func TestTwentyCommandErrorsRetainFullOversizedStderrOnce(t *testing.T) {
 	const recordLimit = 20
 	records := make([]*CandidateDiscoveryError, 0, recordLimit)
 	for record := 1; record <= recordLimit; record++ {
-		tail := fmt.Sprintf("complete oversized stderr tail %d", record)
-		stderr := append(bytes.Repeat([]byte(fmt.Sprintf("oversized stderr evidence %d ", record)), 4096), tail...)
+		tail := fmt.Sprintf("complete oversized stderr tail 界%d", record)
+		stderr := append(bytes.Repeat([]byte(fmt.Sprintf("oversized stderr evidence 界%d ", record)), 4096), tail...)
 		exitError := &exec.ExitError{Stderr: stderr}
 		command := fmt.Sprintf("issue view %d --repo acme/widgets", record)
 		failure := newCommandError(command, exitError)
@@ -216,9 +217,9 @@ func TestTwentyCommandErrorsRetainFullOversizedStderrOnce(t *testing.T) {
 	for record, discovery := range records {
 		text := discovery.Error()
 		command := fmt.Sprintf("gh issue view %d --repo acme/widgets", record+1)
-		tail := fmt.Sprintf("complete oversized stderr tail %d", record+1)
-		if !strings.Contains(text, command) || !strings.Contains(text, "oversized stderr evidence") || !strings.Contains(text, tail) || strings.Contains(text, "truncated") {
-			t.Fatalf("record %d lost full command or stderr evidence", record+1)
+		tail := fmt.Sprintf("complete oversized stderr tail 界%d", record+1)
+		if !utf8.ValidString(text) || !strings.Contains(text, command) || !strings.Contains(text, "oversized stderr evidence") || !strings.Contains(text, tail) || strings.Contains(text, "truncated") {
+			t.Fatalf("record %d lost or corrupted full multibyte command stderr evidence", record+1)
 		}
 		if len([]rune(discovery.Cause)) > 200 {
 			t.Fatalf("record %d concise cause has %d runes, want at most 200", record+1, len([]rune(discovery.Cause)))

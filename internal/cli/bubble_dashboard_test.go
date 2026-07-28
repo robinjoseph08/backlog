@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -445,7 +446,7 @@ func TestBubbleDashboardPagesFullDiagnosticsWithBoundedTickAndResizeWork(t *test
 		TerminalDimensions{Width: 80, Height: 24},
 	)
 	for failure := 1; failure <= dashboardDiagnosticLimit; failure++ {
-		tail := fmt.Sprintf("complete diagnostic tail %02d", failure)
+		tail := fmt.Sprintf("complete multibyte diagnostic tail 界%02d", failure)
 		evidence := strings.Repeat(fmt.Sprintf("oversized evidence %02d ", failure), (64<<10)/22) + tail
 		updated, _ := model.Update(dashboardOperationalMsg{event: runner.CandidateDiscoveryFailed{
 			Operation: runner.CandidateDiscoveryList, Err: errors.New(evidence), Cause: "oversized evidence",
@@ -461,7 +462,7 @@ func TestBubbleDashboardPagesFullDiagnosticsWithBoundedTickAndResizeWork(t *test
 	if len(content) > dashboardDiagnosticPageByteLimit+(12<<10) {
 		t.Fatalf("open Diagnostics viewport bytes = %d, want one bounded evidence page plus dashboard chrome", len(content))
 	}
-	if strings.Contains(content, "complete diagnostic tail 20") {
+	if strings.Contains(content, "complete multibyte diagnostic tail 界20") {
 		t.Fatal("first bounded evidence page unexpectedly contained the oversized record tail")
 	}
 	diagnostic := model.dashboard.admission.failures[dashboardDiagnosticLimit-1]
@@ -469,8 +470,8 @@ func TestBubbleDashboardPagesFullDiagnosticsWithBoundedTickAndResizeWork(t *test
 	var complete strings.Builder
 	for page := range pages {
 		chunk := diagnostic.page(page)
-		if len(chunk) > dashboardDiagnosticPageByteLimit+3 {
-			t.Fatalf("evidence page %d bytes = %d, want bounded UTF-8 page", page+1, len(chunk))
+		if len(chunk) > dashboardDiagnosticPageByteLimit+3 || !utf8.ValidString(chunk) {
+			t.Fatalf("evidence page %d is invalid or %d bytes, want bounded valid UTF-8", page+1, len(chunk))
 		}
 		complete.WriteString(chunk)
 	}
@@ -481,7 +482,7 @@ func TestBubbleDashboardPagesFullDiagnosticsWithBoundedTickAndResizeWork(t *test
 		updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: '.', Text: "."}))
 		model = updated.(bubbleDashboardModel)
 	}
-	if content = ansi.Strip(model.viewport.GetContent()); !strings.Contains(content, "complete diagnostic tail 20") || !strings.Contains(content, fmt.Sprintf("Evidence page %d/%d", pages, pages)) {
+	if content = ansi.Strip(model.viewport.GetContent()); !utf8.ValidString(content) || !strings.Contains(content, "complete multibyte diagnostic tail 界20") || !strings.Contains(content, fmt.Sprintf("Evidence page %d/%d", pages, pages)) {
 		t.Fatalf("paged Diagnostics did not retrieve the complete oversized evidence tail:\n%s", content)
 	}
 
@@ -1713,7 +1714,7 @@ func TestBubbleDashboardFinalFlushWaitsForRecoveryNoticeBeforeAcknowledgingNatur
 
 	requestedDelay := make(chan time.Duration, 1)
 	clockFired := make(chan time.Time, 1)
-	model := newBubbleDashboardModel(context.Background(), control, session, TerminalDimensions{Width: 100, Height: 20})
+	model := newBubbleDashboardModel(context.Background(), control, session, TerminalDimensions{Width: 140, Height: 20})
 	model.flushAfter = func(delay time.Duration) <-chan time.Time {
 		requestedDelay <- delay
 		return clockFired
@@ -1733,7 +1734,7 @@ func TestBubbleDashboardFinalFlushWaitsForRecoveryNoticeBeforeAcknowledgingNatur
 
 	view := ansi.Strip(model.View().Content)
 	for _, want := range []string{
-		"Admission: healthy | Recovered 2s ago after 3 failures",
+		"Admission: stopped | Last Candidate snapshot completed successfully | Recovered 2s ago after 3 failures",
 		"Runner stage: Complete; the Runner has exited",
 		"Next Ctrl-C: no effect",
 	} {
@@ -1760,7 +1761,7 @@ func TestBubbleDashboardFinalFlushWaitsForRecoveryNoticeBeforeAcknowledgingNatur
 		t.Fatalf("delayed natural-exit acknowledgment: %v", err)
 	}
 	view = ansi.Strip(model.View().Content)
-	for _, want := range []string{"Admission: healthy | Recovered", "Runner stage: Complete; the Runner has exited", "Next Ctrl-C: no effect"} {
+	for _, want := range []string{"Admission: stopped | Last Candidate snapshot completed successfully | Recovered", "Runner stage: Complete; the Runner has exited", "Next Ctrl-C: no effect"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("acknowledged natural-exit frame omitted %q:\n%s", want, view)
 		}

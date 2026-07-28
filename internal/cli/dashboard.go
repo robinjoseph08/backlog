@@ -1241,7 +1241,7 @@ func renderAdmissionDetails(output *strings.Builder, admission dashboardAdmissio
 	} else if !admission.snapshotComplete {
 		writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, incompleteAdmissionStatus(stage))
 	} else {
-		health := "  Admission: healthy" + admissionRecoverySummary(admission, now)
+		health := "  Admission: " + completedAdmissionStatus(admission, stage, now)
 		writeDashboardStyledLine(output, styler, dashboardSemanticActive, health)
 	}
 	renderAdmissionDiagnosticsState(output, admission, diagnosticsOpen, styler, 0)
@@ -1271,9 +1271,16 @@ func renderCompactAdmissionStatus(output *strings.Builder, admission dashboardAd
 			line += " | Retry: stopped"
 		}
 	} else if admission.snapshotComplete {
-		line = "  Admission: healthy" + admissionRecoverySummary(admission, now)
+		line = "  Admission: " + completedAdmissionStatus(admission, stage, now)
 	}
 	writeDashboardStyledLine(output, options.styler, semantic, truncateDashboardContent(line, options.width))
+}
+
+func completedAdmissionStatus(admission dashboardAdmission, stage dashboardStage, now time.Time) string {
+	if stage == dashboardRunning {
+		return "healthy" + admissionRecoverySummary(admission, now)
+	}
+	return "stopped | Last Candidate snapshot completed successfully" + admissionRecoverySummary(admission, now)
 }
 
 func incompleteAdmissionStatus(stage dashboardStage) string {

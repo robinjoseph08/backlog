@@ -544,7 +544,7 @@ func TestDashboardDiagnosticsLabelsExpiredReferencesHonestly(t *testing.T) {
 	}
 }
 
-func TestDashboardStopsIncompleteAdmissionAfterRunnerLeavesRunningStage(t *testing.T) {
+func TestDashboardStopsAdmissionAfterRunnerLeavesRunningStage(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	for _, test := range []struct {
 		name  string
@@ -567,12 +567,24 @@ func TestDashboardStopsIncompleteAdmissionAfterRunnerLeavesRunningStage(t *testi
 			}
 
 			admission := dashboardSectionAnchor("Admission health")
-			_, compact, _ := dashboard.renderResponsiveParts(now, responsiveDashboardOptions{
+			collapsedOptions := responsiveDashboardOptions{
 				density: dashboardDensityConstrained, width: 80, selected: admission,
 				expansionOverrides: map[string]bool{admission: false},
-			})
+			}
+			_, compact, _ := dashboard.renderResponsiveParts(now, collapsedOptions)
 			if !strings.Contains(compact.text, "Admission: stopped | Candidate snapshot not completed") || strings.Contains(compact.text, "Admission: checking") {
 				t.Fatalf("compact non-running stage retained active Admission check:\n%s", compact.text)
+			}
+
+			dashboard.operationalEvent(runner.CandidateSnapshotCompleted{OccurredAt: now.Add(-time.Second)})
+			_, body, _ = dashboard.renderParts(now)
+			completed := "Admission: stopped | Last Candidate snapshot completed successfully"
+			if !strings.Contains(body, completed) || strings.Contains(body, "Admission: healthy") || strings.Contains(body, "snapshot not completed") {
+				t.Fatalf("expanded completed Admission did not render a truthful stopped state:\n%s", body)
+			}
+			_, compact, _ = dashboard.renderResponsiveParts(now, collapsedOptions)
+			if !strings.Contains(compact.text, completed) || strings.Contains(compact.text, "Admission: healthy") || strings.Contains(compact.text, "snapshot not completed") {
+				t.Fatalf("collapsed completed Admission did not render a truthful stopped state:\n%s", compact.text)
 			}
 		})
 	}

@@ -70,6 +70,24 @@ type Workers interface {
 	Release(runID string) error
 }
 
+type candidateRetryTimer interface {
+	channel() <-chan time.Time
+	reset(time.Duration)
+	stop()
+}
+
+type systemCandidateRetryTimer struct {
+	timer *time.Timer
+}
+
+func newSystemCandidateRetryTimer(delay time.Duration) candidateRetryTimer {
+	return &systemCandidateRetryTimer{timer: time.NewTimer(delay)}
+}
+
+func (t *systemCandidateRetryTimer) channel() <-chan time.Time { return t.timer.C }
+func (t *systemCandidateRetryTimer) reset(delay time.Duration) { t.timer.Reset(delay) }
+func (t *systemCandidateRetryTimer) stop()                     { t.timer.Stop() }
+
 type Runner struct {
 	Config    Config
 	GitHub    GitHub
@@ -92,12 +110,13 @@ type Runner struct {
 	// one-shot exhaustion. Signal shutdown and watch mode do not call it.
 	FinalSummary func(state.State) error
 
-	Now               func() time.Time
-	NewRunID          func(issue int) string
-	PIDAlive          func(pid int) bool
-	ProcessGroupAlive func(pid int) (bool, error)
-	PIDIdentity       func(context.Context, int) (string, error)
-	Lstat             func(string) (os.FileInfo, error)
+	Now                    func() time.Time
+	newCandidateRetryTimer func(time.Duration) candidateRetryTimer
+	NewRunID               func(issue int) string
+	PIDAlive               func(pid int) bool
+	ProcessGroupAlive      func(pid int) (bool, error)
+	PIDIdentity            func(context.Context, int) (string, error)
+	Lstat                  func(string) (os.FileInfo, error)
 
 	suspensionExit       atomic.Int32
 	suspensionFailed     atomic.Bool
@@ -278,14 +297,18 @@ func (r *Runner) Run(ctx context.Context) error {
 	localWorkers := make(map[int]WorkerProcess)
 	poll := time.NewTicker(r.Config.PollInterval)
 	defer poll.Stop()
-	var candidateRetryTimer *time.Timer
+	newCandidateRetryTimer := r.newCandidateRetryTimer
+	if newCandidateRetryTimer == nil {
+		newCandidateRetryTimer = newSystemCandidateRetryTimer
+	}
+	var candidateRetryTimer candidateRetryTimer
 	var candidateRetry <-chan time.Time
 	candidateDiscoveryFailures := 0
 	candidateSnapshotCompleted := false
 	var candidateDiscoveryFirstFailure time.Time
 	defer func() {
 		if candidateRetryTimer != nil {
-			candidateRetryTimer.Stop()
+			candidateRetryTimer.stop()
 		}
 	}()
 
@@ -361,13 +384,15 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 			if err != nil {
 				candidateDiscoveryFailures++
-				if candidateRetryTimer == nil {
-					candidateRetryTimer = time.NewTimer(r.Config.PollInterval)
-				} else {
-					candidateRetryTimer.Reset(r.Config.PollInterval)
-				}
-				candidateRetry = candidateRetryTimer.C
 				occurredAt := r.Now().UTC()
+				retryAt := occurredAt.Add(r.Config.PollInterval)
+				retryDelay := retryAt.Sub(occurredAt)
+				if candidateRetryTimer == nil {
+					candidateRetryTimer = newCandidateRetryTimer(retryDelay)
+				} else {
+					candidateRetryTimer.reset(retryDelay)
+				}
+				candidateRetry = candidateRetryTimer.channel()
 				if candidateDiscoveryFailures == 1 {
 					candidateDiscoveryFirstFailure = occurredAt
 				}
@@ -392,7 +417,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				}
 				r.emitWhileAdmissionActive(admission, CandidateDiscoveryFailed{
 					Operation: operation, Issue: issue, Err: err, Cause: cause,
-					FirstFailureAt: candidateDiscoveryFirstFailure, OccurredAt: occurredAt, RetryAt: occurredAt.Add(r.Config.PollInterval),
+					FirstFailureAt: candidateDiscoveryFirstFailure, OccurredAt: occurredAt, RetryAt: retryAt,
 					ConsecutiveFailures: candidateDiscoveryFailures, Occurrences: 1,
 				})
 			} else {

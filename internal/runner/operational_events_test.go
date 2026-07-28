@@ -29,6 +29,25 @@ type blockingOperationalOutput struct {
 	once    sync.Once
 }
 
+type controlledCandidateRetryTimer struct {
+	ticks       chan time.Time
+	resetDelays chan time.Duration
+	stopped     chan struct{}
+	stopOnce    sync.Once
+}
+
+func newControlledCandidateRetryTimer() *controlledCandidateRetryTimer {
+	return &controlledCandidateRetryTimer{
+		ticks: make(chan time.Time, 1), resetDelays: make(chan time.Duration, 1), stopped: make(chan struct{}),
+	}
+}
+
+func (t *controlledCandidateRetryTimer) channel() <-chan time.Time { return t.ticks }
+func (t *controlledCandidateRetryTimer) reset(delay time.Duration) { t.resetDelays <- delay }
+func (t *controlledCandidateRetryTimer) stop() {
+	t.stopOnce.Do(func() { close(t.stopped) })
+}
+
 func (w *blockingOperationalOutput) Write(content []byte) (int, error) {
 	w.once.Do(func() { close(w.started) })
 	<-w.release
@@ -234,6 +253,97 @@ func TestRunnerReportsCandidateDiscoveryFailuresAndResetsCountAfterRecovery(t *t
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("plain output omitted %q: %q", want, output.String())
 		}
+	}
+}
+
+func TestRunnerDerivesCandidateRetryTimerAndEventFromOneReferenceTime(t *testing.T) {
+	base := time.Date(2026, 7, 2, 3, 4, 5, 0, time.UTC)
+	const retryDelay = 30 * time.Second
+	github := &fakeGitHub{
+		candidateResults: []candidateResult{{err: errors.New("temporary failure")}, {}},
+		candidateChanged: make(chan struct{}, 2),
+	}
+	runner := testRunner(github, newFakeWorkers(), &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+	runner.Config.PollInterval = retryDelay
+	referenceCaptured := false
+	runner.Now = func() time.Time {
+		referenceCaptured = true
+		return base
+	}
+	timer := newControlledCandidateRetryTimer()
+	type timerCreation struct {
+		delay                  time.Duration
+		referenceCapturedFirst bool
+	}
+	createdWith := make(chan timerCreation, 1)
+	runner.newCandidateRetryTimer = func(delay time.Duration) candidateRetryTimer {
+		createdWith <- timerCreation{delay: delay, referenceCapturedFirst: referenceCaptured}
+		return timer
+	}
+	recorder := &operationalEventRecorder{}
+	runner.OnOperationalEvent = recorder.record
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	<-github.candidateChanged
+	creation := <-createdWith
+	if creation.delay != retryDelay || !creation.referenceCapturedFirst {
+		t.Fatalf("retry timer creation = %#v, want %s after the event reference time", creation, retryDelay)
+	}
+	events := recorder.waitFor(t, func(events []OperationalEvent) bool { return len(events) >= 1 })
+	failure, ok := events[0].(CandidateDiscoveryFailed)
+	if !ok || !failure.OccurredAt.Equal(base) || !failure.RetryAt.Equal(base.Add(retryDelay)) {
+		t.Fatalf("Candidate failure timing = %#v, want occurrence %s and retry %s", events[0], base, base.Add(retryDelay))
+	}
+	select {
+	case <-github.candidateChanged:
+		t.Fatal("Candidate discovery retried before the controlled retry timer fired")
+	default:
+	}
+
+	timer.ticks <- base.Add(retryDelay)
+	select {
+	case <-github.candidateChanged:
+	case <-time.After(time.Second):
+		t.Fatal("Candidate discovery did not retry after the controlled timer fired")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	select {
+	case <-timer.stopped:
+	default:
+		t.Fatal("completed Runner did not stop the retry timer")
+	}
+}
+
+func TestRunnerCancellationStopsPendingCandidateRetryTimer(t *testing.T) {
+	github := &fakeGitHub{
+		candidateResults: []candidateResult{{err: errors.New("temporary failure")}},
+		candidateChanged: make(chan struct{}, 1),
+	}
+	runner := testRunner(github, newFakeWorkers(), &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+	runner.Config.PollInterval = time.Hour
+	timer := newControlledCandidateRetryTimer()
+	created := make(chan struct{}, 1)
+	runner.newCandidateRetryTimer = func(time.Duration) candidateRetryTimer {
+		created <- struct{}{}
+		return timer
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	<-github.candidateChanged
+	<-created
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	select {
+	case <-timer.stopped:
+	default:
+		t.Fatal("canceled Runner did not stop the pending retry timer")
 	}
 }
 
