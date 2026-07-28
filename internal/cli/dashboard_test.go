@@ -10,16 +10,19 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/creack/pty"
 	"github.com/robinjoseph08/backlog/internal/activity"
 	"github.com/robinjoseph08/backlog/internal/runner"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
+	"golang.org/x/term"
 )
 
 type dashboardTestSource struct {
@@ -165,7 +168,8 @@ func TestTerminalDashboardSetupFailureLeavesNormalScreenResult(t *testing.T) {
 
 func TestTerminalDashboardSetupFailureRetainsAvailableState(t *testing.T) {
 	repository := initializeFollowRepository(t)
-	stateDir := t.TempDir()
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
 	active := scheduler.Run{
 		Issue: 72, IssueTitle: "Existing setup work", RunID: "active-72",
 		Status: scheduler.StatusClaimed, WorkerMode: scheduler.WorkerModePrint,
@@ -184,21 +188,75 @@ func TestTerminalDashboardSetupFailureRetainsAvailableState(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	gh := writeExecutable(t, "#!/bin/sh\necho 'repository lookup failed' >&2\nexit 9\n")
+	setupStarted := filepath.Join(root, "setup-started")
+	releaseSetup := filepath.Join(root, "release-setup")
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+touch `+quote(setupStarted)+`
+while ! test -f `+quote(releaseSetup)+`; do sleep 0.01; done
+echo 'repository lookup failed' >&2
+exit 9
+`)
 
-	var stdout, stderr bytes.Buffer
-	exit := MainWithTerminal(context.Background(), []string{
-		"run", "--repo-dir", repository, "--state-dir", stateDir, "--gh", gh,
-	}, TerminalDependencies{
-		Input: strings.NewReader(""), Output: &stdout, ErrorOutput: &stderr,
-		IsTerminal:   func() bool { return true },
-		Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
-		ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
-	})
+	primary, terminal, err := pty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer primary.Close()
+	defer terminal.Close()
+	if err := pty.Setsize(terminal, &pty.Winsize{Rows: 24, Cols: 80}); err != nil {
+		t.Fatal(err)
+	}
+	initialState, err := term.GetState(int(terminal.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := newPTYPresentationOutput(terminal)
+	input := newPTYPresentationInput(terminal)
+	go func() { _, _ = io.Copy(io.Discard, primary) }()
+	var stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- MainWithTerminal(context.Background(), []string{
+			"run", "--repo-dir", repository, "--state-dir", stateDir, "--gh", gh,
+		}, TerminalDependencies{
+			Input: input, Output: output, ErrorOutput: &stderr,
+			IsTerminal:   func() bool { return true },
+			Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
+			ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+		})
+	}()
+	waitForFile(t, setupStarted)
+	select {
+	case <-output.enteredAlternateScreen:
+	case <-time.After(10 * time.Second):
+		t.Fatal("default dashboard did not enter the alternate screen before setup failed")
+	}
+	inputCtx, cancelInput := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInput()
+	if err := finishPTYPresentationInput(inputCtx, primary, input); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(releaseSetup, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var exit int
+	select {
+	case exit = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("repository setup failure did not finish")
+	}
 	if exit != 1 || !strings.Contains(stderr.String(), "repository lookup failed") {
 		t.Fatalf("repository setup failure exit = %d, stderr = %q", exit, stderr.String())
 	}
-	result := stdout.String()
+	restoredState, stateErr := term.GetState(int(terminal.Fd()))
+	if stateErr != nil {
+		t.Fatal(stateErr)
+	}
+	if !reflect.DeepEqual(restoredState, initialState) {
+		t.Fatalf("terminal state after repository setup failure = %#v, want %#v", restoredState, initialState)
+	}
+	result := output.String()
 	for _, want := range []string{
 		"Final aggregate summary", "Final outcome: Error:", "Repository: acme/widgets",
 		"Active (1)", "#72  Existing setup work  claimed",
@@ -207,6 +265,14 @@ func TestTerminalDashboardSetupFailureRetainsAvailableState(t *testing.T) {
 		if !strings.Contains(result, want) {
 			t.Fatalf("setup failure result missing %q: %q", want, result)
 		}
+	}
+	enter := strings.Index(result, "\x1b[?1049h")
+	hideCursor := strings.Index(result, "\x1b[?25l")
+	restore := strings.LastIndex(result, "\x1b[?1049l")
+	showCursor := strings.LastIndex(result, "\x1b[?25h")
+	summary := strings.Index(result, "Final aggregate summary")
+	if enter < 0 || hideCursor < 0 || restore < enter || showCursor < hideCursor || summary < restore || summary < showCursor {
+		t.Fatalf("setup failure did not restore the normal screen and cursor before the summary: %q", result)
 	}
 }
 

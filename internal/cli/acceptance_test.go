@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
@@ -22,6 +23,7 @@ import (
 	"github.com/creack/pty"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
+	"golang.org/x/term"
 )
 
 func TestCompiledExecutableUsesLifecycleExitForSignalDuringSetup(t *testing.T) {
@@ -998,11 +1000,27 @@ while :; do sleep 1; done
 
 	command := exec.Command(binary, "run", "--repo-dir", repository, "--state-dir", stateDir,
 		"--max-workers", "1", "--poll", "5ms", "--gh", gh, "--git", git, "--pi", pi)
-	terminal, err := pty.StartWithSize(command, &pty.Winsize{Rows: 28, Cols: 100})
+	terminal, childTerminal, err := pty.Open()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer terminal.Close()
+	defer childTerminal.Close()
+	if err := pty.Setsize(terminal, &pty.Winsize{Rows: 28, Cols: 100}); err != nil {
+		t.Fatal(err)
+	}
+	initialTerminalState, err := term.GetState(int(terminal.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.Stdin, command.Stdout, command.Stderr = childTerminal, childTerminal, childTerminal
+	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := childTerminal.Close(); err != nil {
+		t.Fatal(err)
+	}
 	var output synchronizedBuffer
 	readDone := make(chan struct{})
 	go func() {
@@ -1058,7 +1076,13 @@ while :; do sleep 1; done
 	if !errors.As(err, &exitError) || exitError.ExitCode() != 130 {
 		t.Fatalf("compiled pseudo-terminal exit = %v, want 130; output = %q", err, output.String())
 	}
-	_ = terminal.Close()
+	restoredTerminalState, stateErr := term.GetState(int(terminal.Fd()))
+	if stateErr != nil {
+		t.Fatal(stateErr)
+	}
+	if !reflect.DeepEqual(restoredTerminalState, initialTerminalState) {
+		t.Fatalf("compiled dashboard terminal state after force stop = %#v, want %#v", restoredTerminalState, initialTerminalState)
+	}
 	select {
 	case <-readDone:
 	case <-time.After(3 * time.Second):

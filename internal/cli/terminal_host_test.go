@@ -16,12 +16,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/creack/pty"
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
 	"github.com/robinjoseph08/backlog/internal/runner"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 	"github.com/robinjoseph08/backlog/internal/worker"
 	"github.com/robinjoseph08/backlog/internal/worktree"
+	"golang.org/x/term"
 )
 
 func TestURLOpenerExecutableUsesPlatformDefault(t *testing.T) {
@@ -1127,6 +1129,147 @@ while :; do sleep 1; done
 			}
 			if stderr.Len() != 0 {
 				t.Fatalf("stderr = %q", stderr.String())
+			}
+		})
+	}
+}
+
+func TestDefaultDashboardCompletesOwnedWorkerShutdownBeforePTYRestorationAndFinalSummary(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		signal           os.Signal
+		workerScript     func(root, started string) string
+		wantExit         int
+		wantStatus       scheduler.Status
+		wantBoundary     bool
+		wantLease        bool
+		wantDashboard    string
+		wantFinalSummary []string
+	}{
+		{
+			name: "Drain", signal: os.Interrupt, wantStatus: scheduler.StatusMerged,
+			workerScript: func(root, started string) string {
+				return `#!/bin/sh
+set -eu
+IFS= read -r prompt
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
+touch ` + quote(started) + `
+while ! test -f ` + quote(filepath.Join(root, "release-worker")) + `; do sleep 0.01; done
+touch ` + quote(filepath.Join(root, "worker-completed")) + `
+printf '%s\n' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+while IFS= read -r ignored; do :; done
+`
+			},
+			wantDashboard: "Runner stage: Drain complete",
+			wantFinalSummary: []string{
+				"Final outcome: Drain complete", "Completions produced (1)", "#65  Terminal host  merged", "Attention Required (0)",
+			},
+		},
+		{
+			name: "bounded suspension", signal: syscall.SIGTERM, workerScript: presentationSuspendingWorkerScript,
+			wantExit: 143, wantStatus: scheduler.StatusSuspended, wantBoundary: true, wantLease: true,
+			wantDashboard: "Runner stage: Suspension finished",
+			wantFinalSummary: []string{
+				"Final outcome: Suspension complete", "Completions produced (0)", "Active (1)", "#65  Terminal host  suspended", "Attention Required (0)",
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newPresentationWorkerFixture(t, test.workerScript)
+			primary, terminal, err := pty.Open()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer primary.Close()
+			defer terminal.Close()
+			if err := pty.Setsize(terminal, &pty.Winsize{Rows: 24, Cols: 80}); err != nil {
+				t.Fatal(err)
+			}
+			initialState, err := term.GetState(int(terminal.Fd()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			output := newPTYPresentationOutput(terminal)
+			input := newPTYPresentationInput(terminal)
+			go func() { _, _ = io.Copy(io.Discard, primary) }()
+			externalSignals := make(chan os.Signal)
+			var stderr bytes.Buffer
+			done := make(chan int, 1)
+			go func() {
+				done <- MainWithTerminal(context.Background(), fixture.args, TerminalDependencies{
+					Input: input, Output: output, ErrorOutput: &stderr, Signals: externalSignals,
+					IsTerminal:   func() bool { return true },
+					Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
+					ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+				})
+			}()
+			waitForFile(t, fixture.workerStarted)
+			select {
+			case <-output.enteredAlternateScreen:
+			case <-time.After(10 * time.Second):
+				t.Fatal("default dashboard did not enter the alternate screen with an Owned Worker")
+			}
+			inputCtx, cancelInput := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancelInput()
+			if err := finishPTYPresentationInput(inputCtx, primary, input); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case externalSignals <- test.signal:
+			case exit := <-done:
+				t.Fatalf("default dashboard exited with %d before shutdown signal", exit)
+			case <-time.After(10 * time.Second):
+				t.Fatal("shutdown signal was not accepted")
+			}
+			if test.signal == syscall.SIGTERM {
+				waitForFile(t, filepath.Join(fixture.root, "suspension-started"))
+			} else {
+				waitForPseudoTerminalScreen(t, &output.output, 80, 24, "Runner stage: Draining")
+			}
+			if err := os.WriteFile(filepath.Join(fixture.root, "release-worker"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var exit int
+			select {
+			case exit = <-done:
+			case <-time.After(15 * time.Second):
+				t.Fatal("default dashboard did not finish Owned Worker shutdown")
+			}
+			if exit != test.wantExit || stderr.Len() != 0 {
+				t.Fatalf("exit = %d, want %d; stderr = %q; output = %q", exit, test.wantExit, stderr.String(), output.String())
+			}
+			current, err := (state.FileStore{Path: fixture.statePath}).Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(current.Runs) != 1 || current.Runs[0].Status != test.wantStatus || (current.Runs[0].Continuation != nil) != test.wantBoundary || (len(current.Leases) == 1) != test.wantLease {
+				t.Fatalf("final state after default-dashboard shutdown = %#v", current)
+			}
+			restoredState, stateErr := term.GetState(int(terminal.Fd()))
+			if stateErr != nil {
+				t.Fatal(stateErr)
+			}
+			if !reflect.DeepEqual(restoredState, initialState) {
+				t.Fatalf("terminal state after %s = %#v, want %#v", test.name, restoredState, initialState)
+			}
+
+			raw := output.String()
+			enter := strings.Index(raw, "\x1b[?1049h")
+			hideCursor := strings.Index(raw, "\x1b[?25l")
+			restore := strings.LastIndex(raw, "\x1b[?1049l")
+			showCursor := strings.LastIndex(raw, "\x1b[?25h")
+			summary := strings.Index(raw, "Final aggregate summary")
+			if enter < 0 || hideCursor < 0 || restore < enter || showCursor < hideCursor || summary < restore || summary < showCursor {
+				t.Fatalf("%s did not restore the normal screen and cursor before the final summary: %q", test.name, raw)
+			}
+			visible := terminalScreenText(raw[:restore], 80, 24)
+			if !strings.Contains(visible, test.wantDashboard) || !strings.Contains(visible, "Next Ctrl-C: no effect") {
+				t.Fatalf("final %s dashboard frame was not flushed before teardown:\n%s\nraw output: %q", test.name, visible, raw)
+			}
+			for _, want := range test.wantFinalSummary {
+				if !strings.Contains(raw[summary:], want) {
+					t.Fatalf("%s final summary missing %q: %q", test.name, want, raw[summary:])
+				}
 			}
 		})
 	}
