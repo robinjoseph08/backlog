@@ -1981,21 +1981,33 @@ func writeActivityEntries(t *testing.T, path string, entries ...activity.Entry) 
 	}
 }
 
+func TestSynchronizedBufferDoesNotExposeUnsafeReadFrom(t *testing.T) {
+	if _, ok := any(&synchronizedBuffer{}).(io.ReaderFrom); ok {
+		t.Fatal("synchronizedBuffer implements io.ReaderFrom, allowing io.Copy to bypass its synchronized Write method")
+	}
+}
+
 type synchronizedBuffer struct {
-	mu sync.Mutex
-	bytes.Buffer
+	mu     sync.Mutex
+	buffer bytes.Buffer
 }
 
 func (b *synchronizedBuffer) Write(data []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.Buffer.Write(data)
+	return b.buffer.Write(data)
 }
 
 func (b *synchronizedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.Buffer.String()
+	return b.buffer.String()
+}
+
+func (b *synchronizedBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Len()
 }
 
 func waitForBuffer(t *testing.T, buffer *synchronizedBuffer, contains string) {
