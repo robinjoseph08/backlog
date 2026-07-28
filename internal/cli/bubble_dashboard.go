@@ -669,7 +669,7 @@ func (m bubbleDashboardModel) View() tea.View {
 
 	lines := make([]string, 0, m.height)
 	if frame.titleHeight > 0 {
-		lines = append(lines, renderDashboardTitle(frame.title))
+		lines = append(lines, renderDashboardTitle(frame.title, m.styler))
 	}
 	lines = append(lines, frame.chrome.top...)
 	if frame.bodyHeight > 0 {
@@ -710,7 +710,10 @@ func (m bubbleDashboardModel) dashboardFrame() dashboardFrame {
 	}
 }
 
-func renderDashboardTitle(title string) string {
+func renderDashboardTitle(title string, styler dashboardStyler) string {
+	if !styler.enabled {
+		return title
+	}
 	return lipgloss.NewStyle().Bold(true).Render(title)
 }
 
