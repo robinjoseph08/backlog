@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1069,6 +1070,59 @@ exec `+quote(gh)+` "$@"
 			}
 			if string(calls) != "disable\ncomment\nclose\n" {
 				t.Fatalf("rerun repeated a completed pull request mutation: %q", calls)
+			}
+		})
+	}
+}
+
+func TestCompiledResolveRecordsCompletionWhenExpectedPullRequestMergesDuringRevalidation(t *testing.T) {
+	binary := buildExecutable(t, t.TempDir())
+	for _, test := range []struct {
+		name    string
+		mergeAt int
+	}{
+		{name: "initial full plan", mergeAt: 3},
+		{name: "pre-action plan", mergeAt: 5},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newGitHubArtifactResetFixture(t, scheduler.StatusWaitingForMerge, false, false, false)
+			gh := githubArtifactResolveGitHub(t, fixture)
+			counter := filepath.Join(t.TempDir(), "pull-request-inspections")
+			racingGitHub := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "pr list --repo acme/widgets --state all --head `+fixture.branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    count=0
+    if [ -f `+quote(counter)+` ]; then count=$(cat `+quote(counter)+`); fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > `+quote(counter)+`
+    if [ "$count" -eq `+strconv.Itoa(test.mergeAt)+` ]; then
+      temporary=`+quote(fixture.githubState)+`.tmp
+      jq '.pr="MERGED" | .merged=true | .auto=false' `+quote(fixture.githubState)+` > "$temporary"
+      mv "$temporary" `+quote(fixture.githubState)+`
+    fi ;;
+esac
+exec `+quote(gh)+` "$@"
+`)
+
+			command := exec.Command(binary, githubArtifactResolveArgs(fixture, fixture.git, racingGitHub, "--yes")...)
+			output, err := command.CombinedOutput()
+			if err != nil || !strings.Contains(string(output), "Completion recorded for Run run-github") {
+				t.Fatalf("compiled %s merge revalidation: %v\n%s", test.name, err, output)
+			}
+			current, err := fixture.store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if current.Runs[0].Status != scheduler.StatusMerged || current.Runs[0].CompletedAt == nil || len(current.Leases) != 0 {
+				t.Fatalf("%s merge revalidation state = %#v", test.name, current)
+			}
+			if calls, err := os.ReadFile(fixture.githubCalls); err == nil && len(calls) != 0 || err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("%s merge revalidation performed a retirement mutation: %q, %v", test.name, calls, err)
+			}
+			github := fixture.githubStateValue(t)
+			if !github.Merged || github.PR != "MERGED" {
+				t.Fatalf("%s merge revalidation pull request = %#v", test.name, github)
 			}
 		})
 	}

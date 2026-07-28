@@ -246,6 +246,9 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 	if err := e.validateMutation(plan); err != nil {
 		return err
 	}
+	if completed, err := e.completeMergedPlan(ctx, plan); completed {
+		return err
+	}
 	if !executablePlansEqual(approved, plan) {
 		return fmt.Errorf("%s Plan changed after confirmation; rerun %s to review the current plan", e.policy.Operation, e.policy.Operation)
 	}
@@ -278,8 +281,8 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			}
 			continue
 		case actionDisablePullRequestAutoMerge:
-			before, err := e.revalidateAction(ctx, plan, approved, action, "disabling pull request auto-merge")
-			if err != nil {
+			before, completed, err := e.revalidateAction(ctx, plan, approved, action, "disabling pull request auto-merge")
+			if err != nil || completed {
 				return err
 			}
 			pull, found := pullRequestByNumber(before.Snapshot.PullRequests, action.pullRequest)
@@ -298,8 +301,8 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return fmt.Errorf("pull request #%d was not freshly verified open, unmerged, and auto-merge unarmed", pull.Number)
 			}
 		case actionExplainPullRequest:
-			before, err := e.revalidateAction(ctx, plan, approved, action, "commenting on pull request")
-			if err != nil {
+			before, completed, err := e.revalidateAction(ctx, plan, approved, action, "commenting on pull request")
+			if err != nil || completed {
 				return err
 			}
 			pull, found := pullRequestByNumber(before.Snapshot.PullRequests, action.pullRequest)
@@ -318,8 +321,8 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return fmt.Errorf("pull request #%d %s explanation did not satisfy its verified postcondition", pull.Number, e.policy.Operation)
 			}
 		case actionClosePullRequest:
-			before, err := e.revalidateAction(ctx, plan, approved, action, "closing pull request")
-			if err != nil {
+			before, completed, err := e.revalidateAction(ctx, plan, approved, action, "closing pull request")
+			if err != nil || completed {
 				return err
 			}
 			pull, found := pullRequestByNumber(before.Snapshot.PullRequests, action.pullRequest)
@@ -338,8 +341,8 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return fmt.Errorf("pull request #%d was not freshly verified closed and unmerged with auto-merge unarmed", pull.Number)
 			}
 		case actionDeleteRemoteBranch:
-			before, err := e.revalidateAction(ctx, plan, approved, action, "deleting remote branch")
-			if err != nil {
+			before, completed, err := e.revalidateAction(ctx, plan, approved, action, "deleting remote branch")
+			if err != nil || completed {
 				return err
 			}
 			branch := before.Snapshot.RemoteBranch
@@ -354,8 +357,8 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return fmt.Errorf("owned remote branch %s is still present after deletion", branch.Name)
 			}
 		case actionRemoveLocalWorktree:
-			before, err := e.revalidateAction(ctx, plan, approved, action, "removing local worktree")
-			if err != nil {
+			before, completed, err := e.revalidateAction(ctx, plan, approved, action, "removing local worktree")
+			if err != nil || completed {
 				return err
 			}
 			worktree := before.Snapshot.Worktree
@@ -373,8 +376,8 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return fmt.Errorf("owned local worktree %s is still present after removal", worktree.Path)
 			}
 		case actionDeleteLocalBranch:
-			before, err := e.revalidateAction(ctx, plan, approved, action, "deleting local branch")
-			if err != nil {
+			before, completed, err := e.revalidateAction(ctx, plan, approved, action, "deleting local branch")
+			if err != nil || completed {
 				return err
 			}
 			branch := before.Snapshot.LocalBranch
@@ -392,8 +395,8 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return fmt.Errorf("owned local branch %s is still present after deletion", branch.Name)
 			}
 		case actionArchiveSession:
-			before, err := e.revalidateAction(ctx, plan, approved, action, "archiving Pi session")
-			if err != nil {
+			before, completed, err := e.revalidateAction(ctx, plan, approved, action, "archiving Pi session")
+			if err != nil || completed {
 				return err
 			}
 			session := before.Snapshot.Session
@@ -408,8 +411,8 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return fmt.Errorf("Pi session %s was not verified in its non-resumable historical archive", session.ID)
 			}
 		case actionRemoveIssueLabel:
-			before, err := e.revalidateAction(ctx, plan, approved, action, "removing issue label "+action.label)
-			if err != nil {
+			before, completed, err := e.revalidateAction(ctx, plan, approved, action, "removing issue label "+action.label)
+			if err != nil || completed {
 				return err
 			}
 			if err := e.github.RemoveIssueLabel(ctx, before.Snapshot.Repository, before.Snapshot.Run.Issue, action.label); err != nil {
@@ -423,8 +426,8 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return err
 			}
 		case actionAddIssueLabel:
-			before, err := e.revalidateAction(ctx, plan, approved, action, "adding issue label "+action.label)
-			if err != nil {
+			before, completed, err := e.revalidateAction(ctx, plan, approved, action, "adding issue label "+action.label)
+			if err != nil || completed {
 				return err
 			}
 			if err := e.github.AddIssueLabel(ctx, before.Snapshot.Repository, before.Snapshot.Run.Issue, action.label); err != nil {
@@ -447,32 +450,35 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 	}
 }
 
-func (e Service) revalidatePlan(ctx context.Context, current, approved Plan, action string) (Plan, error) {
+func (e Service) revalidatePlan(ctx context.Context, current, approved Plan, action string) (Plan, bool, error) {
 	fresh, err := e.inspect(ctx)
 	if err != nil {
-		return Plan{}, err
+		return Plan{}, false, err
 	}
 	if err := e.validateMutation(fresh); err != nil {
-		return Plan{}, err
+		return Plan{}, false, err
+	}
+	if completed, err := e.completeMergedPlan(ctx, fresh); completed {
+		return Plan{}, true, err
 	}
 	if err := e.verifyGitHubIdentityContinuity(approved.Snapshot, fresh.Snapshot); err != nil {
-		return Plan{}, err
+		return Plan{}, false, err
 	}
 	if !executablePlansEqual(current, fresh) {
-		return Plan{}, fmt.Errorf("%s Plan changed immediately before %s", e.policy.Operation, action)
+		return Plan{}, false, fmt.Errorf("%s Plan changed immediately before %s", e.policy.Operation, action)
 	}
-	return fresh, nil
+	return fresh, false, nil
 }
 
-func (e Service) revalidateAction(ctx context.Context, current, approved Plan, action Action, description string) (Plan, error) {
-	fresh, err := e.revalidatePlan(ctx, current, approved, description)
-	if err != nil {
-		return Plan{}, err
+func (e Service) revalidateAction(ctx context.Context, current, approved Plan, action Action, description string) (Plan, bool, error) {
+	fresh, completed, err := e.revalidatePlan(ctx, current, approved, description)
+	if err != nil || completed {
+		return Plan{}, completed, err
 	}
 	if len(fresh.Actions) == 0 || fresh.Actions[0] != action {
-		return Plan{}, fmt.Errorf("%s Plan no longer authorizes %s as its next action", e.policy.Operation, description)
+		return Plan{}, false, fmt.Errorf("%s Plan no longer authorizes %s as its next action", e.policy.Operation, description)
 	}
-	return fresh, nil
+	return fresh, false, nil
 }
 
 func executablePlansEqual(left, right Plan) bool {

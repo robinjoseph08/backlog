@@ -14,7 +14,7 @@ The consequences below describe the accepted end-state architecture. Delivery is
 - Issue #83 adds automatic reconciliation at Runner startup and during watch reconciliation.
 - Issue #84 adds automatic reconciliation after Worker settlement.
 
-Until those later slices land, the consequences below about artifact retirement and automatic Runner reconciliation are architectural decisions, not descriptions of currently available behavior.
+Complete explicit artifact retirement is current behavior. Until those later slices land, the consequences below about automatic Runner reconciliation remain architectural decisions rather than descriptions of currently available behavior.
 
 ## Consequences
 
@@ -27,7 +27,7 @@ Until those later slices land, the consequences below about artifact retirement 
 - Conclusively absent branches, worktrees, and active sessions are already retired. Already archived sessions are also satisfied. Changed, mismatched, or unknown artifacts stop resolution with the Lease retained.
 - Existing diagnostic logs and Run history are preserved. Missing recorded logs add a historical warning but do not retain active ownership solely to preserve unavailable diagnostics.
 - External Resolution removes `in-progress` and `ready-for-agent` from the closed issue while preserving unrelated labels and human workflow labels. Human workflow labels explain rather than block external closure.
-- GitHub and artifact state are revalidated before destructive mutations and finalization. A pull request that merges changes the outcome to Completion. An issue that reopens stops resolution with its Lease retained so the operator can close it again or Reset the Run.
+- GitHub and artifact state are revalidated before destructive mutations and finalization. The recorded expected pull request merging changes the outcome to Completion; a different owned pull request does not. An issue that reopens stops resolution with its Lease retained so the operator can close it again or Reset the Run.
 - External Resolution durably marks `resolving-externally` progress before its first external mutation and after each verified partial mutation, retaining the Lease throughout. Finalization atomically records the terminal outcome, resolution metadata, Worker log closure state, and Lease release.
 - Successful External Resolution is treated as handled and omitted from default status. Full status retains the outcome, timestamp, closure reason, diagnostics, and any missing-log warning.
 - Outcome Acknowledgment remains presentation-only. When a selected Run retains a Lease, its error should guide the operator toward Reset or External Resolution rather than implying it can be acknowledged.
