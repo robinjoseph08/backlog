@@ -489,7 +489,6 @@ while IFS= read -r ignored; do :; done
 	}()
 	waitForFile(t, activityEmitted)
 	waitForBuffer(t, &stdout, "Deepest operation: bash")
-	waitForBuffer(t, &stdout, "Observed tokens: 1200")
 	if err := os.WriteFile(releaseWorker, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}

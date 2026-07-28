@@ -22,7 +22,7 @@ import (
 
 const (
 	dashboardOutputUpdateLimit = 64
-	dashboardNavigationHelp    = "Nav: ↑↓/jk PgUp/Dn/f/b Home/End g/G a:Attention"
+	dashboardNavigationHelp    = "Nav: ↑↓/jk PgUp/Dn/f/b Home/End g/G a:Attention Enter:Details"
 )
 
 type dashboardConfiguredMsg struct {
@@ -303,9 +303,10 @@ type bubbleDashboardModel struct {
 	colorProfile TerminalColorProfile
 	styler       dashboardStyler
 
-	selectedAnchor   string
-	attentionKnown   map[string]struct{}
-	attentionPending map[string]struct{}
+	selectedAnchor     string
+	attentionKnown     map[string]struct{}
+	attentionPending   map[string]struct{}
+	expansionOverrides map[string]bool
 
 	interruptsWaiting int
 	pendingFlushes    []dashboardFlushMsg
@@ -326,7 +327,8 @@ func newBubbleDashboardModel(ctx context.Context, control PresentationControl, s
 		dashboard: newLiveDashboard(io.Discard, nil, empty, control.Terminal.Now),
 		viewport:  view, width: dimensions.Width, height: dimensions.Height,
 		attentionKnown: make(map[string]struct{}), attentionPending: make(map[string]struct{}),
-		colorProfile: profile, styler: newDashboardFallbackStyler(profile), startup: &atomic.Bool{},
+		colorProfile: profile, styler: newDashboardFallbackStyler(profile),
+		expansionOverrides: make(map[string]bool), startup: &atomic.Bool{},
 	}
 	model.refreshViewport(dashboardSelection{})
 	model.selectViewportAnchor()
@@ -393,6 +395,9 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, tea.Batch(commands...)
 		}
+		if msg.String() == "enter" {
+			m.toggleExpansion()
+		}
 	case dashboardInterruptResultMsg:
 		if m.interruptsWaiting > 0 {
 			m.interruptsWaiting--
@@ -458,7 +463,9 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	if m.navigateViewport(msg) {
-		m.selectViewportAnchor()
+		if !dashboardAttentionJump(msg) {
+			m.selectViewportAnchor()
+		}
 		if m.clearVisibleAttention() {
 			m.refreshViewport(m.currentSelection())
 		}
@@ -492,9 +499,17 @@ type dashboardSelection struct {
 }
 
 func (m *bubbleDashboardModel) refreshViewport(selection dashboardSelection) {
-	header, layout, footer, stage := m.dashboard.renderPartsWithLayout(m.dashboard.now(), m.styler)
-	m.header = header
-	m.footer = footer + "\n" + dashboardNavigationHelp
+	density := dashboardDensityForHeight(m.height)
+	header, layout, footer, stage := m.dashboard.renderResponsiveParts(m.dashboard.now(), responsiveDashboardOptions{
+		density: density, width: m.width, selected: m.selectedAnchor, expansionOverrides: m.expansionOverrides,
+	})
+	if density == dashboardDensityMinimal {
+		m.header = minimalDashboardHeader(header, len(layout.attention), len(m.attentionPending))
+		m.footer = minimalDashboardFooter(footer)
+	} else {
+		m.header = dashboardHeaderWithAttention(header, len(m.attentionPending))
+		m.footer = footer + "\n" + dashboardNavigationHelp
+	}
 	m.layout = layout
 	m.stage = stage
 	m.resizeViewport()
@@ -507,6 +522,51 @@ func (m *bubbleDashboardModel) refreshViewport(selection dashboardSelection) {
 		}
 	}
 	m.selectViewportAnchor()
+}
+
+func (m *bubbleDashboardModel) toggleExpansion() {
+	identity := m.selectedAnchor
+	if identity == "" {
+		return
+	}
+	options := responsiveDashboardOptions{
+		density: dashboardDensityForHeight(m.height), selected: identity, expansionOverrides: m.expansionOverrides,
+	}
+	m.expansionOverrides[identity] = !options.expanded(identity, strings.HasPrefix(identity, "section:"))
+}
+
+func minimalDashboardHeader(header string, attention, pending int) string {
+	lines := strings.Split(header, "\n")
+	repository := "not initialized"
+	if len(lines) > 1 {
+		repository = strings.TrimPrefix(lines[1], "Repository: ")
+	}
+	capacity := "W:pending"
+	if len(lines) > 2 {
+		capacity = compactDashboardCapacity(lines[2])
+	}
+	status := fmt.Sprintf("R:%s | %s | Attention:%d", repository, capacity, attention)
+	if pending > 0 {
+		status += fmt.Sprintf(" | New:%d", pending)
+	}
+	return "Backlog: " + repository + "\n" + status
+}
+
+func minimalDashboardFooter(footer string) string {
+	lines := compactDashboardFooter(strings.Split(footer, "\n"))
+	stage := strings.Join(lines, " | ")
+	return stage + "\nN:jk/fb gG a Enter"
+}
+
+func dashboardHeaderWithAttention(header string, pending int) string {
+	if pending == 0 {
+		return header
+	}
+	lines := strings.Split(header, "\n")
+	if len(lines) > 1 {
+		lines[1] += fmt.Sprintf(" | NEW ATTENTION (%d): press a", pending)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m *bubbleDashboardModel) resizeViewport() {
@@ -599,6 +659,11 @@ func (m *bubbleDashboardModel) navigateViewport(msg tea.Msg) bool {
 	default:
 		return false
 	}
+}
+
+func dashboardAttentionJump(msg tea.Msg) bool {
+	key, ok := msg.(tea.KeyPressMsg)
+	return ok && key.String() == "a"
 }
 
 func (m *bubbleDashboardModel) jumpToAttention() {

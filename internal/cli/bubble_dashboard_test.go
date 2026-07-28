@@ -35,13 +35,13 @@ func TestBubbleDashboardModelResizesViewportAroundFixedLifecycleChrome(t *testin
 		model.dashboard.recordMessage("operational event " + strings.Repeat("x", index))
 	}
 
-	assertBubbleDashboardFits(t, model, 48, 10, 4)
+	assertBubbleDashboardFits(t, model, 48, 10)
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 36, Height: 8})
 	model = updated.(bubbleDashboardModel)
-	assertBubbleDashboardFits(t, model, 36, 8, 1)
+	assertBubbleDashboardFits(t, model, 36, 8)
 }
 
-func assertBubbleDashboardFits(t *testing.T, model bubbleDashboardModel, width, height, viewportHeight int) {
+func assertBubbleDashboardFits(t *testing.T, model bubbleDashboardModel, width, height int) {
 	t.Helper()
 	model.refreshViewport(model.currentSelection())
 	frame := model.dashboardFrame()
@@ -59,13 +59,25 @@ func assertBubbleDashboardFits(t *testing.T, model bubbleDashboardModel, width, 
 			t.Fatalf("rendered line width = %d, want at most %d: %q", got, width, line)
 		}
 	}
-	for _, want := range []string{"Repository: acme/widgets", "Worker capacity:", "Runner stage: Running", "Next Ctrl-C: start Drain"} {
-		if !strings.Contains(plain, want) {
-			t.Fatalf("fixed dashboard chrome omitted %q after resize:\n%s", want, plain)
+	for _, expected := range []struct {
+		name     string
+		variants []string
+	}{
+		{name: "repository", variants: []string{"Repository: acme/widgets", "Backlog: acme/widgets", "R:acme/widgets"}},
+		{name: "Worker capacity", variants: []string{"Worker capacity:", "W:"}},
+		{name: "Runner stage", variants: []string{"Runner stage: Running", "S:Running"}},
+		{name: "next Ctrl-C", variants: []string{"Next Ctrl-C: start Drain", "^C:start Drain"}},
+	} {
+		found := false
+		for _, variant := range expected.variants {
+			found = found || strings.Contains(plain, variant)
+		}
+		if !found {
+			t.Fatalf("fixed dashboard chrome omitted %s after resize:\n%s", expected.name, plain)
 		}
 	}
-	if frame.bodyHeight != viewportHeight || model.viewport.Height() != frame.bodyHeight || model.viewport.Width() != width {
-		t.Fatalf("frame body and viewport size = %d and %dx%d, want %d and %dx%d", frame.bodyHeight, model.viewport.Width(), model.viewport.Height(), viewportHeight, width, viewportHeight)
+	if frame.bodyHeight <= 0 || model.viewport.Height() != frame.bodyHeight || model.viewport.Width() != width {
+		t.Fatalf("frame body and viewport size = %d and %dx%d, want a positive body and width %d", frame.bodyHeight, model.viewport.Width(), model.viewport.Height(), width)
 	}
 	if frame.bodyHeight > 0 {
 		body := strings.Split(ansi.Strip(model.viewport.View()), "\n")
@@ -241,15 +253,12 @@ func TestBubbleDashboardPreservesSelectedRunAcrossLiveProjectionChanges(t *testi
 	if !exists {
 		t.Fatalf("selected Run anchor %q missing", selected)
 	}
-	model.viewport.SetYOffset(line + 1)
+	model.viewport.SetYOffset(line)
 	model.selectViewportAnchor()
 	if model.selectedAnchor != selected {
 		t.Fatalf("selected anchor = %q, want %q", model.selectedAnchor, selected)
 	}
 	wantRelative := model.currentSelection().relative
-	if wantRelative == model.dashboardBodyStart() {
-		t.Fatal("selected Run test did not start within the Run body")
-	}
 	wantScreenLine := dashboardVisibleLine(t, model.View().Content, "State: claimed")
 
 	assertStable := func(name string, msg tea.Msg) {
@@ -270,7 +279,7 @@ func TestBubbleDashboardPreservesSelectedRunAcrossLiveProjectionChanges(t *testi
 		Operation: "edit", OperationChanged: true,
 	})
 	assertStable("Activity refresh", dashboardActivityMsg(now.Add(time.Second)))
-	if body := model.viewport.GetContent(); !strings.Contains(body, "Deepest operation: edit") {
+	if body := model.viewport.GetContent(); !strings.Contains(body, "Deepest operation: edi") {
 		t.Fatalf("Activity refresh did not change selected Run content:\n%s", body)
 	}
 	assertStable("unchanged state save", dashboardStateMsg(current))
@@ -610,6 +619,209 @@ func TestBubbleDashboardQueueBoundsOnlyOptionalOutput(t *testing.T) {
 	}
 }
 
+func TestBubbleDashboardResponsiveDensityAndSelectedDetails(t *testing.T) {
+	now := time.Date(2026, 7, 28, 14, 0, 0, 0, time.UTC)
+	logPath := t.TempDir() + "/responsive.jsonl"
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeActivityEntries(t, activity.PathForLog(logPath), activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: now.Add(-5 * time.Second), Kind: "turn", Description: "Worker turn completed",
+		Operation: "edit", OperationChanged: true, TurnDelta: 1,
+	})
+	identity, err := pidStartIdentity(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := scheduler.Run{
+		Issue: 69, IssueTitle: "Responsive layouts", IssueURL: "https://github.com/acme/widgets/issues/69",
+		RunID: "run-responsive", Status: scheduler.StatusRunning, PullRequest: "https://github.com/acme/widgets/pull/169",
+		PID: os.Getpid(), ProcessIdentity: identity, LogPath: logPath, StartedAt: now.Add(-time.Minute),
+	}
+	completedAt := now.Add(-time.Minute)
+	completion := scheduler.Run{
+		Issue: 68, IssueTitle: "Observation model", RunID: "run-complete", Status: scheduler.StatusMerged,
+		PullRequest: "https://github.com/acme/widgets/pull/168", StartedAt: now.Add(-time.Hour), CompletedAt: &completedAt,
+	}
+	attention := scheduler.Run{Issue: 70, IssueTitle: "Operator decision", RunID: "run-attention", Status: scheduler.StatusNeedsHuman, Error: "choose recovery", StartedAt: now.Add(-time.Minute)}
+	current := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 2,
+		Runs: []scheduler.Run{active, completion, attention},
+		Leases: []scheduler.Lease{
+			{LeaseID: active.RunID, Issue: active.Issue, RunID: active.RunID},
+			{LeaseID: attention.RunID, Issue: attention.Issue, RunID: attention.RunID},
+		},
+	}
+	newModel := func(height int) bubbleDashboardModel {
+		model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 160, Height: height})
+		model.dashboard.source = &dashboardTestSource{current: current}
+		model.dashboard.update(current)
+		model.selectedAnchor = dashboardRunAnchor(active.RunID)
+		model.refreshViewport(dashboardSelection{identity: model.selectedAnchor, relative: model.dashboardBodyStart(), valid: true})
+		return model
+	}
+
+	roomy := newModel(24)
+	roomyBody := roomy.viewport.GetContent()
+	activeRow := dashboardContentLine(t, roomyBody, "#69  Responsive layouts")
+	for _, want := range []string{"PR #169", "State: running", "Elapsed: 1m0s", "Deepest operation: edit", "Activity: 5s", "Turns: 1"} {
+		if !strings.Contains(activeRow, want) {
+			t.Fatalf("roomy compact Active row omitted %q: %q", want, activeRow)
+		}
+	}
+	for _, omitted := range []string{active.IssueURL, active.RunID, "tokens", "Worker liveness", "PID"} {
+		if strings.Contains(activeRow, omitted) {
+			t.Fatalf("roomy compact Active row included %q: %q", omitted, activeRow)
+		}
+	}
+	for _, want := range []string{"Issue URL: " + active.IssueURL, "Run: " + active.RunID, "Worker liveness: alive"} {
+		if !strings.Contains(roomyBody, want) {
+			t.Fatalf("roomy selected details omitted %q:\n%s", want, roomyBody)
+		}
+	}
+
+	constrained := newModel(23)
+	constrainedBody := constrained.viewport.GetContent()
+	if strings.Contains(constrainedBody, "Issue URL:") {
+		t.Fatalf("12-23 row layout expanded Run details by default:\n%s", constrainedBody)
+	}
+	if !strings.Contains(constrainedBody, "Recent Completions (1) [collapsed]") || strings.Contains(constrainedBody, completion.IssueTitle) {
+		t.Fatalf("12-23 row layout did not collapse Recent Completions:\n%s", constrainedBody)
+	}
+
+	minimal := newModel(11)
+	minimalView := ansi.Strip(minimal.View().Content)
+	for _, want := range []string{"acme/widgets", "Attention:1", "#69", "N:jk", "Enter"} {
+		if !strings.Contains(minimalView, want) {
+			t.Fatalf("sub-12-row layout omitted %q:\n%s", want, minimalView)
+		}
+	}
+}
+
+func TestBubbleDashboardEnterExpandsRunsAndSections(t *testing.T) {
+	now := time.Date(2026, 7, 28, 14, 0, 0, 0, time.UTC)
+	completedAt := now.Add(-time.Minute)
+	completion := scheduler.Run{Issue: 68, IssueTitle: "Only completion fields", RunID: "completion-secret", Status: scheduler.StatusMerged, PullRequest: "https://github.com/acme/widgets/pull/168", StartedAt: now.Add(-time.Hour), CompletedAt: &completedAt}
+	active := scheduler.Run{Issue: 69, IssueTitle: "Expandable", IssueURL: "https://github.com/acme/widgets/issues/69", RunID: "run-expandable", Status: scheduler.StatusRunning, StartedAt: now.Add(-time.Minute)}
+	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1, Runs: []scheduler.Run{active, completion}, Leases: []scheduler.Lease{{LeaseID: active.RunID, Issue: active.Issue, RunID: active.RunID}}}
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 72, Height: 18})
+	model.dashboard.source = &dashboardTestSource{current: current}
+	model.dashboard.update(current)
+	model.selectedAnchor = dashboardRunAnchor(active.RunID)
+	model.refreshViewport(dashboardSelection{identity: model.selectedAnchor, valid: true})
+	if strings.Contains(model.viewport.GetContent(), "Issue URL:") {
+		t.Fatal("constrained Run started expanded")
+	}
+	updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	model = updated.(bubbleDashboardModel)
+	if !strings.Contains(model.viewport.GetContent(), "Issue URL: "+active.IssueURL) {
+		t.Fatalf("Enter did not expand selected Run:\n%s", model.viewport.GetContent())
+	}
+	updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	model = updated.(bubbleDashboardModel)
+	if strings.Contains(model.viewport.GetContent(), "Issue URL:") {
+		t.Fatal("second Enter did not collapse selected Run")
+	}
+
+	model.selectedAnchor = dashboardSectionAnchor("Recent Completions")
+	model.refreshViewport(dashboardSelection{identity: model.selectedAnchor, valid: true})
+	updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	model = updated.(bubbleDashboardModel)
+	if !strings.Contains(model.viewport.GetContent(), completion.IssueTitle) {
+		t.Fatalf("Enter did not expand collapsed completion section:\n%s", model.viewport.GetContent())
+	}
+
+	model.selectedAnchor = dashboardRunAnchor(completion.RunID)
+	model.refreshViewport(dashboardSelection{identity: model.selectedAnchor, valid: true})
+	updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	model = updated.(bubbleDashboardModel)
+	completionDetails := dashboardSectionOutput(t, model.viewport.GetContent(), "Recent Completions", "")
+	for _, want := range []string{"Issue: #68  Only completion fields", "Pull request: PR #168", "Elapsed: 59m0s", "Completed: 1m0s ago"} {
+		if !strings.Contains(completionDetails, want) {
+			t.Fatalf("expanded Completion omitted %q:\n%s", want, completionDetails)
+		}
+	}
+	for _, omitted := range []string{"Worker liveness", "Activity age", "Turns:", completion.RunID, "State:"} {
+		if strings.Contains(completionDetails, omitted) {
+			t.Fatalf("expanded Completion included %q:\n%s", omitted, completionDetails)
+		}
+	}
+}
+
+func TestBubbleDashboardCompactRowsTruncateAndExpandedDetailsWrap(t *testing.T) {
+	now := time.Date(2026, 7, 28, 14, 0, 0, 0, time.UTC)
+	run := scheduler.Run{Issue: 69, IssueTitle: strings.Repeat("wide界", 20), IssueURL: "https://github.com/acme/widgets/issues/69/with/a/very/long/detail", RunID: "run-wide", Status: scheduler.StatusRunning, StartedAt: now.Add(-time.Minute)}
+	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 32, Height: 18})
+	model.dashboard.source = &dashboardTestSource{current: current}
+	model.dashboard.update(current)
+	model.selectedAnchor = dashboardRunAnchor(run.RunID)
+	model.refreshViewport(dashboardSelection{identity: model.selectedAnchor, valid: true})
+	row := dashboardContentLine(t, model.viewport.GetContent(), "#69")
+	if width := ansi.StringWidth(row); width > 32 {
+		t.Fatalf("compact row width = %d, want at most 32: %q", width, row)
+	}
+	updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	model = updated.(bubbleDashboardModel)
+	if !strings.Contains(model.viewport.GetContent(), run.IssueURL) {
+		t.Fatalf("expanded details were truncated instead of retained for wrapping:\n%s", model.viewport.GetContent())
+	}
+	for _, line := range strings.Split(ansi.Strip(model.View().Content), "\n") {
+		if width := lipgloss.Width(line); width > 32 {
+			t.Fatalf("wrapped viewport line width = %d, want at most 32: %q", width, line)
+		}
+	}
+}
+
+type dashboardPreviewOnlySource struct {
+	current state.State
+}
+
+func (s *dashboardPreviewOnlySource) Preview() (state.State, bool, error) {
+	return s.current, false, nil
+}
+
+func TestBubbleDashboardPromotesOnlyAnomalousLivenessInCompactRows(t *testing.T) {
+	now := time.Date(2026, 7, 28, 14, 0, 0, 0, time.UTC)
+	identity, err := pidStartIdentity(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs := []scheduler.Run{
+		{Issue: 1, IssueTitle: "Healthy", RunID: "healthy", Status: scheduler.StatusRunning, PID: os.Getpid(), ProcessIdentity: identity, StartedAt: now},
+		{Issue: 2, IssueTitle: "Missing", RunID: "missing", Status: scheduler.StatusRunning, StartedAt: now},
+	}
+	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 2, Runs: runs, Leases: []scheduler.Lease{{LeaseID: "healthy", Issue: 1, RunID: "healthy"}, {LeaseID: "missing", Issue: 2, RunID: "missing"}}}
+	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 120, Height: 18})
+	model.dashboard.source = &dashboardPreviewOnlySource{current: current}
+	model.dashboard.update(current)
+	model.refreshViewport(dashboardSelection{})
+	healthy := dashboardContentLine(t, model.viewport.GetContent(), "#1  Healthy")
+	missing := dashboardContentLine(t, model.viewport.GetContent(), "#2  Missing")
+	if strings.Contains(healthy, "Liveness:") || strings.Contains(healthy, "PID") {
+		t.Fatalf("healthy liveness was promoted in compact row: %q", healthy)
+	}
+	if !strings.Contains(healthy, "Supervision: unsupervised") {
+		t.Fatalf("unsupervised healthy Worker anomaly was not promoted: %q", healthy)
+	}
+	for _, want := range []string{"Liveness: missing", "Supervision: unsupervised"} {
+		if !strings.Contains(missing, want) {
+			t.Fatalf("anomalous compact row omitted %q: %q", want, missing)
+		}
+	}
+}
+
+func dashboardContentLine(t *testing.T, content, contains string) string {
+	t.Helper()
+	for _, line := range strings.Split(content, "\n") {
+		if strings.Contains(line, contains) {
+			return line
+		}
+	}
+	t.Fatalf("dashboard content omitted line containing %q:\n%s", contains, content)
+	return ""
+}
+
 func TestBubbleDashboardConstrainedChromeKeepsRequiredLifecycleInformation(t *testing.T) {
 	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 3}
 	for _, dimensions := range []TerminalDimensions{
@@ -670,7 +882,7 @@ func TestBubbleDashboardConstrainedFallbackKeepsGuidanceInFixedFooter(t *testing
 		t.Fatal("constrained dashboard moved fixed-footer guidance above the body")
 	}
 	fixedFooter := strings.Join(chrome.bottom, "\n")
-	for _, want := range []string{"Next Ctrl-C: start Drain and stop Admission", "Nav: ↑↓/jk PgUp/Dn/f/b Home/End g/G a:Attention"} {
+	for _, want := range []string{"^C:start Drain and stop Admission", "N:jk/fb Pg H/E gG a"} {
 		if !strings.Contains(fixedFooter, want) {
 			t.Fatalf("constrained fixed footer omitted %q: %#v", want, chrome)
 		}

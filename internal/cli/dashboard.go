@@ -6,10 +6,12 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/robinjoseph08/backlog/internal/activity"
 	"github.com/robinjoseph08/backlog/internal/runner"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
@@ -510,6 +512,288 @@ func (d *liveDashboard) renderPartsWithLayout(now time.Time, styler dashboardSty
 	d.mu.Unlock()
 	header, layout, footer := d.renderPartsForWithLayout(current, messages, stage, now, styler)
 	return header, layout, footer, stage
+}
+
+type dashboardDensity uint8
+
+const (
+	dashboardDensityRoomy dashboardDensity = iota
+	dashboardDensityConstrained
+	dashboardDensityMinimal
+)
+
+type responsiveDashboardOptions struct {
+	density            dashboardDensity
+	width              int
+	selected           string
+	expansionOverrides map[string]bool
+}
+
+func dashboardDensityForHeight(height int) dashboardDensity {
+	switch {
+	case height >= 24:
+		return dashboardDensityRoomy
+	case height >= 12:
+		return dashboardDensityConstrained
+	default:
+		return dashboardDensityMinimal
+	}
+}
+
+func (o responsiveDashboardOptions) expanded(identity string, section bool) bool {
+	if expanded, exists := o.expansionOverrides[identity]; exists {
+		return expanded
+	}
+	if section {
+		return identity != dashboardSectionAnchor("Recent Completions") || o.density == dashboardDensityRoomy
+	}
+	return o.density == dashboardDensityRoomy && identity == o.selected
+}
+
+func (d *liveDashboard) renderResponsiveParts(now time.Time, options responsiveDashboardOptions) (string, dashboardBodyLayout, string, dashboardStage) {
+	d.mu.Lock()
+	current := cloneDashboardState(d.current)
+	messages := cloneDashboardMessages(d.messages)
+	stage := d.stage
+	d.mu.Unlock()
+
+	sections := d.observeSections(current, now)
+	capacity := "Worker capacity: pending configuration"
+	if current.MaxConcurrentIssues > 0 {
+		used := dashboardUsedCapacity(current)
+		capacity = fmt.Sprintf("Worker capacity: %d used | %d available | %d total", used, max(0, current.MaxConcurrentIssues-used), current.MaxConcurrentIssues)
+	}
+	header := fmt.Sprintf("Backlog Run Dashboard\nRepository: %s\n%s", valueOr(plainStatusValue(current.Repo), "not initialized"), capacity)
+	body := dashboardBodyBuilder{}
+	body.renderResponsiveSection("Active Runs", sections[statusActive], now, options, false)
+	body.renderResponsiveSection("Attention Required", sections[statusAttention], now, options, false)
+	body.renderResponsiveSection("Outcomes to Acknowledge", sections[statusOutcomes], now, options, false)
+	body.renderResponsiveSection("Recent Completions", sections[statusCompletions], now, options, true)
+	if len(messages) > 0 {
+		body.renderResponsiveMessages(messages, options)
+	}
+	attention := make(map[string]struct{}, len(sections[statusAttention]))
+	for _, observed := range sections[statusAttention] {
+		attention[observed.run.RunID] = struct{}{}
+	}
+	return header, dashboardBodyLayout{text: body.body.String(), anchors: body.anchors, attention: attention}, dashboardFooterParts(stage), stage
+}
+
+func (b *dashboardBodyBuilder) renderResponsiveSection(name string, runs []statusRun, now time.Time, options responsiveDashboardOptions, completions bool) {
+	b.separate()
+	sectionIdentity := dashboardSectionAnchor(name)
+	b.anchor(sectionIdentity)
+	marker := "  "
+	if options.selected == sectionIdentity {
+		marker = "> "
+	}
+	expanded := options.expanded(sectionIdentity, true)
+	heading := fmt.Sprintf("%s%s (%d)", marker, name, len(runs))
+	if !expanded {
+		heading += " [collapsed]"
+	}
+	b.write(truncateDashboardContent(heading, options.width) + "\n")
+	if !expanded {
+		return
+	}
+	if len(runs) == 0 {
+		b.write(truncateDashboardContent("    none", options.width) + "\n")
+		return
+	}
+	visible := len(runs)
+	if completions && len(runs) > 3 {
+		visible = 3
+	}
+	for _, observed := range runs[:visible] {
+		identity := dashboardRunAnchor(observed.run.RunID)
+		b.anchor(identity)
+		marker := "  "
+		if options.selected == identity {
+			marker = "> "
+		}
+		b.write(truncateDashboardContent(marker+compactDashboardRun(observed, now, completions, options.width-ansi.StringWidth(marker)), options.width) + "\n")
+		if options.expanded(identity, false) {
+			if completions {
+				b.write(expandedDashboardCompletion(observed.run, now))
+			} else {
+				b.write(expandedDashboardRun(observed, now))
+			}
+		}
+	}
+	if remainder := len(runs) - visible; remainder > 0 {
+		b.write(truncateDashboardContent(fmt.Sprintf("    %d more completions", remainder), options.width) + "\n")
+	}
+}
+
+func (b *dashboardBodyBuilder) renderResponsiveMessages(messages []dashboardMessage, options responsiveDashboardOptions) {
+	b.separate()
+	identity := dashboardSectionAnchor("Operational messages")
+	b.anchor(identity)
+	marker := "  "
+	if options.selected == identity {
+		marker = "> "
+	}
+	expanded := options.expanded(identity, true)
+	heading := fmt.Sprintf("%sOperational messages (%d)", marker, len(messages))
+	if !expanded {
+		heading += " [collapsed]"
+	}
+	b.write(truncateDashboardContent(heading, options.width) + "\n")
+	if expanded {
+		for _, message := range messages {
+			b.write(truncateDashboardContent("    "+message.text, options.width) + "\n")
+		}
+	}
+}
+
+func compactDashboardRun(observed statusRun, now time.Time, completion bool, width int) string {
+	run := observed.run
+	parts := []string{fmt.Sprintf("#%d", run.Issue)}
+	if pullRequest := dashboardPullRequestIdentity(run.PullRequest); pullRequest != "" {
+		parts = append(parts, pullRequest)
+	}
+	progress := summarizeRunProgress(run, observed.observation.metrics, now)
+	if !completion {
+		parts = append(parts, "State: "+displayedRunState(run, observed.observation.process))
+	}
+	parts[0] = compactDashboardIssueIdentity(run, parts, width)
+	if completion {
+		if progress.elapsed != "n/a" {
+			parts = append(parts, "Elapsed: "+progress.elapsed)
+		}
+		if run.CompletedAt != nil && !run.CompletedAt.IsZero() {
+			parts = append(parts, "Completed: "+displayDuration(now.Sub(*run.CompletedAt))+" ago")
+		}
+		return strings.Join(parts, " | ")
+	}
+	parts = append(parts, dashboardLivenessPromotions(observed)...)
+	if run.Error != "" {
+		parts = append(parts, "Diagnostic: "+plainStatusValue(strings.TrimSpace(run.Error)))
+	}
+	if progress.deepestOperation != "n/a" {
+		parts = append(parts, "Deepest operation: "+plainStatusValue(progress.deepestOperation))
+	}
+	if progress.activityAge != "n/a" {
+		parts = append(parts, "Activity: "+progress.activityAge)
+	}
+	if progress.workerTurns != "n/a" {
+		parts = append(parts, "Turns: "+progress.workerTurns)
+	}
+	if progress.elapsed != "n/a" {
+		parts = append(parts, "Elapsed: "+progress.elapsed)
+	}
+	return strings.Join(parts, " | ")
+}
+
+func compactDashboardIssueIdentity(run scheduler.Run, mandatory []string, width int) string {
+	identity := mandatory[0]
+	title := plainStatusValue(run.IssueTitle)
+	if title == "" || width <= 0 {
+		return identity
+	}
+	available := width - ansi.StringWidth(strings.Join(mandatory, " | ")) - width/3 - 2
+	if available <= 0 {
+		return identity
+	}
+	return identity + "  " + ansi.Truncate(title, min(30, available), "")
+}
+
+func dashboardIssueIdentity(run scheduler.Run) string {
+	identity := fmt.Sprintf("#%d", run.Issue)
+	if title := plainStatusValue(run.IssueTitle); title != "" {
+		identity += "  " + title
+	}
+	return identity
+}
+
+func dashboardPullRequestIdentity(value string) string {
+	value = plainStatusValue(strings.TrimSpace(value))
+	if value == "" {
+		return ""
+	}
+	if index := strings.LastIndex(value, "/pull/"); index >= 0 {
+		number := strings.TrimSuffix(value[index+len("/pull/"):], "/")
+		if parsed, err := strconv.Atoi(number); err == nil && parsed > 0 {
+			return fmt.Sprintf("PR #%d", parsed)
+		}
+	}
+	return "PR: " + value
+}
+
+func dashboardLivenessPromotions(observed statusRun) []string {
+	run := observed.run
+	expectsWorker := run.Status == scheduler.StatusRunning || run.PID > 0 || run.ProcessIdentity != ""
+	if !expectsWorker {
+		return nil
+	}
+	var promoted []string
+	switch observed.observation.process.workerLivenessState {
+	case workerLivenessAbsent:
+		promoted = append(promoted, "Liveness: missing")
+	case workerLivenessDead:
+		promoted = append(promoted, "Liveness: dead")
+	case workerLivenessUnknown:
+		promoted = append(promoted, "Liveness: uncertain")
+	}
+	if observed.observation.process.supervision != "SUPERVISED" {
+		promoted = append(promoted, "Supervision: unsupervised")
+	}
+	return promoted
+}
+
+func expandedDashboardRun(observed statusRun, now time.Time) string {
+	run := observed.run
+	progress := summarizeRunProgress(run, observed.observation.metrics, now)
+	var details strings.Builder
+	fmt.Fprintf(&details, "    Issue: %s\n", dashboardIssueIdentity(run))
+	if issueURL := plainStatusValue(run.IssueURL); issueURL != "" {
+		fmt.Fprintf(&details, "    Issue URL: %s\n", issueURL)
+	}
+	if pullRequest := dashboardPullRequestIdentity(run.PullRequest); pullRequest != "" {
+		fmt.Fprintf(&details, "    Pull request: %s\n", pullRequest)
+	}
+	fmt.Fprintf(&details, "    Run: %s\n", plainStatusValue(run.RunID))
+	fmt.Fprintf(&details, "    State: %s\n", displayedRunState(run, observed.observation.process))
+	fmt.Fprintf(&details, "    Runner supervision: %s\n", plainStatusValue(observed.observation.process.supervision))
+	fmt.Fprintf(&details, "    Worker liveness: %s\n", plainStatusValue(observed.observation.process.workerLiveness))
+	fmt.Fprintf(&details, "    Elapsed: %s\n", progress.elapsed)
+	fmt.Fprintf(&details, "    Activity age: %s\n", progress.activityAge)
+	fmt.Fprintf(&details, "    Current Worker operation: %s\n", plainStatusValue(progress.workerOperation))
+	fmt.Fprintf(&details, "    Completed Worker turns: %s\n", progress.workerTurns)
+	fmt.Fprintf(&details, "    Completed Worker tokens: %s\n", progress.workerTokens)
+	fmt.Fprintf(&details, "    Subagents: %d (%d active)\n", len(observed.observation.metrics.subagents), progress.activeSubagents)
+	fmt.Fprintf(&details, "    Deepest current operation: %s\n", plainStatusValue(progress.deepestOperation))
+	fmt.Fprintf(&details, "    Approximate Subagent turns: %s\n", progress.subagentTurns)
+	fmt.Fprintf(&details, "    Approximate Subagent tool uses: %s\n", progress.subagentToolUses)
+	fmt.Fprintf(&details, "    Approximate Subagent tokens: %s\n", progress.subagentTokens)
+	fmt.Fprintf(&details, "    Observed tokens: %s\n", progress.observedTokens)
+	if run.Error != "" {
+		fmt.Fprintf(&details, "    Diagnostic: %s\n", plainStatusValue(strings.TrimSpace(run.Error)))
+	}
+	return details.String()
+}
+
+func expandedDashboardCompletion(run scheduler.Run, now time.Time) string {
+	progress := summarizeRunProgress(run, followMetrics{}, now)
+	completed := "n/a"
+	if run.CompletedAt != nil && !run.CompletedAt.IsZero() {
+		completed = displayDuration(now.Sub(*run.CompletedAt)) + " ago"
+	}
+	var details strings.Builder
+	fmt.Fprintf(&details, "    Issue: %s\n", dashboardIssueIdentity(run))
+	if pullRequest := dashboardPullRequestIdentity(run.PullRequest); pullRequest != "" {
+		fmt.Fprintf(&details, "    Pull request: %s\n", pullRequest)
+	}
+	fmt.Fprintf(&details, "    Elapsed: %s\n", progress.elapsed)
+	fmt.Fprintf(&details, "    Completed: %s\n", completed)
+	return details.String()
+}
+
+func truncateDashboardContent(content string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	return ansi.Truncate(content, width, "")
 }
 
 func (d *liveDashboard) renderPartsFor(current state.State, messages []dashboardMessage, stage dashboardStage, now time.Time, styler dashboardStyler) (string, string, string) {
