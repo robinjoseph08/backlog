@@ -3810,6 +3810,93 @@ func resumableRun(t *testing.T, issue int, runID string) scheduler.Run {
 	}
 }
 
+func TestRunnerResumesVerifiedUnarmedExpectedPullRequestFromCheckpointStage(t *testing.T) {
+	t.Parallel()
+	run := resumableRun(t, 89, "resume-pr-89")
+	run.PullRequest = "https://example.test/pr/89"
+	gitDir := filepath.Join(run.Worktree, ".git")
+	if err := os.Mkdir(gitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	checkpointData := []byte("# Ship-it checkpoint v1\nStage: watch-hosted-ci\n")
+	checkpointFile := filepath.Join(gitDir, "ship-it-checkpoint-v1.md")
+	if err := os.WriteFile(checkpointFile, checkpointData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checkpointHash := sha256.Sum256(checkpointData)
+	run.Continuation.Workflow = "ship-it"
+	run.Continuation.WorkflowStage = "watch-hosted-ci"
+	run.Continuation.CheckpointFile = checkpointFile
+	run.Continuation.CheckpointSHA256 = hex.EncodeToString(checkpointHash[:])
+	github := &fakeGitHub{completions: map[int]ghadapter.CompletionOutcome{89: {
+		PRFound: true, PullRequest: run.PullRequest,
+	}}}
+	workers := newFakeWorkers()
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run},
+		Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+	}}
+	runner := testRunner(github, workers, store, 1)
+	runner.Output = io.Discard
+	current := store.LoadValue()
+	process, err := runner.resume(context.Background(), context.Background(), &current, run)
+	if err != nil || process == nil {
+		t.Fatalf("resume = %v, %v", process, err)
+	}
+	workers.mu.Lock()
+	request := workers.requests[0]
+	workers.mu.Unlock()
+	if request.RunID != run.RunID || request.SessionID != run.SessionID || request.ContinuationStage != "watch-hosted-ci" || request.CheckpointFile != run.Continuation.CheckpointFile || request.CheckpointSHA256 != run.Continuation.CheckpointSHA256 {
+		t.Fatalf("replacement request = %#v", request)
+	}
+	if got := store.LoadValue().Runs[0]; got.Status != scheduler.StatusRunning || got.PullRequest != run.PullRequest {
+		t.Fatalf("resumed Run = %#v", got)
+	}
+	_ = process.Abort()
+	_ = process.Close()
+}
+
+func TestProviderContinuationUsesIndependentOneAttemptBudgetAndCooldown(t *testing.T) {
+	t.Parallel()
+	run := resumableRun(t, 90, "provider-90")
+	run.Status = scheduler.StatusFailed
+	run.Error = "provider unavailable after Pi retries"
+	run.SuspendedAt = nil
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}}
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+	now := time.Date(2026, 7, 28, 10, 0, 0, 0, time.UTC)
+	runner.Now = func() time.Time { return now }
+	current := store.LoadValue()
+	if err := runner.applyProviderContinuation(&current, run.RunID); err != nil {
+		t.Fatalf("first provider continuation: %v", err)
+	}
+	got := store.LoadValue().Runs[0]
+	if got.Status != scheduler.StatusSuspended || got.FailureClass != scheduler.FailureProviderExhaustion || got.ProviderContinuationAttempts != 1 || got.ResumeAfter == nil || !got.ResumeAfter.Equal(now.Add(30*time.Second)) || got.PreservedCause != run.Error {
+		t.Fatalf("first provider continuation = %#v", got)
+	}
+	if candidate := nextSuspendedRun(&current, func() time.Time { return now.Add(29 * time.Second) }); candidate.RunID != "" {
+		t.Fatalf("Run resumed before cooldown: %#v", candidate)
+	}
+	if candidate := nextSuspendedRun(&current, func() time.Time { return now.Add(30 * time.Second) }); candidate.RunID != run.RunID {
+		t.Fatalf("Run not resumable after cooldown: %#v", candidate)
+	}
+
+	current = store.LoadValue()
+	current.Runs[0].Status = scheduler.StatusFailed
+	current.Runs[0].ResumeAfter = nil
+	current.Runs[0].Error = "provider unavailable again"
+	if err := store.Save(current); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.applyProviderContinuation(&current, run.RunID); err != nil {
+		t.Fatalf("second provider exhaustion: %v", err)
+	}
+	got = store.LoadValue().Runs[0]
+	if got.Status != scheduler.StatusNeedsHuman || got.ProviderContinuationAttempts != 1 || !strings.Contains(got.Error, "one bounded Backlog continuation") {
+		t.Fatalf("second provider exhaustion = %#v", got)
+	}
+}
+
 func TestRunnerReconcilesSuspendedRunWithArmedAutoMergeAsWaiting(t *testing.T) {
 	t.Parallel()
 

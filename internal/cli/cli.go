@@ -116,6 +116,10 @@ func MainWithTerminal(ctx context.Context, args []string, dependencies TerminalD
 		commandCtx, stop := cancelContextOnSignal(ctx, terminal.Signals)
 		defer stop()
 		err = resolveCommand(commandCtx, args[1:], stdout, stderr)
+	case "recover":
+		commandCtx, stop := cancelContextOnSignal(ctx, terminal.Signals)
+		defer stop()
+		err = recoverCommand(commandCtx, args[1:], stdout, stderr)
 	case "reset":
 		commandCtx, stop := cancelContextOnSignal(ctx, terminal.Signals)
 		defer stop()
@@ -751,6 +755,7 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "  backlog acknowledge <run-id|positive-issue-number>... [flags]")
 	fmt.Fprintln(writer, "  backlog acknowledge --all [flags]")
 	fmt.Fprintln(writer, "  backlog resolve <run-id|positive-issue-number> [--dry-run | --yes] [flags]")
+	fmt.Fprintln(writer, "  backlog recover <run-id|positive-issue-number> [--dry-run | --yes] [flags]")
 	fmt.Fprintln(writer, "  backlog reset <issue-number> [--dry-run | --yes] [flags]")
 	fmt.Fprintln(writer, "  backlog retry <issue-number> [--dry-run | --yes] [flags]  (deprecated alias for reset)")
 	fmt.Fprintln(writer, "")
@@ -762,6 +767,7 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "  Reset retires verified artifacts, archives active Pi sessions, preserves logs and Run history,")
 	fmt.Fprintln(writer, "  restores Candidate labels, and releases the Lease only after all postconditions pass.")
 	fmt.Fprintln(writer, "  Resolve recognizes a supported GitHub closure without claiming Run Completion or restoring Candidate state.")
+	fmt.Fprintln(writer, "  Recovery verifies durable continuation for an Intervention-required Run, then normal Resume continues the same Run and Lease.")
 	fmt.Fprintln(writer, "  Acknowledge records presentation-only review of eligible Historical Run outcomes.")
 	fmt.Fprintln(writer, "")
 	fmt.Fprintln(writer, "Exit statuses:")

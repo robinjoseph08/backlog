@@ -461,6 +461,26 @@ func validateRun(run scheduler.Run, requireWorkerMode, recoverUnsafeContinuation
 			boundary.SessionFile == "" || boundary.LeafID == "" || boundary.EntryCount <= 0 || len(boundary.SHA256) != sha256HexLength || hashErr != nil || boundary.VerifiedAt.IsZero() {
 			return fmt.Errorf("state contains Run %q with an invalid continuation boundary", run.RunID)
 		}
+		checkpointHash, checkpointHashErr := hex.DecodeString(boundary.CheckpointSHA256)
+		switch boundary.Workflow {
+		case "":
+			if boundary.WorkflowStage != "" || boundary.CheckpointFile != "" || boundary.CheckpointSHA256 != "" {
+				return fmt.Errorf("state contains Run %q with incomplete continuation workflow identity", run.RunID)
+			}
+		case "afk":
+			if boundary.WorkflowStage == "" || boundary.CheckpointFile != "" || boundary.CheckpointSHA256 != "" {
+				return fmt.Errorf("state contains Run %q with invalid AFK continuation identity", run.RunID)
+			}
+		case "ship-it":
+			if boundary.WorkflowStage == "" || boundary.CheckpointFile == "" || len(boundary.CheckpointSHA256) != sha256HexLength || checkpointHashErr != nil || len(checkpointHash) != sha256HexLength/2 {
+				return fmt.Errorf("state contains Run %q with invalid ship-it continuation identity", run.RunID)
+			}
+		default:
+			return fmt.Errorf("state contains Run %q with unsupported continuation workflow %q", run.RunID, boundary.Workflow)
+		}
+		if run.WorkflowStage != "" && run.WorkflowStage != boundary.WorkflowStage {
+			return fmt.Errorf("state contains Run %q with mismatched workflow stage metadata", run.RunID)
+		}
 		relative, err := filepath.Rel(run.SessionDir, boundary.SessionFile)
 		if err != nil || relative == "." || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 			return fmt.Errorf("state contains Run %q with a continuation file outside its session directory", run.RunID)
@@ -474,7 +494,30 @@ func validateRun(run scheduler.Run, requireWorkerMode, recoverUnsafeContinuation
 	if run.ResumePending && ((run.Status != scheduler.StatusSuspended && run.Status != scheduler.StatusNeedsHuman) || run.PID != 0 || run.ProcessIdentity != "" || run.Continuation == nil && run.Status != scheduler.StatusNeedsHuman && !recoverUnsafeContinuation) {
 		return fmt.Errorf("state contains Run %q with an invalid pending Resume", run.RunID)
 	}
+	if !knownFailureClass(run.FailureClass) {
+		return fmt.Errorf("state contains Run %q with unknown failure class %q", run.RunID, run.FailureClass)
+	}
+	if run.ProviderContinuationAttempts < 0 || run.ProviderContinuationAttempts > 1 {
+		return fmt.Errorf("state contains Run %q with an invalid provider continuation budget", run.RunID)
+	}
+	if run.ResumeAfter != nil && (run.ResumeAfter.IsZero() || run.Status != scheduler.StatusSuspended || run.ProviderContinuationAttempts != 1) {
+		return fmt.Errorf("state contains Run %q with an invalid provider continuation cooldown", run.RunID)
+	}
+	if run.RecoveryCount < 0 || run.RecoveryCount == 0 && (run.FirstRecoveredAt != nil || run.LastRecoveredAt != nil) ||
+		run.RecoveryCount > 0 && (run.FirstRecoveredAt == nil || run.LastRecoveredAt == nil || run.FirstRecoveredAt.IsZero() || run.LastRecoveredAt.IsZero() || run.LastRecoveredAt.Before(*run.FirstRecoveredAt)) {
+		return fmt.Errorf("state contains Run %q with invalid Recovery metadata", run.RunID)
+	}
 	return nil
+}
+
+func knownFailureClass(class scheduler.FailureClass) bool {
+	switch class {
+	case "", scheduler.FailureProviderExhaustion, scheduler.FailureBaseAdvancement, scheduler.FailureValidation,
+		scheduler.FailureRepairBudgetExhaustion, scheduler.FailureUnsafeContinuation:
+		return true
+	default:
+		return false
+	}
 }
 
 func knownStatus(status scheduler.Status) bool {

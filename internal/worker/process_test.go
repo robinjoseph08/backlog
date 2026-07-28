@@ -239,6 +239,36 @@ printf '`+test.output+`'
 	}
 }
 
+func TestRPCWriterClassifiesProviderExhaustionOnlyFromStructuredFailedRetryEnd(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name, retryEnd string
+		want           bool
+	}{
+		{name: "failed", retryEnd: `{"type":"auto_retry_end","attempt":1,"success":false}`, want: true},
+		{name: "successful", retryEnd: `{"type":"auto_retry_end","attempt":1,"success":true}`},
+		{name: "missing result", retryEnd: `{"type":"auto_retry_end","attempt":1}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			writer := newRPCWriter(&strings.Builder{}, nil, promptCommandID, 1)
+			transcript := strings.Join([]string{
+				`{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}`,
+				`{"type":"agent_start"}`, `{"type":"turn_start"}`, `{"type":"turn_end"}`, `{"type":"agent_end"}`,
+				`{"type":"auto_retry_start","attempt":1}`, test.retryEnd, `{"type":"agent_settled"}`,
+			}, "\n") + "\n"
+			if _, err := writer.Write([]byte(transcript)); err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.Finish(); err != nil {
+				t.Fatalf("finish: %v", err)
+			}
+			if got := writer.ProviderExhausted(); got != test.want {
+				t.Fatalf("ProviderExhausted = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestRPCEntryAppendedDoesNotChangeLifecycleState(t *testing.T) {
 	t.Parallel()
 
@@ -1021,6 +1051,65 @@ while IFS= read -r ignored; do :; done
 		t.Fatalf("boundary = %#v", boundary)
 	}
 	if result := process.CloseContext(context.Background(), nil); !result.GroupExited || result.Err != nil {
+		t.Fatalf("close = %#v", result)
+	}
+}
+
+func TestProcessCheckpointSettledCapturesBoundaryWithoutAbort(t *testing.T) {
+	root := t.TempDir()
+	worktree := filepath.Join(root, "worktree")
+	sessionDir := filepath.Join(root, "sessions")
+	sessionFile := filepath.Join(sessionDir, "session.jsonl")
+	firstCommand := filepath.Join(root, "first-command")
+	if err := os.MkdirAll(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	header := `{"type":"session","version":3,"id":"backlog-run-settled","cwd":` + strconv.Quote(worktree) + `}`
+	entry := `{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"done"}}`
+	if err := os.WriteFile(sessionFile, []byte(header+"\n"+entry+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateData := `{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(sessionFile) + `,"sessionId":"backlog-run-settled"}`
+	pi := fakePi(t, `
+IFS= read -r prompt
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+IFS= read -r state
+printf '%s' "$state" > `+shellQuote(firstCommand)+`
+printf '%s\n' `+shellQuote(`{"id":"backlog-suspend-state","type":"response","command":"get_state","success":true,"data":`+stateData+`}`)+`
+IFS= read -r entries
+printf '%s\n' `+shellQuote(`{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[`+entry+`],"leafId":"leaf"}}`)+`
+IFS= read -r final
+printf '%s\n' `+shellQuote(`{"id":"backlog-suspend-final-state","type":"response","command":"get_state","success":true,"data":`+stateData+`}`)+`
+while IFS= read -r ignored; do :; done
+`)
+	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(context.Background(), request(54, "run-settled", worktree, sessionDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if result := process.Wait(); !result.Settled || result.Err != nil {
+		t.Fatalf("wait = %#v", result)
+	}
+	boundary, err := process.CheckpointSettled(context.Background(), ContinuationRequest{SessionID: "backlog-run-settled", SessionDir: sessionDir, Worktree: worktree})
+	if err != nil {
+		t.Fatalf("checkpoint settled: %v", err)
+	}
+	command, err := os.ReadFile(firstCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(command), `"type":"abort"`) || !strings.Contains(string(command), `"type":"get_state"`) {
+		t.Fatalf("first settled checkpoint command = %s", command)
+	}
+	if boundary.LeafID != "leaf" || boundary.Workflow != "afk" || boundary.WorkflowStage != "afk-coordinator" {
+		t.Fatalf("boundary = %#v", boundary)
+	}
+	if result := process.Close(); !result.GroupExited || result.Err != nil {
 		t.Fatalf("close = %#v", result)
 	}
 }

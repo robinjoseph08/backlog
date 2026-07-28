@@ -632,6 +632,33 @@ func TestFileStoreLoadsUnsafeSuspensionForNeedsHumanRecovery(t *testing.T) {
 	}
 }
 
+func TestFileStoreRejectsMalformedRecoveryAndProviderMetadata(t *testing.T) {
+	t.Parallel()
+	now := time.Now().UTC()
+	base := scheduler.Run{Issue: 10, RunID: "run-10", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint}
+	tests := []struct {
+		name   string
+		mutate func(*scheduler.Run)
+		want   string
+	}{
+		{name: "unknown failure class", mutate: func(run *scheduler.Run) { run.FailureClass = "unknown" }, want: "failure class"},
+		{name: "provider budget overflow", mutate: func(run *scheduler.Run) { run.ProviderContinuationAttempts = 2 }, want: "provider continuation budget"},
+		{name: "cooldown outside suspension", mutate: func(run *scheduler.Run) { run.ProviderContinuationAttempts = 1; run.ResumeAfter = &now }, want: "cooldown"},
+		{name: "count without timestamps", mutate: func(run *scheduler.Run) { run.RecoveryCount = 1 }, want: "Recovery metadata"},
+		{name: "timestamps without count", mutate: func(run *scheduler.Run) { run.FirstRecoveredAt = &now; run.LastRecoveredAt = &now }, want: "Recovery metadata"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			run := base
+			test.mutate(&run)
+			err := (FileStore{Path: filepath.Join(t.TempDir(), "state.json")}).Save(State{Version: CurrentVersion, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestDecodeRecoverableRunPreservesMalformedContinuationEvidence(t *testing.T) {
 	t.Parallel()
 

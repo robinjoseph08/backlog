@@ -26,14 +26,17 @@ import (
 const promptCommandID = "backlog-afk-prompt"
 
 type Request struct {
-	Issue       int
-	RunID       string
-	Worktree    string
-	SessionName string
-	SessionID   string
-	SessionDir  string
-	SessionFile string
-	Resume      bool
+	Issue             int
+	RunID             string
+	Worktree          string
+	SessionName       string
+	SessionID         string
+	SessionDir        string
+	SessionFile       string
+	Resume            bool
+	ContinuationStage string
+	CheckpointFile    string
+	CheckpointSHA256  string
 }
 
 type ContinuationRequest struct {
@@ -43,28 +46,33 @@ type ContinuationRequest struct {
 }
 
 type Continuation struct {
-	SessionID   string
-	SessionFile string
-	Worktree    string
-	LeafID      string
-	EntryCount  int
-	SHA256      string
-	LogPath     string
-	StderrPath  string
+	SessionID        string
+	SessionFile      string
+	Worktree         string
+	LeafID           string
+	EntryCount       int
+	SHA256           string
+	Workflow         string
+	WorkflowStage    string
+	CheckpointFile   string
+	CheckpointSHA256 string
+	LogPath          string
+	StderrPath       string
 }
 
 type Result struct {
-	ExitCode     int
-	GroupExited  bool
-	ForceStopped bool
-	LogClosed    bool
-	LogPath      string
-	StderrPath   string
-	Settled      bool
-	StreamErr    error
-	ControlErr   error
-	cleanupErr   error
-	Err          error
+	ExitCode          int
+	GroupExited       bool
+	ForceStopped      bool
+	LogClosed         bool
+	LogPath           string
+	StderrPath        string
+	Settled           bool
+	StreamErr         error
+	ControlErr        error
+	cleanupErr        error
+	Err               error
+	ProviderExhausted bool
 }
 
 type Supervisor struct {
@@ -97,6 +105,9 @@ type Process struct {
 	resultMu           sync.Mutex
 	result             Result
 	resume             bool
+	continuationStage  string
+	checkpointFile     string
+	checkpointSHA256   string
 }
 
 var safeRunIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
@@ -216,7 +227,8 @@ func (s Supervisor) Start(ctx context.Context, request Request) (*Process, error
 		command: command, logPath: logPath, stderrPath: stderrPath, gatePath: gatePath,
 		stdin: stdin, stdout: stdoutLog, stderr: stderrLog, activity: activityWriter, events: events, terminate: terminate,
 		terminationStarted: terminationStarted, terminationDone: terminationDone, processGroupGrace: grace, exitDone: make(chan struct{}),
-		resume: request.Resume,
+		resume: request.Resume, continuationStage: request.ContinuationStage,
+		checkpointFile: request.CheckpointFile, checkpointSHA256: request.CheckpointSHA256,
 	}
 	go process.reap()
 	return process, nil
@@ -261,7 +273,14 @@ func (p *Process) Release() error {
 		}
 		message := fmt.Sprintf("/skill:afk %d", p.events.issue)
 		if p.resume {
-			message = fmt.Sprintf("Reassess the repository and GitHub state before continuing the existing AFK workflow for issue #%d. Continue from this Pi session and finish the AFK workflow.", p.events.issue)
+			stage := strings.TrimSpace(p.continuationStage)
+			if stage == "" {
+				stage = "AFK coordinator"
+			}
+			message = fmt.Sprintf("Recover the existing AFK workflow for issue #%d from the verified durable continuation boundary at %s. Reassess the repository and GitHub state before acting. Inspect the remote branch and expected-branch pull request before any push, pull request, merge, issue, or cleanup mutation, and never repeat a mutation whose prior outcome is uncertain.", p.events.issue, stage)
+			if p.checkpointFile != "" {
+				message += fmt.Sprintf(" The verified ship-it checkpoint is %s with SHA-256 %s.", p.checkpointFile, p.checkpointSHA256)
+			}
 		}
 		command := struct {
 			ID      string `json:"id"`
@@ -307,7 +326,18 @@ func (p *Process) Suspend(ctx context.Context, expected ContinuationRequest) (Co
 	if err := p.events.Idle(); err != nil {
 		return Continuation{}, err
 	}
+	return p.CheckpointSettled(ctx, expected)
+}
 
+// CheckpointSettled establishes a continuation boundary for an already settled
+// idle RPC session without sending abort or otherwise changing agent state.
+func (p *Process) CheckpointSettled(ctx context.Context, expected ContinuationRequest) (Continuation, error) {
+	if expected.SessionID == "" || expected.SessionDir == "" || expected.Worktree == "" {
+		return Continuation{}, errors.New("continuation request is incomplete")
+	}
+	if err := p.events.Idle(); err != nil {
+		return Continuation{}, err
+	}
 	stateResponse, err := p.rpcCommand(ctx, "backlog-suspend-state", "get_state")
 	if err != nil {
 		return Continuation{}, fmt.Errorf("get Pi RPC state: %w", err)
@@ -367,9 +397,14 @@ func (p *Process) Suspend(ctx context.Context, expected ContinuationRequest) (Co
 	if err := p.events.Err(); err != nil {
 		return Continuation{}, fmt.Errorf("confirm final Pi RPC transcript: %w", err)
 	}
+	workflow, stage, checkpointFile, checkpointSHA, err := InspectWorkflowCheckpoint(expected.Worktree)
+	if err != nil {
+		return Continuation{}, err
+	}
 	return Continuation{
 		SessionID: expected.SessionID, SessionFile: rpcState.SessionFile, Worktree: expected.Worktree,
 		LeafID: rpcEntries.LeafID, EntryCount: len(rpcEntries.Entries), SHA256: sha,
+		Workflow: workflow, WorkflowStage: stage, CheckpointFile: checkpointFile, CheckpointSHA256: checkpointSHA,
 		LogPath: p.logPath, StderrPath: p.stderrPath,
 	}, nil
 }
@@ -456,7 +491,7 @@ func (p *Process) Wait() Result {
 		if err := p.events.Err(); err != nil {
 			return Result{ExitCode: -1, LogPath: p.logPath, StderrPath: p.stderrPath, StreamErr: err, Err: err}
 		}
-		return Result{ExitCode: 0, LogPath: p.logPath, StderrPath: p.stderrPath, Settled: true}
+		return Result{ExitCode: 0, LogPath: p.logPath, StderrPath: p.stderrPath, Settled: true, ProviderExhausted: p.events.ProviderExhausted()}
 	case <-p.exitDone:
 		return p.exitResult()
 	}
@@ -630,7 +665,7 @@ func (p *Process) reap() {
 	p.resultMu.Lock()
 	p.result = Result{
 		ExitCode: exitCode, LogClosed: true, LogPath: p.logPath, StderrPath: p.stderrPath,
-		Settled:   p.events.Settled() && streamErr == nil,
+		Settled: p.events.Settled() && streamErr == nil, ProviderExhausted: p.events.ProviderExhausted(),
 		StreamErr: streamErr, ControlErr: closeErr, cleanupErr: closeErr, Err: errors.Join(waitErr, streamErr, closeErr),
 	}
 	p.resultMu.Unlock()
@@ -700,7 +735,175 @@ func VerifyContinuation(expected ContinuationRequest, continuation Continuation)
 	if err := verifyContinuationLeaf(entries, continuation.LeafID); err != nil {
 		return err
 	}
+	if continuation.Workflow != "" {
+		workflow, stage, checkpointFile, checkpointSHA, err := InspectWorkflowCheckpoint(expected.Worktree)
+		if err != nil {
+			return err
+		}
+		if workflow != continuation.Workflow || stage != continuation.WorkflowStage || checkpointFile != continuation.CheckpointFile || checkpointSHA != continuation.CheckpointSHA256 {
+			return errors.New("workflow checkpoint identity changed after continuation verification")
+		}
+	}
 	return nil
+}
+
+// InspectContinuation derives a boundary from one unambiguous offline Pi
+// session file. Callers must prove Worker and process-group absence first.
+func InspectContinuation(expected ContinuationRequest) (Continuation, error) {
+	if expected.SessionID == "" || expected.SessionDir == "" || expected.Worktree == "" {
+		return Continuation{}, errors.New("continuation request is incomplete")
+	}
+	entries, err := os.ReadDir(expected.SessionDir)
+	if err != nil {
+		return Continuation{}, fmt.Errorf("inspect Pi session directory: %w", err)
+	}
+	var candidates []string
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			return Continuation{}, fmt.Errorf("inspect Pi session entry %q: %w", entry.Name(), err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return Continuation{}, fmt.Errorf("Pi session directory contains unsafe symlink %q", entry.Name())
+		}
+		if info.Mode().IsRegular() {
+			candidates = append(candidates, filepath.Join(expected.SessionDir, entry.Name()))
+		}
+	}
+	if len(candidates) != 1 {
+		return Continuation{}, fmt.Errorf("Pi session directory has %d regular session-file candidates; exactly one is required", len(candidates))
+	}
+	sessionFile := candidates[0]
+	if err := verifySessionPath(expected.SessionDir, sessionFile); err != nil {
+		return Continuation{}, err
+	}
+	records, sha, err := readSessionRecords(sessionFile)
+	if err != nil {
+		return Continuation{}, err
+	}
+	if len(records) < 2 {
+		return Continuation{}, errors.New("Pi session file has no durable continuation entry")
+	}
+	var leaf struct {
+		ID string `json:"id"`
+	}
+	if _, err := decodeExactJSON(records[len(records)-1]); err != nil {
+		return Continuation{}, fmt.Errorf("decode Pi session leaf: %w", err)
+	}
+	if err := rejectNonCanonicalJSONFields(records[len(records)-1], "id"); err != nil {
+		return Continuation{}, fmt.Errorf("decode Pi session leaf: %w", err)
+	}
+	if err := json.Unmarshal(records[len(records)-1], &leaf); err != nil || leaf.ID == "" {
+		return Continuation{}, errors.New("Pi session leaf has no durable identity")
+	}
+	continuation := Continuation{SessionID: expected.SessionID, SessionFile: sessionFile, Worktree: expected.Worktree, LeafID: leaf.ID, EntryCount: len(records) - 1, SHA256: sha}
+	if err := VerifyContinuation(expected, continuation); err != nil {
+		return Continuation{}, err
+	}
+	workflow, stage, checkpointFile, checkpointSHA, err := InspectWorkflowCheckpoint(expected.Worktree)
+	if err != nil {
+		return Continuation{}, err
+	}
+	continuation.Workflow, continuation.WorkflowStage = workflow, stage
+	continuation.CheckpointFile, continuation.CheckpointSHA256 = checkpointFile, checkpointSHA
+	return continuation, nil
+}
+
+// SyncContinuation revalidates and durably synchronizes an offline boundary.
+// Inspection remains read-only so dry-run Recovery never writes external state.
+func SyncContinuation(expected ContinuationRequest, continuation Continuation) error {
+	if err := VerifyContinuation(expected, continuation); err != nil {
+		return err
+	}
+	file, err := openSessionFile(continuation.SessionFile)
+	if err != nil {
+		return err
+	}
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	directory, dirErr := os.Open(expected.SessionDir)
+	if dirErr == nil {
+		dirErr = errors.Join(directory.Sync(), directory.Close())
+	}
+	if err := errors.Join(syncErr, closeErr, dirErr); err != nil {
+		return fmt.Errorf("sync offline Pi continuation: %w", err)
+	}
+	return nil
+}
+
+// InspectWorkflowCheckpoint identifies the durable AFK continuation stage. A
+// ship-it checkpoint, when present, is hashed and its exact Stage field is used.
+func InspectWorkflowCheckpoint(worktree string) (workflow, stage, checkpointFile, checkpointSHA string, resultErr error) {
+	gitMarker := filepath.Join(worktree, ".git")
+	info, err := os.Lstat(gitMarker)
+	if errors.Is(err, os.ErrNotExist) {
+		// Pi can be exercised against a synthetic worktree in protocol tests. The
+		// absence of ship-it state still has the explicit AFK coordinator boundary.
+		return "afk", "afk-coordinator", "", "", nil
+	}
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("inspect worktree Git identity: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", "", "", "", errors.New("worktree Git identity is a symlink")
+	}
+	gitDir := gitMarker
+	if info.Mode().IsRegular() {
+		data, err := os.ReadFile(gitMarker)
+		if err != nil {
+			return "", "", "", "", fmt.Errorf("read worktree Git identity: %w", err)
+		}
+		value := strings.TrimSpace(string(data))
+		if !strings.HasPrefix(value, "gitdir: ") {
+			return "", "", "", "", errors.New("worktree Git identity file is malformed")
+		}
+		gitDir = strings.TrimSpace(strings.TrimPrefix(value, "gitdir: "))
+		if !filepath.IsAbs(gitDir) {
+			gitDir = filepath.Join(worktree, gitDir)
+		}
+	} else if !info.IsDir() {
+		return "", "", "", "", errors.New("worktree Git identity is not a regular file or directory")
+	}
+	gitDir, err = filepath.EvalSymlinks(gitDir)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("resolve worktree Git directory: %w", err)
+	}
+	checkpointFile = filepath.Join(gitDir, "ship-it-checkpoint-v1.md")
+	// #nosec G703 -- gitDir is the resolved Git directory owned by this verified worktree.
+	checkpointInfo, err := os.Lstat(checkpointFile)
+	if errors.Is(err, os.ErrNotExist) {
+		return "afk", "afk-coordinator", "", "", nil
+	}
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("inspect ship-it checkpoint: %w", err)
+	}
+	if !checkpointInfo.Mode().IsRegular() || checkpointInfo.Mode()&os.ModeSymlink != 0 {
+		return "", "", "", "", errors.New("ship-it checkpoint is not a regular file")
+	}
+	if checkpointInfo.Size() > 4*1024*1024 {
+		return "", "", "", "", errors.New("ship-it checkpoint exceeds the supported size")
+	}
+	// #nosec G703 -- checkpointFile is a fixed basename under the resolved worktree Git directory.
+	data, err := os.ReadFile(checkpointFile)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("read ship-it checkpoint: %w", err)
+	}
+	if !strings.HasPrefix(string(data), "# Ship-it checkpoint v1\n") {
+		return "", "", "", "", errors.New("ship-it checkpoint has an unsupported header")
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "Stage: ") {
+			if stage != "" {
+				return "", "", "", "", errors.New("ship-it checkpoint contains multiple Stage fields")
+			}
+			stage = strings.TrimSpace(strings.TrimPrefix(line, "Stage: "))
+		}
+	}
+	if stage == "" {
+		return "", "", "", "", errors.New("ship-it checkpoint omits its Stage")
+	}
+	hash := sha256.Sum256(data)
+	return "ship-it", stage, checkpointFile, hex.EncodeToString(hash[:]), nil
 }
 
 func readSessionRecords(path string) ([]json.RawMessage, string, error) {
@@ -1263,6 +1466,7 @@ type rpcWriter struct {
 	retryAttempt              int
 	summarizationRetryOpen    bool
 	summarizationRetryAttempt int
+	providerExhausted         bool
 	openTools                 map[string]struct{}
 	responses                 map[string]responseWaiter
 	parseErrors               []error
@@ -1332,6 +1536,12 @@ func (w *rpcWriter) Settled() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.state == rpcAgentSettled
+}
+
+func (w *rpcWriter) ProviderExhausted() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.providerExhausted
 }
 
 func (w *rpcWriter) ExpectResponse(id, command string) <-chan rpcResponse {
@@ -1532,6 +1742,9 @@ func (w *rpcWriter) validate(line []byte) {
 		}
 		w.retryOpen = false
 		w.retryAttempt = 0
+		if message.Success != nil && !*message.Success {
+			w.providerExhausted = true
+		}
 	case "summarization_retry_scheduled":
 		if w.state != rpcBetweenAgentRuns || w.retryOpen || message.Attempt <= w.summarizationRetryAttempt {
 			w.invalidOrder(message.Type)

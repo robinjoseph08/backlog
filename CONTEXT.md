@@ -56,9 +56,13 @@ _Avoid_: Pausing Run, paused Worker
 A Run with no live Worker whose retained continuation state allows a replacement Worker to continue it.
 _Avoid_: Paused Worker, failed Run
 
+**Recovery**:
+A fail-closed operator lifecycle operation that verifies durable continuation evidence for an Intervention-required Run and transitions that same leased Run to Suspended.
+_Avoid_: Resume, Retry, Reset
+
 **Resume**:
-Continuation of a Suspended Run by a replacement Worker using the same Run identity and retained artifacts.
-_Avoid_: Retry, restart
+Launch of a replacement Worker for a Suspended Run using the same Run identity and retained artifacts after fresh launch checks.
+_Avoid_: Recovery, Retry, restart
 
 **Reset**:
 Idempotent abandonment of an incomplete Run that retires its active artifacts, restores the issue as a Candidate, and releases its Lease while preserving history.

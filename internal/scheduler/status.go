@@ -57,7 +57,7 @@ func CanTransition(from, to Status) bool {
 	case StatusWaitingForMerge:
 		return to == StatusMerged || to == StatusFailed || to == StatusNeedsHuman || to == StatusResetting || to == StatusResolvingExternally
 	case StatusFailed, StatusNeedsHuman:
-		return to == StatusResetting || to == StatusReset || to == StatusResolvingExternally || to == StatusMerged
+		return to == StatusSuspended || to == StatusResetting || to == StatusReset || to == StatusResolvingExternally || to == StatusMerged
 	case StatusResetting:
 		return to == StatusReset || to == StatusResolvingExternally || to == StatusMerged
 	case StatusResolvingExternally:
