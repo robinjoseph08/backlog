@@ -138,7 +138,8 @@ func (e Service) inspect(ctx context.Context) (Plan, error) {
 		return Plan{}, err
 	}
 	snapshot := Snapshot{
-		Run: run, Lease: lease,
+		Repository: repository.Slug,
+		Run:        run, Lease: lease,
 		Issue:        Issue{Number: issueResource.Number, URL: issueResource.URL, Open: issueResource.State == "open", Labels: issueResource.Labels},
 		RemoteBranch: remoteBranch, LocalBranch: localBranch, Worktree: localWorktree, Session: session,
 		WorkerSummary: absentWorkerSummary(run),
@@ -263,11 +264,7 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 				return err
 			}
 			pull, _ = pullRequestByNumber(before.Snapshot.PullRequests, pull.Number)
-			repository, err := e.repositorySlug()
-			if err != nil {
-				return err
-			}
-			if err := e.github.DisablePullRequestAutoMerge(ctx, repository, pull.Number); err != nil {
+			if err := e.github.DisablePullRequestAutoMerge(ctx, before.Snapshot.Repository, pull.Number); err != nil {
 				return fmt.Errorf("disable auto-merge for pull request #%d: %w", pull.Number, err)
 			}
 			after, err := e.inspect(ctx)
@@ -295,11 +292,7 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			if pull.AutoMergeArmed {
 				return fmt.Errorf("pull request #%d auto-merge was rearmed before the %s explanation", pull.Number, e.policy.Operation)
 			}
-			repository, err := e.repositorySlug()
-			if err != nil {
-				return err
-			}
-			if err := e.github.CommentOnPullRequest(ctx, repository, pull.Number, e.policy.Explanation(before.Snapshot.Run)); err != nil {
+			if err := e.github.CommentOnPullRequest(ctx, before.Snapshot.Repository, pull.Number, e.policy.Explanation(before.Snapshot.Run)); err != nil {
 				return fmt.Errorf("%s on pull request #%d: %w", e.policy.ExplanationAction, pull.Number, err)
 			}
 			after, err := e.inspect(ctx)
@@ -322,11 +315,7 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			if pull.AutoMergeArmed || !pull.Explained {
 				return fmt.Errorf("pull request #%d is not ready for safe closure", pull.Number)
 			}
-			repository, err := e.repositorySlug()
-			if err != nil {
-				return err
-			}
-			if err := e.github.ClosePullRequest(ctx, repository, pull.Number); err != nil {
+			if err := e.github.ClosePullRequest(ctx, before.Snapshot.Repository, pull.Number); err != nil {
 				return fmt.Errorf("close unmerged pull request #%d: %w", pull.Number, err)
 			}
 			after, err := e.inspect(ctx)
@@ -416,11 +405,7 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			if err != nil {
 				return err
 			}
-			repository, err := e.repositorySlug()
-			if err != nil {
-				return err
-			}
-			if err := e.github.RemoveIssueLabel(ctx, repository, before.Snapshot.Run.Issue, label); err != nil {
+			if err := e.github.RemoveIssueLabel(ctx, before.Snapshot.Repository, before.Snapshot.Run.Issue, label); err != nil {
 				return fmt.Errorf("remove issue label %s: %w", label, err)
 			}
 			after, err := e.inspect(ctx)
@@ -436,11 +421,7 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			if err != nil {
 				return err
 			}
-			repository, err := e.repositorySlug()
-			if err != nil {
-				return err
-			}
-			if err := e.github.AddIssueLabel(ctx, repository, before.Snapshot.Run.Issue, label); err != nil {
+			if err := e.github.AddIssueLabel(ctx, before.Snapshot.Repository, before.Snapshot.Run.Issue, label); err != nil {
 				return fmt.Errorf("add issue label %s: %w", label, err)
 			}
 			after, err := e.inspect(ctx)
@@ -474,6 +455,9 @@ func (e Service) revalidatePlan(ctx context.Context, current, approved Plan, act
 }
 
 func (e Service) verifyGitHubIdentityContinuity(expected, actual Snapshot) error {
+	if expected.Repository == "" || expected.Repository != actual.Repository {
+		return fmt.Errorf("repository identity changed while %s Run artifacts", e.policy.ProgressStatus)
+	}
 	if expected.Run.RunID != actual.Run.RunID || expected.Lease != actual.Lease {
 		return fmt.Errorf("Run or Lease identity changed while %s Run artifacts", e.policy.ProgressStatus)
 	}
@@ -729,17 +713,6 @@ func verifyLabelMutation(before, after []string, added, removed string) error {
 	return fmt.Errorf("issue label mutation did not satisfy its verified postcondition: labels changed from %s to %s", formatLabels(before), formatLabels(after))
 }
 
-func (e Service) repositorySlug() (string, error) {
-	current, _, err := e.store.Preview()
-	if err != nil {
-		return "", err
-	}
-	if current.Repo == "" {
-		return "", errors.New("Run state has no repository identity")
-	}
-	return current.Repo, nil
-}
-
 func (e Service) markProgress() error {
 	current, _, err := e.store.Preview()
 	if err != nil {
@@ -769,6 +742,11 @@ func (e Service) markProgress() error {
 }
 
 func (e Service) finalize(ctx context.Context, verified Plan) error {
+	if verified.Snapshot.Session.Archived {
+		if err := syncArchivedSession(verified.Snapshot.Session, e.stateDirectory, e.filesystemSync); err != nil {
+			return fmt.Errorf("verify durable Pi session archive: %w", err)
+		}
+	}
 	fresh, err := e.inspect(ctx)
 	if err != nil {
 		return err
@@ -785,11 +763,6 @@ func (e Service) finalize(ctx context.Context, verified Plan) error {
 	}
 	if err := e.verifyOwnedFinalState(verified.Snapshot); err != nil {
 		return err
-	}
-	if verified.Snapshot.Session.Archived {
-		if err := syncArchivedSession(verified.Snapshot.Session, e.stateDirectory, e.filesystemSync); err != nil {
-			return fmt.Errorf("verify durable Pi session archive: %w", err)
-		}
 	}
 	current, _, err := e.store.Preview()
 	if err != nil {

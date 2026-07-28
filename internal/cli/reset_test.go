@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -343,15 +344,16 @@ esac
 }
 
 type localArtifactResetFixture struct {
-	repository string
-	stateDir   string
-	store      state.FileStore
-	branch     string
-	worktree   string
-	sessionDir string
-	archiveDir string
-	github     string
-	git        string
+	repository  string
+	stateDir    string
+	store       state.FileStore
+	branch      string
+	worktree    string
+	sessionDir  string
+	archiveDir  string
+	githubState string
+	github      string
+	git         string
 }
 
 func newLocalArtifactResetFixture(t *testing.T, failLabelOnce bool) localArtifactResetFixture {
@@ -430,7 +432,8 @@ esac
 `)
 	return localArtifactResetFixture{
 		repository: repository, stateDir: stateDir, store: store, branch: branch, worktree: worktreePath,
-		sessionDir: sessionDir, archiveDir: filepath.Join(stateDir, "history", "sessions", runID), github: gh, git: githubGit(t),
+		sessionDir: sessionDir, archiveDir: filepath.Join(stateDir, "history", "sessions", runID),
+		githubState: githubState, github: gh, git: githubGit(t),
 	}
 }
 
@@ -594,6 +597,59 @@ func TestResetRerunsAfterSessionArchiveSyncFailure(t *testing.T) {
 	}
 	if current.Runs[0].Status != scheduler.StatusReset || len(current.Leases) != 0 {
 		t.Fatalf("rerun final state = %#v", current)
+	}
+}
+
+func TestResetReinspectsExternalPostconditionsAfterArchiveSynchronization(t *testing.T) {
+	fixture := newLocalArtifactResetFixture(t, false)
+	commonDirectory, err := gitCommonDirectory(context.Background(), fixture.git, fixture.repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := false
+	executor := resetExecutor{
+		store: fixture.store, github: ghadapter.Client{Executable: fixture.github, Dir: fixture.repository}, issue: 42,
+		repositoryRoot: fixture.repository, commonDirectory: commonDirectory, stateDirectory: fixture.stateDir, gitExecutable: fixture.git,
+		syncPath: func(path string) error {
+			var value struct {
+				Labels []string `json:"labels"`
+			}
+			data, readErr := os.ReadFile(fixture.githubState)
+			if readErr != nil {
+				return readErr
+			}
+			if unmarshalErr := json.Unmarshal(data, &value); unmarshalErr != nil {
+				return unmarshalErr
+			}
+			if !mutated && slices.Contains(value.Labels, "ready-for-agent") {
+				temporary := fixture.githubState + ".tmp"
+				if writeErr := os.WriteFile(temporary, []byte(`{"labels":["in-progress","spec"]}`), 0o600); writeErr != nil {
+					return writeErr
+				}
+				if renameErr := os.Rename(temporary, fixture.githubState); renameErr != nil {
+					return renameErr
+				}
+				mutated = true
+			}
+			return syncFilesystemPath(path)
+		},
+	}
+	approved, err := executor.inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.apply(context.Background(), approved); err == nil || !strings.Contains(err.Error(), "Plan changed immediately before finalization") {
+		t.Fatalf("post-synchronization external race error = %v", err)
+	}
+	if !mutated {
+		t.Fatal("archive synchronization did not inject the external race")
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusResetting || len(current.Leases) != 1 {
+		t.Fatalf("post-synchronization race released ownership: %#v", current)
 	}
 }
 
@@ -1563,6 +1619,36 @@ func TestResetFinalizationPersistsRunAndLeaseTogether(t *testing.T) {
 	persisted := store.saves[0]
 	if len(persisted.Runs) != 1 || persisted.Runs[0].Status != scheduler.StatusReset || len(persisted.Leases) != 0 {
 		t.Fatalf("atomic finalization snapshot = %#v", persisted)
+	}
+}
+
+func TestResetUsesRevalidatedRepositoryForLabelMutation(t *testing.T) {
+	fixture := newArtifactFreeResetFixture(t, []string{"in-progress", "ready-for-agent", "spec"})
+	commonDirectory, err := gitCommonDirectory(context.Background(), fixture.git, fixture.repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &repositoryRaceResetStore{resetStateStore: fixture.store, raceAt: 7}
+	executor := resetExecutor{
+		store: store, github: ghadapter.Client{Executable: fixture.gh, Dir: fixture.repository}, issue: 42,
+		repositoryRoot: fixture.repository, commonDirectory: commonDirectory, stateDirectory: fixture.stateDir, gitExecutable: fixture.git,
+	}
+	approved, err := executor.inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.apply(context.Background(), approved); err == nil || !strings.Contains(err.Error(), "Run state belongs to \"other/widgets\"") {
+		t.Fatalf("repository race error = %v", err)
+	}
+	if labels := strings.Join(fixture.labels(t), ","); labels != "ready-for-agent,spec" {
+		t.Fatalf("verified repository label mutation did not occur: %q", labels)
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusResetting || len(current.Leases) != 1 {
+		t.Fatalf("repository race released ownership: %#v", current)
 	}
 }
 
@@ -2687,6 +2773,21 @@ func (w *failOnTextWriter) Write(data []byte) (int, error) {
 		return 0, errors.New("injected output failure")
 	}
 	return len(data), nil
+}
+
+type repositoryRaceResetStore struct {
+	resetStateStore
+	previews int
+	raceAt   int
+}
+
+func (s *repositoryRaceResetStore) Preview() (state.State, bool, error) {
+	current, exists, err := s.resetStateStore.Preview()
+	s.previews++
+	if err == nil && s.previews == s.raceAt {
+		current.Repo = "other/widgets"
+	}
+	return current, exists, err
 }
 
 type recordingResetStore struct {

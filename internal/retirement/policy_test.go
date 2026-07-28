@@ -51,6 +51,11 @@ func TestPolicyValidationRefusesEveryIncompletePolicyShape(t *testing.T) {
 		{name: "core behavior", mutate: func(policy *Policy) { policy.Explanation = nil }, want: "policy is incomplete"},
 		{name: "lifecycle states", mutate: func(policy *Policy) { policy.ProgressStatus = "" }, want: "incomplete lifecycle states"},
 		{name: "label outcome", mutate: func(policy *Policy) { policy.Labels = LabelOutcome{} }, want: "no label outcome"},
+		{name: "empty add label", mutate: func(policy *Policy) { policy.Labels.Add = append(policy.Labels.Add, " ") }, want: "empty label to add"},
+		{name: "empty remove label", mutate: func(policy *Policy) { policy.Labels.Remove = append(policy.Labels.Remove, "") }, want: "empty label to remove"},
+		{name: "duplicate add label", mutate: func(policy *Policy) { policy.Labels.Add = append(policy.Labels.Add, "AVAILABLE") }, want: "duplicate label"},
+		{name: "duplicate remove label", mutate: func(policy *Policy) { policy.Labels.Remove = append(policy.Labels.Remove, "OWNED") }, want: "duplicate label"},
+		{name: "overlapping label", mutate: func(policy *Policy) { policy.Labels.Remove = append(policy.Labels.Remove, "AVAILABLE") }, want: "both add and remove"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

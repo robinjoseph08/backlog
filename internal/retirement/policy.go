@@ -41,6 +41,31 @@ func (p Policy) validate() error {
 	if len(p.Labels.Add) == 0 && len(p.Labels.Remove) == 0 {
 		return fmt.Errorf("owned Run retirement policy has no label outcome")
 	}
+	add := make(map[string]struct{}, len(p.Labels.Add))
+	for _, label := range p.Labels.Add {
+		normalized := strings.ToLower(label)
+		if strings.TrimSpace(label) == "" {
+			return fmt.Errorf("owned Run retirement policy has an empty label to add")
+		}
+		if _, duplicate := add[normalized]; duplicate {
+			return fmt.Errorf("owned Run retirement policy has duplicate label %q to add", label)
+		}
+		add[normalized] = struct{}{}
+	}
+	remove := make(map[string]struct{}, len(p.Labels.Remove))
+	for _, label := range p.Labels.Remove {
+		normalized := strings.ToLower(label)
+		if strings.TrimSpace(label) == "" {
+			return fmt.Errorf("owned Run retirement policy has an empty label to remove")
+		}
+		if _, duplicate := remove[normalized]; duplicate {
+			return fmt.Errorf("owned Run retirement policy has duplicate label %q to remove", label)
+		}
+		if _, overlaps := add[normalized]; overlaps {
+			return fmt.Errorf("owned Run retirement policy cannot both add and remove label %q", label)
+		}
+		remove[normalized] = struct{}{}
+	}
 	return nil
 }
 

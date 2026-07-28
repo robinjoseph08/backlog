@@ -58,6 +58,7 @@ type Session struct {
 // Snapshot contains only known-present or known-absent resources. Inspectors
 // return an error rather than constructing a Snapshot when any state is unknown.
 type Snapshot struct {
+	Repository    string
 	Run           scheduler.Run
 	Lease         scheduler.Lease
 	Issue         Issue
