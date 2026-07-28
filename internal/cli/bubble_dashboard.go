@@ -94,7 +94,7 @@ func (s *bubbleDashboardSession) presentation(ctx context.Context, control Prese
 		tea.WithInput(control.Terminal.Input),
 		tea.WithOutput(control.Terminal.Output),
 		tea.WithWindowSize(dimensions.Width, dimensions.Height),
-		tea.WithColorProfile(bubbleColorProfile(control.Terminal.ColorProfile())),
+		tea.WithColorProfile(bubbleColorProfile(model.colorProfile)),
 		tea.WithoutSignalHandler(),
 	)
 	_, err = program.Run()
@@ -289,16 +289,19 @@ func (s bubbleDashboardStore) Save(current state.State) error {
 }
 
 type bubbleDashboardModel struct {
-	ctx       context.Context
-	control   PresentationControl
-	session   *bubbleDashboardSession
-	dashboard *liveDashboard
-	viewport  viewport.Model
-	width     int
-	height    int
-	header    string
-	footer    string
-	layout    dashboardBodyLayout
+	ctx          context.Context
+	control      PresentationControl
+	session      *bubbleDashboardSession
+	dashboard    *liveDashboard
+	viewport     viewport.Model
+	width        int
+	height       int
+	header       string
+	footer       string
+	layout       dashboardBodyLayout
+	stage        dashboardStage
+	colorProfile TerminalColorProfile
+	styler       dashboardStyler
 
 	selectedAnchor   string
 	attentionKnown   map[string]struct{}
@@ -312,6 +315,10 @@ type bubbleDashboardModel struct {
 func newBubbleDashboardModel(ctx context.Context, control PresentationControl, session *bubbleDashboardSession, dimensions TerminalDimensions) bubbleDashboardModel {
 	empty := state.State{Version: state.CurrentVersion}
 	view := viewport.New(viewport.WithWidth(dimensions.Width))
+	profile := TerminalColorNone
+	if control.Terminal.ColorProfile != nil {
+		profile = control.Terminal.ColorProfile()
+	}
 	view.SoftWrap = true
 	view.FillHeight = true
 	model := bubbleDashboardModel{
@@ -319,7 +326,7 @@ func newBubbleDashboardModel(ctx context.Context, control PresentationControl, s
 		dashboard: newLiveDashboard(io.Discard, nil, empty, control.Terminal.Now),
 		viewport:  view, width: dimensions.Width, height: dimensions.Height,
 		attentionKnown: make(map[string]struct{}), attentionPending: make(map[string]struct{}),
-		startup: &atomic.Bool{},
+		colorProfile: profile, styler: newDashboardFallbackStyler(profile), startup: &atomic.Bool{},
 	}
 	model.refreshViewport(dashboardSelection{})
 	model.selectViewportAnchor()
@@ -333,7 +340,11 @@ func (m bubbleDashboardModel) started() bool {
 func (m bubbleDashboardModel) Init() tea.Cmd {
 	m.startup.Store(true)
 	m.session.signalStartup(nil)
-	return tea.Batch(m.waitForSessionUpdate(), m.waitForOperationalEvent(), dashboardElapsedTick(), dashboardActivityTick())
+	commands := []tea.Cmd{m.waitForSessionUpdate(), m.waitForOperationalEvent(), dashboardElapsedTick(), dashboardActivityTick()}
+	if m.colorProfile != TerminalColorNone {
+		commands = append(commands, tea.RequestBackgroundColor)
+	}
+	return tea.Batch(commands...)
 }
 
 func (m bubbleDashboardModel) waitForSessionUpdate() tea.Cmd {
@@ -372,6 +383,8 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = max(1, msg.Width), max(1, msg.Height)
+	case tea.BackgroundColorMsg:
+		m.styler = newDashboardStyler(m.colorProfile, msg.IsDark())
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" {
 			m.interruptsWaiting++
@@ -479,10 +492,11 @@ type dashboardSelection struct {
 }
 
 func (m *bubbleDashboardModel) refreshViewport(selection dashboardSelection) {
-	header, layout, footer := m.dashboard.renderPartsWithLayout(m.dashboard.now())
-	m.header = dashboardHeaderWithAttention(header, len(m.attentionPending))
+	header, layout, footer, stage := m.dashboard.renderPartsWithLayout(m.dashboard.now(), m.styler)
+	m.header = header
 	m.footer = footer + "\n" + dashboardNavigationHelp
 	m.layout = layout
+	m.stage = stage
 	m.resizeViewport()
 	m.viewport.SetContent(layout.text)
 	if selection.valid {
@@ -493,17 +507,6 @@ func (m *bubbleDashboardModel) refreshViewport(selection dashboardSelection) {
 		}
 	}
 	m.selectViewportAnchor()
-}
-
-func dashboardHeaderWithAttention(header string, pending int) string {
-	if pending == 0 {
-		return header
-	}
-	lines := strings.Split(header, "\n")
-	if len(lines) > 1 {
-		lines[1] += fmt.Sprintf(" | NEW ATTENTION (%d): press a", pending)
-	}
-	return strings.Join(lines, "\n")
 }
 
 func (m *bubbleDashboardModel) resizeViewport() {
@@ -666,7 +669,7 @@ func (m bubbleDashboardModel) View() tea.View {
 
 	lines := make([]string, 0, m.height)
 	if frame.titleHeight > 0 {
-		lines = append(lines, lipgloss.NewStyle().Bold(true).Render(frame.title))
+		lines = append(lines, renderDashboardTitle(frame.title, m.styler))
 	}
 	lines = append(lines, frame.chrome.top...)
 	if frame.bodyHeight > 0 {
@@ -692,7 +695,7 @@ type dashboardFrame struct {
 
 func (m bubbleDashboardModel) dashboardFrame() dashboardFrame {
 	headerLines := strings.SplitN(m.header, "\n", 3)
-	chrome := dashboardChromeLines(headerLines[1:], strings.Split(m.footer, "\n"), m.width, m.height)
+	chrome := dashboardChromeLines(headerLines[1:], strings.Split(m.footer, "\n"), len(m.attentionPending), m.stage, m.styler, m.width, m.height)
 	chromeHeight := len(chrome.top) + len(chrome.bottom)
 	titleHeight := 0
 	if chromeHeight+1 < m.height {
@@ -707,12 +710,19 @@ func (m bubbleDashboardModel) dashboardFrame() dashboardFrame {
 	}
 }
 
+func renderDashboardTitle(title string, styler dashboardStyler) string {
+	if !styler.enabled {
+		return title
+	}
+	return lipgloss.NewStyle().Bold(true).Render(title)
+}
+
 type dashboardChrome struct {
 	top    []string
 	bottom []string
 }
 
-func dashboardChromeLines(header, footer []string, width, height int) dashboardChrome {
+func dashboardChromeLines(header, footer []string, pendingAttention int, stage dashboardStage, styler dashboardStyler, width, height int) dashboardChrome {
 	if width <= 0 || height <= 0 {
 		return dashboardChrome{}
 	}
@@ -720,22 +730,26 @@ func dashboardChromeLines(header, footer []string, width, height int) dashboardC
 	if height >= 3 {
 		chromeLimit--
 	}
-	headerGroups := dashboardChromeGroups(header)
-	footerGroups := dashboardChromeGroups(footer)
+	metadata := styledDashboardHeaderItems(header, pendingAttention, false, styler)
+	lifecycle := styledDashboardFooterItems(footer, stage, styler)
+	headerGroups := dashboardChromeGroups(metadata)
+	footerGroups := dashboardChromeGroups(lifecycle)
 	compactNavigation := append([]string(nil), footer...)
 	if len(compactNavigation) > 2 {
 		compactNavigation[2] = "N:jk/fb Pg H/E gG a"
 	}
-	compactHeader := compactDashboardHeader(header)
-	compactFooter := compactDashboardFooter(footer)
+	compactNavigation = styledDashboardFooterItems(compactNavigation, stage, styler)
+	compactHeader := styledDashboardHeaderItems(compactDashboardHeader(header), pendingAttention, true, styler)
+	compactFooter := styledDashboardFooterItems(compactDashboardFooter(footer), stage, styler)
 	candidates := []dashboardChrome{
 		{top: wrapDashboardChrome(headerGroups, width), bottom: wrapDashboardChrome(footerGroups, width)},
 		{top: wrapDashboardChrome(headerGroups, width), bottom: wrapDashboardChrome(dashboardChromeGroups(compactNavigation), width)},
-		{top: wrapDashboardChrome([][]string{header}, width), bottom: wrapDashboardChrome([][]string{footer}, width)},
+		{top: wrapDashboardChrome([][]string{metadata}, width), bottom: wrapDashboardChrome([][]string{lifecycle}, width)},
 		{top: wrapDashboardChrome([][]string{compactHeader}, width), bottom: wrapDashboardChrome([][]string{compactFooter}, width)},
 		// A one-line terminal cannot have distinct header and footer rows. Keep
-		// the whole compact chrome in the footer row so lifecycle guidance and
-		// navigation are never moved above the scrollable body.
+		// the whole chrome in the footer row, preferring full labels when width
+		// permits and compact labels otherwise.
+		{bottom: wrapDashboardChrome([][]string{append(append([]string(nil), metadata...), lifecycle...)}, width)},
 		{bottom: wrapDashboardChrome([][]string{append(append([]string(nil), compactHeader...), compactFooter...)}, width)},
 	}
 	for _, candidate := range candidates {
@@ -781,7 +795,6 @@ func compactDashboardHeader(header []string) []string {
 			line = compactDashboardCapacity(line)
 		} else {
 			line = strings.Replace(line, "Repository: ", "R:", 1)
-			line = strings.Replace(line, " | NEW ATTENTION ", " | ! ", 1)
 		}
 		compact = append(compact, line)
 	}
@@ -804,6 +817,34 @@ func compactFooterLine(footer []string, index int) string {
 		return ""
 	}
 	return footer[index]
+}
+
+func styledDashboardHeaderItems(items []string, pendingAttention int, compact bool, styler dashboardStyler) []string {
+	styled := make([]string, len(items))
+	for index, item := range items {
+		styled[index] = styler.render(dashboardSemanticMetadata, item)
+	}
+	if pendingAttention == 0 || len(styled) == 0 {
+		return styled
+	}
+	notice := fmt.Sprintf("NEW ATTENTION (%d): press a", pendingAttention)
+	if compact {
+		notice = fmt.Sprintf("! (%d): press a", pendingAttention)
+	}
+	styled[0] += styler.render(dashboardSemanticMetadata, " | ") + styler.render(dashboardSemanticAttention, notice)
+	return styled
+}
+
+func styledDashboardFooterItems(items []string, stage dashboardStage, styler dashboardStyler) []string {
+	styled := make([]string, len(items))
+	for index, item := range items {
+		semantic := dashboardSemanticMetadata
+		if index < 2 {
+			semantic = dashboardStageSemantic(stage)
+		}
+		styled[index] = styler.render(semantic, item)
+	}
+	return styled
 }
 
 func wrapDashboardChrome(groups [][]string, width int) []string {

@@ -14,6 +14,7 @@ import (
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
+	"github.com/robinjoseph08/backlog/internal/worker"
 )
 
 type operationalEventRecorder struct {
@@ -68,6 +69,57 @@ func findShutdownEvent(events []OperationalEvent, stage ShutdownStage, action st
 		}
 	}
 	return ShutdownEvent{}, false
+}
+
+func findRunLifecycleEvent(events []OperationalEvent, stage RunLifecycleStage) (RunLifecycleEvent, bool) {
+	for _, event := range events {
+		lifecycle, ok := event.(RunLifecycleEvent)
+		if ok && lifecycle.Stage == stage {
+			return lifecycle, true
+		}
+	}
+	return RunLifecycleEvent{}, false
+}
+
+func TestRunnerReportsClaimStartAndMergeLifecycleEvents(t *testing.T) {
+	t.Parallel()
+
+	const issue = 42
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: issue, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	runner := testRunner(github, workers, &memoryStore{value: state.State{Version: state.CurrentVersion}}, 1)
+	var output bytes.Buffer
+	runner.Output = &output
+	recorder := &operationalEventRecorder{}
+	runner.OnOperationalEvent = recorder.record
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, issue)
+	github.setCompletion(issue, mergedOutcome(issue))
+	workers.complete(issue, worker.Result{ExitCode: 0})
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	runner.WaitForOperationalEventDelivery()
+
+	events := recorder.snapshot()
+	for _, test := range []struct {
+		stage RunLifecycleStage
+		want  string
+	}{
+		{stage: RunLifecycleClaimed, want: "claimed issue #42"},
+		{stage: RunLifecycleStarted, want: "started issue #42"},
+		{stage: RunLifecycleMerged, want: "verified merged completion for issue #42"},
+	} {
+		event, ok := findRunLifecycleEvent(events, test.stage)
+		if !ok || !strings.Contains(event.Message, test.want) {
+			t.Fatalf("%s lifecycle event = %#v, %t, want message containing %q", test.stage, event, ok, test.want)
+		}
+		if !strings.Contains(output.String(), event.Message+"\n") {
+			t.Fatalf("plain output omitted lifecycle event %q: %q", event.Message, output.String())
+		}
+	}
 }
 
 func TestRunnerReportsCandidateDiscoveryFailuresAndResetsCountAfterRecovery(t *testing.T) {
@@ -446,7 +498,7 @@ func TestRunnerReportsStructuredDrainStages(t *testing.T) {
 		t.Fatalf("Drain event = %#v", draining)
 	}
 	complete := <-events
-	if complete.Stage != ShutdownStageDrainComplete || complete.Action != "exiting successfully" || complete.RemainingWorkers != 0 || complete.NextInterrupt != NextInterruptNone {
+	if complete.Stage != ShutdownStageDrainComplete || complete.Result != ShutdownResultSuccess || complete.Action != "exiting successfully" || complete.RemainingWorkers != 0 || complete.NextInterrupt != NextInterruptNone {
 		t.Fatalf("Drain completion event = %#v", complete)
 	}
 }
@@ -564,7 +616,7 @@ func TestRunnerReportsStructuredIncompleteSuspension(t *testing.T) {
 		return ok
 	})
 	incomplete, _ := findShutdownEvent(events, ShutdownStageSuspensionIncomplete, "exiting with incomplete suspension")
-	if incomplete.RemainingWorkers != 0 || incomplete.NextInterrupt != NextInterruptNone {
+	if incomplete.Result != ShutdownResultFailure || incomplete.RemainingWorkers != 0 || incomplete.NextInterrupt != NextInterruptNone {
 		t.Fatalf("Suspension incomplete event = %#v", incomplete)
 	}
 }
