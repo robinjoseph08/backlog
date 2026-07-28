@@ -805,14 +805,21 @@ func TestDashboardRenderersShareProjectionMetadata(t *testing.T) {
 	}
 	dashboard := newLiveDashboard(io.Discard, &dashboardTestSource{current: current}, current, func() time.Time { return now })
 	dashboard.recordMessage("observation changed")
-	responsiveHeader, responsiveLayout, responsiveFooter, _ := dashboard.renderResponsiveParts(now, responsiveDashboardOptions{
+	responsive, responsiveLayout, _ := dashboard.renderResponsiveParts(now, responsiveDashboardOptions{
 		density: dashboardDensityConstrained, width: 120,
 	})
 	plainHeader, plainLayout, plainFooter := dashboard.renderPartsForWithLayout(current, []dashboardMessage{{text: "observation changed"}}, dashboardRunning, now, dashboardStyler{})
 
-	if responsiveHeader != plainHeader || responsiveFooter != plainFooter || !maps.Equal(responsiveLayout.attention, plainLayout.attention) {
+	if responsive.header != plainHeader || responsive.footer != plainFooter || !maps.Equal(responsiveLayout.attention, plainLayout.attention) {
 		t.Fatalf("responsive and plain projection metadata drifted:\nresponsive header: %q\nplain header: %q\nresponsive footer: %q\nplain footer: %q\nresponsive Attention: %#v\nplain Attention: %#v",
-			responsiveHeader, plainHeader, responsiveFooter, plainFooter, responsiveLayout.attention, plainLayout.attention)
+			responsive.header, plainHeader, responsive.footer, plainFooter, responsiveLayout.attention, plainLayout.attention)
+	}
+	responsive.header = "presentation labels changed independently"
+	minimal := minimalDashboardHeader(responsive.metadata, len(responsiveLayout.attention), 0)
+	for _, want := range []string{"Backlog: acme/widgets", "R:acme/widgets", "W:1u/1a/2t", "Health:0 healthy, 1 anomalous", "Attention:1"} {
+		if !strings.Contains(minimal, want) {
+			t.Fatalf("minimal projection omitted structured metadata %q after display header changed:\n%s", want, minimal)
+		}
 	}
 }
 

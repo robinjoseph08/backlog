@@ -505,15 +505,15 @@ type dashboardSelection struct {
 
 func (m *bubbleDashboardModel) refreshViewport(selection dashboardSelection) {
 	density := dashboardDensityForHeight(m.height)
-	header, layout, footer, stage := m.dashboard.renderResponsiveParts(m.dashboard.now(), responsiveDashboardOptions{
+	projection, layout, stage := m.dashboard.renderResponsiveParts(m.dashboard.now(), responsiveDashboardOptions{
 		density: density, width: m.width, selected: m.selectedAnchor, expansionOverrides: m.expansionOverrides, styler: m.styler,
 	})
 	if density == dashboardDensityMinimal {
-		m.header = minimalDashboardHeader(header, len(layout.attention), 0)
-		m.footer = minimalDashboardFooter(footer + "\n" + dashboardNavigationHelp)
+		m.header = minimalDashboardHeader(projection.metadata, len(layout.attention), 0)
+		m.footer = minimalDashboardFooter(projection.footer + "\n" + dashboardNavigationHelp)
 	} else {
-		m.header = header
-		m.footer = footer + "\n" + dashboardNavigationHelp
+		m.header = projection.header
+		m.footer = projection.footer + "\n" + dashboardNavigationHelp
 	}
 	m.layout = layout
 	m.stage = stage
@@ -562,25 +562,13 @@ func (m *bubbleDashboardModel) toggleExpansion() {
 	m.expansionOverrides[identity] = !options.expanded(identity, strings.HasPrefix(identity, "section:"))
 }
 
-func minimalDashboardHeader(header string, attention, pending int) string {
-	repository := "not initialized"
-	capacity := "W:pending"
-	health := "unknown"
-	for _, line := range strings.Split(header, "\n") {
-		switch {
-		case strings.HasPrefix(line, "Repository: "):
-			repository = strings.TrimPrefix(line, "Repository: ")
-		case strings.HasPrefix(line, "Worker capacity: "):
-			capacity = compactDashboardCapacity(line)
-		case strings.HasPrefix(line, "Worker health: "):
-			health = strings.TrimPrefix(line, "Worker health: ")
-		}
-	}
-	status := fmt.Sprintf("R:%s | %s | Health:%s | Attention:%d", repository, capacity, health, attention)
+func minimalDashboardHeader(metadata dashboardProjectionMetadata, attention, pending int) string {
+	health := fmt.Sprintf("%d healthy, %d anomalous", metadata.healthy, metadata.anomalous)
+	status := fmt.Sprintf("R:%s | %s | Health:%s | Attention:%d", metadata.repository, metadata.capacity.compact(), health, attention)
 	if pending > 0 {
 		status += fmt.Sprintf(" | New:%d", pending)
 	}
-	return "Backlog: " + repository + "\n" + status
+	return "Backlog: " + metadata.repository + "\n" + status
 }
 
 func minimalDashboardFooter(footer string) string {

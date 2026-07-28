@@ -66,6 +66,19 @@ func TestDashboardStylingUsesTypedRunSemanticsWithoutChangingLabels(t *testing.T
 	}
 }
 
+func TestResponsiveDashboardSectionKeepsTypedSemanticWhenHeadingChanges(t *testing.T) {
+	styler := newDashboardStyler(TerminalColorTrueColor, true)
+	body := dashboardBodyBuilder{}
+	body.renderResponsiveSection(statusAttention, "Intervention Required", nil, time.Now(), responsiveDashboardOptions{
+		width: 80, styler: styler,
+	}, false)
+
+	want := styler.attention.Render("  Intervention Required (0)")
+	if !strings.Contains(body.body.String(), want) {
+		t.Fatalf("renamed responsive section lost typed Attention styling: %q", body.body.String())
+	}
+}
+
 func TestDashboardPaletteAdaptsToBackgroundAndReducedProfiles(t *testing.T) {
 	tests := []struct {
 		name       string

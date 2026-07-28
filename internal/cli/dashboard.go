@@ -541,7 +541,34 @@ func (o responsiveDashboardOptions) expanded(identity string, section bool) bool
 	return o.density == dashboardDensityRoomy && identity == o.selected
 }
 
+type dashboardCapacity struct {
+	configured      bool
+	used, available int
+	total           int
+}
+
+func (c dashboardCapacity) full() string {
+	if !c.configured {
+		return "Worker capacity: pending configuration"
+	}
+	return fmt.Sprintf("Worker capacity: %d used | %d available | %d total", c.used, c.available, c.total)
+}
+
+func (c dashboardCapacity) compact() string {
+	if !c.configured {
+		return "W:pending"
+	}
+	return fmt.Sprintf("W:%du/%da/%dt", c.used, c.available, c.total)
+}
+
+type dashboardProjectionMetadata struct {
+	repository         string
+	capacity           dashboardCapacity
+	healthy, anomalous int
+}
+
 type dashboardProjection struct {
+	metadata  dashboardProjectionMetadata
 	header    string
 	sections  map[statusSection][]statusRun
 	attention map[string]struct{}
@@ -550,24 +577,28 @@ type dashboardProjection struct {
 
 func (d *liveDashboard) project(current state.State, stage dashboardStage, now time.Time) dashboardProjection {
 	sections := d.observeSections(current, now)
-	capacity := "Worker capacity: pending configuration"
+	capacity := dashboardCapacity{}
 	if current.MaxConcurrentIssues > 0 {
 		used := dashboardUsedCapacity(current)
-		capacity = fmt.Sprintf("Worker capacity: %d used | %d available | %d total", used, max(0, current.MaxConcurrentIssues-used), current.MaxConcurrentIssues)
+		capacity = dashboardCapacity{configured: true, used: used, available: max(0, current.MaxConcurrentIssues-used), total: current.MaxConcurrentIssues}
 	}
 	healthy, anomalous := dashboardWorkerHealth(sections[statusActive], sections[statusAttention])
+	metadata := dashboardProjectionMetadata{
+		repository: valueOr(plainStatusValue(current.Repo), "not initialized"),
+		capacity:   capacity, healthy: healthy, anomalous: anomalous,
+	}
 	header := fmt.Sprintf("Backlog Run Dashboard\nRepository: %s\n%s\nWorker health: %d healthy, %d anomalous",
-		valueOr(plainStatusValue(current.Repo), "not initialized"), capacity, healthy, anomalous)
+		metadata.repository, metadata.capacity.full(), metadata.healthy, metadata.anomalous)
 	attention := make(map[string]struct{}, len(sections[statusAttention]))
 	for _, observed := range sections[statusAttention] {
 		attention[observed.run.RunID] = struct{}{}
 	}
 	return dashboardProjection{
-		header: header, sections: sections, attention: attention, footer: dashboardFooterParts(stage),
+		metadata: metadata, header: header, sections: sections, attention: attention, footer: dashboardFooterParts(stage),
 	}
 }
 
-func (d *liveDashboard) renderResponsiveParts(now time.Time, options responsiveDashboardOptions) (string, dashboardBodyLayout, string, dashboardStage) {
+func (d *liveDashboard) renderResponsiveParts(now time.Time, options responsiveDashboardOptions) (dashboardProjection, dashboardBodyLayout, dashboardStage) {
 	d.mu.Lock()
 	current := cloneDashboardState(d.current)
 	messages := cloneDashboardMessages(d.messages)
@@ -576,19 +607,18 @@ func (d *liveDashboard) renderResponsiveParts(now time.Time, options responsiveD
 
 	projection := d.project(current, stage, now)
 	body := dashboardBodyBuilder{}
-	body.renderResponsiveSection("Active Runs", projection.sections[statusActive], now, options, false)
-	body.renderResponsiveSection("Attention Required", projection.sections[statusAttention], now, options, false)
-	body.renderResponsiveSection("Outcomes to Acknowledge", projection.sections[statusOutcomes], now, options, false)
-	body.renderResponsiveSection("Recent Completions", projection.sections[statusCompletions], now, options, true)
+	body.renderResponsiveSection(statusActive, "Active Runs", projection.sections[statusActive], now, options, false)
+	body.renderResponsiveSection(statusAttention, "Attention Required", projection.sections[statusAttention], now, options, false)
+	body.renderResponsiveSection(statusOutcomes, "Outcomes to Acknowledge", projection.sections[statusOutcomes], now, options, false)
+	body.renderResponsiveSection(statusCompletions, "Recent Completions", projection.sections[statusCompletions], now, options, true)
 	if len(messages) > 0 {
 		body.renderResponsiveMessages(messages, options)
 	}
-	return projection.header, dashboardBodyLayout{text: body.body.String(), anchors: body.anchors, attention: projection.attention}, projection.footer, stage
+	return projection, dashboardBodyLayout{text: body.body.String(), anchors: body.anchors, attention: projection.attention}, stage
 }
 
-func (b *dashboardBodyBuilder) renderResponsiveSection(name string, runs []statusRun, now time.Time, options responsiveDashboardOptions, completions bool) {
+func (b *dashboardBodyBuilder) renderResponsiveSection(section statusSection, name string, runs []statusRun, now time.Time, options responsiveDashboardOptions, completions bool) {
 	b.separate()
-	section := responsiveDashboardSection(name)
 	sectionIdentity := dashboardSectionAnchor(name)
 	b.anchor(sectionIdentity)
 	marker := "  "
@@ -626,21 +656,6 @@ func (b *dashboardBodyBuilder) renderResponsiveSection(name string, runs []statu
 			}
 			b.write(options.styler.render(dashboardSemanticMetadata, details))
 		}
-	}
-}
-
-func responsiveDashboardSection(name string) statusSection {
-	switch name {
-	case "Active Runs":
-		return statusActive
-	case "Attention Required":
-		return statusAttention
-	case "Outcomes to Acknowledge":
-		return statusOutcomes
-	case "Recent Completions":
-		return statusCompletions
-	default:
-		return statusHistory
 	}
 }
 
