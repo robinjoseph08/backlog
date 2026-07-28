@@ -117,6 +117,20 @@ func (e retainedCandidateDiscoveryError) Unwrap() error {
 	return ErrCandidateDiscoveryDiagnosticExpired
 }
 
+// SnapshotCandidateDiscoveryDiagnostic resolves one retained diagnostic for a
+// presentation cache. The returned error remains valid if later Runner records
+// evict its reference, so presentation can sanitize the evidence exactly once.
+func SnapshotCandidateDiscoveryDiagnostic(err error) error {
+	var retained retainedCandidateDiscoveryError
+	if !errors.As(err, &retained) {
+		return err
+	}
+	if resolved := retained.diagnostics.lookup(retained.id); resolved != nil {
+		return resolved
+	}
+	return ErrCandidateDiscoveryDiagnosticExpired
+}
+
 // CandidateDiscoveryRecovered reports that a complete Candidate snapshot made
 // Admission healthy again after one or more consecutive failures.
 type CandidateDiscoveryRecovered struct {

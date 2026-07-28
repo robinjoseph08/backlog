@@ -289,6 +289,21 @@ func TestRunnerRetainsAtMostTwentyFullAdmissionDiagnostics(t *testing.T) {
 	}
 }
 
+func TestCandidateDiagnosticSnapshotSurvivesLaterReferenceEviction(t *testing.T) {
+	runner := &Runner{}
+	first := runner.retainCandidateDiagnostic(CandidateDiscoveryFailed{Err: errors.New("complete first evidence")}).(CandidateDiscoveryFailed)
+	snapshot := SnapshotCandidateDiscoveryDiagnostic(first.Err)
+	for failure := 2; failure <= candidateDiscoveryDiagnosticLimit+1; failure++ {
+		runner.retainCandidateDiagnostic(CandidateDiscoveryFailed{Err: fmt.Errorf("failure %d", failure)})
+	}
+	if !errors.Is(first.Err, ErrCandidateDiscoveryDiagnosticExpired) {
+		t.Fatalf("original bounded reference remained available: %v", first.Err)
+	}
+	if got := snapshot.Error(); got != "complete first evidence" {
+		t.Fatalf("presentation snapshot after reference eviction = %q", got)
+	}
+}
+
 func TestRunnerRetainsExactLightweightAdmissionCountsBeyondOneThousandIdentities(t *testing.T) {
 	const distinctIdentities = 1024
 	var counts map[string]int

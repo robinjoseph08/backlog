@@ -230,6 +230,106 @@ func (composedBackpressureWorkers) Start(context.Context, worker.Request) (runne
 }
 func (composedBackpressureWorkers) Release(string) error { return nil }
 
+type composedOversizedGitHub struct {
+	failures []error
+	calls    atomic.Int64
+	blocked  chan struct{}
+}
+
+func (g *composedOversizedGitHub) Candidates(ctx context.Context, _ string) ([]scheduler.Candidate, error) {
+	call := int(g.calls.Add(1)) - 1
+	if call < len(g.failures) {
+		return nil, g.failures[call]
+	}
+	if call == len(g.failures) {
+		return nil, nil
+	}
+	close(g.blocked)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (*composedOversizedGitHub) Completion(context.Context, string, int, string) (ghadapter.CompletionOutcome, error) {
+	return ghadapter.CompletionOutcome{}, nil
+}
+
+func (*composedOversizedGitHub) IssueState(context.Context, string, int) (ghadapter.IssueState, error) {
+	return ghadapter.IssueState{}, nil
+}
+
+func TestOversizedAdmissionFailuresRemainCompleteInPlainOutputAndLatestTwentyDiagnostics(t *testing.T) {
+	const failures = 25
+	failureErrors := make([]error, 0, failures)
+	for failure := 1; failure <= failures; failure++ {
+		tail := fmt.Sprintf("complete oversized tail %02d", failure)
+		evidence := strings.Repeat(fmt.Sprintf("oversized failure %02d evidence ", failure), 300) + tail
+		failureErrors = append(failureErrors, &ghadapter.CandidateDiscoveryError{
+			Operation: ghadapter.CandidateDiscoveryList, Cause: "oversized failure",
+			Err: errors.New(evidence),
+		})
+	}
+	github := &composedOversizedGitHub{failures: failureErrors, blocked: make(chan struct{})}
+	queue := newPresentationEventQueue()
+	var plain bytes.Buffer
+	candidateRunner := &runner.Runner{
+		Config: runner.Config{
+			Repo: "acme/widgets", DefaultBranch: "master", MaxConcurrentIssues: 1,
+			PollInterval: 10 * time.Microsecond, Watch: true, SessionsDir: t.TempDir(),
+		},
+		GitHub: github, Store: &composedBackpressureStore{current: state.State{Version: state.CurrentVersion}},
+		Worktrees: composedBackpressureWorktrees{}, Workers: composedBackpressureWorkers{},
+		Output: &plain, OnOperationalEvent: queue.publish,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- candidateRunner.Run(ctx) }()
+	select {
+	case <-github.blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Runner did not emit the oversized failure sequence")
+	}
+	cancel()
+	if err := <-runDone; err != nil {
+		t.Fatalf("Runner oversized failure sequence: %v", err)
+	}
+	candidateRunner.WaitForOperationalEventDelivery()
+
+	output := plain.String()
+	if count := strings.Count(output, "candidate discovery failed; admission paused"); count != failures {
+		t.Fatalf("plain oversized failure rows = %d, want %d", count, failures)
+	}
+	for failure := 1; failure <= failures; failure++ {
+		if tail := fmt.Sprintf("complete oversized tail %02d", failure); !strings.Contains(output, tail) {
+			t.Fatalf("plain output omitted complete diagnostic %q", tail)
+		}
+	}
+	if strings.Contains(output, runner.ErrCandidateDiscoveryDiagnosticExpired.Error()) || strings.Contains(output, "truncated") {
+		t.Fatal("plain output replaced complete evidence with an expiry or truncation marker")
+	}
+
+	dashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, time.Now)
+	drainCtx, stopDrain := context.WithCancel(context.Background())
+	stopDrain()
+	for {
+		event, err := queue.next(drainCtx)
+		if errors.Is(err, context.Canceled) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		dashboard.operationalEvent(event)
+		queue.complete()
+	}
+	if got := len(dashboard.admission.failures); got != dashboardDiagnosticLimit {
+		t.Fatalf("dashboard oversized Diagnostics = %d, want latest %d", got, dashboardDiagnosticLimit)
+	}
+	first, latest := dashboard.admission.failures[0], dashboard.admission.failures[dashboardDiagnosticLimit-1]
+	if first.unavailable || latest.unavailable || !strings.Contains(first.evidence, "complete oversized tail 06") || !strings.Contains(latest.evidence, "complete oversized tail 25") {
+		t.Fatalf("dashboard did not retain complete latest-twenty oversized evidence")
+	}
+}
+
 func TestAdmissionBackpressureComposesRunnerPresentationAndDashboardBounds(t *testing.T) {
 	const (
 		firstDistinct  = 600
@@ -429,10 +529,10 @@ func TestAdmissionBackpressureComposesRunnerPresentationAndDashboardBounds(t *te
 		dashboard.mu.Unlock()
 		t.Fatalf("dashboard diagnostics = %d, want bounded latest %d", diagnostics, dashboardDiagnosticLimit)
 	}
-	for _, failure := range dashboard.admission.failures {
-		if errors.Is(failure.Err, runner.ErrCandidateDiscoveryDiagnosticExpired) {
+	for _, diagnostic := range dashboard.admission.failures {
+		if diagnostic.unavailable {
 			dashboard.mu.Unlock()
-			t.Fatalf("bounded composed delivery retained an expired latest diagnostic: %v", failure.Err)
+			t.Fatal("bounded composed delivery retained an expired latest diagnostic")
 		}
 	}
 	if identities := len(dashboard.admission.equivalentFailures); identities != 1 {

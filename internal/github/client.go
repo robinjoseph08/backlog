@@ -12,7 +12,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/robinjoseph08/backlog/internal/dependencies"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
@@ -719,12 +718,6 @@ func (c Client) command(ctx context.Context, args ...string) error {
 	return fmt.Errorf("gh %s: %w", strings.Join(args, " "), err)
 }
 
-// commandDiagnosticByteLimit retains complete stderr evidence through 64 KiB
-// per command record. Larger evidence is cut at a UTF-8 boundary and labeled.
-const commandDiagnosticByteLimit = 64 << 10
-
-const commandDiagnosticTruncation = "\n... [command diagnostic truncated at 65536 bytes]"
-
 type commandError struct {
 	command string
 	detail  []byte
@@ -746,28 +739,13 @@ func newCommandError(command string, err error) *commandError {
 	if !ok || len(exitError.Stderr) == 0 {
 		return failure
 	}
-	failure.detail = boundedCommandDiagnostic(exitError.Stderr)
-	// ProcessState preserves exit-status semantics without retaining stderr a
-	// second time through exec.ExitError after detail has been snapshotted.
-	failure.err = &exec.ExitError{ProcessState: exitError.ProcessState}
+	// Transfer the command-owned stderr allocation into the diagnostic. Clearing
+	// ExitError.Stderr preserves exit-status semantics without retaining the same
+	// evidence a second time. The full evidence remains invocation-local and is
+	// released when its bounded Runner diagnostic record is evicted.
+	failure.detail = bytes.TrimSpace(exitError.Stderr)
+	exitError.Stderr = nil
 	return failure
-}
-
-func boundedCommandDiagnostic(stderr []byte) []byte {
-	detail := bytes.TrimSpace(stderr)
-	if len(detail) <= commandDiagnosticByteLimit {
-		return bytes.Clone(detail)
-	}
-	prefixLimit := commandDiagnosticByteLimit - len(commandDiagnosticTruncation)
-	if utf8.Valid(detail) {
-		for prefixLimit > 0 && !utf8.RuneStart(detail[prefixLimit]) {
-			prefixLimit--
-		}
-	}
-	bounded := make([]byte, 0, commandDiagnosticByteLimit)
-	bounded = append(bounded, detail[:prefixLimit]...)
-	bounded = append(bounded, commandDiagnosticTruncation...)
-	return bounded
 }
 
 func newCandidateDiscoveryError(operation CandidateDiscoveryOperation, issue int, err error) *CandidateDiscoveryError {

@@ -90,14 +90,24 @@ type dashboardAdmission struct {
 	issue               *int
 	cause               string
 	equivalentFailures  map[string]int
-	failures            []runner.CandidateDiscoveryFailed
+	failures            []dashboardDiagnostic
+	diagnosticRecord    int
+	diagnosticPage      int
 	recoveredAt         time.Time
 	recoveredFailures   int
 }
 
+type dashboardDiagnostic struct {
+	occurredAt  time.Time
+	evidence    string
+	pageStarts  []int
+	unavailable bool
+}
+
 const (
-	dashboardDiagnosticLimit = 20
-	admissionRecoveryNotice  = 10 * time.Second
+	dashboardDiagnosticLimit         = 20
+	dashboardDiagnosticPageByteLimit = 4 << 10
+	admissionRecoveryNotice          = 10 * time.Second
 )
 
 type fileSignature struct {
@@ -432,10 +442,51 @@ func (d *liveDashboard) recordAdmissionFailureLocked(failure runner.CandidateDis
 	d.admission.recoveredFailures = 0
 	key := string(failure.Operation) + "\x00" + cause
 	d.admission.equivalentFailures = retainAdmissionOccurrences(d.admission.equivalentFailures, key, presentationFailureOccurrences(failure))
-	d.admission.failures = append(d.admission.failures, failure)
+	d.admission.failures = append(d.admission.failures, newDashboardDiagnostic(failure))
 	if len(d.admission.failures) > dashboardDiagnosticLimit {
-		d.admission.failures = append([]runner.CandidateDiscoveryFailed(nil), d.admission.failures[len(d.admission.failures)-dashboardDiagnosticLimit:]...)
+		d.admission.failures = append([]dashboardDiagnostic(nil), d.admission.failures[len(d.admission.failures)-dashboardDiagnosticLimit:]...)
 	}
+	// New failures keep an open drawer on the latest complete record. Evidence
+	// is sanitized once above and only the selected bounded page is rendered.
+	d.admission.diagnosticRecord = len(d.admission.failures) - 1
+	d.admission.diagnosticPage = 0
+}
+
+func newDashboardDiagnostic(failure runner.CandidateDiscoveryFailed) dashboardDiagnostic {
+	failure.Err = runner.SnapshotCandidateDiscoveryDiagnostic(failure.Err)
+	if errors.Is(failure.Err, runner.ErrCandidateDiscoveryDiagnosticExpired) {
+		return dashboardDiagnostic{
+			occurredAt: failure.OccurredAt, evidence: runner.ErrCandidateDiscoveryDiagnosticExpired.Error(),
+			pageStarts: []int{0}, unavailable: true,
+		}
+	}
+	evidence := normalizedDashboardDiagnostic(runner.FormatOperationalEvent(failure))
+	return dashboardDiagnostic{occurredAt: failure.OccurredAt, evidence: evidence, pageStarts: dashboardDiagnosticPages(evidence)}
+}
+
+func dashboardDiagnosticPages(evidence string) []int {
+	starts := []int{0}
+	pageStart := 0
+	for offset := range evidence {
+		if offset-pageStart < dashboardDiagnosticPageByteLimit {
+			continue
+		}
+		starts = append(starts, offset)
+		pageStart = offset
+	}
+	return starts
+}
+
+func (d dashboardDiagnostic) page(index int) string {
+	if len(d.pageStarts) == 0 {
+		return ""
+	}
+	index = max(0, min(index, len(d.pageStarts)-1))
+	end := len(d.evidence)
+	if index+1 < len(d.pageStarts) {
+		end = d.pageStarts[index+1]
+	}
+	return d.evidence[d.pageStarts[index]:end]
 }
 
 // Admission occurrence counts are lightweight degradation-episode state. They
@@ -466,7 +517,43 @@ func cloneIssue(issue *int) *int {
 func (d *liveDashboard) toggleDiagnostics() {
 	d.mu.Lock()
 	d.diagnosticsOpen = !d.diagnosticsOpen
+	if d.diagnosticsOpen && len(d.admission.failures) > 0 {
+		d.admission.diagnosticRecord = len(d.admission.failures) - 1
+		d.admission.diagnosticPage = 0
+	}
 	d.mu.Unlock()
+	d.requestRedraw()
+}
+
+func (d *liveDashboard) moveDiagnosticRecord(delta int) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.diagnosticsOpen || len(d.admission.failures) == 0 {
+		return false
+	}
+	next := max(0, min(d.admission.diagnosticRecord+delta, len(d.admission.failures)-1))
+	if next == d.admission.diagnosticRecord {
+		return false
+	}
+	d.admission.diagnosticRecord = next
+	d.admission.diagnosticPage = 0
+	d.requestRedraw()
+	return true
+}
+
+func (d *liveDashboard) moveDiagnosticPage(delta int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.diagnosticsOpen || len(d.admission.failures) == 0 {
+		return
+	}
+	record := max(0, min(d.admission.diagnosticRecord, len(d.admission.failures)-1))
+	pages := len(d.admission.failures[record].pageStarts)
+	next := max(0, min(d.admission.diagnosticPage+delta, pages-1))
+	if next == d.admission.diagnosticPage {
+		return
+	}
+	d.admission.diagnosticPage = next
 	d.requestRedraw()
 }
 
@@ -805,7 +892,7 @@ func (b *dashboardBodyBuilder) renderResponsiveAdmission(admission dashboardAdmi
 		renderAdmissionDetails(&content, admission, diagnosticsOpen, stage, now, options.styler)
 	} else {
 		renderCompactAdmissionStatus(&content, admission, stage, now, options)
-		renderAdmissionDiagnosticsState(&content, admission.failures, diagnosticsOpen, options.styler, options.width)
+		renderAdmissionDiagnosticsState(&content, admission, diagnosticsOpen, options.styler, options.width)
 	}
 	b.write(content.String())
 }
@@ -1099,7 +1186,7 @@ func (b *dashboardBodyBuilder) renderAdmission(admission dashboardAdmission, dia
 
 func cloneDashboardAdmission(admission dashboardAdmission) dashboardAdmission {
 	admission.issue = cloneIssue(admission.issue)
-	admission.failures = append([]runner.CandidateDiscoveryFailed(nil), admission.failures...)
+	admission.failures = append([]dashboardDiagnostic(nil), admission.failures...)
 	if admission.equivalentFailures != nil {
 		groups := make(map[string]int, len(admission.equivalentFailures))
 		for key, count := range admission.equivalentFailures {
@@ -1157,7 +1244,7 @@ func renderAdmissionDetails(output *strings.Builder, admission dashboardAdmissio
 		health := "  Admission: healthy" + admissionRecoverySummary(admission, now)
 		writeDashboardStyledLine(output, styler, dashboardSemanticActive, health)
 	}
-	renderAdmissionDiagnosticsState(output, admission.failures, diagnosticsOpen, styler, 0)
+	renderAdmissionDiagnosticsState(output, admission, diagnosticsOpen, styler, 0)
 }
 
 func renderCompactAdmissionStatus(output *strings.Builder, admission dashboardAdmission, stage dashboardStage, now time.Time, options responsiveDashboardOptions) {
@@ -1214,12 +1301,12 @@ func admissionRecoverySummary(admission dashboardAdmission, now time.Time) strin
 	return fmt.Sprintf(" | Recovered %s ago after %d %s", displayDuration(age), admission.recoveredFailures, noun)
 }
 
-func renderAdmissionDiagnosticsState(output *strings.Builder, failures []runner.CandidateDiscoveryFailed, diagnosticsOpen bool, styler dashboardStyler, width int) {
+func renderAdmissionDiagnosticsState(output *strings.Builder, admission dashboardAdmission, diagnosticsOpen bool, styler dashboardStyler, width int) {
 	if diagnosticsOpen {
-		renderAdmissionDiagnosticsStyled(output, failures, styler)
+		renderAdmissionDiagnosticsStyled(output, admission.failures, admission.diagnosticRecord, admission.diagnosticPage, styler)
 		return
 	}
-	line := fmt.Sprintf("  Diagnostics: closed (d to open; %d recent)", len(failures))
+	line := fmt.Sprintf("  Diagnostics: closed (d to open; %d recent)", len(admission.failures))
 	if width > 0 {
 		line = truncateDashboardContent(line, width)
 	}
@@ -1232,10 +1319,14 @@ func writeDashboardStyledLine(output *strings.Builder, styler dashboardStyler, s
 }
 
 func renderAdmissionDiagnostics(output *strings.Builder, failures []runner.CandidateDiscoveryFailed) {
-	renderAdmissionDiagnosticsStyled(output, failures, dashboardStyler{})
+	diagnostics := make([]dashboardDiagnostic, 0, len(failures))
+	for _, failure := range failures {
+		diagnostics = append(diagnostics, newDashboardDiagnostic(failure))
+	}
+	renderAdmissionDiagnosticsStyled(output, diagnostics, len(diagnostics)-1, 0, dashboardStyler{})
 }
 
-func renderAdmissionDiagnosticsStyled(output *strings.Builder, failures []runner.CandidateDiscoveryFailed, styler dashboardStyler) {
+func renderAdmissionDiagnosticsStyled(output *strings.Builder, failures []dashboardDiagnostic, recordIndex, pageIndex int, styler dashboardStyler) {
 	noun := "records"
 	if len(failures) == 1 {
 		noun = "record"
@@ -1246,16 +1337,18 @@ func renderAdmissionDiagnosticsStyled(output *strings.Builder, failures []runner
 		writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, "  none")
 		return
 	}
-	for _, failure := range failures {
-		diagnostic := normalizedDashboardDiagnostic(runner.FormatOperationalEvent(failure))
-		label := "Full error/command"
-		if errors.Is(failure.Err, runner.ErrCandidateDiscoveryDiagnosticExpired) {
-			label = "Diagnostic unavailable"
-			diagnostic = runner.ErrCandidateDiscoveryDiagnosticExpired.Error()
-		}
-		line := fmt.Sprintf("  [%s] %s: %s", formatAdmissionTime(failure.OccurredAt), label, diagnostic)
-		writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, line)
+	recordIndex = max(0, min(recordIndex, len(failures)-1))
+	diagnostic := failures[recordIndex]
+	pageIndex = max(0, min(pageIndex, len(diagnostic.pageStarts)-1))
+	writeDashboardStyledLine(output, styler, dashboardSemanticMetadata,
+		fmt.Sprintf("  Record %d/%d ([ previous, ] next) | Evidence page %d/%d (, previous, . next)",
+			recordIndex+1, len(failures), pageIndex+1, len(diagnostic.pageStarts)))
+	label := fmt.Sprintf("Full error/command (page %d/%d)", pageIndex+1, len(diagnostic.pageStarts))
+	if diagnostic.unavailable {
+		label = "Diagnostic unavailable"
 	}
+	line := fmt.Sprintf("  [%s] %s: %s", formatAdmissionTime(diagnostic.occurredAt), label, diagnostic.page(pageIndex))
+	writeDashboardStyledLine(output, styler, dashboardSemanticMetadata, line)
 }
 
 func formatAdmissionTime(value time.Time) string {

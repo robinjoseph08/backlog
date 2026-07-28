@@ -127,6 +127,7 @@ func TestBubbleDashboardElapsedTickAdvancesAndReschedulesWithoutExternalUpdates(
 	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return clock }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 16})
 	model.dashboard.source = &dashboardTestSource{current: current}
 	model.dashboard.update(current)
+	model.refreshViewport(model.currentSelection())
 	if initial := ansi.Strip(model.View().Content); !strings.Contains(initial, "Elapsed: 5s") {
 		t.Fatalf("initial Bubble Tea elapsed value missing:\n%s", initial)
 	}
@@ -431,8 +432,88 @@ func TestBubbleDashboardPreservesSelectedRunAcrossAdmissionChanges(t *testing.T)
 		FirstFailureAt: now, OccurredAt: now, RetryAt: now.Add(30 * time.Second), ConsecutiveFailures: 1,
 	}
 	assertStable("failure", dashboardOperationalMsg{event: failure}, "Admission: DEGRADED")
-	assertStable("Diagnostics toggle", tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}), "Full error/command: candidate discovery failed")
+	assertStable("Diagnostics toggle", tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}), "Full error/command (page 1/1): candidate discovery failed")
 	assertStable("recovery", dashboardOperationalMsg{event: runner.CandidateDiscoveryRecovered{OccurredAt: now.Add(time.Second), Failures: 1}}, "Admission: healthy | Recovered")
+}
+
+func TestBubbleDashboardPagesFullDiagnosticsWithBoundedTickAndResizeWork(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	model := newBubbleDashboardModel(
+		context.Background(),
+		PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}},
+		newBubbleDashboardSession(time.Now),
+		TerminalDimensions{Width: 80, Height: 24},
+	)
+	for failure := 1; failure <= dashboardDiagnosticLimit; failure++ {
+		tail := fmt.Sprintf("complete diagnostic tail %02d", failure)
+		evidence := strings.Repeat(fmt.Sprintf("oversized evidence %02d ", failure), (64<<10)/22) + tail
+		updated, _ := model.Update(dashboardOperationalMsg{event: runner.CandidateDiscoveryFailed{
+			Operation: runner.CandidateDiscoveryList, Err: errors.New(evidence), Cause: "oversized evidence",
+			OccurredAt: now.Add(time.Duration(failure) * time.Second), RetryAt: now.Add(time.Minute),
+			ConsecutiveFailures: failure, Occurrences: 1,
+		}})
+		model = updated.(bubbleDashboardModel)
+	}
+	updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: 'd', Text: "d"}))
+	model = updated.(bubbleDashboardModel)
+
+	content := ansi.Strip(model.viewport.GetContent())
+	if len(content) > dashboardDiagnosticPageByteLimit+(12<<10) {
+		t.Fatalf("open Diagnostics viewport bytes = %d, want one bounded evidence page plus dashboard chrome", len(content))
+	}
+	if strings.Contains(content, "complete diagnostic tail 20") {
+		t.Fatal("first bounded evidence page unexpectedly contained the oversized record tail")
+	}
+	diagnostic := model.dashboard.admission.failures[dashboardDiagnosticLimit-1]
+	pages := len(diagnostic.pageStarts)
+	var complete strings.Builder
+	for page := range pages {
+		chunk := diagnostic.page(page)
+		if len(chunk) > dashboardDiagnosticPageByteLimit+3 {
+			t.Fatalf("evidence page %d bytes = %d, want bounded UTF-8 page", page+1, len(chunk))
+		}
+		complete.WriteString(chunk)
+	}
+	if complete.String() != diagnostic.evidence {
+		t.Fatal("paged retrieval lost or duplicated full diagnostic evidence")
+	}
+	for page := 1; page < pages; page++ {
+		updated, _ = model.Update(tea.KeyPressMsg(tea.Key{Code: '.', Text: "."}))
+		model = updated.(bubbleDashboardModel)
+	}
+	if content = ansi.Strip(model.viewport.GetContent()); !strings.Contains(content, "complete diagnostic tail 20") || !strings.Contains(content, fmt.Sprintf("Evidence page %d/%d", pages, pages)) {
+		t.Fatalf("paged Diagnostics did not retrieve the complete oversized evidence tail:\n%s", content)
+	}
+
+	activityAllocs := testing.AllocsPerRun(20, func() {
+		updated, _ := model.Update(dashboardActivityMsg(now))
+		model = updated.(bubbleDashboardModel)
+		_ = model.View()
+	})
+	if activityAllocs > 1500 {
+		t.Fatalf("unchanged activity Update+View allocations = %.0f, want at most 1500", activityAllocs)
+	}
+	width := 79
+	resizeAllocs := testing.AllocsPerRun(10, func() {
+		updated, _ := model.Update(tea.WindowSizeMsg{Width: width, Height: 24})
+		model = updated.(bubbleDashboardModel)
+		_ = model.View()
+		width = 159 - width
+	})
+	if resizeAllocs > 2500 {
+		t.Fatalf("Diagnostics resize Update+View allocations = %.0f, want at most 2500", resizeAllocs)
+	}
+	shutdownAllocs := testing.AllocsPerRun(5, func() {
+		updated, _ := model.Update(dashboardOperationalMsg{event: runner.ShutdownEvent{Stage: runner.ShutdownStageDraining}})
+		model = updated.(bubbleDashboardModel)
+		_ = model.View()
+	})
+	if shutdownAllocs > 2500 {
+		t.Fatalf("Diagnostics shutdown Update+View allocations = %.0f, want at most 2500", shutdownAllocs)
+	}
+	if content = ansi.Strip(model.viewport.GetContent()); len(content) > dashboardDiagnosticPageByteLimit+(12<<10) || !strings.Contains(content, "Retry: stopped") {
+		t.Fatalf("shutdown lost bounded Diagnostics or stopped retry state: bytes=%d\n%s", len(content), content)
+	}
 }
 
 func TestBubbleDashboardPreservesDownstreamSelectionAcrossStyledDiagnosticsChanges(t *testing.T) {
@@ -475,6 +556,7 @@ func TestBubbleDashboardPreservesDownstreamSelectionAcrossStyledDiagnosticsChang
 			if !wantSelection.valid || wantSelection.identity != selected {
 				t.Fatalf("selected anchor = %#v, want %q", wantSelection, selected)
 			}
+			model.refreshViewport(wantSelection)
 
 			assertStable := func(name string, msg tea.Msg) {
 				t.Helper()
@@ -1458,6 +1540,7 @@ func TestBubbleDashboardConstrainedChromeKeepsRequiredLifecycleInformation(t *te
 	} {
 		model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: time.Now}}, newBubbleDashboardSession(time.Now), dimensions)
 		model.dashboard.update(current)
+		model.refreshViewport(model.currentSelection())
 		plain := ansi.Strip(model.View().Content)
 		for _, expected := range []struct {
 			name     string

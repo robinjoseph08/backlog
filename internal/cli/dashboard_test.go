@@ -162,6 +162,7 @@ case "$*" in
   "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
     attempts=0
     if [ -f `+quote(attemptsPath)+` ]; then attempts=$(cat `+quote(attemptsPath)+`); fi
+    if [ "$attempts" -ge 2 ]; then exec sleep 30; fi
     attempts=$((attempts + 1))
     printf '%s\n' "$attempts" > `+quote(attemptsPath)+`
     printf '%s\n' "TLS handshake timeout" "retained stderr evidence for attempt $attempts" >&2
@@ -212,10 +213,14 @@ esac
 	}
 
 	diagnosticsOffset := len(stdout.String())
-	if _, err := writeInput.Write([]byte("d" + strings.Repeat("j", 12))); err != nil {
-		t.Fatalf("open and scroll Diagnostics: %v", err)
+	if _, err := writeInput.Write([]byte("d" + strings.Repeat("j", 5))); err != nil {
+		t.Fatalf("open paged Diagnostics: %v", err)
 	}
-	waitForDashboardOutputAfter(t, &stdout, diagnosticsOffset, "retained stderr evidence")
+	waitForDashboardOutputAfter(t, &stdout, diagnosticsOffset, "Diagnostics (")
+	if _, err := writeInput.Write([]byte("f")); err != nil {
+		t.Fatalf("page through the selected Diagnostics evidence: %v", err)
+	}
+	waitForDashboardOutputAfter(t, &stdout, diagnosticsOffset, "for attempt 2")
 
 	if _, err := writeInput.Write([]byte("G")); err != nil {
 		t.Fatalf("jump to bottom of existing dashboard sections: %v", err)
@@ -492,9 +497,18 @@ func TestDashboardAggregatesAdmissionFailuresAndBoundsDiagnostics(t *testing.T) 
 	dashboard.toggleDiagnostics()
 	_, body, _ = dashboard.renderParts(now)
 	if !strings.Contains(body, "Diagnostics (20 recent Candidate discovery failure records; d to close)") ||
-		!strings.Contains(body, "full gh command 4") || !strings.Contains(body, "full gh command 23") ||
-		strings.Contains(body, "full gh command 3") {
-		t.Fatalf("Diagnostics did not contain exactly the latest 20 full failures:\n%s", body)
+		!strings.Contains(body, "Record 20/20") || !strings.Contains(body, "full gh command 23") {
+		t.Fatalf("Diagnostics did not open the latest full failure:\n%s", body)
+	}
+	if first, latest := dashboard.admission.failures[0].evidence, dashboard.admission.failures[19].evidence; !strings.Contains(first, "full gh command 4") || !strings.Contains(latest, "full gh command 23") || strings.Contains(first, "full gh command 3") {
+		t.Fatalf("Diagnostics did not retain exactly the latest 20 full failures")
+	}
+	if !dashboard.moveDiagnosticRecord(-19) {
+		t.Fatal("Diagnostics could not select the oldest retained full failure")
+	}
+	_, body, _ = dashboard.renderParts(now)
+	if !strings.Contains(body, "Record 1/20") || !strings.Contains(body, "full gh command 4") {
+		t.Fatalf("Diagnostics did not retrieve the oldest retained full failure:\n%s", body)
 	}
 }
 
@@ -525,7 +539,7 @@ func TestDashboardDiagnosticsLabelsExpiredReferencesHonestly(t *testing.T) {
 	if !strings.Contains(got, "Diagnostic unavailable: full Candidate discovery diagnostic is no longer retained") {
 		t.Fatalf("expired diagnostic did not expose an honest unavailable state: %q", got)
 	}
-	if strings.Contains(got, "Full error/command:") {
+	if strings.Contains(got, "Full error/command") {
 		t.Fatalf("expired diagnostic was falsely labeled as full evidence: %q", got)
 	}
 }
@@ -627,9 +641,11 @@ func TestPresentationQueuePreservesAdmissionAggregateThroughDashboard(t *testing
 	}
 	dashboard.toggleDiagnostics()
 	_, body, _ = dashboard.renderParts(now)
-	if !strings.Contains(body, "Diagnostics (20 recent Candidate discovery failure records; d to close)") ||
-		!strings.Contains(body, "full gh command 6") || !strings.Contains(body, "full gh command 25") || strings.Contains(body, "full gh command 5") {
-		t.Fatalf("queue-to-dashboard Diagnostics did not truthfully label the latest twenty records representing 25 failures:\n%s", body)
+	if !strings.Contains(body, "Diagnostics (20 recent Candidate discovery failure records; d to close)") || !strings.Contains(body, "full gh command 25") {
+		t.Fatalf("queue-to-dashboard Diagnostics did not open the latest record representing 25 failures:\n%s", body)
+	}
+	if first := dashboard.admission.failures[0].evidence; !strings.Contains(first, "full gh command 6") || strings.Contains(first, "full gh command 5") {
+		t.Fatalf("queue-to-dashboard Diagnostics did not retain the latest twenty records")
 	}
 }
 
@@ -676,8 +692,11 @@ func TestPresentationQueuePreservesRecurringAdmissionAggregateAfterEviction(t *t
 	}
 	dashboard.toggleDiagnostics()
 	_, body, _ = dashboard.renderParts(firstFailure.Add(22 * time.Second))
-	if !strings.Contains(body, "full gh command 4") || !strings.Contains(body, "full gh command 23") || strings.Contains(body, "full gh command 3") {
-		t.Fatalf("queue-to-dashboard Diagnostics did not remain bounded to the latest twenty failures:\n%s", body)
+	if !strings.Contains(body, "full gh command 23") || !strings.Contains(body, "Record 20/20") {
+		t.Fatalf("queue-to-dashboard Diagnostics did not open the latest failure:\n%s", body)
+	}
+	if first := dashboard.admission.failures[0].evidence; !strings.Contains(first, "full gh command 4") || strings.Contains(first, "full gh command 3") {
+		t.Fatalf("queue-to-dashboard Diagnostics did not remain bounded to the latest twenty failures")
 	}
 }
 

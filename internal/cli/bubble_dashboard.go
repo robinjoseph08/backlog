@@ -408,6 +408,14 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(commands...)
 		case "d":
 			m.dashboard.toggleDiagnostics()
+		case "[":
+			m.dashboard.moveDiagnosticRecord(-1)
+		case "]":
+			m.dashboard.moveDiagnosticRecord(1)
+		case ",":
+			m.dashboard.moveDiagnosticPage(-1)
+		case ".":
+			m.dashboard.moveDiagnosticPage(1)
 		}
 		if msg.String() == "enter" {
 			m.toggleExpansion()
@@ -447,8 +455,12 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case dashboardElapsedMsg:
 		commands = append(commands, dashboardElapsedTick())
 	case dashboardActivityMsg:
-		_ = m.dashboard.activityChanged()
 		commands = append(commands, dashboardActivityTick())
+		if !m.dashboard.activityChanged() {
+			// Most 100 ms activity ticks observe no filesystem change. Keep the
+			// existing viewport instead of rebuilding and wrapping it.
+			return m, tea.Batch(commands...)
+		}
 	case dashboardFlushMsg:
 		if msg.naturalExit {
 			m.dashboard.markNaturalExit()
@@ -458,6 +470,7 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		commands = append(commands, m.waitForSessionUpdate())
 	case dashboardFlushRenderedMsg:
 		close(msg.acknowledged)
+		return m, nil
 	case dashboardQueueStoppedMsg:
 		if m.ctx.Err() != nil || errors.Is(msg.err, context.Canceled) {
 			return m, tea.Quit
@@ -859,10 +872,8 @@ func (m *bubbleDashboardModel) clearVisibleAttention() bool {
 }
 
 func (m bubbleDashboardModel) View() tea.View {
-	// Keep direct projection updates visible to callers that render without a
-	// preceding Bubble Tea message. The program's normal path already refreshes
-	// in Update, so this local copy does not alter navigation state.
-	m.refreshViewport(m.currentSelection())
+	// Update owns projection refreshes. View only composes the already wrapped
+	// viewport with fixed chrome, avoiding a duplicate full refresh per message.
 	frame := m.dashboardFrame()
 
 	lines := make([]string, 0, m.height)

@@ -187,30 +187,28 @@ esac`)
 	}
 }
 
-func TestTwentyCommandErrorsBoundOversizedStderrWithoutRetainingItTwice(t *testing.T) {
+func TestTwentyCommandErrorsRetainFullOversizedStderrOnce(t *testing.T) {
 	const recordLimit = 20
 	records := make([]*CandidateDiscoveryError, 0, recordLimit)
 	for record := 1; record <= recordLimit; record++ {
-		stderr := bytes.Repeat([]byte(fmt.Sprintf("oversized stderr evidence %d ", record)), commandDiagnosticByteLimit/8)
+		tail := fmt.Sprintf("complete oversized stderr tail %d", record)
+		stderr := append(bytes.Repeat([]byte(fmt.Sprintf("oversized stderr evidence %d ", record)), 4096), tail...)
 		exitError := &exec.ExitError{Stderr: stderr}
 		command := fmt.Sprintf("issue view %d --repo acme/widgets", record)
 		failure := newCommandError(command, exitError)
 
-		if len(failure.detail) != commandDiagnosticByteLimit {
-			t.Fatalf("record %d retained command detail bytes = %d, want %d", record, len(failure.detail), commandDiagnosticByteLimit)
+		if len(failure.detail) != len(stderr) || !bytes.HasSuffix(failure.detail, []byte(tail)) {
+			t.Fatalf("record %d did not retain all %d stderr bytes", record, len(stderr))
 		}
-		if !bytes.HasSuffix(failure.detail, []byte(commandDiagnosticTruncation)) {
-			t.Fatalf("record %d omitted honest truncation marker: %q", record, failure.detail[len(failure.detail)-100:])
-		}
-		if &failure.detail[0] == &stderr[0] {
-			t.Fatalf("record %d detail aliases the oversized stderr backing array", record)
+		if &failure.detail[0] != &stderr[0] {
+			t.Fatalf("record %d copied stderr instead of taking ownership", record)
 		}
 		var retainedExit *exec.ExitError
 		if !errors.As(failure, &retainedExit) {
 			t.Fatalf("record %d lost exit-error semantics: %v", record, failure)
 		}
-		if len(retainedExit.Stderr) != 0 {
-			t.Fatalf("record %d retained duplicate stderr bytes = %d", record, len(retainedExit.Stderr))
+		if len(retainedExit.Stderr) != 0 || len(exitError.Stderr) != 0 {
+			t.Fatalf("record %d retained duplicate ExitError stderr bytes", record)
 		}
 		records = append(records, newCandidateDiscoveryError(CandidateDiscoveryInspect, record, failure))
 	}
@@ -218,8 +216,9 @@ func TestTwentyCommandErrorsBoundOversizedStderrWithoutRetainingItTwice(t *testi
 	for record, discovery := range records {
 		text := discovery.Error()
 		command := fmt.Sprintf("gh issue view %d --repo acme/widgets", record+1)
-		if !strings.Contains(text, command) || !strings.Contains(text, "oversized stderr evidence") || !strings.Contains(text, "truncated at 65536 bytes") {
-			t.Fatalf("record %d lost command, evidence, or truncation honesty: %q", record+1, text)
+		tail := fmt.Sprintf("complete oversized stderr tail %d", record+1)
+		if !strings.Contains(text, command) || !strings.Contains(text, "oversized stderr evidence") || !strings.Contains(text, tail) || strings.Contains(text, "truncated") {
+			t.Fatalf("record %d lost full command or stderr evidence", record+1)
 		}
 		if len([]rune(discovery.Cause)) > 200 {
 			t.Fatalf("record %d concise cause has %d runes, want at most 200", record+1, len([]rune(discovery.Cause)))
