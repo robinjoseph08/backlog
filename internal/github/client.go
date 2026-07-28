@@ -35,14 +35,14 @@ type IssueState struct {
 	Labels []string
 }
 
-type ResetIssue struct {
+type OwnedRunIssue struct {
 	Number int
 	URL    string
 	State  string
 	Labels []string
 }
 
-type ResetPullRequest struct {
+type OwnedRunPullRequest struct {
 	Number         int
 	URL            string
 	Branch         string
@@ -298,9 +298,9 @@ func (c Client) IssueState(ctx context.Context, repo string, issue int) (IssueSt
 	return IssueState{Open: strings.EqualFold(response.State, "open"), Labels: labels}, nil
 }
 
-// ResetResources reads the issue and every pull request for the exact owned
+// OwnedRunResources reads the issue and every pull request for the exact owned
 // branch. Incomplete or mismatched identities fail closed.
-func (c Client) ResetResources(ctx context.Context, repo string, issueNumber int, branch string) (ResetIssue, []ResetPullRequest, error) {
+func (c Client) OwnedRunResources(ctx context.Context, repo string, issueNumber int, branch string) (OwnedRunIssue, []OwnedRunPullRequest, error) {
 	var issue struct {
 		Number int             `json:"number"`
 		URL    string          `json:"url"`
@@ -309,22 +309,22 @@ func (c Client) ResetResources(ctx context.Context, repo string, issueNumber int
 	}
 	if err := c.jsonCommand(ctx, &issue, "issue", "view", fmt.Sprint(issueNumber), "--repo", repo,
 		"--json", "number,url,state,labels"); err != nil {
-		return ResetIssue{}, nil, fmt.Errorf("inspect Reset issue: %w", err)
+		return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset issue: %w", err)
 	}
 	if issue.Number != issueNumber || !resourceURLMatches(issue.URL, repo, "issues", issueNumber) ||
 		(!strings.EqualFold(issue.State, "open") && !strings.EqualFold(issue.State, "closed")) {
-		return ResetIssue{}, nil, fmt.Errorf("inspect Reset issue: gh returned incomplete or unknown issue identity/state")
+		return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset issue: gh returned incomplete or unknown issue identity/state")
 	}
 	var labels []struct {
 		Name string `json:"name"`
 	}
 	if len(issue.Labels) == 0 || string(issue.Labels) == "null" || json.Unmarshal(issue.Labels, &labels) != nil {
-		return ResetIssue{}, nil, fmt.Errorf("inspect Reset issue: gh returned unknown labels")
+		return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset issue: gh returned unknown labels")
 	}
-	resultIssue := ResetIssue{Number: issue.Number, URL: issue.URL, State: strings.ToLower(issue.State)}
+	resultIssue := OwnedRunIssue{Number: issue.Number, URL: issue.URL, State: strings.ToLower(issue.State)}
 	for _, label := range labels {
 		if label.Name == "" {
-			return ResetIssue{}, nil, fmt.Errorf("inspect Reset issue: gh returned a label without identity")
+			return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset issue: gh returned a label without identity")
 		}
 		resultIssue.Labels = append(resultIssue.Labels, label.Name)
 	}
@@ -334,7 +334,7 @@ func (c Client) ResetResources(ctx context.Context, repo string, issueNumber int
 	}
 	parts := strings.SplitN(repo, "/", 2)
 	if len(parts) != 2 || parts[0] == "" {
-		return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull requests: invalid repository %q", repo)
+		return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset pull requests: invalid repository %q", repo)
 	}
 	var pulls []struct {
 		Number           int             `json:"number"`
@@ -355,44 +355,44 @@ func (c Client) ResetResources(ctx context.Context, repo string, issueNumber int
 	var pullsJSON json.RawMessage
 	if err := c.jsonCommand(ctx, &pullsJSON, "pr", "list", "--repo", repo, "--state", "all", "--head", branch, "--limit", "1000",
 		"--json", "number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository"); err != nil {
-		return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull requests: %w", err)
+		return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset pull requests: %w", err)
 	}
 	if len(pullsJSON) == 0 || string(pullsJSON) == "null" || json.Unmarshal(pullsJSON, &pulls) != nil {
-		return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull requests: gh returned an unknown pull request list")
+		return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset pull requests: gh returned an unknown pull request list")
 	}
 	if len(pulls) == 1000 {
-		return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull requests: result reached the inspection limit; completeness is unknown")
+		return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset pull requests: result reached the inspection limit; completeness is unknown")
 	}
-	resultPulls := make([]ResetPullRequest, 0, len(pulls))
+	resultPulls := make([]OwnedRunPullRequest, 0, len(pulls))
 	for _, pull := range pulls {
 		if pull.Number <= 0 || !resourceURLMatches(pull.URL, repo, "pull", pull.Number) || pull.HeadRefName != branch || !validCommitOID(pull.HeadRefOID) ||
 			!strings.EqualFold(pull.HeadOwner.Login, parts[0]) || !strings.EqualFold(pull.HeadRepository.NameWithOwner, repo) {
-			return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull requests: gh returned incomplete or mismatched pull request identity")
+			return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset pull requests: gh returned incomplete or mismatched pull request identity")
 		}
 		state := strings.ToLower(pull.State)
 		if state != "open" && state != "closed" && state != "merged" {
-			return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull request #%d: unknown state %q", pull.Number, pull.State)
+			return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset pull request #%d: unknown state %q", pull.Number, pull.State)
 		}
-		merged, err := resetMergedState(pull.MergedAt)
+		merged, err := inspectedMergedState(pull.MergedAt)
 		if err != nil {
-			return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull request #%d: %w", pull.Number, err)
+			return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset pull request #%d: %w", pull.Number, err)
 		}
-		autoMergeArmed, err := resetAutoMergeState(pull.AutoMergeRequest, pull.IsDraft)
+		autoMergeArmed, err := inspectedAutoMergeState(pull.AutoMergeRequest, pull.IsDraft)
 		if err != nil {
-			return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull request #%d: %w", pull.Number, err)
+			return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset pull request #%d: %w", pull.Number, err)
 		}
 		merged = merged || state == "merged"
 		if merged {
 			state = "merged"
 		}
-		result := ResetPullRequest{
+		result := OwnedRunPullRequest{
 			Number: pull.Number, URL: pull.URL, Branch: pull.HeadRefName, Commit: pull.HeadRefOID,
 			State: state, Merged: merged, AutoMergeArmed: autoMergeArmed,
 		}
 		if state == "open" {
-			comments, err := c.resetPullRequestComments(ctx, repo, pull.Number)
+			comments, err := c.ownedPullRequestComments(ctx, repo, pull.Number)
 			if err != nil {
-				return ResetIssue{}, nil, fmt.Errorf("inspect Reset pull request #%d comments: %w", pull.Number, err)
+				return OwnedRunIssue{}, nil, fmt.Errorf("inspect Reset pull request #%d comments: %w", pull.Number, err)
 			}
 			result.Comments = comments
 		}
@@ -401,7 +401,7 @@ func (c Client) ResetResources(ctx context.Context, repo string, issueNumber int
 	return resultIssue, resultPulls, nil
 }
 
-func (c Client) resetPullRequestComments(ctx context.Context, repo string, number int) ([]string, error) {
+func (c Client) ownedPullRequestComments(ctx context.Context, repo string, number int) ([]string, error) {
 	var pagesJSON json.RawMessage
 	endpoint := fmt.Sprintf("repos/%s/issues/%d/comments?per_page=100", repo, number)
 	if err := c.jsonCommand(ctx, &pagesJSON, "api",
@@ -475,7 +475,7 @@ func asciiEqualFold(left, right string) bool {
 	return true
 }
 
-func resetMergedState(raw json.RawMessage) (bool, error) {
+func inspectedMergedState(raw json.RawMessage) (bool, error) {
 	if len(raw) == 0 {
 		return false, errors.New("gh returned unknown merged state")
 	}
@@ -489,7 +489,7 @@ func resetMergedState(raw json.RawMessage) (bool, error) {
 	return true, nil
 }
 
-func resetAutoMergeState(raw json.RawMessage, isDraft *bool) (bool, error) {
+func inspectedAutoMergeState(raw json.RawMessage, isDraft *bool) (bool, error) {
 	if len(raw) == 0 || isDraft == nil {
 		return false, errors.New("gh returned unknown auto-merge state")
 	}
@@ -567,18 +567,18 @@ func (c Client) Completion(ctx context.Context, repo string, issue int, branch s
 		if !strings.EqualFold(pull.State, "open") && !strings.EqualFold(pull.State, "closed") && !strings.EqualFold(pull.State, "merged") {
 			return CompletionOutcome{}, fmt.Errorf("find pull request #%d: unknown state %q", pull.Number, pull.State)
 		}
-		if _, err := resetMergedState(pull.MergedAt); err != nil {
+		if _, err := inspectedMergedState(pull.MergedAt); err != nil {
 			return CompletionOutcome{}, fmt.Errorf("find pull request #%d: %w", pull.Number, err)
 		}
-		if _, err := resetAutoMergeState(pull.AutoMergeRequest, pull.IsDraft); err != nil {
+		if _, err := inspectedAutoMergeState(pull.AutoMergeRequest, pull.IsDraft); err != nil {
 			return CompletionOutcome{}, fmt.Errorf("find pull request #%d: %w", pull.Number, err)
 		}
 	}
 	outcome := CompletionOutcome{}
 	if len(pulls) > 0 {
 		sort.SliceStable(pulls, func(i, j int) bool { return pulls[i].Number > pulls[j].Number })
-		merged, _ := resetMergedState(pulls[0].MergedAt)
-		autoMergeArmed, _ := resetAutoMergeState(pulls[0].AutoMergeRequest, pulls[0].IsDraft)
+		merged, _ := inspectedMergedState(pulls[0].MergedAt)
+		autoMergeArmed, _ := inspectedAutoMergeState(pulls[0].AutoMergeRequest, pulls[0].IsDraft)
 		outcome.PRFound = true
 		outcome.PullRequest = pulls[0].URL
 		outcome.Merged = merged || strings.EqualFold(pulls[0].State, "merged")
@@ -612,6 +612,9 @@ func (c Client) command(ctx context.Context, args ...string) error {
 	if err == nil {
 		return nil
 	}
+	if contextErr := ctx.Err(); contextErr != nil {
+		return fmt.Errorf("gh %s: %w", strings.Join(args, " "), contextErr)
+	}
 	message := strings.TrimSpace(string(output))
 	if message != "" {
 		return fmt.Errorf("gh %s: %s", strings.Join(args, " "), message)
@@ -628,6 +631,9 @@ func (c Client) jsonCommand(ctx context.Context, target any, args ...string) err
 	command.Dir = c.Dir
 	output, err := command.Output()
 	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return fmt.Errorf("gh %s: %w", strings.Join(args, " "), contextErr)
+		}
 		if exitError, ok := err.(*exec.ExitError); ok {
 			message := strings.TrimSpace(string(exitError.Stderr))
 			if message != "" {
