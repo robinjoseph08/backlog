@@ -25,19 +25,19 @@ func TestBuildAppliesLifecyclePolicyWithoutOwningLifecycleDecisions(t *testing.T
 		t.Fatal(err)
 	}
 	want := []string{
-		"mark Run run-42 retiring while retaining Lease lease-42",
+		"mark Run run-42 resetting while retaining Lease lease-42",
 		"explain retirement on pull request #7 (https://github.com/acme/widgets/pull/7)",
 		"close unmerged pull request #7 (https://github.com/acme/widgets/pull/7)",
 		"remove issue label owned from https://github.com/acme/widgets/issues/42",
 		"add issue label available to https://github.com/acme/widgets/issues/42",
-		"mark Run run-42 retired and release Lease lease-42",
+		"mark Run run-42 reset and release Lease lease-42",
 	}
 	if strings.Join(plan.Actions, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("actions = %q, want %q", plan.Actions, want)
 	}
 	var output bytes.Buffer
 	WritePlan(&output, plan)
-	if !strings.Contains(output.String(), "Abandon Plan for issue #42") {
+	if !strings.Contains(output.String(), "Reset Plan for issue #42") {
 		t.Fatalf("policy operation missing from plan output: %q", output.String())
 	}
 }
@@ -72,7 +72,7 @@ func TestNewRefusesIncompleteConfiguration(t *testing.T) {
 func TestValidateRefusesStatusOutsideLifecyclePolicy(t *testing.T) {
 	service := Service{policy: testPolicy()}
 	err := service.Validate(Plan{Snapshot: Snapshot{Run: scheduler.Run{Status: scheduler.StatusRunning}}})
-	if err == nil || !strings.Contains(err.Error(), "not eligible for Abandon") {
+	if err == nil || !strings.Contains(err.Error(), "not eligible for Reset") {
 		t.Fatalf("status eligibility error = %v", err)
 	}
 }
@@ -98,16 +98,16 @@ func (e *testError) Error() string { return e.message }
 
 func testPolicy() Policy {
 	return Policy{
-		Operation: "Abandon",
+		Operation: "Reset",
 		SelectRun: func(state.State) (scheduler.Run, scheduler.Lease, error) {
 			return scheduler.Run{}, scheduler.Lease{}, nil
 		},
 		ValidateSnapshot:  func(Snapshot) error { return nil },
-		EligibleStatuses:  []scheduler.Status{scheduler.StatusFailed, "retiring", "retired"},
+		EligibleStatuses:  []scheduler.Status{scheduler.StatusFailed, scheduler.StatusResetting, scheduler.StatusReset},
 		Explanation:       func(scheduler.Run) string { return "explanation" },
 		ExplanationAction: "explain retirement",
 		Labels:            LabelOutcome{Remove: []string{"owned"}, Add: []string{"available"}},
-		ProgressStatus:    "retiring",
-		TerminalStatus:    "retired",
+		ProgressStatus:    scheduler.StatusResetting,
+		TerminalStatus:    scheduler.StatusReset,
 	}
 }
