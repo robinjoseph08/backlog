@@ -91,6 +91,7 @@ func MainWithTerminal(ctx context.Context, args []string, dependencies TerminalD
 			return runCommand(ctx, options, stdout, signals, onOperationalEvent, dashboard, terminal.Now)
 		}, presentation)
 		if dashboard != nil {
+			dashboard.setResult(err)
 			if summaryErr := dashboard.printFinalSummary(stdout); summaryErr != nil {
 				err = errors.Join(err, summaryErr)
 			}
@@ -269,6 +270,9 @@ func runCommand(ctx context.Context, options runOptions, stdout io.Writer, signa
 			}
 			if forceStop {
 				fmt.Fprintln(stdout, "Force stop: additional signal accepted during setup; 0 Workers remaining")
+				if dashboard != nil {
+					dashboard.observeOperationalEvent(runner.ShutdownEvent{Stage: runner.ShutdownStageForceStopping})
+				}
 			}
 			switch setupExit {
 			case setupSignalDrainAccepted:

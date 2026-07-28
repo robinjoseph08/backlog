@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 	"github.com/charmbracelet/colorprofile"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/robinjoseph08/backlog/internal/runner"
+	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 )
 
@@ -68,10 +70,15 @@ type bubbleDashboardSession struct {
 	doneOnce    sync.Once
 	done        chan struct{}
 
-	finalMu    sync.Mutex
-	finalState *state.State
-	source     followStateSource
-	now        func() time.Time
+	finalMu            sync.Mutex
+	finalState         *state.State
+	initialCompletions map[string]struct{}
+	source             followStateSource
+	naturalExit        bool
+	shutdownResult     runner.ShutdownResult
+	forceStopping      bool
+	resultErr          error
+	now                func() time.Time
 }
 
 func newBubbleDashboardSession(now func() time.Time) *bubbleDashboardSession {
@@ -99,21 +106,94 @@ func (s *bubbleDashboardSession) presentation(ctx context.Context, control Prese
 		return fmt.Errorf("read initial terminal dimensions: invalid size %dx%d", dimensions.Width, dimensions.Height)
 	}
 	model := newBubbleDashboardModel(ctx, control, s, dimensions)
+	monitoredOutput := newPresentationOutputMonitor(control.Terminal.Output)
 	program := tea.NewProgram(
 		model,
 		tea.WithContext(ctx),
 		tea.WithInput(control.Terminal.Input),
-		tea.WithOutput(control.Terminal.Output),
+		tea.WithOutput(monitoredOutput),
 		tea.WithWindowSize(dimensions.Width, dimensions.Height),
 		tea.WithColorProfile(bubbleColorProfile(model.colorProfile)),
 		tea.WithoutSignalHandler(),
 	)
+	watchStopped := make(chan struct{})
+	go func() {
+		defer close(watchStopped)
+		select {
+		case <-monitoredOutput.failed:
+			program.Kill()
+		case <-s.done:
+		}
+	}()
 	_, err = program.Run()
 	started = model.started()
-	if ctx.Err() != nil && (err == nil || errors.Is(err, tea.ErrProgramKilled)) {
-		return ctx.Err()
+	if outputErr := monitoredOutput.failure(); outputErr != nil {
+		resultErr = fmt.Errorf("write terminal presentation: %w", outputErr)
+		if restoreErr := restoreDashboardTerminal(control.Terminal.Output); restoreErr != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("restore terminal presentation: %w", restoreErr))
+		}
+	} else if ctx.Err() != nil && (err == nil || errors.Is(err, tea.ErrProgramKilled)) {
+		resultErr = ctx.Err()
+	} else {
+		resultErr = err
 	}
+	// Closing done in the function defer releases this watcher on ordinary
+	// completion. An output failure already released it before Program.Run.
+	if monitoredOutput.failure() != nil {
+		<-watchStopped
+	}
+	return resultErr
+}
+
+// Bubble Tea's forced Kill path does not emit its normal terminal teardown.
+// This sequence is intentionally idempotent and is used only after a monitored
+// output failure forced that path.
+func restoreDashboardTerminal(output io.Writer) error {
+	_, err := io.WriteString(output, "\x1b[>4m\x1b[=0;1u\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1049l\x1b[?25h")
 	return err
+}
+
+type presentationOutputMonitor struct {
+	output io.Writer
+	failed chan struct{}
+	once   sync.Once
+	mu     sync.Mutex
+	err    error
+}
+
+func newPresentationOutputMonitor(output io.Writer) *presentationOutputMonitor {
+	return &presentationOutputMonitor{output: output, failed: make(chan struct{})}
+}
+
+func (w *presentationOutputMonitor) Write(content []byte) (written int, resultErr error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			resultErr = fmt.Errorf("terminal output panic: %v", recovered)
+		}
+		if resultErr != nil {
+			w.recordFailure(resultErr)
+		}
+	}()
+	written, resultErr = w.output.Write(content)
+	if resultErr == nil && written != len(content) {
+		resultErr = io.ErrShortWrite
+	}
+	return written, resultErr
+}
+
+func (w *presentationOutputMonitor) recordFailure(err error) {
+	w.once.Do(func() {
+		w.mu.Lock()
+		w.err = err
+		w.mu.Unlock()
+		close(w.failed)
+	})
+}
+
+func (w *presentationOutputMonitor) failure() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.err
 }
 
 func bubbleColorProfile(profile TerminalColorProfile) colorprofile.Profile {
@@ -143,20 +223,37 @@ func (s *bubbleDashboardSession) waitForStartup(ctx context.Context) error {
 }
 
 func (s *bubbleDashboardSession) configure(initial state.State, source followStateSource) {
+	cloned := cloneDashboardState(initial)
 	s.finalMu.Lock()
 	s.source = source
+	s.finalState = &cloned
+	s.initialCompletions = mergedRunIdentities(initial)
 	s.finalMu.Unlock()
-	s.publish(dashboardConfiguredMsg{initial: cloneDashboardState(initial), source: source})
+	s.publish(dashboardConfiguredMsg{initial: cloned, source: source})
+}
+
+func mergedRunIdentities(current state.State) map[string]struct{} {
+	identities := make(map[string]struct{})
+	for _, run := range current.Runs {
+		if run.Status == scheduler.StatusMerged {
+			identities[run.RunID] = struct{}{}
+		}
+	}
+	return identities
 }
 
 func (s *bubbleDashboardSession) stateSaved(current state.State) {
-	s.publish(dashboardStateMsg(cloneDashboardState(current)))
+	cloned := cloneDashboardState(current)
+	s.finalMu.Lock()
+	s.finalState = &cloned
+	s.finalMu.Unlock()
+	s.publish(dashboardStateMsg(cloned))
 }
 
 func (s *bubbleDashboardSession) flush(ctx context.Context) error {
 	acknowledged := make(chan struct{})
 	s.finalMu.Lock()
-	naturalExit := s.finalState != nil
+	naturalExit := s.naturalExit
 	s.finalMu.Unlock()
 	s.publish(dashboardFlushMsg{acknowledged: acknowledged, naturalExit: naturalExit})
 	select {
@@ -173,20 +270,76 @@ func (s *bubbleDashboardSession) captureFinalSummary(current state.State) error 
 	cloned := cloneDashboardState(current)
 	s.finalMu.Lock()
 	s.finalState = &cloned
+	s.naturalExit = true
 	s.finalMu.Unlock()
 	return nil
 }
 
+func (s *bubbleDashboardSession) observeOperationalEvent(event runner.OperationalEvent) {
+	shutdown, ok := event.(runner.ShutdownEvent)
+	if !ok {
+		return
+	}
+	s.finalMu.Lock()
+	s.shutdownResult = shutdown.Result
+	if shutdown.Stage == runner.ShutdownStageForceStopping {
+		s.forceStopping = true
+	}
+	s.finalMu.Unlock()
+}
+
+func (s *bubbleDashboardSession) setResult(err error) {
+	s.finalMu.Lock()
+	s.resultErr = err
+	s.finalMu.Unlock()
+}
+
 func (s *bubbleDashboardSession) printFinalSummary(output io.Writer) error {
 	s.finalMu.Lock()
-	if s.finalState == nil {
-		s.finalMu.Unlock()
-		return nil
+	current := state.State{Version: state.CurrentVersion}
+	if s.finalState != nil {
+		current = cloneDashboardState(*s.finalState)
 	}
-	current := cloneDashboardState(*s.finalState)
+	initialCompletions := maps.Clone(s.initialCompletions)
 	source := s.source
+	outcome := dashboardFinalOutcome(s.naturalExit, s.forceStopping, s.shutdownResult, s.resultErr)
 	s.finalMu.Unlock()
-	return printRunFinalSummary(output, current, source, s.now())
+	return printRunFinalReport(output, current, source, s.now(), initialCompletions, outcome)
+}
+
+func dashboardFinalOutcome(natural, forceStopping bool, result runner.ShutdownResult, err error) string {
+	var presentationFailure *PresentationFailure
+	if errors.As(err, &presentationFailure) {
+		return "Error: " + presentationFailure.Error()
+	}
+	if natural {
+		if err != nil {
+			var intervention *runner.InterventionRequired
+			if !errors.As(err, &intervention) {
+				return "Error: " + err.Error()
+			}
+			return "Natural exhaustion with Attention Required"
+		}
+		return "Natural exhaustion"
+	}
+
+	var signalExit *runner.SignalExit
+	if errors.As(err, &signalExit) {
+		if forceStopping {
+			if result == runner.ShutdownResultFailure || signalExit.Cause != nil {
+				return "Force stop finished with errors"
+			}
+			return "Force stop complete"
+		}
+		if result == runner.ShutdownResultFailure || signalExit.Cause != nil {
+			return "Suspension finished with errors"
+		}
+		return "Suspension complete"
+	}
+	if err != nil {
+		return "Error: " + err.Error()
+	}
+	return "Drain complete"
 }
 
 func (s *bubbleDashboardSession) publish(msg tea.Msg) {
@@ -490,6 +643,7 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.dashboard.recordMessage(string(msg))
 		commands = append(commands, m.waitForSessionUpdate())
 	case dashboardOperationalMsg:
+		m.session.observeOperationalEvent(msg.event)
 		m.dashboard.operationalEvent(msg.event)
 		if m.control.operationalEvents != nil {
 			m.control.operationalEvents.complete()

@@ -647,6 +647,29 @@ func TestPrintRunFinalSummaryUsesSharedAttentionPresentation(t *testing.T) {
 	}
 }
 
+func TestPrintRunFinalReportIncludesOnlyInvocationCompletionsAndOutcome(t *testing.T) {
+	completedAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", Runs: []scheduler.Run{
+		{Issue: 10, RunID: "old-completion", Status: scheduler.StatusMerged, CompletedAt: &completedAt},
+		{Issue: 11, IssueTitle: "Completed now", RunID: "new-completion", Status: scheduler.StatusMerged, CompletedAt: &completedAt},
+		{Issue: 12, RunID: "old-retry", Status: scheduler.StatusFailed, Error: "transient retry history"},
+	}}
+	var output bytes.Buffer
+	if err := printRunFinalReport(&output, current, &sequenceFollowSource{}, completedAt, map[string]struct{}{"old-completion": {}}, "Drain complete"); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Final outcome: Drain complete", "Completions produced (1)", "#11  Completed now", "Attention Required (0)"} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("final report missing %q:\n%s", want, output.String())
+		}
+	}
+	for _, omitted := range []string{"old-completion", "old-retry", "transient retry history", "Operational messages", "Admission health"} {
+		if strings.Contains(output.String(), omitted) {
+			t.Fatalf("final report reproduced invocation-external or transient text %q:\n%s", omitted, output.String())
+		}
+	}
+}
+
 func TestPrintRunFinalSummaryReturnsOutputFailure(t *testing.T) {
 	err := printRunFinalSummary(failingStatusWriter{}, state.State{Version: state.CurrentVersion}, &sequenceFollowSource{}, time.Now())
 	if err == nil || !strings.Contains(err.Error(), "status output failed") {

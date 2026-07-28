@@ -140,6 +140,63 @@ esac
 	}
 }
 
+func TestTerminalDashboardSetupFailureLeavesNormalScreenResult(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	exit := MainWithTerminal(context.Background(), []string{"run"}, TerminalDependencies{
+		Input: strings.NewReader(""), Output: &stdout, ErrorOutput: &stderr,
+		IsTerminal: func() bool { return true },
+		Dimensions: func() (TerminalDimensions, error) {
+			return TerminalDimensions{}, errors.New("terminal dimensions unavailable")
+		},
+	})
+	if exit != 1 || !strings.Contains(stderr.String(), "terminal dimensions unavailable") {
+		t.Fatalf("setup failure exit = %d, stderr = %q", exit, stderr.String())
+	}
+	output := stdout.String()
+	for _, want := range []string{"Final aggregate summary", "Final outcome: Error: presentation failed", "Repository: not initialized"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("setup failure normal-screen result missing %q: %q", want, output)
+		}
+	}
+	if strings.Contains(output, "\x1b[?1049h") || strings.Contains(output, "\x1b[?25l") {
+		t.Fatalf("setup failure changed terminal mode before failing: %q", output)
+	}
+}
+
+func TestTerminalDashboardRunnerFailureRestoresBeforeErrorResult(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef") printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	var stdout, stderr bytes.Buffer
+	exit := MainWithTerminal(context.Background(), []string{
+		"run", "--repo-dir", repository, "--state-dir", t.TempDir(), "--max-workers", "0", "--gh", gh,
+	}, TerminalDependencies{
+		Input: strings.NewReader(""), Output: &stdout, ErrorOutput: &stderr,
+		IsTerminal:   func() bool { return true },
+		Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
+		ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+	})
+	if exit != 1 || !strings.Contains(stderr.String(), "max concurrent issues must be positive") {
+		t.Fatalf("Runner failure exit = %d, stderr = %q", exit, stderr.String())
+	}
+	output := stdout.String()
+	restore := strings.LastIndex(output, "\x1b[?1049l")
+	summary := strings.Index(output, "Final aggregate summary")
+	if restore < 0 || summary < restore || !strings.Contains(output[summary:], "Final outcome: Error: max concurrent issues must be positive") {
+		t.Fatalf("Runner error result was not printed after terminal restoration: %q", output)
+	}
+	for _, control := range []string{"\x1b[?1049h", "\x1b[?25l", "\x1b[?25h"} {
+		if !strings.Contains(output, control) {
+			t.Fatalf("Runner failure output missing terminal control %q: %q", control, output)
+		}
+	}
+}
+
 func TestPlainRunEmitsCompleteCandidateDiscoveryEvidenceForEveryRetry(t *testing.T) {
 	repository := initializeFollowRepository(t)
 	attemptsPath := filepath.Join(t.TempDir(), "attempts")
@@ -303,7 +360,11 @@ esac
 	if !strings.Contains(output, "\x1b[?1049h") || !strings.Contains(output, "\x1b[?1049l") || stderr.Len() != 0 {
 		t.Fatalf("automatic dashboard terminal lifecycle changed: stdout=%q stderr=%q", output, stderr.String())
 	}
-	visible := terminalScreenText(output, 100, 12)
+	restore := strings.LastIndex(output, "\x1b[?1049l")
+	if restore < 0 {
+		t.Fatalf("automatic dashboard did not restore the normal screen: %q", output)
+	}
+	visible := terminalScreenText(output[:restore], 100, 12)
 	for _, want := range []string{"Admission: DEGRADED", "Retry: stopped"} {
 		if !strings.Contains(visible, want) {
 			t.Fatalf("final degraded Admission screen missing %q:\n%s\nraw output: %q", want, visible, output)
@@ -311,6 +372,11 @@ esac
 	}
 	if strings.Contains(visible, "Next retry:") {
 		t.Fatalf("final degraded Admission screen retained an actionable retry:\n%s\nraw output: %q", visible, output)
+	}
+	for _, want := range []string{"Final aggregate summary", "Final outcome: Drain complete", "Completions produced (0)", "Attention Required (0)"} {
+		if !strings.Contains(output[restore:], want) {
+			t.Fatalf("normal-screen result missing %q: %q", want, output[restore:])
+		}
 	}
 }
 
@@ -388,14 +454,15 @@ func TestTerminalDashboardPreservesDrainAndSuspensionMessages(t *testing.T) {
 		signal     os.Signal
 		wantExit   int
 		wantOutput []string
+		wantFinal  string
 	}{
 		{
 			name: "Drain", signal: os.Interrupt, wantExit: 0,
-			wantOutput: []string{"Drain complete", "no effect"},
+			wantOutput: []string{"Drain complete", "no effect"}, wantFinal: "Final outcome: Drain complete",
 		},
 		{
 			name: "suspension", signal: syscall.SIGTERM, wantExit: 143,
-			wantOutput: []string{"Suspension finished", "no effect"},
+			wantOutput: []string{"Suspension finished", "no effect"}, wantFinal: "Final outcome: Suspension complete",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -433,6 +500,11 @@ esac
 				if !strings.Contains(visible, want) {
 					t.Fatalf("dashboard shutdown screen missing %q:\n%s\nraw output: %q", want, visible, output)
 				}
+			}
+			restore := strings.LastIndex(output, "\x1b[?1049l")
+			summary := strings.Index(output, "Final aggregate summary")
+			if restore < 0 || summary < restore || !strings.Contains(output[summary:], test.wantFinal) {
+				t.Fatalf("shutdown normal-screen result was not printed after restoration: %q", output)
 			}
 		})
 	}
@@ -1132,8 +1204,8 @@ esac
 	}
 	finalFrame := lastDashboardFrame(stdout.String())
 	for _, want := range []string{
-		"Final aggregate summary", "Repository: acme/widgets", "Runs: 1", "Active Leases: 0",
-		"Active (0)", "Attention Required (0)",
+		"Final aggregate summary", "Final outcome: Natural exhaustion", "Repository: acme/widgets", "Runs: 1", "Active Leases: 0",
+		"Completions produced (1)", "#44  Merge while watching", "Active (0)", "Attention Required (0)",
 	} {
 		if !strings.Contains(finalFrame, want) {
 			t.Fatalf("terminal final frame missing %q: %q", want, finalFrame)

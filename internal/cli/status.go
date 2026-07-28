@@ -126,6 +126,34 @@ func printRunFinalSummary(output io.Writer, current state.State, source followSt
 	return printer.err
 }
 
+// printRunFinalReport leaves a concise invocation result on the normal screen.
+// Completions are limited to Runs that became merged during this invocation;
+// transient Admission and operational-message history belongs only to the live
+// dashboard and is intentionally omitted.
+func printRunFinalReport(output io.Writer, current state.State, source followStateSource, now time.Time, initialCompletions map[string]struct{}, outcome string) error {
+	sections := observeStatusSections(current, source, now)
+	completions := make([]statusRun, 0)
+	for _, observed := range sections[statusHistory] {
+		if observed.run.Status != scheduler.StatusMerged {
+			continue
+		}
+		if _, existed := initialCompletions[observed.run.RunID]; existed {
+			continue
+		}
+		completions = append(completions, observed)
+	}
+	sortStatusRuns(completions)
+
+	printer := statusPrinter{output: output}
+	printer.printf("\nFinal aggregate summary\n")
+	printer.printf("Final outcome: %s\n", plainStatusValue(outcome))
+	printer.header(current)
+	printer.section("Completions produced", completions)
+	printer.section("Active", sections[statusActive])
+	printer.section("Attention Required", sections[statusAttention])
+	return printer.err
+}
+
 func selectRecentCompletions(runs []scheduler.Run) map[string]bool {
 	completions := make([]scheduler.Run, 0)
 	for _, run := range runs {

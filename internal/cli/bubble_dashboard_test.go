@@ -9,6 +9,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -2002,6 +2003,97 @@ func TestBubbleDashboardConstrainedFallbackKeepsGuidanceInFixedFooter(t *testing
 	}
 }
 
+type oneShotPresentationFailureWriter struct {
+	bytes.Buffer
+	panic  bool
+	failed bool
+}
+
+func (w *oneShotPresentationFailureWriter) Write(content []byte) (int, error) {
+	written, _ := w.Buffer.Write(content)
+	if w.failed || !bytes.Contains(content, []byte("Backlog Run Dashboard")) {
+		return written, nil
+	}
+	w.failed = true
+	if w.panic {
+		panic("terminal writer panic")
+	}
+	return written, errors.New("terminal output lost")
+}
+
+func TestBubbleDashboardFailureRestoresTerminalBeforeStaticErrorResult(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		panic     bool
+		wantError string
+	}{
+		{name: "output loss", wantError: "terminal output lost"},
+		{name: "recovered TUI panic", panic: true, wantError: "terminal output panic: terminal writer panic"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output := &oneShotPresentationFailureWriter{panic: test.panic}
+			session := newBubbleDashboardSession(time.Now)
+			host := runnerHost{terminal: TerminalDependencies{
+				Input: strings.NewReader(""), Output: output,
+				Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
+				ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+			}}
+			err := host.run(context.Background(), func(signals <-chan lifecycleSignal, _ func(runner.OperationalEvent)) error {
+				event := <-signals
+				if event.signal != syscall.SIGTERM {
+					t.Errorf("presentation failure signal = %v, want SIGTERM", event.signal)
+				}
+				event.accept()
+				return &runner.SignalExit{Code: 143}
+			}, session.presentation)
+			var failure *PresentationFailure
+			if !errors.As(err, &failure) || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("host failure = %v, want recovered presentation failure containing %q", err, test.wantError)
+			}
+			session.setResult(err)
+			if summaryErr := session.printFinalSummary(output); summaryErr != nil {
+				t.Fatalf("static error result: %v", summaryErr)
+			}
+
+			raw := output.String()
+			for _, control := range []string{"\x1b[?1049h", "\x1b[?1049l", "\x1b[?25l", "\x1b[?25h"} {
+				if !strings.Contains(raw, control) {
+					t.Fatalf("presentation failure output missing restoration control %q: %q", control, raw)
+				}
+			}
+			restore := strings.LastIndex(raw, "\x1b[?1049l")
+			summary := strings.Index(raw, "Final aggregate summary")
+			if restore < 0 || summary < restore || !strings.Contains(raw[summary:], "Final outcome: Error: presentation failed:") {
+				t.Fatalf("static error result was not printed after restoration: %q", raw)
+			}
+		})
+	}
+}
+
+type shortPresentationWriter struct{}
+
+func (shortPresentationWriter) Write(content []byte) (int, error) {
+	return len(content) - 1, nil
+}
+
+func TestPresentationOutputMonitorTreatsShortWriteAsOutputLoss(t *testing.T) {
+	monitor := newPresentationOutputMonitor(shortPresentationWriter{})
+	if _, err := monitor.Write([]byte("dashboard")); !errors.Is(err, io.ErrShortWrite) || !errors.Is(monitor.failure(), io.ErrShortWrite) {
+		t.Fatalf("short terminal write = %v, retained = %v", err, monitor.failure())
+	}
+	select {
+	case <-monitor.failed:
+	default:
+		t.Fatal("short terminal write did not wake the presentation failure monitor")
+	}
+}
+
+func TestRestoreDashboardTerminalReturnsOutputFailure(t *testing.T) {
+	if err := restoreDashboardTerminal(failingStatusWriter{}); err == nil || !strings.Contains(err.Error(), "status output failed") {
+		t.Fatalf("terminal restoration error = %v", err)
+	}
+}
+
 func TestBubbleDashboardPresentationRejectsDimensionFailureBeforeRunnerStartup(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -2186,6 +2278,33 @@ func TestBubbleDashboardStoreDoesNotPublishFailedSave(t *testing.T) {
 	defer session.mu.Unlock()
 	if len(session.updates) != 0 {
 		t.Fatalf("failed state save published %d dashboard updates", len(session.updates))
+	}
+}
+
+func TestDashboardFinalOutcomeDistinguishesEveryExitPath(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		natural       bool
+		forceStopping bool
+		result        runner.ShutdownResult
+		err           error
+		want          string
+	}{
+		{name: "natural", natural: true, want: "Natural exhaustion"},
+		{name: "natural attention", natural: true, err: &runner.InterventionRequired{Count: 1}, want: "Natural exhaustion with Attention Required"},
+		{name: "Drain", want: "Drain complete"},
+		{name: "bounded suspension", err: &runner.SignalExit{Code: 143}, want: "Suspension complete"},
+		{name: "bounded suspension failure", result: runner.ShutdownResultFailure, err: &runner.SignalExit{Code: 130, Cause: errors.New("boundary failed")}, want: "Suspension finished with errors"},
+		{name: "force stop", forceStopping: true, err: &runner.SignalExit{Code: 130}, want: "Force stop complete"},
+		{name: "force stop failure", forceStopping: true, result: runner.ShutdownResultFailure, err: &runner.SignalExit{Code: 130, Cause: errors.New("kill failed")}, want: "Force stop finished with errors"},
+		{name: "Runner failure", err: errors.New("state unavailable"), want: "Error: state unavailable"},
+		{name: "presentation failure", err: &PresentationFailure{Err: errors.New("renderer panic"), RunnerErr: &runner.SignalExit{Code: 143}}, want: "Error: presentation failed: renderer panic; Runner completion: signal shutdown (143)"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := dashboardFinalOutcome(test.natural, test.forceStopping, test.result, test.err); got != test.want {
+				t.Fatalf("final outcome = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 

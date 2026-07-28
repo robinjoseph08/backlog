@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -18,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/creack/pty"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 )
@@ -944,6 +946,159 @@ while IFS= read -r ignored; do :; done
 	if secondDiagnostics.Len() != 0 {
 		t.Fatalf("terminal normalized follower diagnostics = %q", secondDiagnostics.String())
 	}
+}
+
+func TestCompiledPseudoTerminalDashboardHandlesResizeNavigationActivityAndStagedSignals(t *testing.T) {
+	root := t.TempDir()
+	repository := filepath.Join(root, "repo")
+	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, output)
+	}
+	binary := buildExecutable(t, root)
+	stateDir := filepath.Join(root, "state")
+	workerStarted := filepath.Join(root, "worker-started")
+	abortReceived := filepath.Join(root, "abort-received")
+
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef")
+    printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
+    printf '%s\n' '[{"number":73,"title":"Terminal teardown","createdAt":"2026-01-01T00:00:00Z","url":"https://github.com/acme/widgets/issues/73"}]' ;;
+  "issue view 73 --repo acme/widgets --json number,title,body,state,url,createdAt")
+    printf '%s\n' '{"number":73,"title":"Terminal teardown","body":"","state":"OPEN","url":"https://github.com/acme/widgets/issues/73","createdAt":"2026-01-01T00:00:00Z"}' ;;
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/73/comments?per_page=100 --paginate --slurp"|\
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/73/dependencies/blocked_by?per_page=100 --paginate --slurp")
+    printf '%s\n' '[[]]' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	git := writeExecutable(t, `#!/bin/sh
+set -eu
+if [ "$3" = "rev-parse" ] && [ "$4" = "--show-toplevel" ]; then printf '%s\n' `+quote(repository)+`; exit 0; fi
+if [ "$3" = "rev-parse" ] && [ "$4" = "--git-common-dir" ]; then printf '%s\n' `+quote(filepath.Join(repository, ".git"))+`; exit 0; fi
+if [ "$3" = "worktree" ] && [ "$4" = "add" ]; then mkdir -p "$7"; exit 0; fi
+exit 0
+`)
+	pi := writeExecutable(t, `#!/bin/sh
+set -eu
+trap '' TERM
+IFS= read -r prompt
+printf '%s\n' \
+  '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' \
+  '{"type":"agent_start"}' \
+  '{"type":"turn_start"}' \
+  '{"type":"tool_execution_start","toolCallId":"tool-live","toolName":"bash","args":{"command":"private"}}'
+touch `+quote(workerStarted)+`
+IFS= read -r abort
+touch `+quote(abortReceived)+`
+while :; do sleep 1; done
+`)
+
+	command := exec.Command(binary, "run", "--repo-dir", repository, "--state-dir", stateDir,
+		"--max-workers", "1", "--poll", "5ms", "--gh", gh, "--git", git, "--pi", pi)
+	terminal, err := pty.StartWithSize(command, &pty.Winsize{Rows: 28, Cols: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer terminal.Close()
+	var output synchronizedBuffer
+	readDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(&output, terminal)
+		close(readDone)
+	}()
+	defer func() {
+		if command.ProcessState == nil {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+	}()
+
+	waitForFile(t, workerStarted)
+	waitForPseudoTerminalScreen(t, &output, 100, 28, "Deepest operation: bash")
+	if _, err := terminal.Write([]byte("G")); err != nil {
+		t.Fatalf("navigate to dashboard end: %v", err)
+	}
+	waitForPseudoTerminalScreen(t, &output, 100, 28, "> Operational messages")
+	if _, err := terminal.Write([]byte("g")); err != nil {
+		t.Fatalf("navigate to dashboard start: %v", err)
+	}
+	waitForPseudoTerminalScreen(t, &output, 100, 28, "> Admission health")
+
+	beforeResize := len(output.String())
+	if err := pty.Setsize(terminal, &pty.Winsize{Rows: 10, Cols: 72}); err != nil {
+		t.Fatalf("resize pseudo-terminal: %v", err)
+	}
+	if err := command.Process.Signal(syscall.SIGWINCH); err != nil {
+		t.Fatalf("notify pseudo-terminal resize: %v", err)
+	}
+	resizeDeadline := time.Now().Add(5 * time.Second)
+	for len(output.String()) <= beforeResize && time.Now().Before(resizeDeadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(output.String()) <= beforeResize {
+		t.Fatal("dashboard emitted no update after pseudo-terminal resize")
+	}
+	if err := pty.Setsize(terminal, &pty.Winsize{Rows: 28, Cols: 100}); err != nil {
+		t.Fatalf("restore pseudo-terminal size: %v", err)
+	}
+	if err := command.Process.Signal(syscall.SIGWINCH); err != nil {
+		t.Fatalf("notify restored pseudo-terminal size: %v", err)
+	}
+
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		t.Fatalf("send first staged SIGINT: %v", err)
+	}
+	waitForBuffer(t, &output, "Draining")
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		t.Fatalf("send second staged SIGINT: %v", err)
+	}
+	waitForFile(t, abortReceived)
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		t.Fatalf("send force-stop SIGINT: %v", err)
+	}
+
+	err = command.Wait()
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ExitCode() != 130 {
+		t.Fatalf("compiled pseudo-terminal exit = %v, want 130; output = %q", err, output.String())
+	}
+	_ = terminal.Close()
+	select {
+	case <-readDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("pseudo-terminal output reader did not finish")
+	}
+
+	raw := output.String()
+	for _, want := range []string{
+		"\x1b[?1049h", "\x1b[?1049l", "\x1b[?25l", "\x1b[?25h",
+		"Final aggregate summary", "Final outcome: Force stop finished with errors",
+		"Completions produced (0)", "Attention Required (1)", "#73  Terminal teardown",
+	} {
+		if !strings.Contains(raw, want) {
+			t.Fatalf("compiled pseudo-terminal output missing %q: %q", want, raw)
+		}
+	}
+	restore := strings.LastIndex(raw, "\x1b[?1049l")
+	summary := strings.Index(raw, "Final aggregate summary")
+	if restore < 0 || summary < restore {
+		t.Fatalf("normal-screen summary preceded terminal restoration: %q", raw)
+	}
+}
+
+func waitForPseudoTerminalScreen(t *testing.T, output *synchronizedBuffer, width, height int, want string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(terminalScreenText(output.String(), width, height), want) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("pseudo-terminal screen never contained %q:\n%s\nraw output: %q", want, terminalScreenText(output.String(), width, height), output.String())
 }
 
 func buildExecutable(t *testing.T, root string) string {
