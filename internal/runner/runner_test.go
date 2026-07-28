@@ -1249,6 +1249,8 @@ func TestRunnerDrainReportsProcessControlFailureAfterVerifiedExit(t *testing.T) 
 	runner := testRunner(github, workers, store, 1)
 	runner.Signals = signals
 	runner.Output = output
+	recorder := &operationalEventRecorder{}
+	runner.OnOperationalEvent = recorder.record
 
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
@@ -1261,6 +1263,14 @@ func TestRunnerDrainReportsProcessControlFailureAfterVerifiedExit(t *testing.T) 
 	err := <-done
 	if err == nil || !strings.Contains(err.Error(), "abort unavailable") {
 		t.Fatalf("Drain error = %v, want process-control failure", err)
+	}
+	events := recorder.waitFor(t, func(events []OperationalEvent) bool {
+		_, ok := findShutdownEvent(events, ShutdownStageDrainComplete, "exiting after an operational failure")
+		return ok
+	})
+	terminal, _ := findShutdownEvent(events, ShutdownStageDrainComplete, "exiting after an operational failure")
+	if terminal.Result != ShutdownResultFailure {
+		t.Fatalf("operational-failure Drain result = %q, want %q", terminal.Result, ShutdownResultFailure)
 	}
 	got := store.LoadValue()
 	run := findRun(got.Runs, fmt.Sprintf("run-%d", issue))

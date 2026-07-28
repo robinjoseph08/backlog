@@ -80,9 +80,9 @@ type PresentationControl struct {
 	operationalEvents *presentationEventQueue
 }
 
-// NextOperationalEvent waits for the next typed Admission or shutdown event
-// from the hosted Runner. Events are returned in Runner delivery order without
-// requiring the presentation to parse compatible plain output.
+// NextOperationalEvent waits for the next typed Admission, Run, or shutdown
+// event from the hosted Runner. Events are returned in Runner delivery order
+// without requiring the presentation to parse compatible plain output.
 func (c PresentationControl) NextOperationalEvent(ctx context.Context) (runner.OperationalEvent, error) {
 	return c.operationalEvents.next(ctx)
 }

@@ -300,8 +300,12 @@ func (p *statusPrinter) printReason(run scheduler.Run) {
 	p.printf("    Diagnostic: %s\n", valueOr(strings.TrimSpace(plainStatusValue(run.Error)), "n/a"))
 }
 
+func displayedRunIsSuspending(run scheduler.Run, process followObservation) bool {
+	return run.Status == scheduler.StatusRunning && run.SuspendingAt != nil && process.supervision == "SUPERVISED"
+}
+
 func displayedRunState(run scheduler.Run, process followObservation) string {
-	if run.Status == scheduler.StatusRunning && run.SuspendingAt != nil && process.supervision == "SUPERVISED" {
+	if displayedRunIsSuspending(run, process) {
 		return "suspending"
 	}
 	return string(run.Status)

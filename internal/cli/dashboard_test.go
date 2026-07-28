@@ -671,6 +671,82 @@ func TestDashboardAdmissionRecoveryNoticeExpiresAfterTenSeconds(t *testing.T) {
 	}
 }
 
+func TestDashboardMessageLimitPrioritizesOnlyShutdownEvents(t *testing.T) {
+	dashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, time.Now)
+	shutdownMessage := "Drain: preserving shutdown history"
+	dashboard.operationalEvent(runner.ShutdownEvent{Stage: runner.ShutdownStageDraining, Message: shutdownMessage})
+
+	var oldestOperational string
+	for index := range dashboardMessageLimit - 1 {
+		event := runner.RunLifecycleEvent{
+			Stage:   runner.RunLifecycleClaimed,
+			Message: fmt.Sprintf("Run %d claimed", index),
+		}
+		if index == 0 {
+			oldestOperational = normalizedDashboardMessage(runner.FormatOperationalEvent(event))
+		}
+		dashboard.operationalEvent(event)
+	}
+	ordinary := "latest ordinary runtime message"
+	dashboard.recordMessage(ordinary)
+
+	visible := make(map[string]dashboardMessage, len(dashboard.messages))
+	for _, message := range dashboard.messages {
+		visible[message.text] = message
+	}
+	if len(dashboard.messages) != dashboardMessageLimit {
+		t.Fatalf("visible message history = %d entries, want %d", len(dashboard.messages), dashboardMessageLimit)
+	}
+	if _, ok := visible[ordinary]; !ok {
+		t.Fatalf("latest ordinary message evicted itself: %#v", dashboard.messages)
+	}
+	if shutdown, ok := visible[shutdownMessage]; !ok || !shutdown.shutdownPriority {
+		t.Fatalf("shutdown message lost retention priority: %#v", shutdown)
+	}
+	if _, ok := visible[oldestOperational]; ok {
+		t.Fatalf("ordinary typed operational event retained shutdown priority: %#v", visible[oldestOperational])
+	}
+}
+
+func TestDashboardReconcilesOperationalSemanticsInBothDeliveryOrders(t *testing.T) {
+	event := runner.RunLifecycleEvent{
+		Stage:   runner.RunLifecycleClaimed,
+		Message: "Run #70 claimed",
+	}
+	message := normalizedDashboardMessage(runner.FormatOperationalEvent(event))
+
+	for _, eventFirst := range []bool{false, true} {
+		name := "output first"
+		if eventFirst {
+			name = "event first"
+		}
+		t.Run(name, func(t *testing.T) {
+			dashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, time.Now)
+			if eventFirst {
+				dashboard.operationalEvent(event)
+				dashboard.recordMessage(message)
+			} else {
+				dashboard.recordMessage(message)
+				dashboard.operationalEvent(event)
+			}
+
+			if len(dashboard.messages) != 1 {
+				t.Fatalf("reconciled message history = %#v, want one typed occurrence", dashboard.messages)
+			}
+			stored := dashboard.messages[0]
+			if stored.text != message || stored.semantic != dashboardSemanticActive || !stored.shutdown || stored.shutdownPriority || !stored.plainMatched {
+				t.Fatalf("reconciled operational message = %#v", stored)
+			}
+			if _, exists := dashboard.messageOccurrences[message]; exists {
+				t.Fatal("reconciled plain occurrence remained tracked")
+			}
+			if _, exists := dashboard.shutdownOccurrences[message]; exists {
+				t.Fatal("reconciled typed occurrence remained tracked")
+			}
+		})
+	}
+}
+
 func TestDashboardBoundsOccurrenceTrackingAndSuppressesTypedFirstOutput(t *testing.T) {
 	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
 	source := &dashboardTestSource{current: current}
@@ -736,7 +812,7 @@ func TestDashboardClosePreservesIncompleteShutdownStages(t *testing.T) {
 		want  string
 	}{
 		{name: "Drain incomplete", stage: runner.ShutdownStageDrainIncomplete, want: "Drain incomplete: Worker liveness remains unverified"},
-		{name: "Suspension incomplete", stage: runner.ShutdownStageSuspensionIncomplete, want: "Suspension finished: no further interrupt has an effect before exit"},
+		{name: "Suspension incomplete", stage: runner.ShutdownStageSuspensionIncomplete, want: "Suspension incomplete: one or more shutdown steps failed; review operational messages and Run diagnostics"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
@@ -1105,6 +1181,9 @@ func TestDashboardStagePresentationCoversEveryStage(t *testing.T) {
 		if presentation.summary == "" || presentation.stage == "" || presentation.nextInterrupt == "" {
 			t.Fatalf("stage %d has incomplete presentation: %#v", stage, presentation)
 		}
+		if semantic := dashboardStageSemantic(stage); semantic == dashboardSemanticNone {
+			t.Fatalf("stage %d has no semantic styling", stage)
+		}
 		if previous, exists := seen[presentation.stage]; exists {
 			t.Fatalf("stages %d and %d share presentation %q; the stage switch may be incomplete", previous, stage, presentation.stage)
 		}
@@ -1358,7 +1437,7 @@ func TestRenderDashboardCompletionsUsesOneLineRowsAndVerifiedCompletionTime(t *t
 		}},
 	}
 	var output strings.Builder
-	renderDashboardCompletions(&output, runs, now)
+	renderDashboardCompletions(&output, runs, now, dashboardStyler{})
 	want := "\nRecent Completions (2)\n" +
 		"  #42  Populated metadata | PR: https://github.com/acme/widgets/pull/42 | Elapsed: 30m0s | Completed: 30m0s ago\n" +
 		"  #42  Legacy completion | PR: https://github.com/acme/widgets/pull/41 | Elapsed: 1h0m0s | Completed: n/a\n"

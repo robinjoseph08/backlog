@@ -79,8 +79,8 @@ type Runner struct {
 	Output    io.Writer
 	Signals   <-chan os.Signal
 
-	// OnOperationalEvent receives typed Admission and shutdown lifecycle events.
-	// Delivery is asynchronous, ordered, and isolated from callback panics so
+	// OnOperationalEvent receives typed Admission, Run, and shutdown lifecycle
+	// events. Delivery is asynchronous, ordered, and isolated from callback panics so
 	// presentation cannot block Runner control paths or compatible plain output.
 	OnOperationalEvent func(OperationalEvent)
 
@@ -463,7 +463,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				if unverified := persistedWorkerCount(&current); unverified > 0 {
 					r.shutdownEvent(ShutdownStageDrainIncomplete, "retaining Workers with unverified liveness", 0, NextInterruptNone, "Drain incomplete: 0 supervised Workers remaining; %s retained with unverified liveness", workerSummary(unverified))
 				} else {
-					r.shutdownEvent(ShutdownStageDrainComplete, "exiting after an operational failure", 0, NextInterruptNone, "Drain complete: 0 Workers remaining; exiting after an operational failure")
+					r.shutdownResultEvent(ShutdownStageDrainComplete, ShutdownResultFailure, "exiting after an operational failure", 0, NextInterruptNone, "Drain complete: 0 Workers remaining; exiting after an operational failure")
 				}
 				return drainOperationalErr
 			}
@@ -914,7 +914,7 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 	if !admitted {
 		return nil, nil
 	}
-	r.logf("claimed issue #%d as %s", candidate.Number, runID)
+	r.runLifecycleEvent(RunLifecycleClaimed, "claimed issue #%d as %s", candidate.Number, runID)
 
 	assignment, err := r.Worktrees.Plan(candidate.Number, runID)
 	if err != nil {
@@ -992,7 +992,7 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 	if err := process.Release(); err != nil {
 		return nil, r.failAfterWorkerStart(current, candidate.Number, process, fmt.Sprintf("release Pi worker: %v", err))
 	}
-	r.logf("started issue #%d in %s (pid %d)", candidate.Number, assignment.Path, process.PID())
+	r.runLifecycleEvent(RunLifecycleStarted, "started issue #%d in %s (pid %d)", candidate.Number, assignment.Path, process.PID())
 	return process, nil
 }
 
@@ -1123,7 +1123,7 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 		}
 		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("release replacement Pi Worker: %v; close: %v", err, closed.Err))
 	}
-	r.logf("resumed issue #%d in %s (pid %d, Run %s)", run.Issue, run.Worktree, process.PID(), run.RunID)
+	r.runLifecycleEvent(RunLifecycleResumed, "resumed issue #%d in %s (pid %d, Run %s)", run.Issue, run.Worktree, process.PID(), run.RunID)
 	return process, nil
 }
 
@@ -1339,7 +1339,7 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 		historical.UpdatedAt = r.Now().UTC()
 		replaceRun(current, historical)
 		changed = true
-		r.logf("completed pending worktree cleanup for merged issue #%d", historical.Issue)
+		r.runLifecycleEvent(RunLifecycleCleanupCompleted, "completed pending worktree cleanup for merged issue #%d", historical.Issue)
 	}
 	for _, lease := range append([]scheduler.Lease(nil), current.Leases...) {
 		run := findRun(current.Runs, lease.RunID)
@@ -1508,7 +1508,7 @@ func (r *Runner) applyOutcome(ctx context.Context, current *state.State, run sch
 		run.PID = 0
 		run.Error = ""
 		removeLease(current, run.RunID)
-		r.logf("verified merged completion for issue #%d", run.Issue)
+		r.runLifecycleEvent(RunLifecycleMerged, "verified merged completion for issue #%d", run.Issue)
 	case outcome.Merged && !outcome.IssueClosed:
 		transitionStatus(&run, scheduler.StatusNeedsHuman)
 		run.Error = "pull request merged but issue remains open"
@@ -1673,7 +1673,7 @@ func (r *Runner) retainProvisionalCompletion(current *state.State, run *schedule
 	if findActiveRun(current, run.Issue).RunID == "" {
 		current.Leases = append(current.Leases, scheduler.Lease{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID})
 	}
-	r.logf("issue #%d needs human attention: %s", run.Issue, message)
+	r.runLifecycleEvent(RunLifecycleNeedsHuman, "issue #%d needs human attention: %s", run.Issue, message)
 }
 
 func (r *Runner) retainUnverifiedWorker(current *state.State, original scheduler.Run, message string, closed worker.Result) error {
@@ -1695,7 +1695,7 @@ func (r *Runner) retainUnverifiedWorker(current *state.State, original scheduler
 	if findActiveRun(current, run.Issue).RunID == "" {
 		current.Leases = append(current.Leases, scheduler.Lease{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID})
 	}
-	r.logf("issue #%d needs human attention: %s", run.Issue, message)
+	r.runLifecycleEvent(RunLifecycleNeedsHuman, "issue #%d needs human attention: %s", run.Issue, message)
 	if err := r.Store.Save(*current); err != nil {
 		return fmt.Errorf("persist unverified Worker for issue #%d: %w", run.Issue, err)
 	}
@@ -1749,7 +1749,7 @@ func (r *Runner) failRun(current *state.State, issue int, message string) {
 	run.Error = message
 	run.UpdatedAt = r.Now().UTC()
 	replaceRun(current, run)
-	r.logf("issue #%d failed: %s", issue, message)
+	r.runLifecycleEvent(RunLifecycleFailed, "issue #%d failed: %s", issue, message)
 }
 
 func (r *Runner) needsHuman(current *state.State, issue int, message string) {
@@ -1759,7 +1759,7 @@ func (r *Runner) needsHuman(current *state.State, issue int, message string) {
 	run.Error = message
 	run.UpdatedAt = r.Now().UTC()
 	replaceRun(current, run)
-	r.logf("issue #%d needs human attention: %s", issue, message)
+	r.runLifecycleEvent(RunLifecycleNeedsHuman, "issue #%d needs human attention: %s", issue, message)
 }
 
 func (r *Runner) needsHumanWithLiveWorker(current *state.State, issue int, message string) {
@@ -1768,7 +1768,7 @@ func (r *Runner) needsHumanWithLiveWorker(current *state.State, issue int, messa
 	run.Error = message
 	run.UpdatedAt = r.Now().UTC()
 	replaceRun(current, run)
-	r.logf("issue #%d needs human attention: %s", issue, message)
+	r.runLifecycleEvent(RunLifecycleNeedsHuman, "issue #%d needs human attention: %s", issue, message)
 }
 
 func (r *Runner) saveAfterFailure(current state.State, issue int) error {
@@ -2367,11 +2367,22 @@ func invokeOperationalEvent(deliver func(OperationalEvent), event OperationalEve
 }
 
 func (r *Runner) shutdownEvent(stage ShutdownStage, action string, workers int, next NextInterruptBehavior, format string, args ...any) {
+	result := ShutdownResultNone
+	switch stage {
+	case ShutdownStageDrainComplete:
+		result = ShutdownResultSuccess
+	case ShutdownStageDrainIncomplete, ShutdownStageSuspensionIncomplete:
+		result = ShutdownResultFailure
+	}
+	r.shutdownResultEvent(stage, result, action, workers, next, format, args...)
+}
+
+func (r *Runner) shutdownResultEvent(stage ShutdownStage, result ShutdownResult, action string, workers int, next NextInterruptBehavior, format string, args ...any) {
 	if stage == ShutdownStageForceStopping {
 		r.forceStopping.Store(true)
 	}
 	r.emit(ShutdownEvent{
-		Stage: stage, Action: action, RemainingWorkers: workers, NextInterrupt: next,
+		Stage: stage, Result: result, Action: action, RemainingWorkers: workers, NextInterrupt: next,
 		Message: fmt.Sprintf(format, args...),
 	})
 }
@@ -2382,6 +2393,10 @@ func (r *Runner) suspensionProgressEvent(action string, workers int, format stri
 		stage, next = ShutdownStageForceStopping, NextInterruptRepeatsForceStop
 	}
 	r.shutdownEvent(stage, action, workers, next, format, args...)
+}
+
+func (r *Runner) runLifecycleEvent(stage RunLifecycleStage, format string, args ...any) {
+	r.emit(RunLifecycleEvent{Stage: stage, Message: fmt.Sprintf(format, args...)})
 }
 
 func (r *Runner) logf(format string, args ...any) {
