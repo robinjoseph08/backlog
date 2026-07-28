@@ -754,6 +754,21 @@ exec `+quote(fixture.git)+` "$@"
 	}
 }
 
+func TestResolveFinalVerificationRequiresDurablyClosedWorkerLogMarker(t *testing.T) {
+	resolvedAt := time.Date(2026, 7, 28, 2, 3, 4, 0, time.UTC)
+	expected := scheduler.Run{
+		Issue: 42, RunID: "run-42", Status: scheduler.StatusResolvedExternally, WorkerMode: scheduler.WorkerModePrint,
+		ResolvedExternallyAt: &resolvedAt, ClosureReason: "completed", UpdatedAt: resolvedAt,
+	}
+	persisted := expected
+	persisted.WorkerLogOpen = true
+
+	err := retirement.VerifyFinalState(state.State{Runs: []scheduler.Run{persisted}}, expected, resolution.Policy(expected.RunID))
+	if err == nil || !strings.Contains(err.Error(), "Worker-log-open marker remains open") {
+		t.Fatalf("open Worker-log marker verification error = %v", err)
+	}
+}
+
 func TestResolveRerunsOnlyFinalizationAfterStatePersistenceFailure(t *testing.T) {
 	fixture := newResolveFixture(t, []string{"spec"}, "COMPLETED")
 	current, err := fixture.store.Load()

@@ -1052,9 +1052,11 @@ func (e Service) verifyFinalState(current state.State, expected scheduler.Run) e
 			if run.Status != e.policy.TerminalStatus {
 				return fmt.Errorf("Run %s final status is %s, not %s", expected.RunID, run.Status, e.policy.TerminalStatus)
 			}
+			if run.WorkerLogOpen {
+				return fmt.Errorf("Run %s Worker-log-open marker remains open after %s", expected.RunID, e.policy.Operation)
+			}
 			metadata := run
 			metadata.Status = expected.Status
-			metadata.WorkerLogOpen = expected.WorkerLogOpen
 			metadata.UpdatedAt = expected.UpdatedAt
 			metadata.CompletedAt = expected.CompletedAt
 			if !reflect.DeepEqual(metadata, expected) {
