@@ -307,7 +307,7 @@ func TestDashboardAggregatesAdmissionFailuresAndBoundsDiagnostics(t *testing.T) 
 	_, body, _ := dashboard.renderParts(now)
 	for _, want := range []string{
 		"Admission: DEGRADED", "23 consecutive failures", "First failure: 2026-07-28T12:00:08Z",
-		"Latest failure: 2026-07-28T12:00:30Z", "Next retry: 30s", "Operation: list candidates",
+		"Latest failure: 2026-07-28T12:00:30Z", "Operation: list candidates",
 		"Issue: #70", "Cause: TLS handshake timeout", "Equivalent failures: 22", "Diagnostics: closed (d to open; 20 recent)",
 	} {
 		if !strings.Contains(body, want) {
@@ -316,6 +316,20 @@ func TestDashboardAggregatesAdmissionFailuresAndBoundsDiagnostics(t *testing.T) 
 	}
 	if strings.Contains(body, "full gh command") {
 		t.Fatalf("closed Diagnostics exposed full errors:\n%s", body)
+	}
+	for _, check := range []struct {
+		at   time.Time
+		want string
+	}{
+		{at: now, want: "Next retry: 30s"},
+		{at: now.Add(11 * time.Second), want: "Next retry: 19s"},
+		{at: now.Add(30 * time.Second), want: "Next retry: 0s"},
+		{at: now.Add(31 * time.Second), want: "Next retry: 0s"},
+	} {
+		_, countdownBody, _ := dashboard.renderParts(check.at)
+		if !strings.Contains(countdownBody, check.want) {
+			t.Fatalf("Admission countdown at %s missing %q:\n%s", check.at, check.want, countdownBody)
+		}
 	}
 	if len(dashboard.admission.failures) != 20 {
 		t.Fatalf("retained failure references = %d, want 20", len(dashboard.admission.failures))
