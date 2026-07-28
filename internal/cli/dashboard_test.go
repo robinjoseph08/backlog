@@ -238,6 +238,45 @@ func TestDashboardReceivesShutdownStageWithoutParsingFormattedMessages(t *testin
 	}
 }
 
+func TestDashboardMessageLimitPrioritizesOnlyShutdownEvents(t *testing.T) {
+	dashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, time.Now)
+	shutdownMessage := "Drain: preserving shutdown history"
+	dashboard.operationalEvent(runner.ShutdownEvent{Stage: runner.ShutdownStageDraining, Message: shutdownMessage})
+
+	occurredAt := time.Date(2026, 7, 28, 1, 0, 0, 0, time.UTC)
+	var oldestOperational string
+	for index := range dashboardMessageLimit - 1 {
+		event := runner.CandidateDiscoveryFailed{
+			OccurredAt: occurredAt,
+			RetryAt:    occurredAt.Add(time.Second),
+			Err:        fmt.Errorf("candidate failure %d", index),
+		}
+		if index == 0 {
+			oldestOperational = normalizedDashboardMessage(runner.FormatOperationalEvent(event))
+		}
+		dashboard.operationalEvent(event)
+	}
+	ordinary := "latest ordinary runtime message"
+	dashboard.recordMessage(ordinary)
+
+	visible := make(map[string]dashboardMessage, len(dashboard.messages))
+	for _, message := range dashboard.messages {
+		visible[message.text] = message
+	}
+	if len(dashboard.messages) != dashboardMessageLimit {
+		t.Fatalf("visible message history = %d entries, want %d", len(dashboard.messages), dashboardMessageLimit)
+	}
+	if _, ok := visible[ordinary]; !ok {
+		t.Fatalf("latest ordinary message evicted itself: %#v", dashboard.messages)
+	}
+	if shutdown, ok := visible[shutdownMessage]; !ok || !shutdown.shutdownPriority {
+		t.Fatalf("shutdown message lost retention priority: %#v", shutdown)
+	}
+	if _, ok := visible[oldestOperational]; ok {
+		t.Fatalf("ordinary typed operational event retained shutdown priority: %#v", visible[oldestOperational])
+	}
+}
+
 func TestDashboardBoundsOccurrenceTrackingAndSuppressesTypedFirstOutput(t *testing.T) {
 	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
 	source := &dashboardTestSource{current: current}

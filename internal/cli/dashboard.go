@@ -67,10 +67,11 @@ type liveDashboard struct {
 }
 
 type dashboardMessage struct {
-	text         string
-	semantic     dashboardSemantic
-	shutdown     bool
-	plainMatched bool
+	text             string
+	semantic         dashboardSemantic
+	shutdown         bool
+	shutdownPriority bool
+	plainMatched     bool
 }
 
 type fileSignature struct {
@@ -274,7 +275,7 @@ func (d *liveDashboard) appendMessageLocked(message dashboardMessage) {
 		return
 	}
 	for index, retained := range d.messages {
-		if !retained.shutdown {
+		if !retained.shutdownPriority {
 			d.messages = append(d.messages[:index], d.messages[index+1:]...)
 			return
 		}
@@ -296,6 +297,7 @@ func cloneDashboardMessages(messages []dashboardMessage) []dashboardMessage {
 func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
 	message := normalizedDashboardMessage(runner.FormatOperationalEvent(event))
 	semantic := dashboardOperationalEventSemantic(event)
+	_, shutdownPriority := event.(runner.ShutdownEvent)
 	next, hasNext := dashboardStageForOperationalEvent(event)
 	if message == "" && !hasNext {
 		return
@@ -309,6 +311,7 @@ func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
 			if d.messages[index].text == message && !d.messages[index].shutdown {
 				d.messages[index].semantic = semantic
 				d.messages[index].shutdown = true
+				d.messages[index].shutdownPriority = shutdownPriority
 				d.messages[index].plainMatched = true
 				matched = true
 				break
@@ -318,7 +321,7 @@ func (d *liveDashboard) operationalEvent(event runner.OperationalEvent) {
 			// Event delivery may lag far enough behind output for the matching
 			// ordinary line to be evicted. Restore it as typed history. This also
 			// represents the line when the event arrives before plain output.
-			d.appendMessageLocked(dashboardMessage{text: message, semantic: semantic, shutdown: true})
+			d.appendMessageLocked(dashboardMessage{text: message, semantic: semantic, shutdown: true, shutdownPriority: shutdownPriority})
 		}
 		d.reconcileOccurrencesLocked(message)
 	}

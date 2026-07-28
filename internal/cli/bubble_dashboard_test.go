@@ -656,6 +656,7 @@ func TestBubbleDashboardConstrainedFallbackKeepsGuidanceInFixedFooter(t *testing
 		[]string{"Repository: acme/widgets", "Worker capacity: 1 used | 2 available | 3 total"},
 		footer,
 		dashboardRunning,
+		dashboardStyler{},
 		120,
 		2,
 	)

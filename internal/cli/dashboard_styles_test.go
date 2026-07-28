@@ -58,6 +58,50 @@ func TestDashboardStylingUsesTypedRunSemanticsWithoutChangingLabels(t *testing.T
 }
 
 func TestDashboardPaletteAdaptsToBackgroundAndReducedProfiles(t *testing.T) {
+	tests := []struct {
+		name       string
+		profile    TerminalColorProfile
+		dark       bool
+		active     color.Color
+		completion color.Color
+		warning    color.Color
+		attention  color.Color
+		metadata   color.Color
+	}{
+		{name: "ANSI dark", profile: TerminalColorANSI, dark: true, active: lipgloss.BrightCyan, completion: lipgloss.BrightGreen, warning: lipgloss.BrightYellow, attention: lipgloss.BrightRed, metadata: lipgloss.BrightBlack},
+		{name: "ANSI light", profile: TerminalColorANSI, active: lipgloss.Blue, completion: lipgloss.Green, warning: lipgloss.Yellow, attention: lipgloss.Red, metadata: lipgloss.BrightBlack},
+		{name: "ANSI256 dark", profile: TerminalColorANSI256, dark: true, active: lipgloss.ANSIColor(81), completion: lipgloss.ANSIColor(78), warning: lipgloss.ANSIColor(221), attention: lipgloss.ANSIColor(203), metadata: lipgloss.ANSIColor(245)},
+		{name: "ANSI256 light", profile: TerminalColorANSI256, active: lipgloss.ANSIColor(25), completion: lipgloss.ANSIColor(28), warning: lipgloss.ANSIColor(94), attention: lipgloss.ANSIColor(124), metadata: lipgloss.ANSIColor(242)},
+		{name: "true color dark", profile: TerminalColorTrueColor, dark: true, active: lipgloss.Color("#5FD7FF"), completion: lipgloss.Color("#5FD787"), warning: lipgloss.Color("#FFD75F"), attention: lipgloss.Color("#FF6B6B"), metadata: lipgloss.Color("#A0A0A0")},
+		{name: "true color light", profile: TerminalColorTrueColor, active: lipgloss.Color("#005FAF"), completion: lipgloss.Color("#1A7F37"), warning: lipgloss.Color("#8A4B00"), attention: lipgloss.Color("#B42318"), metadata: lipgloss.Color("#5F6368")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			styler := newDashboardStyler(test.profile, test.dark)
+			for semantic, colors := range map[string][2]color.Color{
+				"active cyan or blue": {styler.active.GetForeground(), test.active},
+				"completion green":    {styler.completion.GetForeground(), test.completion},
+				"warning amber":       {styler.warning.GetForeground(), test.warning},
+				"attention red":       {styler.attention.GetForeground(), test.attention},
+				"metadata gray":       {styler.metadata.GetForeground(), test.metadata},
+			} {
+				if !sameColor(colors[0], colors[1]) {
+					t.Fatalf("%s foreground = %v, want required hue family color %v", semantic, colors[0], colors[1])
+				}
+			}
+			got := styler.render(dashboardSemanticActive, "Active Runs (0)") + "\n" + styler.render(dashboardSemanticMetadata, "  none")
+			if ansi.Strip(got) != "Active Runs (0)\n  none" || !strings.Contains(got, "\x1b[") {
+				t.Fatalf("palette did not preserve readable text while styling: %q", got)
+			}
+			if test.profile == TerminalColorANSI && (strings.Contains(got, "38;2;") || strings.Contains(got, "38;5;")) {
+				t.Fatalf("ANSI profile used a higher color profile: %q", got)
+			}
+			if test.profile == TerminalColorANSI256 && strings.Contains(got, "38;2;") {
+				t.Fatalf("ANSI256 profile used true color: %q", got)
+			}
+		})
+	}
+
 	for _, profile := range []TerminalColorProfile{TerminalColorANSI, TerminalColorANSI256, TerminalColorTrueColor} {
 		dark := newDashboardStyler(profile, true)
 		light := newDashboardStyler(profile, false)
@@ -66,21 +110,6 @@ func TestDashboardPaletteAdaptsToBackgroundAndReducedProfiles(t *testing.T) {
 			sameColor(dark.warning.GetForeground(), light.warning.GetForeground()) ||
 			sameColor(dark.attention.GetForeground(), light.attention.GetForeground()) {
 			t.Fatalf("profile %d did not adapt every semantic color to terminal background", profile)
-		}
-		for _, semantic := range []color.Color{dark.active.GetForeground(), dark.completion.GetForeground(), dark.warning.GetForeground(), dark.attention.GetForeground()} {
-			if sameColor(dark.metadata.GetForeground(), semantic) {
-				t.Fatalf("profile %d metadata foreground was not visually muted from semantic state", profile)
-			}
-		}
-		got := dark.render(dashboardSemanticActive, "Active Runs (0)") + "\n" + dark.render(dashboardSemanticMetadata, "  none")
-		if ansi.Strip(got) != "Active Runs (0)\n  none" || !strings.Contains(got, "\x1b[") {
-			t.Fatalf("profile %d did not preserve readable text while styling: %q", profile, got)
-		}
-		if profile == TerminalColorANSI && (strings.Contains(got, "38;2;") || strings.Contains(got, "38;5;")) {
-			t.Fatalf("ANSI profile used a higher color profile: %q", got)
-		}
-		if profile == TerminalColorANSI256 && strings.Contains(got, "38;2;") {
-			t.Fatalf("ANSI256 profile used true color: %q", got)
 		}
 	}
 }
@@ -103,6 +132,44 @@ func TestDashboardChromeUsesTypedStageStylesWithoutRemovingNavigation(t *testing
 		if ansi.Strip(got) != test.line || got != test.style.Render(test.line) {
 			t.Fatalf("styled chrome = %q, want labeled %q", got, test.line)
 		}
+	}
+}
+
+func TestDashboardConstrainedChromeKeepsMetadataMuted(t *testing.T) {
+	styler := newDashboardStyler(TerminalColorTrueColor, true)
+	header := []string{
+		"Repository: acme/widgets",
+		"Worker capacity: 1 used | 2 available | 3 total",
+	}
+	footer := []string{
+		"Runner stage: Draining",
+		"Next Ctrl-C: request suspension",
+	}
+	for _, test := range []struct {
+		name          string
+		width         int
+		metadata      string
+		capacity      string
+		lifecycle     string
+		nextInterrupt string
+	}{
+		{name: "combined", width: 200, metadata: header[0], capacity: header[1], lifecycle: footer[0], nextInterrupt: footer[1]},
+		{name: "compact", width: 80, metadata: "R:acme/widgets", capacity: "W:1u/2a/3t", lifecycle: "S:Draining", nextInterrupt: "^C:request suspension"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			chrome := dashboardChromeLines(header, footer, dashboardDraining, styler, test.width, 1)
+			got := strings.Join(append(append([]string(nil), chrome.top...), chrome.bottom...), "\n")
+			for _, want := range []string{
+				styler.metadata.Render(test.metadata),
+				styler.metadata.Render(test.capacity),
+				styler.warning.Render(test.lifecycle),
+				styler.warning.Render(test.nextInterrupt),
+			} {
+				if !strings.Contains(got, want) {
+					t.Fatalf("constrained chrome omitted semantic span %q: %q", ansi.Strip(want), got)
+				}
+			}
+		})
 	}
 }
 

@@ -682,15 +682,11 @@ func (m bubbleDashboardModel) View() tea.View {
 	if frame.titleHeight > 0 {
 		lines = append(lines, renderDashboardTitle(frame.title))
 	}
-	for _, line := range frame.chrome.top {
-		lines = append(lines, m.styler.render(frame.chrome.topSemantic, line))
-	}
+	lines = append(lines, frame.chrome.top...)
 	if frame.bodyHeight > 0 {
 		lines = append(lines, strings.Split(m.viewport.View(), "\n")...)
 	}
-	for _, line := range frame.chrome.bottom {
-		lines = append(lines, m.styler.render(frame.chrome.bottomSemantic, line))
-	}
+	lines = append(lines, frame.chrome.bottom...)
 	for index := range lines {
 		lines[index] = fitDashboardLine(lines[index], m.width)
 	}
@@ -710,7 +706,7 @@ type dashboardFrame struct {
 
 func (m bubbleDashboardModel) dashboardFrame() dashboardFrame {
 	headerLines := strings.SplitN(m.header, "\n", 3)
-	chrome := dashboardChromeLines(headerLines[1:], strings.Split(m.footer, "\n"), m.stage, m.width, m.height)
+	chrome := dashboardChromeLines(headerLines[1:], strings.Split(m.footer, "\n"), m.stage, m.styler, m.width, m.height)
 	chromeHeight := len(chrome.top) + len(chrome.bottom)
 	titleHeight := 0
 	if chromeHeight+1 < m.height {
@@ -730,13 +726,11 @@ func renderDashboardTitle(title string) string {
 }
 
 type dashboardChrome struct {
-	top            []string
-	bottom         []string
-	topSemantic    dashboardSemantic
-	bottomSemantic dashboardSemantic
+	top    []string
+	bottom []string
 }
 
-func dashboardChromeLines(header, footer []string, stage dashboardStage, width, height int) dashboardChrome {
+func dashboardChromeLines(header, footer []string, stage dashboardStage, styler dashboardStyler, width, height int) dashboardChrome {
 	if width <= 0 || height <= 0 {
 		return dashboardChrome{}
 	}
@@ -744,24 +738,26 @@ func dashboardChromeLines(header, footer []string, stage dashboardStage, width, 
 	if height >= 3 {
 		chromeLimit--
 	}
-	headerGroups := dashboardChromeGroups(header)
-	footerGroups := dashboardChromeGroups(footer)
+	metadata := styledDashboardChromeItems(header, dashboardSemanticMetadata, styler)
+	lifecycle := styledDashboardFooterItems(footer, stage, styler)
+	headerGroups := dashboardChromeGroups(metadata)
+	footerGroups := dashboardChromeGroups(lifecycle)
 	compactNavigation := append([]string(nil), footer...)
 	if len(compactNavigation) > 2 {
 		compactNavigation[2] = "N:jk/fb Pg H/E gG a"
 	}
-	compactHeader := compactDashboardHeader(header)
-	compactFooter := compactDashboardFooter(footer)
-	stageSemantic := dashboardStageSemantic(stage)
+	compactNavigation = styledDashboardFooterItems(compactNavigation, stage, styler)
+	compactHeader := styledDashboardChromeItems(compactDashboardHeader(header), dashboardSemanticMetadata, styler)
+	compactFooter := styledDashboardFooterItems(compactDashboardFooter(footer), stage, styler)
 	candidates := []dashboardChrome{
-		{top: wrapDashboardChrome(headerGroups, width), bottom: wrapDashboardChrome(footerGroups, width), topSemantic: dashboardSemanticMetadata, bottomSemantic: stageSemantic},
-		{top: wrapDashboardChrome(headerGroups, width), bottom: wrapDashboardChrome(dashboardChromeGroups(compactNavigation), width), topSemantic: dashboardSemanticMetadata, bottomSemantic: stageSemantic},
-		{top: wrapDashboardChrome([][]string{header}, width), bottom: wrapDashboardChrome([][]string{footer}, width), topSemantic: dashboardSemanticMetadata, bottomSemantic: stageSemantic},
-		{top: wrapDashboardChrome([][]string{compactHeader}, width), bottom: wrapDashboardChrome([][]string{compactFooter}, width), topSemantic: dashboardSemanticMetadata, bottomSemantic: stageSemantic},
+		{top: wrapDashboardChrome(headerGroups, width), bottom: wrapDashboardChrome(footerGroups, width)},
+		{top: wrapDashboardChrome(headerGroups, width), bottom: wrapDashboardChrome(dashboardChromeGroups(compactNavigation), width)},
+		{top: wrapDashboardChrome([][]string{metadata}, width), bottom: wrapDashboardChrome([][]string{lifecycle}, width)},
+		{top: wrapDashboardChrome([][]string{compactHeader}, width), bottom: wrapDashboardChrome([][]string{compactFooter}, width)},
 		// A one-line terminal cannot have distinct header and footer rows. Keep
 		// the whole compact chrome in the footer row so lifecycle guidance and
 		// navigation are never moved above the scrollable body.
-		{bottom: wrapDashboardChrome([][]string{append(append([]string(nil), compactHeader...), compactFooter...)}, width), bottomSemantic: stageSemantic},
+		{bottom: wrapDashboardChrome([][]string{append(append([]string(nil), compactHeader...), compactFooter...)}, width)},
 	}
 	for _, candidate := range candidates {
 		if len(candidate.top)+len(candidate.bottom) <= chromeLimit {
@@ -786,9 +782,9 @@ func dashboardChromeLines(header, footer []string, stage dashboardStage, width, 
 		if len(top) > remaining {
 			top = top[:remaining]
 		}
-		return dashboardChrome{top: top, bottom: bottom, topSemantic: stageSemantic, bottomSemantic: stageSemantic}
+		return dashboardChrome{top: top, bottom: bottom}
 	}
-	return dashboardChrome{bottom: bottom, bottomSemantic: stageSemantic}
+	return dashboardChrome{bottom: bottom}
 }
 
 func dashboardChromeGroups(lines []string) [][]string {
@@ -829,6 +825,26 @@ func compactFooterLine(footer []string, index int) string {
 		return ""
 	}
 	return footer[index]
+}
+
+func styledDashboardChromeItems(items []string, semantic dashboardSemantic, styler dashboardStyler) []string {
+	styled := make([]string, len(items))
+	for index, item := range items {
+		styled[index] = styler.render(semantic, item)
+	}
+	return styled
+}
+
+func styledDashboardFooterItems(items []string, stage dashboardStage, styler dashboardStyler) []string {
+	styled := make([]string, len(items))
+	for index, item := range items {
+		semantic := dashboardSemanticMetadata
+		if index < 2 {
+			semantic = dashboardStageSemantic(stage)
+		}
+		styled[index] = styler.render(semantic, item)
+	}
+	return styled
 }
 
 func wrapDashboardChrome(groups [][]string, width int) []string {
