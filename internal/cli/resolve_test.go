@@ -23,12 +23,26 @@ import (
 	"github.com/robinjoseph08/backlog/internal/state"
 )
 
-func TestResolveHelpDescribesCompleteArtifactRetirement(t *testing.T) {
+func TestResolveHelpDescribesCompletionPrecedenceAndCompleteArtifactRetirement(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if exit := Main(context.Background(), []string{"resolve", "--help"}, &stdout, &stderr); exit != 0 {
 		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
 	}
-	for _, want := range []string{"Safely retire owned unmerged pull requests", "remote", "local branches", "worktrees", "active Pi sessions", "preserve diagnostics", "release the Lease"} {
+	for _, want := range []string{
+		"Completion takes precedence",
+		"no recorded pull request",
+		"exactly one merged pull request discovered from its expected branch",
+		"Multiple unrecorded merged pull requests are ambiguous",
+		"retains the Lease",
+		"requires operator intervention",
+		"Safely retire owned unmerged pull requests",
+		"remote",
+		"local branches",
+		"worktrees",
+		"active Pi sessions",
+		"preserve diagnostics",
+		"release the Lease",
+	} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("help omitted %q: %q", want, stderr.String())
 		}
