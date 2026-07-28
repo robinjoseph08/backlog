@@ -225,6 +225,9 @@ func PlansEqual(left, right Plan) bool {
 // Retire executes the complete ordered retirement, revalidating immediately
 // before each mutation and verifying every postcondition before returning.
 func (e Service) Retire(ctx context.Context, approved Plan) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if e.policy.MarkProgressBeforeMutation && len(approved.Actions) != 0 && approved.Actions[0].kind == actionMarkProgress {
 		if err := e.markProgress(); err != nil {
 			return err

@@ -345,6 +345,35 @@ func TestRetirePersistsProgressBeforeFullReinspectionCanFail(t *testing.T) {
 	}
 }
 
+func TestRetireWithCancelledContextDoesNotPersistProgress(t *testing.T) {
+	run := scheduler.Run{Issue: 42, RunID: "run-42", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint}
+	lease := scheduler.Lease{LeaseID: "lease-42", Issue: 42, RunID: run.RunID}
+	store := &policyStateStore{current: state.State{Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{lease}}}
+	policy := testPolicy()
+	policy.MarkProgressBeforeMutation = true
+	policy.SelectRun = func(current state.State) (scheduler.Run, scheduler.Lease, error) {
+		return current.Runs[0], current.Leases[0], nil
+	}
+	service := Service{store: store, policy: policy}
+	approved := Plan{
+		Snapshot: Snapshot{Run: run, Lease: lease},
+		Actions: []Action{
+			plannedAction(actionMarkProgress, "mark progress"),
+			plannedAction(actionFinalize, "finalize"),
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := service.Retire(ctx, approved)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled retirement error = %v", err)
+	}
+	if store.saves != 0 || store.current.Runs[0].Status != scheduler.StatusFailed || store.current.Leases[0] != lease {
+		t.Fatalf("cancelled retirement changed state: %#v", store.current)
+	}
+}
+
 func TestFinalStateRequiresExplanationOnClosedUnmergedPullRequest(t *testing.T) {
 	policy := testPolicy()
 	policy.RequireClosedExplanation = true

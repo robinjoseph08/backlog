@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -870,6 +871,36 @@ esac
 	}
 }
 
+func TestCompiledResolveExplainsClosedUnmergedPullRequestWithoutReclosing(t *testing.T) {
+	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusFailed, false, false, false)
+	fixture.updateGitHubState(t, `.pr="CLOSED" | .auto=false | .comments=[]`)
+	gh := githubArtifactResolveGitHub(t, fixture)
+	binary := buildExecutable(t, t.TempDir())
+	command := exec.Command(binary, githubArtifactResolveArgs(fixture, fixture.git, gh, "--yes")...)
+	output, err := command.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "External Resolution complete for Run run-github") {
+		t.Fatalf("compiled closed pull request retirement: %v\n%s", err, output)
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusResolvedExternally || len(current.Leases) != 0 {
+		t.Fatalf("closed pull request retirement state = %#v", current)
+	}
+	github := fixture.githubStateValue(t)
+	if github.PR != "CLOSED" || github.Merged || github.Auto || len(github.Comments) != 1 || !strings.Contains(github.Comments[0], resolution.CommentMarker("run-github")) {
+		t.Fatalf("explained closed pull request = %#v", github)
+	}
+	calls, err := os.ReadFile(fixture.githubCalls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(calls) != "comment\n" {
+		t.Fatalf("closed pull request mutations = %q, want one explanation and no close", calls)
+	}
+}
+
 func TestResolveRerunsOnlyRemainingPullRequestActionsAfterEveryMutationBoundary(t *testing.T) {
 	for _, test := range []struct {
 		name, pattern, completedAbsent, remaining string
@@ -981,6 +1012,63 @@ esac
 	github := fixture.githubStateValue(t)
 	if !github.Merged || github.PR != "MERGED" {
 		t.Fatalf("merge race pull request state = %#v", github)
+	}
+}
+
+func TestCompiledResolveRecordsCompletionWhenExpectedPullRequestMergesDuringFailedGitHubMutation(t *testing.T) {
+	binary := buildExecutable(t, t.TempDir())
+	tests := []struct {
+		name, pattern, call, initialState string
+	}{
+		{name: "disable auto-merge", pattern: `"pr merge 99 --repo acme/widgets --disable-auto"`, call: "disable"},
+		{name: "pull request explanation", pattern: `pr\ comment\ 99\ --repo\ acme/widgets\ --body\ *`, call: "comment", initialState: `.auto=false`},
+		{name: "pull request closure", pattern: `"pr close 99 --repo acme/widgets"`, call: "close", initialState: fmt.Sprintf(`.auto=false | .comments=[%q]`, resolution.Explanation(scheduler.Run{Issue: 42, RunID: "run-github"}))},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newGitHubArtifactResetFixture(t, scheduler.StatusWaitingForMerge, false, false, false)
+			if test.initialState != "" {
+				fixture.updateGitHubState(t, test.initialState)
+			}
+			gh := githubArtifactResolveGitHub(t, fixture)
+			failingGitHub := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  `+test.pattern+`)
+    printf '%s\n' `+quote(test.call)+` >> `+quote(fixture.githubCalls)+`
+    temporary=`+quote(fixture.githubState)+`.tmp
+    jq '.pr="MERGED" | .merged=true | .auto=false' `+quote(fixture.githubState)+` > "$temporary"
+    mv "$temporary" `+quote(fixture.githubState)+`
+    echo 'mutation failed after pull request merged' >&2
+    exit 1 ;;
+esac
+exec `+quote(gh)+` "$@"
+`)
+
+			command := exec.Command(binary, githubArtifactResolveArgs(fixture, fixture.git, failingGitHub, "--yes")...)
+			output, err := command.CombinedOutput()
+			if err != nil || !strings.Contains(string(output), "Completion recorded for Run run-github") {
+				t.Fatalf("compiled failed-mutation merge race: %v\n%s", err, output)
+			}
+			current, err := fixture.store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if current.Runs[0].Status != scheduler.StatusMerged || current.Runs[0].CompletedAt == nil || len(current.Leases) != 0 {
+				t.Fatalf("failed-mutation Completion state = %#v", current)
+			}
+			calls, err := os.ReadFile(fixture.githubCalls)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(calls) != test.call+"\n" {
+				t.Fatalf("merge race performed mutations after failed %s: %q", test.call, calls)
+			}
+			github := fixture.githubStateValue(t)
+			if !github.Merged || github.PR != "MERGED" {
+				t.Fatalf("failed-mutation merge race pull request = %#v", github)
+			}
+		})
 	}
 }
 
