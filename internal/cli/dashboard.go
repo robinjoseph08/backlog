@@ -431,6 +431,25 @@ func (d *liveDashboard) toggleDiagnostics() {
 	d.requestRedraw()
 }
 
+func (d *liveDashboard) recoveryNoticeRemaining(now time.Time) time.Duration {
+	d.mu.Lock()
+	degraded := d.admission.degraded
+	recoveredAt := d.admission.recoveredAt
+	d.mu.Unlock()
+	if degraded || recoveredAt.IsZero() {
+		return 0
+	}
+	elapsed := now.Sub(recoveredAt)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	remaining := admissionRecoveryNotice - elapsed
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
 func (d *liveDashboard) activityChanged() bool {
 	d.mu.Lock()
 	current := d.current

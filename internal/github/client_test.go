@@ -97,7 +97,7 @@ func TestClientSeparatesCandidateDiscoveryCauseFromFullCommand(t *testing.T) {
 
 	gh := fakeGH(t, `
 case "$*" in
-  "issue list "*) echo "TLS handshake timeout" >&2; exit 1 ;;
+  "issue list "*) printf '%s\n' "TLS handshake timeout" "complete verbose stderr detail" >&2; exit 1 ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
 esac`)
 	_, err := (Client{Executable: gh}).Candidates(context.Background(), "acme/widgets")
@@ -108,8 +108,15 @@ esac`)
 	if discovery.Cause != "TLS handshake timeout" {
 		t.Fatalf("concise cause = %q", discovery.Cause)
 	}
-	if !strings.Contains(discovery.Error(), "gh issue list --repo acme/widgets") || !strings.Contains(discovery.Error(), discovery.Cause) {
-		t.Fatalf("full error lost command evidence: %q", discovery.Error())
+	if !strings.Contains(discovery.Error(), "gh issue list --repo acme/widgets") || !strings.Contains(discovery.Error(), discovery.Cause) || !strings.Contains(discovery.Error(), "complete verbose stderr detail") {
+		t.Fatalf("full error lost command or stderr evidence: %q", discovery.Error())
+	}
+}
+
+func TestCandidateDiscoveryCauseIsBounded(t *testing.T) {
+	cause := boundedCandidateDiscoveryCause(strings.Repeat("x", 250))
+	if len([]rune(cause)) != 200 || !strings.HasSuffix(cause, "...") {
+		t.Fatalf("bounded cause length = %d, cause = %q", len([]rune(cause)), cause)
 	}
 }
 

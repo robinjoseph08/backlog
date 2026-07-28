@@ -434,15 +434,24 @@ func (m *bubbleDashboardModel) renderPendingFlushes() []tea.Cmd {
 	if m.control.operationalEvents != nil && !m.control.operationalEvents.idle() {
 		return nil
 	}
+	delay := dashboardFlushDelay(m.dashboard, m.dashboard.now())
 	commands := make([]tea.Cmd, 0, len(m.pendingFlushes))
 	for _, pending := range m.pendingFlushes {
 		message := pending
-		commands = append(commands, tea.Tick(time.Second/30, func(time.Time) tea.Msg {
+		commands = append(commands, tea.Tick(delay, func(time.Time) tea.Msg {
 			return dashboardFlushRenderedMsg(message)
 		}))
 	}
 	m.pendingFlushes = nil
 	return commands
+}
+
+func dashboardFlushDelay(dashboard *liveDashboard, now time.Time) time.Duration {
+	delay := time.Second / 30
+	if remaining := dashboard.recoveryNoticeRemaining(now); remaining > delay {
+		return remaining
+	}
+	return delay
 }
 
 func (m *bubbleDashboardModel) resizeViewport() {

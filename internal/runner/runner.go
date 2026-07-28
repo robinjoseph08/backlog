@@ -115,6 +115,7 @@ type Runner struct {
 	operationalEventDone     chan struct{}
 	operationalEventStopping bool
 	operationalEvents        []OperationalEvent
+	candidateDiagnostics     candidateDiscoveryDiagnostics
 }
 
 const operationalAdmissionFailureLimit = 20
@@ -374,7 +375,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				var discoveryErr *ghadapter.CandidateDiscoveryError
 				if errors.As(err, &discoveryErr) {
 					if discoveryErr.Cause != "" {
-						cause = discoveryErr.Cause
+						cause = boundedDiscoveryCause(discoveryErr.Cause)
 					}
 					switch discoveryErr.Operation {
 					case ghadapter.CandidateDiscoveryList:
@@ -2183,7 +2184,32 @@ func conciseDiscoveryCause(err error) string {
 	if cause == nil {
 		return "unknown error"
 	}
-	return cause.Error()
+	return boundedDiscoveryCause(cause.Error())
+}
+
+func boundedDiscoveryCause(cause string) string {
+	cause = strings.TrimSpace(cause)
+	if line, _, found := strings.Cut(cause, "\n"); found {
+		cause = strings.TrimSpace(line)
+	}
+	const limit = 200
+	runes := []rune(cause)
+	if len(runes) > limit {
+		cause = string(runes[:limit-3]) + "..."
+	}
+	if cause == "" {
+		return "unknown error"
+	}
+	return cause
+}
+
+func (r *Runner) retainCandidateDiagnostic(event OperationalEvent) OperationalEvent {
+	failure, ok := event.(CandidateDiscoveryFailed)
+	if !ok || failure.Err == nil {
+		return event
+	}
+	failure.Err = r.candidateDiagnostics.retain(failure.Err)
+	return failure
 }
 
 func (r *Runner) enqueueOperationalEvent(event OperationalEvent) {
@@ -2193,6 +2219,7 @@ func (r *Runner) enqueueOperationalEvent(event OperationalEvent) {
 		r.operationalEventDone = make(chan struct{})
 		go r.deliverOperationalEvents(r.OnOperationalEvent)
 	})
+	event = r.retainCandidateDiagnostic(event)
 	r.operationalEventMu.Lock()
 	r.operationalEvents = append(r.operationalEvents, event)
 	for operationalAdmissionFailureCount(r.operationalEvents) > operationalAdmissionFailureLimit {

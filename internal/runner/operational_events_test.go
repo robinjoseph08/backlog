@@ -176,20 +176,24 @@ func TestRunnerStructuredPresentationCanSuppressCompatibleAdmissionOutput(t *tes
 	}
 }
 
-func TestOperationalEventQueueRetainsAtMostTwentyAdmissionFailures(t *testing.T) {
-	events := make([]OperationalEvent, 0, operationalAdmissionFailureLimit+5)
-	for failure := 1; failure <= operationalAdmissionFailureLimit+5; failure++ {
-		events = append(events, CandidateDiscoveryFailed{ConsecutiveFailures: failure, Err: fmt.Errorf("failure %d", failure)})
-		for operationalAdmissionFailureCount(events) > operationalAdmissionFailureLimit {
-			events = removeOperationalEvent(events, oldestOperationalAdmissionFailure(events))
-		}
+func TestRunnerRetainsAtMostTwentyFullAdmissionDiagnostics(t *testing.T) {
+	runner := &Runner{}
+	events := make([]CandidateDiscoveryFailed, 0, candidateDiscoveryDiagnosticLimit+5)
+	for failure := 1; failure <= candidateDiscoveryDiagnosticLimit+5; failure++ {
+		event := runner.retainCandidateDiagnostic(CandidateDiscoveryFailed{
+			ConsecutiveFailures: failure,
+			Err:                 fmt.Errorf("full failure %d", failure),
+		}).(CandidateDiscoveryFailed)
+		events = append(events, event)
 	}
-	if len(events) != operationalAdmissionFailureLimit {
-		t.Fatalf("retained failures = %d, want %d", len(events), operationalAdmissionFailureLimit)
+	if count := runner.candidateDiagnostics.count(); count != candidateDiscoveryDiagnosticLimit {
+		t.Fatalf("retained full diagnostics = %d, want %d", count, candidateDiscoveryDiagnosticLimit)
 	}
-	first := events[0].(CandidateDiscoveryFailed)
-	if first.ConsecutiveFailures != 6 {
-		t.Fatalf("oldest retained failure = %d, want 6", first.ConsecutiveFailures)
+	if got := events[0].Err.Error(); !strings.Contains(got, "no longer retained") {
+		t.Fatalf("old diagnostic = %q, want bounded-retention marker", got)
+	}
+	if got := events[len(events)-1].Err.Error(); got != "full failure 25" {
+		t.Fatalf("latest diagnostic = %q, want full failure 25", got)
 	}
 }
 

@@ -2,6 +2,7 @@ package runner
 
 import (
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -23,10 +24,11 @@ const (
 
 // CandidateDiscoveryFailed reports that Admission cannot use an incomplete
 // Candidate snapshot. Issue is nil when the failed operation was not scoped to
-// one Candidate. Err is the original discovery error. Cause is a concise
-// terminal cause supplied independently of the retry policy. FirstFailureAt
-// preserves the start of the current degradation episode if delivery is
-// coalesced by a bounded presentation queue.
+// one Candidate. Err presents the original discovery error through the
+// invocation's bounded Diagnostics retention. Cause is a concise terminal
+// cause supplied independently of the retry policy. FirstFailureAt preserves
+// the start of the current degradation episode if delivery is coalesced by a
+// bounded presentation queue.
 type CandidateDiscoveryFailed struct {
 	Operation           CandidateDiscoveryOperation
 	Issue               *int
@@ -39,6 +41,63 @@ type CandidateDiscoveryFailed struct {
 }
 
 func (CandidateDiscoveryFailed) operationalEvent() {}
+
+const candidateDiscoveryDiagnosticLimit = 20
+
+type candidateDiscoveryDiagnostics struct {
+	mu      sync.Mutex
+	nextID  uint64
+	records map[uint64]error
+	order   []uint64
+}
+
+func (d *candidateDiscoveryDiagnostics) retain(err error) error {
+	if err == nil {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.records == nil {
+		d.records = make(map[uint64]error, candidateDiscoveryDiagnosticLimit)
+	}
+	d.nextID++
+	id := d.nextID
+	d.records[id] = err
+	d.order = append(d.order, id)
+	if len(d.order) > candidateDiscoveryDiagnosticLimit {
+		delete(d.records, d.order[0])
+		d.order = d.order[1:]
+	}
+	return retainedCandidateDiscoveryError{diagnostics: d, id: id}
+}
+
+func (d *candidateDiscoveryDiagnostics) lookup(id uint64) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.records[id]
+}
+
+func (d *candidateDiscoveryDiagnostics) count() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.records)
+}
+
+type retainedCandidateDiscoveryError struct {
+	diagnostics *candidateDiscoveryDiagnostics
+	id          uint64
+}
+
+func (e retainedCandidateDiscoveryError) Error() string {
+	if err := e.diagnostics.lookup(e.id); err != nil {
+		return err.Error()
+	}
+	return "full Candidate discovery diagnostic is no longer retained"
+}
+
+func (e retainedCandidateDiscoveryError) Unwrap() error {
+	return e.diagnostics.lookup(e.id)
+}
 
 // CandidateDiscoveryRecovered reports that a complete Candidate snapshot made
 // Admission healthy again after one or more consecutive failures.

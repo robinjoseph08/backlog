@@ -272,7 +272,7 @@ func TestDashboardAggregatesAdmissionFailuresAndBoundsDiagnostics(t *testing.T) 
 		t.Fatalf("closed Diagnostics exposed full errors:\n%s", body)
 	}
 	if len(dashboard.admission.failures) != 20 {
-		t.Fatalf("retained full failures = %d, want 20", len(dashboard.admission.failures))
+		t.Fatalf("retained failure references = %d, want 20", len(dashboard.admission.failures))
 	}
 
 	dashboard.toggleDiagnostics()
@@ -297,6 +297,9 @@ func TestDashboardAdmissionRecoveryNoticeExpiresAfterTenSeconds(t *testing.T) {
 	_, body, _ := dashboard.renderParts(recoveredAt.Add(9 * time.Second))
 	if !strings.Contains(body, "Admission: healthy | Recovered 9s ago after 1 failure") || strings.Contains(body, "DEGRADED") {
 		t.Fatalf("active recovery notice = %q", body)
+	}
+	if remaining := dashboard.recoveryNoticeRemaining(recoveredAt.Add(9 * time.Second)); remaining != time.Second {
+		t.Fatalf("recovery notice remaining = %s, want 1s", remaining)
 	}
 	_, body, _ = dashboard.renderParts(recoveredAt.Add(10 * time.Second))
 	if !strings.Contains(body, "Admission: healthy") || strings.Contains(body, "Recovered") {

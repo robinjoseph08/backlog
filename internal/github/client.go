@@ -645,10 +645,10 @@ func conciseCandidateDiscoveryCause(err error) string {
 	var command *commandError
 	if errors.As(err, &command) {
 		if command.detail != "" {
-			return command.detail
+			return boundedCandidateDiscoveryCause(command.detail)
 		}
 		if command.err != nil {
-			return command.err.Error()
+			return boundedCandidateDiscoveryCause(command.err.Error())
 		}
 	}
 	cause := err
@@ -658,7 +658,23 @@ func conciseCandidateDiscoveryCause(err error) string {
 	if cause == nil {
 		return "unknown error"
 	}
-	return cause.Error()
+	return boundedCandidateDiscoveryCause(cause.Error())
+}
+
+func boundedCandidateDiscoveryCause(cause string) string {
+	cause = strings.TrimSpace(cause)
+	if line, _, found := strings.Cut(cause, "\n"); found {
+		cause = strings.TrimSpace(line)
+	}
+	const limit = 200
+	runes := []rune(cause)
+	if len(runes) > limit {
+		cause = string(runes[:limit-3]) + "..."
+	}
+	if cause == "" {
+		return "unknown error"
+	}
+	return cause
 }
 
 func (c Client) jsonCommand(ctx context.Context, target any, args ...string) error {

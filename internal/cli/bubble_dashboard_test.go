@@ -363,6 +363,19 @@ func TestBubbleDashboardPresentationRejectsDimensionFailureBeforeRunnerStartup(t
 	}
 }
 
+func TestBubbleDashboardFinalFlushKeepsRecoveryNoticeVisible(t *testing.T) {
+	recoveredAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	dashboard := newLiveDashboard(io.Discard, nil, state.State{Version: state.CurrentVersion}, time.Now)
+	dashboard.operationalEvent(runner.CandidateDiscoveryRecovered{OccurredAt: recoveredAt, Failures: 3})
+
+	if delay := dashboardFlushDelay(dashboard, recoveredAt.Add(2*time.Second)); delay != 8*time.Second {
+		t.Fatalf("final flush delay = %s, want 8s", delay)
+	}
+	if delay := dashboardFlushDelay(dashboard, recoveredAt.Add(10*time.Second)); delay != time.Second/30 {
+		t.Fatalf("expired-notice flush delay = %s, want %s", delay, time.Second/30)
+	}
+}
+
 func TestBubbleDashboardFlushFailsWhenPresentationAlreadyStopped(t *testing.T) {
 	session := newBubbleDashboardSession(time.Now)
 	close(session.done)
