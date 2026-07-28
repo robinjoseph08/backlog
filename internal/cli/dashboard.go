@@ -504,16 +504,6 @@ func (d *liveDashboard) render(current state.State, messages []dashboardMessage,
 	return header + "\n" + body + "\n\n" + dashboardFooter(stage) + "\n"
 }
 
-func (d *liveDashboard) renderPartsWithLayout(now time.Time, styler dashboardStyler) (string, dashboardBodyLayout, string, dashboardStage) {
-	d.mu.Lock()
-	current := cloneDashboardState(d.current)
-	messages := cloneDashboardMessages(d.messages)
-	stage := d.stage
-	d.mu.Unlock()
-	header, layout, footer := d.renderPartsForWithLayout(current, messages, stage, now, styler)
-	return header, layout, footer, stage
-}
-
 type dashboardDensity uint8
 
 const (
@@ -527,6 +517,7 @@ type responsiveDashboardOptions struct {
 	width              int
 	selected           string
 	expansionOverrides map[string]bool
+	styler             dashboardStyler
 }
 
 func dashboardDensityForHeight(height int) dashboardDensity {
@@ -597,6 +588,7 @@ func (d *liveDashboard) renderResponsiveParts(now time.Time, options responsiveD
 
 func (b *dashboardBodyBuilder) renderResponsiveSection(name string, runs []statusRun, now time.Time, options responsiveDashboardOptions, completions bool) {
 	b.separate()
+	section := responsiveDashboardSection(name)
 	sectionIdentity := dashboardSectionAnchor(name)
 	b.anchor(sectionIdentity)
 	marker := "  "
@@ -608,12 +600,14 @@ func (b *dashboardBodyBuilder) renderResponsiveSection(name string, runs []statu
 	if !expanded {
 		heading += " [collapsed]"
 	}
-	b.write(truncateDashboardContent(heading, options.width) + "\n")
+	heading = truncateDashboardContent(heading, options.width)
+	b.write(options.styler.render(dashboardSectionSemantic(section), heading) + "\n")
 	if !expanded {
 		return
 	}
 	if len(runs) == 0 {
-		b.write(truncateDashboardContent("    none", options.width) + "\n")
+		none := truncateDashboardContent("    none", options.width)
+		b.write(options.styler.render(dashboardSemanticMetadata, none) + "\n")
 		return
 	}
 	for _, observed := range runs {
@@ -623,14 +617,30 @@ func (b *dashboardBodyBuilder) renderResponsiveSection(name string, runs []statu
 		if options.selected == identity {
 			marker = "> "
 		}
-		b.write(truncateDashboardContent(marker+compactDashboardRun(observed, now, completions, options.width-ansi.StringWidth(marker)), options.width) + "\n")
+		line := truncateDashboardContent(marker+compactDashboardRun(observed, now, completions, options.width-ansi.StringWidth(marker)), options.width)
+		b.write(options.styler.render(dashboardRunSemantic(observed, section), line) + "\n")
 		if options.expanded(identity, false) {
+			details := expandedDashboardRun(observed, now)
 			if completions {
-				b.write(expandedDashboardCompletion(observed.run, now))
-			} else {
-				b.write(expandedDashboardRun(observed, now))
+				details = expandedDashboardCompletion(observed.run, now)
 			}
+			b.write(options.styler.render(dashboardSemanticMetadata, details))
 		}
+	}
+}
+
+func responsiveDashboardSection(name string) statusSection {
+	switch name {
+	case "Active Runs":
+		return statusActive
+	case "Attention Required":
+		return statusAttention
+	case "Outcomes to Acknowledge":
+		return statusOutcomes
+	case "Recent Completions":
+		return statusCompletions
+	default:
+		return statusHistory
 	}
 }
 
@@ -647,10 +657,12 @@ func (b *dashboardBodyBuilder) renderResponsiveMessages(messages []dashboardMess
 	if !expanded {
 		heading += " [collapsed]"
 	}
-	b.write(truncateDashboardContent(heading, options.width) + "\n")
+	heading = truncateDashboardContent(heading, options.width)
+	b.write(options.styler.render(dashboardSemanticMetadata, heading) + "\n")
 	if expanded {
 		for _, message := range messages {
-			b.write(truncateDashboardContent("    "+message.text, options.width) + "\n")
+			line := truncateDashboardContent("    "+message.text, options.width)
+			b.write(options.styler.render(message.semantic, line) + "\n")
 		}
 	}
 }

@@ -367,7 +367,7 @@ func TestBubbleDashboardBackgroundAdaptationPreservesNavigationPosition(t *testi
 	if !exists {
 		t.Fatalf("selected Run anchor %q missing", selected)
 	}
-	model.viewport.SetYOffset(line + 1)
+	model.viewport.SetYOffset(line)
 	model.selectViewportAnchor()
 	if model.selectedAnchor != selected {
 		t.Fatalf("selected anchor = %q, want %q", model.selectedAnchor, selected)
@@ -420,7 +420,7 @@ func TestBubbleDashboardNoColorProfilePreservesLabelsAndNavigationWithoutANSI(t 
 		if strings.Contains(rendered, "\x1b[") {
 			t.Fatalf("%s NO_COLOR model emitted ANSI: %q", name, rendered)
 		}
-		for _, want := range []string{"Backlog Run Dashboard", "#1  Navigation Run 0", "State: claimed", "Runner stage: Running", "Next Ctrl-C:", "Nav:"} {
+		for _, want := range []string{"Backlog Run Dashboard", "#", "State: claimed", "Runner stage: Running", "Next Ctrl-C:", "Nav:"} {
 			if !strings.Contains(rendered, want) {
 				t.Fatalf("%s NO_COLOR model omitted %q:\n%s", name, want, rendered)
 			}

@@ -805,10 +805,10 @@ func TestDashboardRenderersShareProjectionMetadata(t *testing.T) {
 	}
 	dashboard := newLiveDashboard(io.Discard, &dashboardTestSource{current: current}, current, func() time.Time { return now })
 	dashboard.recordMessage("observation changed")
-	responsiveHeader, responsiveLayout, responsiveFooter := dashboard.renderResponsiveParts(now, responsiveDashboardOptions{
+	responsiveHeader, responsiveLayout, responsiveFooter, _ := dashboard.renderResponsiveParts(now, responsiveDashboardOptions{
 		density: dashboardDensityConstrained, width: 120,
 	})
-	plainHeader, plainLayout, plainFooter := dashboard.renderPartsForWithLayout(current, []string{"observation changed"}, dashboardRunning, now)
+	plainHeader, plainLayout, plainFooter := dashboard.renderPartsForWithLayout(current, []dashboardMessage{{text: "observation changed"}}, dashboardRunning, now, dashboardStyler{})
 
 	if responsiveHeader != plainHeader || responsiveFooter != plainFooter || !maps.Equal(responsiveLayout.attention, plainLayout.attention) {
 		t.Fatalf("responsive and plain projection metadata drifted:\nresponsive header: %q\nplain header: %q\nresponsive footer: %q\nplain footer: %q\nresponsive Attention: %#v\nplain Attention: %#v",

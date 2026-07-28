@@ -506,13 +506,13 @@ type dashboardSelection struct {
 func (m *bubbleDashboardModel) refreshViewport(selection dashboardSelection) {
 	density := dashboardDensityForHeight(m.height)
 	header, layout, footer, stage := m.dashboard.renderResponsiveParts(m.dashboard.now(), responsiveDashboardOptions{
-		density: density, width: m.width, selected: m.selectedAnchor, expansionOverrides: m.expansionOverrides,
+		density: density, width: m.width, selected: m.selectedAnchor, expansionOverrides: m.expansionOverrides, styler: m.styler,
 	})
 	if density == dashboardDensityMinimal {
-		m.header = minimalDashboardHeader(header, len(layout.attention), len(m.attentionPending))
-		m.footer = minimalDashboardFooter(footer)
+		m.header = minimalDashboardHeader(header, len(layout.attention), 0)
+		m.footer = minimalDashboardFooter(footer + "\n" + dashboardNavigationHelp)
 	} else {
-		m.header = dashboardHeaderWithAttention(header, len(m.attentionPending))
+		m.header = header
 		m.footer = footer + "\n" + dashboardNavigationHelp
 	}
 	m.layout = layout
@@ -584,20 +584,7 @@ func minimalDashboardHeader(header string, attention, pending int) string {
 }
 
 func minimalDashboardFooter(footer string) string {
-	lines := compactDashboardFooter(strings.Split(footer, "\n"))
-	stage := strings.Join(lines, " | ")
-	return stage + "\nN:jk/fb gG a Enter"
-}
-
-func dashboardHeaderWithAttention(header string, pending int) string {
-	if pending == 0 {
-		return header
-	}
-	lines := strings.Split(header, "\n")
-	if len(lines) > 1 {
-		lines[1] += fmt.Sprintf(" | NEW ATTENTION (%d): press a", pending)
-	}
-	return strings.Join(lines, "\n")
+	return strings.Join(compactDashboardFooter(strings.Split(footer, "\n")), "\n")
 }
 
 func (m *bubbleDashboardModel) resizeViewport() {
@@ -907,7 +894,7 @@ func compactDashboardFooter(footer []string) []string {
 	for _, line := range footer {
 		line = strings.Replace(line, "Runner stage: ", "S:", 1)
 		line = strings.Replace(line, "Next Ctrl-C: ", "^C:", 1)
-		line = strings.Replace(line, dashboardNavigationHelp, "N:jk/fb Pg H/E gG a", 1)
+		line = strings.Replace(line, dashboardNavigationHelp, "N:jk/fb Pg H/E gG a Enter", 1)
 		compact = append(compact, line)
 	}
 	return compact
