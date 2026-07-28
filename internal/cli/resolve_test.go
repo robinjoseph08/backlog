@@ -719,6 +719,40 @@ exec `+quote(underlying)+` "$@"
 	}
 }
 
+func TestResolveRejectsSuccessfulLocalArtifactCommandsWithoutPostconditions(t *testing.T) {
+	for _, test := range []struct {
+		name, commandPattern, wantError string
+	}{
+		{name: "worktree removal", commandPattern: `*" worktree remove --force "*`, wantError: "still present after removal"},
+		{name: "local branch deletion", commandPattern: `*" update-ref -d refs/heads/BRANCH "*`, wantError: "still present after deletion"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newLocalArtifactResetFixture(t, false)
+			gh := localArtifactResolveGitHub(t, fixture)
+			pattern := strings.ReplaceAll(test.commandPattern, "BRANCH", fixture.branch)
+			git := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  `+pattern+`) exit 0 ;;
+esac
+exec `+quote(fixture.git)+` "$@"
+`)
+
+			var stdout, stderr bytes.Buffer
+			if exit := Main(context.Background(), localArtifactResolveArgs(fixture, git, gh, "--yes"), &stdout, &stderr); exit == 0 || !strings.Contains(stderr.String(), test.wantError) {
+				t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
+			}
+			current, err := fixture.store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if current.Runs[0].Status != scheduler.StatusResolvingExternally || len(current.Leases) != 1 || current.Leases[0].RunID != "run-local" {
+				t.Fatalf("missing local postcondition released ownership: %#v", current)
+			}
+		})
+	}
+}
+
 func TestResolveRerunsOnlyFinalizationAfterStatePersistenceFailure(t *testing.T) {
 	fixture := newResolveFixture(t, []string{"spec"}, "COMPLETED")
 	current, err := fixture.store.Load()
@@ -812,6 +846,72 @@ func TestCompiledResolveAcceptsAlreadyArchivedSession(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(fixture.archiveDir, "session.jsonl")); err != nil {
 		t.Fatalf("matching historical session archive was not preserved: %v", err)
+	}
+}
+
+func TestResolveRetriesAlreadyArchivedSessionDurabilityBeforeFinalization(t *testing.T) {
+	fixture := newLocalArtifactResetFixture(t, false)
+	if err := os.MkdirAll(filepath.Dir(fixture.archiveDir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(fixture.sessionDir, fixture.archiveDir); err != nil {
+		t.Fatal(err)
+	}
+	gh := localArtifactResolveGitHub(t, fixture)
+	commonDirectory, err := gitCommonDirectory(context.Background(), fixture.git, fixture.repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncFailures, syncAttempts := 1, 0
+	module, err := retirement.New(retirement.Config{
+		Store: fixture.store, GitHub: ghadapter.Client{Executable: gh, Dir: fixture.repository},
+		RepositoryRoot: fixture.repository, CommonDirectory: commonDirectory,
+		StateDirectory: fixture.stateDir, GitExecutable: fixture.git,
+		SyncPath: func(path string) error {
+			syncAttempts++
+			if syncFailures > 0 {
+				syncFailures--
+				return errors.New("injected historical session sync failure")
+			}
+			return syncFilesystemPath(path)
+		},
+	}, resolution.Policy("run-local"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	approved, err := module.Inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := module.Retire(context.Background(), approved); err == nil || !strings.Contains(err.Error(), "injected historical session sync failure") {
+		t.Fatalf("already-archived durability error = %v", err)
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusResolvingExternally || len(current.Leases) != 1 || current.Leases[0].RunID != "run-local" {
+		t.Fatalf("already-archived sync failure released ownership: %#v", current)
+	}
+	rerun, err := module.Inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rerun.Actions) != 1 || !strings.Contains(rerun.Actions[0].String(), "resolved-externally") {
+		t.Fatalf("already-archived sync rerun actions = %#v", rerun.Actions)
+	}
+	if err := module.Retire(context.Background(), rerun); err != nil {
+		t.Fatalf("retry already-archived durability synchronization: %v", err)
+	}
+	current, err = fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusResolvedExternally || len(current.Leases) != 0 {
+		t.Fatalf("already-archived sync retry final state = %#v", current)
+	}
+	if syncAttempts <= 1 {
+		t.Fatalf("already-archived durability synchronization attempts = %d, want a retry", syncAttempts)
 	}
 }
 
