@@ -214,6 +214,107 @@ esac
 	}
 }
 
+func TestModulePerformsRequiredProgressTransitionWhenArtifactsAreAlreadyRetired(t *testing.T) {
+	const (
+		statusResolvingExternally scheduler.Status = "resolving-externally"
+		statusResolvedExternally  scheduler.Status = "resolved-externally"
+	)
+	root := t.TempDir()
+	git := writeRetirementExecutable(t, `#!/bin/sh
+case "$*" in
+  *" remote get-url origin") printf '%s\n' 'https://github.com/acme/widgets.git' ;;
+  *) echo "unexpected git: $*" >&2; exit 9 ;;
+esac
+`)
+	gh := writeRetirementExecutable(t, `#!/bin/sh
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef")
+    printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","labels":[]}' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	run := scheduler.Run{
+		Issue: 42, RunID: "run-42", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint,
+		WorkerLogOpen: true,
+	}
+	lease := scheduler.Lease{LeaseID: "lease-42", Issue: 42, RunID: run.RunID}
+	store := &policyStateStore{current: state.State{
+		Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{lease},
+	}}
+	policy := testPolicy()
+	policy.Operation = "External Resolution"
+	policy.SelectRun = func(current state.State) (scheduler.Run, scheduler.Lease, error) {
+		selected := current.Runs[0]
+		for _, candidate := range current.Leases {
+			if candidate.RunID == selected.RunID {
+				return selected, candidate, nil
+			}
+		}
+		return selected, scheduler.Lease{}, nil
+	}
+	policy.ValidateSnapshot = func(snapshot Snapshot) error {
+		if snapshot.Issue.Open {
+			return errors.New("issue is not externally resolved")
+		}
+		return nil
+	}
+	policy.EligibleStatuses = []scheduler.Status{
+		scheduler.StatusFailed, statusResolvingExternally, statusResolvedExternally,
+	}
+	policy.CanTransition = func(from, to scheduler.Status) bool {
+		return from == scheduler.StatusFailed && to == statusResolvingExternally ||
+			from == statusResolvingExternally && to == statusResolvedExternally
+	}
+	policy.Labels = LabelOutcome{Remove: []string{"ready-for-agent"}}
+	policy.ProgressStatus = statusResolvingExternally
+	policy.TerminalStatus = statusResolvedExternally
+
+	module, err := New(Config{
+		Store: store, GitHub: ghadapter.Client{Executable: gh, Dir: root}, RepositoryRoot: root,
+		CommonDirectory: root, StateDirectory: root, GitExecutable: git,
+	}, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approved, err := module.Inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"mark Run run-42 resolving-externally while retaining Lease lease-42",
+		"mark Run run-42 resolved-externally and release Lease lease-42",
+	}
+	if strings.Join(actionDescriptions(approved), "\n") != strings.Join(want, "\n") {
+		t.Fatalf("already-retired actions = %q, want %q", actionDescriptions(approved), want)
+	}
+	if err := module.Retire(context.Background(), approved); err != nil {
+		t.Fatalf("already-retired External Resolution: %v", err)
+	}
+	if len(store.saved) != 2 || store.saved[0].Runs[0].Status != statusResolvingExternally || len(store.saved[0].Leases) != 1 {
+		t.Fatalf("required progress state = %#v", store.saved)
+	}
+	terminal := store.current
+	if terminal.Runs[0].Status != statusResolvedExternally || terminal.Runs[0].WorkerLogOpen || terminal.Runs[0].CompletedAt == nil || len(terminal.Leases) != 0 {
+		t.Fatalf("terminal state = %#v", terminal)
+	}
+
+	rerun, err := module.Inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rerun.Actions) != 0 {
+		t.Fatalf("idempotent already-retired actions = %q", actionDescriptions(rerun))
+	}
+	if err := module.Retire(context.Background(), rerun); err != nil {
+		t.Fatalf("idempotent already-retired External Resolution: %v", err)
+	}
+	if len(store.saved) != 2 {
+		t.Fatalf("idempotent already-retired External Resolution persisted %d states, want 2", len(store.saved))
+	}
+}
+
 func TestPolicyValidationRefusesEveryIncompletePolicyShape(t *testing.T) {
 	tests := []struct {
 		name   string

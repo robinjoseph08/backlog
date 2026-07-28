@@ -179,7 +179,9 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 		}
 	}
 	addLabels, removeLabels := policy.desiredLabels(snapshot.Issue.Labels)
-	needsProgress := hasOpenPullRequest || snapshot.RemoteBranch.Present || snapshot.LocalBranch.Present ||
+	requiresProgressTransition := planning.Run.Status != policy.ProgressStatus && planning.Run.Status != policy.TerminalStatus &&
+		!policy.CanTransition(planning.Run.Status, policy.TerminalStatus)
+	needsProgress := requiresProgressTransition || hasOpenPullRequest || snapshot.RemoteBranch.Present || snapshot.LocalBranch.Present ||
 		snapshot.Worktree.Present || snapshot.Session.Present || len(addLabels) > 0 || len(removeLabels) > 0
 	if needsProgress && planning.Run.Status != policy.ProgressStatus && planning.Run.Status != scheduler.StatusWaitingForMerge && planning.Run.Status != policy.TerminalStatus {
 		plan.Actions = append(plan.Actions, plannedAction(actionMarkProgress, fmt.Sprintf("mark Run %s %s while retaining Lease %s", snapshot.Run.RunID, policy.ProgressStatus, snapshot.Lease.LeaseID)))
