@@ -149,7 +149,7 @@ func (s *bubbleDashboardSession) presentation(ctx context.Context, control Prese
 // forced it may also prevent teardown controls from being written. Retry those
 // controls directly with this intentionally idempotent sequence.
 func restoreDashboardTerminal(output io.Writer) error {
-	_, err := io.WriteString(output, "\x1b[?2026l\x1b[>4m\x1b[=0;1u\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1049l\x1b[?25h")
+	_, err := io.WriteString(output, ansi.ResetModeSynchronizedOutput+ansi.ResetModeUnicodeCore+"\x1b[>4m\x1b[=0;1u\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1049l\x1b[?25h")
 	return err
 }
 

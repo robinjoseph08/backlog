@@ -2155,13 +2155,14 @@ func TestRestoreDashboardTerminalReturnsOutputFailure(t *testing.T) {
 	}
 }
 
-type synchronizedTerminalWriter struct {
+type statefulTerminalWriter struct {
 	visible      bytes.Buffer
 	pending      bytes.Buffer
 	synchronized bool
+	unicodeCore  bool
 }
 
-func (w *synchronizedTerminalWriter) Write(content []byte) (int, error) {
+func (w *statefulTerminalWriter) Write(content []byte) (int, error) {
 	rest := string(content)
 	for rest != "" {
 		if w.synchronized {
@@ -2179,23 +2180,40 @@ func (w *synchronizedTerminalWriter) Write(content []byte) (int, error) {
 			continue
 		}
 
-		set := strings.Index(rest, ansi.SetModeSynchronizedOutput)
-		if set < 0 {
+		control, index := nextTerminalModeControl(rest)
+		if index < 0 {
 			_, _ = w.visible.WriteString(rest)
 			break
 		}
-		_, _ = w.visible.WriteString(rest[:set+len(ansi.SetModeSynchronizedOutput)])
-		w.synchronized = true
-		rest = rest[set+len(ansi.SetModeSynchronizedOutput):]
+		_, _ = w.visible.WriteString(rest[:index+len(control)])
+		switch control {
+		case ansi.SetModeSynchronizedOutput:
+			w.synchronized = true
+		case ansi.SetModeUnicodeCore:
+			w.unicodeCore = true
+		case ansi.ResetModeUnicodeCore:
+			w.unicodeCore = false
+		}
+		rest = rest[index+len(control):]
 	}
 	return len(content), nil
 }
 
-func TestRestoreDashboardTerminalReleasesInterruptedSynchronizedFrameBeforeStaticOutput(t *testing.T) {
-	output := &synchronizedTerminalWriter{}
-	_, _ = io.WriteString(output, ansi.SetModeSynchronizedOutput+"interrupted dashboard frame")
-	if !output.synchronized || output.pending.Len() == 0 {
-		t.Fatal("test terminal did not retain the interrupted synchronized frame")
+func nextTerminalModeControl(content string) (string, int) {
+	control, first := "", -1
+	for _, candidate := range []string{ansi.SetModeSynchronizedOutput, ansi.SetModeUnicodeCore, ansi.ResetModeUnicodeCore} {
+		if index := strings.Index(content, candidate); index >= 0 && (first < 0 || index < first) {
+			control, first = candidate, index
+		}
+	}
+	return control, first
+}
+
+func TestRestoreDashboardTerminalReleasesInterruptedModesBeforeStaticOutput(t *testing.T) {
+	output := &statefulTerminalWriter{}
+	_, _ = io.WriteString(output, ansi.SetModeUnicodeCore+ansi.SetModeSynchronizedOutput+"interrupted dashboard frame")
+	if !output.unicodeCore || !output.synchronized || output.pending.Len() == 0 {
+		t.Fatal("test terminal did not retain the interrupted Unicode Core synchronized frame")
 	}
 	if err := restoreDashboardTerminal(output); err != nil {
 		t.Fatal(err)
@@ -2203,11 +2221,12 @@ func TestRestoreDashboardTerminalReleasesInterruptedSynchronizedFrameBeforeStati
 	_, _ = io.WriteString(output, "Final aggregate summary")
 
 	visible := output.visible.String()
-	reset := strings.Index(visible, ansi.ResetModeSynchronizedOutput)
+	synchronizedReset := strings.Index(visible, ansi.ResetModeSynchronizedOutput)
+	unicodeReset := strings.Index(visible, ansi.ResetModeUnicodeCore)
 	restore := strings.Index(visible, "\x1b[?1049l")
 	summary := strings.Index(visible, "Final aggregate summary")
-	if output.synchronized || output.pending.Len() != 0 || reset < 0 || restore < reset || summary < restore {
-		t.Fatalf("interrupted synchronized frame retained restoration or static output: visible=%q pending=%q", visible, output.pending.String())
+	if output.synchronized || output.unicodeCore || output.pending.Len() != 0 || synchronizedReset < 0 || unicodeReset != synchronizedReset+len(ansi.ResetModeSynchronizedOutput) || restore < unicodeReset || summary < restore {
+		t.Fatalf("interrupted terminal modes retained restoration or static output: synchronized=%t unicode_core=%t visible=%q pending=%q", output.synchronized, output.unicodeCore, visible, output.pending.String())
 	}
 }
 
