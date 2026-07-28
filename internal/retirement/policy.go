@@ -43,6 +43,9 @@ func (p Policy) validate() error {
 	if p.ProgressStatus == p.TerminalStatus {
 		return fmt.Errorf("owned Run retirement policy must have distinct progress and terminal states")
 	}
+	if !p.CanTransition(p.ProgressStatus, p.TerminalStatus) {
+		return fmt.Errorf("owned Run retirement policy cannot transition from progress state %s to terminal state %s", p.ProgressStatus, p.TerminalStatus)
+	}
 	if len(p.Labels.Add) == 0 && len(p.Labels.Remove) == 0 {
 		return fmt.Errorf("owned Run retirement policy has no label outcome")
 	}
