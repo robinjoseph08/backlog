@@ -3831,6 +3831,62 @@ func TestProviderContinuationRejectsStaleBoundaryFromPriorWorkerGeneration(t *te
 	}
 }
 
+func TestRunnerProviderContinuationCapturesIdentityAndRefusesCooldownDrift(t *testing.T) {
+	run := resumableRun(t, 108, "provider-drift-108")
+	workers := newFakeWorkers()
+	workers.checkpointFunc = func(_ context.Context, _ int, request worker.ContinuationRequest) (worker.Continuation, error) {
+		content, err := os.ReadFile(run.Continuation.SessionFile)
+		if err != nil {
+			return worker.Continuation{}, err
+		}
+		hash := sha256.Sum256(content)
+		return worker.Continuation{
+			SessionID: request.SessionID, SessionFile: run.Continuation.SessionFile, Worktree: request.Worktree,
+			LeafID: "leaf", EntryCount: 1, SHA256: hex.EncodeToString(hash[:]),
+		}, nil
+	}
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run},
+		Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+	}}
+	start := time.Date(2026, 7, 29, 2, 0, 0, 0, time.UTC)
+	var clock atomic.Int64
+	clock.Store(start.UnixNano())
+	var localCommit atomic.Value
+	localCommit.Store(strings.Repeat("a", 40))
+	runner := testRunner(&fakeGitHub{}, workers, store, 1)
+	runner.Now = func() time.Time { return time.Unix(0, clock.Load()).UTC() }
+	runner.VerifyResumeGit = func(context.Context, scheduler.Run) (string, bool, string, error) {
+		return localCommit.Load().(string), false, "", nil
+	}
+	wake := newControlledCandidateRetryTimer()
+	wakeCreated := make(chan time.Duration, 1)
+	runner.newResumeWakeTimer = func(delay time.Duration) candidateRetryTimer {
+		wakeCreated <- delay
+		return wake
+	}
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, run.Issue)
+	workers.complete(run.Issue, worker.Result{ExitCode: 1, Settled: true, ProviderExhausted: true, Err: errors.New("provider unavailable")})
+	if delay := <-wakeCreated; delay != 30*time.Second {
+		t.Fatalf("provider cooldown = %s", delay)
+	}
+	first := store.LoadValue().Runs[0]
+	if first.Status != scheduler.StatusSuspended || first.Continuation == nil || first.Continuation.LocalCommit != strings.Repeat("a", 40) || first.Continuation.RemoteBranchState != "absent" || first.Continuation.RemoteCommit != "" || first.Continuation.PullRequest != "" || first.Continuation.PullRequestHead != "" {
+		t.Fatalf("provider continuation identity = %#v", first)
+	}
+	localCommit.Store(strings.Repeat("b", 40))
+	resumeAt := start.Add(30 * time.Second)
+	clock.Store(resumeAt.UnixNano())
+	wake.ticks <- resumeAt
+	assertInterventionRequired(t, <-done, 1)
+	got := store.LoadValue().Runs[0]
+	if got.Status != scheduler.StatusNeedsHuman || !strings.Contains(got.Error, "identity drifted") || workers.startCount(run.Issue) != 1 || workers.releaseCount() != 1 {
+		t.Fatalf("provider cooldown drift = %#v, starts=%d releases=%d", got, workers.startCount(run.Issue), workers.releaseCount())
+	}
+}
+
 func TestRunnerWakesAtProviderResumeDeadlineIndependentOfPollInterval(t *testing.T) {
 	run := resumableRun(t, 104, "wake-104")
 	start := time.Date(2026, 7, 29, 2, 0, 0, 0, time.UTC)
@@ -4318,16 +4374,20 @@ while IFS= read -r ignored; do :; done
 	var clock atomic.Int64
 	pullRequest := "https://example.test/pull/106"
 	completionCalls := 0
+	remoteCommit := strings.Repeat("b", 40)
 	github := &fakeGitHub{completionFunc: func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
 		completionCalls++
-		if completionCalls >= 4 {
-			return ghadapter.CompletionOutcome{PRFound: true, PullRequest: pullRequest}, nil
+		if completionCalls >= 3 {
+			return ghadapter.CompletionOutcome{PRFound: true, PullRequest: pullRequest, HeadCommit: remoteCommit}, nil
 		}
 		return ghadapter.CompletionOutcome{}, nil
 	}}
 	runner := testRunner(github, newFakeWorkers(), store, 1)
 	runner.Workers = realWorkers
 	runner.Now = func() time.Time { return base.Add(time.Duration(clock.Load()) * time.Second) }
+	runner.VerifyResumeGit = func(context.Context, scheduler.Run) (string, bool, string, error) {
+		return strings.Repeat("a", 40), true, remoteCommit, nil
+	}
 	wake := newControlledCandidateRetryTimer()
 	wakeCreated := make(chan time.Duration, 1)
 	runner.newResumeWakeTimer = func(delay time.Duration) candidateRetryTimer {
@@ -4701,7 +4761,7 @@ func TestProviderContinuationUsesIndependentOneAttemptBudgetAndCooldown(t *testi
 		t.Fatalf("first provider continuation: %v", err)
 	}
 	got := store.LoadValue().Runs[0]
-	if got.Status != scheduler.StatusSuspended || got.FailureClass != scheduler.FailureProviderExhaustion || got.ProviderContinuationAttempts != 1 || got.ResumeAfter == nil || !got.ResumeAfter.Equal(now.Add(30*time.Second)) || got.PreservedCause != run.Error {
+	if got.Status != scheduler.StatusSuspended || got.FailureClass != scheduler.FailureProviderExhaustion || got.ProviderContinuationAttempts != 1 || got.ResumeAfter == nil || !got.ResumeAfter.Equal(now.Add(30*time.Second)) || got.PreservedCause != run.Error || !got.RecoveredRetirementRequired || got.RecoveryCount != 0 || !requiresRecoveredRetirement(got) {
 		t.Fatalf("first provider continuation = %#v", got)
 	}
 	if candidate := nextSuspendedRun(&current, func() time.Time { return now.Add(29 * time.Second) }); candidate.RunID != "" {
@@ -5909,6 +5969,9 @@ func testRunner(github *fakeGitHub, workers *fakeWorkers, store *memoryStore, ma
 		PIDAlive:          func(int) bool { return true },
 		ProcessGroupAlive: func(int) (bool, error) { return false, nil },
 		PIDIdentity:       func(_ context.Context, pid int) (string, error) { return fmt.Sprintf("identity-%d", pid), nil },
+		VerifyResumeGit: func(context.Context, scheduler.Run) (string, bool, string, error) {
+			return strings.Repeat("a", 40), false, "", nil
+		},
 	}
 }
 

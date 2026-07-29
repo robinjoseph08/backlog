@@ -605,14 +605,14 @@ func (r *Runner) Run(ctx context.Context) error {
 			// when their outcome remains incomplete.
 			if completion.result.Settled && completion.result.ProviderExhausted {
 				settledRun := findRun(current.Runs, runID)
-				settledCheckpointErr = r.checkpointSettledWorker(operationCtx, &current, settledRun, process)
+				settledCheckpointErr = r.checkpointSettledWorker(operationCtx, &current, settledRun, process, true)
 			}
 			startedDraining, issueClosed, err := r.handleWorkerCompletionWhileObservingSignals(operationCtx, &current, completion, signalEvents, len(localWorkers))
 			draining = startedDraining || draining
 			if completion.result.Settled && !completion.result.ProviderExhausted {
 				settledRun := findRun(current.Runs, runID)
 				if settledRun.Status != scheduler.StatusMerged && settledRun.Error != recoveredCompletionPendingShutdown {
-					settledCheckpointErr = r.checkpointSettledWorker(operationCtx, &current, settledRun, process)
+					settledCheckpointErr = r.checkpointSettledWorker(operationCtx, &current, settledRun, process, false)
 				}
 			}
 			if err != nil && operationCtx.Err() != nil && r.suspensionExit.Load() != 0 {
@@ -1424,7 +1424,7 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 	return process, nil
 }
 
-func (r *Runner) checkpointSettledWorker(ctx context.Context, current *state.State, run scheduler.Run, process WorkerProcess) error {
+func (r *Runner) checkpointSettledWorker(ctx context.Context, current *state.State, run scheduler.Run, process WorkerProcess, captureRepositoryIdentity bool) error {
 	original := run
 	checkpointer, ok := process.(settledCheckpointer)
 	if !ok {
@@ -1452,6 +1452,39 @@ func (r *Runner) checkpointSettledWorker(ctx context.Context, current *state.Sta
 		}
 		return err
 	}
+	var localCommit, remoteBranchState, remoteCommit, pullRequest, pullRequestHead string
+	if captureRepositoryIdentity {
+		if r.VerifyResumeGit == nil {
+			return errors.New("provider continuation repository identity verifier is unavailable")
+		}
+		local, remotePresent, remote, err := r.VerifyResumeGit(checkpointCtx, run)
+		if err != nil {
+			return fmt.Errorf("capture provider continuation local and remote branch identities: %w", err)
+		}
+		if local == "" {
+			return errors.New("provider continuation local branch has no commit identity")
+		}
+		if remotePresent != (remote != "") {
+			return errors.New("provider continuation remote branch presence and commit identity are inconsistent")
+		}
+		outcome, err := r.GitHub.Completion(checkpointCtx, r.Config.Repo, run.Issue, run.Branch)
+		if err != nil {
+			return fmt.Errorf("capture provider continuation expected pull request identity: %w", err)
+		}
+		if outcome.PRFound {
+			if outcome.PullRequest == "" || outcome.HeadCommit == "" {
+				return errors.New("provider continuation expected pull request identity is incomplete")
+			}
+			if !remotePresent || outcome.HeadCommit != remote {
+				return errors.New("provider continuation expected pull request head does not match the remote branch identity")
+			}
+		} else if outcome.PullRequest != "" || outcome.HeadCommit != "" {
+			return errors.New("provider continuation expected pull request presence and identity are inconsistent")
+		}
+		localCommit, remoteCommit = local, remote
+		remoteBranchState = map[bool]string{true: "present", false: "absent"}[remotePresent]
+		pullRequest, pullRequestHead = outcome.PullRequest, outcome.HeadCommit
+	}
 	now := r.Now().UTC()
 	run = findRun(current.Runs, run.RunID)
 	run.Continuation = &scheduler.ContinuationBoundary{
@@ -1462,7 +1495,9 @@ func (r *Runner) checkpointSettledWorker(ctx context.Context, current *state.Sta
 		CheckpointStatus: boundary.CheckpointStatus, CheckpointFailureClass: boundary.CheckpointFailureClass,
 		CheckpointBlockerKind: boundary.CheckpointBlockerKind, CheckpointBlockerCause: boundary.CheckpointBlockerCause,
 		CheckpointBlockerFingerprint: boundary.CheckpointBlockerFingerprint,
-		WorkerGeneration:             run.WorkerGeneration, VerifiedAt: now,
+		WorkerGeneration:             run.WorkerGeneration, LocalCommit: localCommit,
+		RemoteBranchState: remoteBranchState, RemoteCommit: remoteCommit,
+		PullRequest: pullRequest, PullRequestHead: pullRequestHead, VerifiedAt: now,
 	}
 	run.Workflow = boundary.Workflow
 	run.WorkflowStage = boundary.WorkflowStage
@@ -1516,6 +1551,7 @@ func (r *Runner) applyProviderContinuation(current *state.State, runID string) e
 	transitionStatus(&run, scheduler.StatusSuspended)
 	run.Error = originalError
 	run.ProviderContinuationAttempts++
+	run.RecoveredRetirementRequired = true
 	run.ResumeAfter = &resumeAfter
 	run.SuspendedAt = &now
 	run.UpdatedAt = now
