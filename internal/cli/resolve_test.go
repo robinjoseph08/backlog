@@ -32,8 +32,8 @@ func TestResolveHelpDescribesCompletionSafetyAndCompleteArtifactRetirement(t *te
 	for _, want := range []string{
 		"Completion is preferred",
 		"Verified Completion",
-		"retires owned branches, worktrees, and active Pi sessions",
-		"before recording the",
+		"retires owned branches, worktrees, active Pi sessions, and managed labels",
+		"`in-progress` and `ready-for-agent` before recording the merged outcome",
 		"merged outcome and releasing the Lease",
 		"no recorded pull request",
 		"exactly one merged pull request discovered from its expected branch",
