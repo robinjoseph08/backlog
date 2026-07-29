@@ -96,6 +96,47 @@ func TestRecoveryDerivesOfflineBoundaryAndSuspendsSameRun(t *testing.T) {
 	}
 }
 
+func TestAlreadyRecoveredWithoutPersistedContinuationFailsClosed(t *testing.T) {
+	run, store := recoverableFixture(t)
+	recoveredAt := time.Now().Add(-time.Minute).UTC()
+	run.Status = scheduler.StatusSuspended
+	run.RecoveryCount = 1
+	run.FirstRecoveredAt = &recoveredAt
+	run.LastRecoveredAt = &recoveredAt
+	store.value.Runs[0] = run
+	module := newTestModule(t, store, fakeGitHub{issue: openIssue(run.Issue)}, func(int) (bool, error) { return false, nil }, time.Now())
+
+	if _, err := module.Inspect(context.Background(), run.RunID); err == nil || !strings.Contains(err.Error(), "no persisted Recovery continuation boundary") {
+		t.Fatalf("missing persisted boundary error = %v", err)
+	}
+	if store.value.Runs[0].Continuation != nil || store.value.Runs[0].Status != scheduler.StatusSuspended || len(store.value.Leases) != 1 {
+		t.Fatalf("missing-boundary refusal mutated state = %#v", store.value)
+	}
+}
+
+func TestAlreadyRecoveredRejectsObsoleteWorkerGenerationBoundary(t *testing.T) {
+	run, store := recoverableFixture(t)
+	module := newTestModule(t, store, fakeGitHub{issue: openIssue(run.Issue)}, func(int) (bool, error) { return false, nil }, time.Now())
+	plan, err := module.Inspect(context.Background(), run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := module.Recover(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	recovered := store.value.Runs[0]
+	recovered.WorkerGeneration = 3
+	recovered.StoppedWorkerGeneration = 3
+	store.value.Runs[0] = recovered
+
+	if _, err := module.Inspect(context.Background(), run.RunID); err == nil || !strings.Contains(err.Error(), "obsolete Worker generation") {
+		t.Fatalf("obsolete generation error = %v", err)
+	}
+	if store.value.Runs[0].Continuation == nil || store.value.Runs[0].Continuation.WorkerGeneration != 1 || len(store.value.Leases) != 1 {
+		t.Fatalf("obsolete-generation refusal mutated state = %#v", store.value)
+	}
+}
+
 func TestRecoveryAcceptsConclusiveAbsenceFromRetainedProcessIdentity(t *testing.T) {
 	run, store := recoverableFixture(t)
 	run.StoppedWorkerPID = 456
@@ -363,7 +404,7 @@ func TestRecoveryLateExpectedBranchMergeOutranksChangedPlan(t *testing.T) {
 	}
 }
 
-func TestRecoveryLateArmedPullRequestOutranksChangedPlan(t *testing.T) {
+func TestRecoveryLateArmedPullRequestRequiresExactPlanReconfirmation(t *testing.T) {
 	run, store := recoverableFixture(t)
 	calls := 0
 	pull := ghadapter.OwnedRunPullRequest{Number: 10, URL: "https://github.com/acme/widgets/pull/10", Branch: run.Branch, Commit: strings.Repeat("b", 40), State: "open"}
@@ -379,12 +420,11 @@ func TestRecoveryLateArmedPullRequestOutranksChangedPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := module.Recover(context.Background(), plan)
-	if err != nil || result.Outcome != OutcomeWaiting {
-		t.Fatalf("late waiting outcome = %#v, %v", result, err)
+	if _, err := module.Recover(context.Background(), plan); err == nil || !strings.Contains(err.Error(), "Plan changed after confirmation") {
+		t.Fatalf("late waiting plan change error = %v", err)
 	}
-	if store.value.Runs[0].Status != scheduler.StatusWaitingForMerge || !store.value.Runs[0].RecoveredRetirementRequired || len(store.value.Leases) != 1 {
-		t.Fatalf("late waiting transition = %#v", store.value)
+	if store.value.Runs[0].Status != scheduler.StatusFailed || store.value.Runs[0].RecoveredRetirementRequired || len(store.value.Leases) != 1 {
+		t.Fatalf("late waiting plan change mutated state = %#v", store.value)
 	}
 }
 

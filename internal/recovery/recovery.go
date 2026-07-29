@@ -112,6 +112,9 @@ func (m *Module) Inspect(ctx context.Context, selector string) (Plan, error) {
 	if run.Status != scheduler.StatusFailed && run.Status != scheduler.StatusNeedsHuman && !already {
 		return Plan{}, fmt.Errorf("Run %q is not eligible for Recovery in state %q", run.RunID, run.Status)
 	}
+	if already && run.Continuation == nil {
+		return Plan{}, fmt.Errorf("Run %q has no persisted Recovery continuation boundary", run.RunID)
+	}
 	if run.WorkerMode != scheduler.WorkerModeRPC || run.Branch == "" || run.Worktree == "" || run.SessionID == "" || run.SessionDir == "" {
 		return Plan{}, fmt.Errorf("Run %q has incomplete RPC continuation identities", run.RunID)
 	}
@@ -190,6 +193,9 @@ func (m *Module) Inspect(ctx context.Context, selector string) (Plan, error) {
 		if err = worker.VerifyContinuation(continuationRequest(run), continuation); err != nil {
 			return Plan{}, fmt.Errorf("verify persisted continuation evidence: %w", err)
 		}
+		if continuation.WorkerGeneration > 0 && continuation.WorkerGeneration != run.WorkerGeneration {
+			return Plan{}, errors.New("persisted continuation boundary belongs to an obsolete Worker generation")
+		}
 	}
 	if err != nil {
 		return Plan{}, fmt.Errorf("derive offline continuation evidence: %w", err)
@@ -231,9 +237,7 @@ func (m *Module) Recover(ctx context.Context, expected Plan) (Plan, error) {
 		return fresh, nil
 	}
 	if !PlansEqual(expected, fresh) {
-		if fresh.Outcome != OutcomeWaiting {
-			return Plan{}, errors.New("Recovery Plan changed after confirmation; inspect and confirm the current plan")
-		}
+		return Plan{}, errors.New("Recovery Plan changed after confirmation; inspect and confirm the current plan")
 	}
 	if fresh.Outcome == OutcomeAlready {
 		return fresh, nil
