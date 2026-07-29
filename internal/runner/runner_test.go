@@ -4286,6 +4286,7 @@ func TestRunnerSettledCheckpointFailurePersistsUnsafeClassificationBeforeProvide
 			done := make(chan error, 1)
 			go func() { done <- runner.Run(context.Background()) }()
 			workers.waitForStarts(t, run.Issue)
+			workers.waitForCompletionWaiters(t, run.Issue)
 			if test.failSave {
 				store.failNext()
 			}
@@ -4294,6 +4295,9 @@ func TestRunnerSettledCheckpointFailurePersistsUnsafeClassificationBeforeProvide
 			got := store.LoadValue().Runs[0]
 			if got.Status != scheduler.StatusNeedsHuman || got.FailureClass != scheduler.FailureUnsafeContinuation || got.ProviderContinuationAttempts != 0 || got.Continuation != nil || workers.checkpointCount != 1 {
 				t.Fatalf("settled checkpoint failure = %#v, checkpoints=%d", got, workers.checkpointCount)
+			}
+			if test.failSave && !strings.Contains(got.Error, "persist settled continuation boundary: injected state save failure") {
+				t.Fatalf("settled checkpoint persistence error = %q", got.Error)
 			}
 		})
 	}
@@ -6477,7 +6481,9 @@ type fakeProcess struct {
 	issue       int
 	owner       *fakeWorkers
 	done        chan worker.Result
+	waitStarted chan struct{}
 	closeResult worker.Result
+	waitOnce    sync.Once
 	closeOnce   sync.Once
 }
 
@@ -6540,6 +6546,7 @@ func (p *fakeProcess) CheckpointSettled(ctx context.Context, request worker.Cont
 	return worker.Continuation{}, errSettledCheckpointUnsupported
 }
 func (p *fakeProcess) Wait() worker.Result {
+	p.waitOnce.Do(func() { close(p.waitStarted) })
 	return <-p.done
 }
 func (p *fakeProcess) Close() worker.Result {
@@ -6686,7 +6693,9 @@ func (w *fakeWorkers) Start(_ context.Context, request worker.Request) (WorkerPr
 	if w.startErr != nil {
 		return nil, w.startErr
 	}
-	process := &fakeProcess{issue: request.Issue, owner: w, done: make(chan worker.Result, 1), closeResult: w.startupCloseResult}
+	process := &fakeProcess{
+		issue: request.Issue, owner: w, done: make(chan worker.Result, 1), waitStarted: make(chan struct{}), closeResult: w.startupCloseResult,
+	}
 	w.processes[request.Issue] = process
 	w.started = append(w.started, request.Issue)
 	w.requests = append(w.requests, request)
@@ -6773,6 +6782,24 @@ func (w *fakeWorkers) waitForStarts(t *testing.T, issues ...int) {
 		case <-w.startChanged:
 		case <-deadline:
 			t.Fatalf("started %v, want %v", w.startedSnapshot(), issues)
+		}
+	}
+}
+func (w *fakeWorkers) waitForCompletionWaiters(t *testing.T, issues ...int) {
+	t.Helper()
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for _, issue := range issues {
+		w.mu.Lock()
+		process := w.processes[issue]
+		w.mu.Unlock()
+		if process == nil {
+			t.Fatalf("completion waiter for issue #%d has no Worker process", issue)
+		}
+		select {
+		case <-process.waitStarted:
+		case <-deadline.C:
+			t.Fatalf("completion waiter for issue #%d was not established", issue)
 		}
 	}
 }
