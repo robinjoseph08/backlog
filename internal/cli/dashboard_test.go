@@ -988,7 +988,8 @@ func TestTerminalDashboardPreservesDrainAndSuspensionMessages(t *testing.T) {
 			wantOutput: []string{"Drain complete", "no effect"},
 			wantFinal: []string{
 				"Final outcome: Drain complete", "Attention Required (1)",
-				"#73  Operator decision  needs-human", "Diagnostic: review retained Worker",
+				"#73  Operator decision  needs-human", "Run: retained-attention | State: needs-human",
+				"Diagnostic: review retained Worker",
 			},
 		},
 		{
