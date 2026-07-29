@@ -118,6 +118,7 @@ type Run struct {
 	ClosureReason                string                `json:"closureReason,omitempty"`
 	DiagnosticWarning            string                `json:"diagnosticWarning,omitempty"`
 	FailureClass                 FailureClass          `json:"failureClass,omitempty"`
+	Workflow                     string                `json:"workflow,omitempty"`
 	WorkflowStage                string                `json:"workflowStage,omitempty"`
 	PreservedCause               string                `json:"preservedCause,omitempty"`
 	BlockerKind                  string                `json:"blockerKind,omitempty"`
@@ -126,6 +127,7 @@ type Run struct {
 	ProviderContinuationAttempts int                   `json:"providerContinuationAttempts,omitempty"`
 	ResumeAfter                  *time.Time            `json:"resumeAfter,omitempty"`
 	RecoveryCount                int                   `json:"recoveryCount,omitempty"`
+	RecoveredRetirementRequired  bool                  `json:"recoveredRetirementRequired,omitempty"`
 	FirstRecoveredAt             *time.Time            `json:"firstRecoveredAt,omitempty"`
 	LastRecoveredAt              *time.Time            `json:"lastRecoveredAt,omitempty"`
 }

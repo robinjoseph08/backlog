@@ -1186,6 +1186,26 @@ func TestWorkflowCheckpointRequiresDurableOwnedAFKOrStrictShipItSchema(t *testin
 	if err != nil || workflow != "afk" || stage != "afk-coordinator" || status != "active" || filepath.Base(checkpointFile) != "backlog-afk-checkpoint-v1.json" || checkpointSHA == "" || failure != "" {
 		t.Fatalf("owned AFK checkpoint = %q/%q/%q/%q/%q/%q, %v", workflow, stage, checkpointFile, checkpointSHA, status, failure, err)
 	}
+	for _, malformed := range []string{
+		strings.TrimSpace(marker[:len(marker)-2]) + `,"runId":"run-42"}` + "\n",
+		strings.TrimSpace(marker[:len(marker)-2]) + `,"extra":true}` + "\n",
+		strings.Replace(marker, `"runId"`, `"RunId"`, 1),
+	} {
+		if err := os.WriteFile(filepath.Join(request.SessionDir, "backlog-afk-checkpoint-v1.json"), []byte(malformed), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, _, _, _, _, err := inspectWorkflowCheckpoint(request, owned); err == nil || !strings.Contains(err.Error(), "malformed") {
+			t.Fatalf("noncanonical AFK checkpoint was accepted: %s, error %v", malformed, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(request.SessionDir, "backlog-afk-checkpoint-v1.json"), []byte(marker), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request.ExpectedWorkflow = "ship-it"
+	if _, _, _, _, _, _, err := inspectWorkflowCheckpoint(request, owned); err == nil || !strings.Contains(err.Error(), "missing after the Run entered ship-it") {
+		t.Fatalf("ship-it to AFK fallback was accepted: %v", err)
+	}
+	request.ExpectedWorkflow = ""
 	checkpoint := filepath.Join(gitDir, "ship-it-checkpoint-v1.md")
 	valid := func(status, stage, session, directory, branch, failure string) []byte {
 		data := fmt.Sprintf("# Ship-it checkpoint v1\n\nStatus: %s\nStage: %s\nCoordinator session: %s\nWorking directory: %s\nBranch: %s\n", status, stage, session, directory, branch)

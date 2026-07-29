@@ -286,6 +286,7 @@ func (m *Module) Recover(ctx context.Context, expected Plan) (Plan, error) {
 		run.ResumeAfter = nil
 		run.PullRequest = fresh.PullRequest
 		run.PID, run.ProcessIdentity = 0, ""
+		run.RecoveredRetirementRequired = true
 		run.UpdatedAt = now
 	default:
 		if run.PreservedCause == "" {
@@ -296,7 +297,9 @@ func (m *Module) Recover(ctx context.Context, expected Plan) (Plan, error) {
 		run.PID, run.ProcessIdentity = 0, ""
 		run.WorkerLogOpen = false
 		run.Continuation = &fresh.Boundary
+		run.Workflow = fresh.Boundary.Workflow
 		run.WorkflowStage = fresh.Boundary.WorkflowStage
+		run.RecoveredRetirementRequired = true
 		if fresh.Boundary.CheckpointFailureClass != "" {
 			run.FailureClass = scheduler.FailureClass(fresh.Boundary.CheckpointFailureClass)
 		}
@@ -324,6 +327,12 @@ func (m *Module) Recover(ctx context.Context, expected Plan) (Plan, error) {
 }
 
 func (m *Module) verifyAbsent(run scheduler.Run) error {
+	if run.ResumePending {
+		return errors.New("Run has a pending replacement Worker launch")
+	}
+	if run.PID != 0 || run.ProcessIdentity != "" {
+		return errors.New("Run still has a current Worker process identity")
+	}
 	if run.WorkerGeneration <= 0 || run.StoppedWorkerGeneration != run.WorkerGeneration || run.WorkerStoppedAt == nil || run.WorkerStoppedAt.IsZero() {
 		return errors.New("Run has no durable proof that its last Worker generation stopped")
 	}
@@ -356,9 +365,17 @@ func (m *Module) verifyAbsent(run scheduler.Run) error {
 }
 
 func continuationRequest(run scheduler.Run) worker.ContinuationRequest {
+	expectedWorkflow := run.Workflow
+	if expectedWorkflow == "" && run.Continuation != nil {
+		expectedWorkflow = run.Continuation.Workflow
+	}
+	if expectedWorkflow == "" && run.WorkflowStage != "" && run.WorkflowStage != "afk-coordinator" {
+		expectedWorkflow = "ship-it"
+	}
 	return worker.ContinuationRequest{
 		Issue: run.Issue, RunID: run.RunID, Branch: run.Branch,
 		SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree,
+		ExpectedWorkflow: expectedWorkflow,
 	}
 }
 

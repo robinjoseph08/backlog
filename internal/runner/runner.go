@@ -744,7 +744,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 			if closed.GroupExited {
 				recovered := findRun(current.Runs, runID)
-				if recovered.RecoveryCount > 0 && recovered.Error == recoveredCompletionPendingShutdown {
+				if requiresRecoveredRetirement(recovered) && recovered.Error == recoveredCompletionPendingShutdown {
 					if _, err := r.retireRecoveredCompletion(ctx, &current, recovered); err != nil {
 						if draining {
 							drainOperationalErr = errors.Join(drainOperationalErr, err)
@@ -1258,10 +1258,36 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 		replaceRun(current, run)
 		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("start replacement Pi Worker: %v", err))
 	}
+	// The replacement remains behind its start gate. Persist its generation and
+	// PID before any identity lookup or other operation can become uncertain.
+	run = findActiveRun(current, run.Issue)
+	run.WorkerGeneration++
+	run.PID = process.PID()
+	run.ProcessIdentity = ""
+	run.WorkerStartedAt = r.Now().UTC()
+	run.UpdatedAt = run.WorkerStartedAt
+	replaceRun(current, run)
+	if err := r.Store.Save(*current); err != nil {
+		abortErr := process.Abort()
+		closed := process.Close()
+		if closed.GroupExited {
+			run.ResumePending = false
+			markStoppedRun(&run, r.Now().UTC())
+			replaceRun(current, run)
+		}
+		failureErr := r.rejectResume(current, run.Issue, fmt.Sprintf("persist gated replacement Worker PID: %v; abort: %v; close: %v", err, abortErr, closed.Err))
+		return nil, errors.Join(fmt.Errorf("persist gated replacement Worker PID for issue #%d: %w", run.Issue, err), failureErr)
+	}
 	logPath, stderrPath := process.LogPaths()
 	if logPath == "" || stderrPath == "" || run.LogPath != "" && run.LogPath != logPath || run.StderrPath != "" && run.StderrPath != stderrPath {
 		_ = process.Abort()
 		closed := process.Close()
+		run = findActiveRun(current, run.Issue)
+		if closed.GroupExited {
+			run.ResumePending = false
+			markStoppedRun(&run, r.Now().UTC())
+			replaceRun(current, run)
+		}
 		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("verify replacement Worker log identities: got %q/%q; close: %v", logPath, stderrPath, closed.Err))
 	}
 	run.LogPath, run.StderrPath = logPath, stderrPath
@@ -1273,11 +1299,8 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 			r.suspensionFailed.Store(true)
 		}
 		run = findActiveRun(current, run.Issue)
-		run.ResumePending = false
-		if !closed.GroupExited {
-			run.PID = process.PID()
-			run.ProcessIdentity = ""
-		} else {
+		if closed.GroupExited {
+			run.ResumePending = false
 			markStoppedRun(&run, r.Now().UTC())
 		}
 		replaceRun(current, run)
@@ -1286,7 +1309,8 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 	now := r.Now().UTC()
 	transitionStatus(&run, scheduler.StatusRunning)
 	run.ResumePending = false
-	run.WorkerGeneration++
+	run.Workflow = boundary.Workflow
+	run.WorkflowStage = boundary.WorkflowStage
 	run.Continuation = nil
 	run.ResumeAfter = nil
 	run.PID = process.PID()
@@ -1341,6 +1365,37 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("fresh issue, workflow label, worktree, or stopped Worker state changed before replacement Worker release: %v; close: %v", inspectErr, closed.Err))
 	}
 	freshOutcome, inspectErr := r.GitHub.Completion(operationCtx, r.Config.Repo, run.Issue, run.Branch)
+	if inspectErr == nil && (freshOutcome.Merged && freshOutcome.IssueClosed || freshOutcome.PRFound && freshOutcome.AutoMergeArmed) {
+		_ = process.Abort()
+		closed := process.Close()
+		if !closed.GroupExited {
+			return nil, r.rejectResume(current, run.Issue, "GitHub outcome appeared before replacement release but gated Worker exit was not verified")
+		}
+		run = findActiveRun(current, run.Issue)
+		markStoppedRun(&run, r.Now().UTC())
+		// Restore the verified pre-replacement boundary so the stopped gated
+		// generation can durably return to Suspended before outcome handling.
+		run.Continuation = &boundary
+		transitionStatus(&run, scheduler.StatusSuspended)
+		run.PullRequest = freshOutcome.PullRequest
+		if freshOutcome.Merged {
+			run.Error = recoveredCompletionPendingShutdown
+		} else {
+			run.Error = ""
+		}
+		run.UpdatedAt = r.Now().UTC()
+		replaceRun(current, run)
+		if err := r.Store.Save(*current); err != nil {
+			return nil, fmt.Errorf("persist stopped gated Worker before late GitHub outcome: %w", err)
+		}
+		if err := r.applyOutcome(operationCtx, current, run, freshOutcome, true, requiresRecoveredRetirement(run)); err != nil {
+			return nil, err
+		}
+		if err := r.Store.Save(*current); err != nil {
+			return nil, fmt.Errorf("persist late GitHub outcome before replacement release: %w", err)
+		}
+		return nil, nil
+	}
 	identityErr := inspectErr
 	if identityErr == nil {
 		identityErr = r.verifyRecoveryRepositoryIdentity(operationCtx, run, boundary, freshOutcome)
@@ -1354,30 +1409,6 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 			replaceRun(current, run)
 		}
 		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("fresh repository identity changed before replacement Worker release: %v; close: %v", identityErr, closed.Err))
-	}
-	if freshOutcome.Merged || freshOutcome.PRFound && freshOutcome.AutoMergeArmed {
-		_ = process.Abort()
-		closed := process.Close()
-		if !closed.GroupExited {
-			return nil, r.rejectResume(current, run.Issue, "Completion appeared before replacement release but gated Worker exit was not verified")
-		}
-		run = findActiveRun(current, run.Issue)
-		markStoppedRun(&run, r.Now().UTC())
-		transitionStatus(&run, scheduler.StatusNeedsHuman)
-		run.PullRequest = freshOutcome.PullRequest
-		run.Error = recoveredCompletionPendingShutdown
-		run.UpdatedAt = r.Now().UTC()
-		replaceRun(current, run)
-		if err := r.Store.Save(*current); err != nil {
-			return nil, fmt.Errorf("persist stopped gated Worker before late Completion retirement: %w", err)
-		}
-		if err := r.applyOutcome(operationCtx, current, run, freshOutcome, true, true); err != nil {
-			return nil, err
-		}
-		if err := r.Store.Save(*current); err != nil {
-			return nil, fmt.Errorf("persist late Completion before replacement release: %w", err)
-		}
-		return nil, nil
 	}
 	if err := process.Release(); err != nil {
 		_ = process.Abort()
@@ -1404,6 +1435,7 @@ func (r *Runner) checkpointSettledWorker(ctx context.Context, current *state.Sta
 	boundary, err := checkpointer.CheckpointSettled(checkpointCtx, worker.ContinuationRequest{
 		Issue: run.Issue, RunID: run.RunID, Branch: run.Branch,
 		SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree,
+		ExpectedWorkflow: expectedContinuationWorkflow(run),
 	})
 	if err != nil {
 		if errors.Is(err, errSettledCheckpointUnsupported) {
@@ -1432,6 +1464,7 @@ func (r *Runner) checkpointSettledWorker(ctx context.Context, current *state.Sta
 		CheckpointBlockerFingerprint: boundary.CheckpointBlockerFingerprint,
 		WorkerGeneration:             run.WorkerGeneration, VerifiedAt: now,
 	}
+	run.Workflow = boundary.Workflow
 	run.WorkflowStage = boundary.WorkflowStage
 	if boundary.CheckpointFailureClass != "" {
 		run.FailureClass = scheduler.FailureClass(boundary.CheckpointFailureClass)
@@ -1450,7 +1483,10 @@ func (r *Runner) checkpointSettledWorker(ctx context.Context, current *state.Sta
 
 func (r *Runner) applyProviderContinuation(current *state.State, runID string) error {
 	run := findRun(current.Runs, runID)
-	if run.Status != scheduler.StatusFailed || run.PullRequest != "" {
+	// Reconciliation has already allowed merged Completion and an armed expected
+	// pull request to win. A verified unarmed expected pull request remains safe
+	// for the one structured provider continuation and keeps its identity.
+	if run.Status != scheduler.StatusFailed && run.Status != scheduler.StatusNeedsHuman {
 		return nil
 	}
 	run.FailureClass = scheduler.FailureProviderExhaustion
@@ -1485,6 +1521,19 @@ func (r *Runner) applyProviderContinuation(current *state.State, runID string) e
 	run.UpdatedAt = now
 	replaceRun(current, run)
 	return r.Store.Save(*current)
+}
+
+func expectedContinuationWorkflow(run scheduler.Run) string {
+	if run.Workflow != "" {
+		return run.Workflow
+	}
+	if run.Continuation != nil && run.Continuation.Workflow != "" {
+		return run.Continuation.Workflow
+	}
+	if run.WorkflowStage != "" && run.WorkflowStage != "afk-coordinator" {
+		return "ship-it"
+	}
+	return ""
 }
 
 func verifyContinuationArtifacts(run scheduler.Run) error {
@@ -1701,7 +1750,7 @@ func (r *Runner) handleWorkerCompletion(ctx context.Context, current *state.Stat
 			updated.PullRequest = outcome.PullRequest
 			replaceRun(current, updated)
 		} else {
-			if err := r.applyOutcome(ctx, current, run, outcome, completion.result.ExitCode == 0 && completion.result.Err == nil, run.RecoveryCount > 0); err != nil {
+			if err := r.applyOutcome(ctx, current, run, outcome, completion.result.ExitCode == 0 && completion.result.Err == nil, requiresRecoveredRetirement(run)); err != nil {
 				return false, err
 			}
 		}
@@ -1840,7 +1889,11 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 			continue
 		}
 		if run.ResumePending {
-			r.needsHuman(current, run.Issue, "replacement Worker launch was interrupted before its process identity became durable")
+			if run.PID != 0 || run.ProcessIdentity != "" {
+				r.needsHumanWithLiveWorker(current, run.Issue, "replacement Worker launch was interrupted; the gated replacement identity remains current")
+			} else {
+				r.needsHuman(current, run.Issue, "replacement Worker launch was interrupted before its gated PID became durable")
+			}
 			changed = true
 			continue
 		}
@@ -1856,6 +1909,12 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 			continue
 		}
 		recoverableMarker := run.Status == scheduler.StatusRunning && run.WorkerMode == scheduler.WorkerModeRPC && run.Continuation != nil
+		if run.Status == scheduler.StatusSuspended && run.FailureClass == scheduler.FailureProviderExhaustion && run.ProviderContinuationAttempts == 1 && run.ResumeAfter != nil && outcome.PRFound && !outcome.AutoMergeArmed && outcome.PullRequest == run.PullRequest {
+			// The one bounded provider continuation may cross a verified unarmed
+			// expected pull request. Preserve both its identity and cooldown until
+			// Resume performs the next fresh checks.
+			continue
+		}
 		if (run.Status == scheduler.StatusSuspended || recoverableMarker) && !outcome.Merged && !outcome.PRFound {
 			if run.Status == scheduler.StatusSuspended {
 				if err := verifyContinuationArtifacts(run); err != nil {
@@ -1891,7 +1950,7 @@ func (r *Runner) reconcile(ctx context.Context, current *state.State, owned map[
 }
 
 func (r *Runner) reconcileExternalResolutions(ctx context.Context, current *state.State, owned map[int]WorkerProcess) error {
-	if r.ExternalResolution == nil {
+	if r.ExternalResolution == nil && r.CompletionRetirement == nil {
 		return nil
 	}
 	for _, lease := range append([]scheduler.Lease(nil), current.Leases...) {
@@ -1901,6 +1960,24 @@ func (r *Runner) reconcileExternalResolutions(ctx context.Context, current *stat
 		}
 		if _, isOwned := owned[run.Issue]; isOwned || run.Status == scheduler.StatusMerged || run.Status == scheduler.StatusReset || run.Status == scheduler.StatusResolvedExternally {
 			continue
+		}
+		if requiresRecoveredRetirement(run) {
+			outcome, completionErr := r.GitHub.Completion(ctx, r.Config.Repo, run.Issue, run.Branch)
+			if completionErr != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return fmt.Errorf("verify recovered Completion before automatic External Resolution for Run %s: %w", run.RunID, completionErr)
+			}
+			if outcome.Merged && outcome.IssueClosed {
+				attempted, retirementErr := r.retireRecoveredCompletion(ctx, current, run)
+				if retirementErr != nil {
+					return retirementErr
+				}
+				if attempted {
+					continue
+				}
+			}
 		}
 		if err := r.reconcileExternalResolution(ctx, current, run); err != nil {
 			return err
@@ -2030,7 +2107,7 @@ func (r *Runner) applyOutcome(ctx context.Context, current *state.State, run sch
 	run.UpdatedAt = r.Now().UTC()
 	switch {
 	case outcome.Merged && outcome.IssueClosed:
-		if cleanupMerged && run.RecoveryCount > 0 {
+		if cleanupMerged && requiresRecoveredRetirement(run) {
 			if run.PID != 0 || run.ProcessIdentity != "" {
 				transitionStatus(&run, scheduler.StatusNeedsHuman)
 				run.Error = recoveredCompletionPendingShutdown
@@ -2083,7 +2160,7 @@ func (r *Runner) applyOutcome(ctx context.Context, current *state.State, run sch
 }
 
 func (r *Runner) retireRecoveredCompletion(ctx context.Context, current *state.State, run scheduler.Run) (bool, error) {
-	if run.RecoveryCount == 0 {
+	if !requiresRecoveredRetirement(run) {
 		return false, nil
 	}
 	if r.CompletionRetirement == nil {
@@ -2212,7 +2289,7 @@ func (r *Runner) finalizeSettledWorker(ctx context.Context, current *state.State
 	if run.Status != scheduler.StatusMerged {
 		return nil
 	}
-	if run.RecoveryCount > 0 && !run.CleanupPending {
+	if requiresRecoveredRetirement(run) && !run.CleanupPending {
 		// Recovered Completion reaches Merged only through the full retirement
 		// service, which has already retired every owned artifact before releasing
 		// the Lease. Do not repeat its local cleanup with weaker postconditions.
@@ -2343,6 +2420,9 @@ func markStoppedRun(run *scheduler.Run, stoppedAt time.Time) {
 	if run.PID > 0 && run.ProcessIdentity != "" {
 		run.StoppedWorkerPID = run.PID
 		run.StoppedWorkerProcessIdentity = run.ProcessIdentity
+	} else {
+		run.StoppedWorkerPID = 0
+		run.StoppedWorkerProcessIdentity = ""
 	}
 	run.PID = 0
 	run.ProcessIdentity = ""
@@ -2538,6 +2618,7 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 			boundary, err := process.Suspend(ctx, worker.ContinuationRequest{
 				Issue: run.Issue, RunID: run.RunID, Branch: run.Branch,
 				SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree,
+				ExpectedWorkflow: expectedContinuationWorkflow(run),
 			})
 			boundaries <- suspensionBoundaryResult{issue: issue, boundary: boundary, err: err}
 		}(issue, process, run)
@@ -2581,6 +2662,8 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 			CheckpointBlockerFingerprint: result.boundary.CheckpointBlockerFingerprint,
 			WorkerGeneration:             run.WorkerGeneration, VerifiedAt: now,
 		}
+		run.Workflow = result.boundary.Workflow
+		run.WorkflowStage = result.boundary.WorkflowStage
 		if run.LogPath == "" {
 			run.LogPath = result.boundary.LogPath
 		}
@@ -2699,7 +2782,7 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 			markStoppedRun(&run, r.Now().UTC())
 			run.UpdatedAt = r.Now().UTC()
 			if outcome, exists := verifiedOutcomes[closed.issue]; exists && failureReasons[closed.issue] == "" {
-				cleanupMerged := outcome.Merged && outcome.IssueClosed && run.RecoveryCount > 0
+				cleanupMerged := outcome.Merged && outcome.IssueClosed && requiresRecoveredRetirement(run)
 				if cleanupMerged {
 					transitionStatus(&run, scheduler.StatusNeedsHuman)
 					run.PullRequest = outcome.PullRequest
@@ -3092,6 +3175,10 @@ func (r *Runner) runLifecycleEvent(stage RunLifecycleStage, format string, args 
 
 func (r *Runner) logf(format string, args ...any) {
 	fmt.Fprintf(r.Output, format+"\n", args...)
+}
+
+func requiresRecoveredRetirement(run scheduler.Run) bool {
+	return run.RecoveredRetirementRequired || run.RecoveryCount > 0
 }
 
 func (r *Runner) transitionToSuspended(run *scheduler.Run) {

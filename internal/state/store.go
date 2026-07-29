@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -143,19 +144,39 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 func migrateV4WorkerProof(value *State) {
 	for index := range value.Runs {
 		run := &value.Runs[index]
-		if run.PID > 0 && run.ProcessIdentity != "" && run.Status != scheduler.StatusRunning {
+		if run.Workflow == "" && run.Continuation != nil {
+			run.Workflow = run.Continuation.Workflow
+		}
+		if run.RecoveryCount > 0 {
+			run.RecoveredRetirementRequired = true
+		}
+		if run.Status == scheduler.StatusRunning && run.WorkerMode == scheduler.WorkerModeRPC && run.Continuation != nil {
 			if run.WorkerGeneration == 0 {
 				run.WorkerGeneration = 1
 			}
-			run.StoppedWorkerGeneration = run.WorkerGeneration
-			run.StoppedWorkerPID = run.PID
-			run.StoppedWorkerProcessIdentity = run.ProcessIdentity
-			stoppedAt := run.UpdatedAt
-			if stoppedAt.IsZero() {
-				stoppedAt = run.StartedAt
+			if run.Continuation.WorkerGeneration == 0 {
+				run.Continuation.WorkerGeneration = run.WorkerGeneration
 			}
-			if !stoppedAt.IsZero() {
-				run.WorkerStoppedAt = &stoppedAt
+		}
+		if run.Status != scheduler.StatusRunning && run.ProcessIdentity != "" {
+			pidText, started, found := strings.Cut(run.ProcessIdentity, ":")
+			identityPID, err := strconv.Atoi(pidText)
+			if found && err == nil && identityPID > 0 && strings.TrimSpace(started) != "" && (run.PID == 0 || run.PID == identityPID) {
+				if run.WorkerGeneration == 0 {
+					run.WorkerGeneration = 1
+				}
+				run.StoppedWorkerGeneration = run.WorkerGeneration
+				run.StoppedWorkerPID = identityPID
+				run.StoppedWorkerProcessIdentity = run.ProcessIdentity
+				stoppedAt := run.UpdatedAt
+				if stoppedAt.IsZero() {
+					stoppedAt = run.StartedAt
+				}
+				if !stoppedAt.IsZero() {
+					run.WorkerStoppedAt = &stoppedAt
+					run.PID = 0
+					run.ProcessIdentity = ""
+				}
 			}
 		}
 		if run.Status != scheduler.StatusSuspended || run.Continuation == nil {
@@ -528,8 +549,8 @@ func validateRun(run scheduler.Run, requireWorkerMode, recoverUnsafeContinuation
 			boundary.PullRequest == "" && boundary.PullRequestHead != "" || boundary.PullRequest != "" && boundary.PullRequestHead == "" {
 			return fmt.Errorf("state contains Run %q with invalid continuation generation or repository identity", run.RunID)
 		}
-		if run.WorkflowStage != "" && run.WorkflowStage != boundary.WorkflowStage {
-			return fmt.Errorf("state contains Run %q with mismatched workflow stage metadata", run.RunID)
+		if run.Workflow != "" && run.Workflow != boundary.Workflow || run.WorkflowStage != "" && run.WorkflowStage != boundary.WorkflowStage {
+			return fmt.Errorf("state contains Run %q with mismatched workflow metadata", run.RunID)
 		}
 		relative, err := filepath.Rel(run.SessionDir, boundary.SessionFile)
 		if err != nil || relative == "." || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
@@ -542,15 +563,18 @@ func validateRun(run scheduler.Run, requireWorkerMode, recoverUnsafeContinuation
 		return fmt.Errorf("state contains Run %q with invalid Worker generation stop proof", run.RunID)
 	}
 	if run.Status == scheduler.StatusSuspended && !unsafeContinuation {
-		if run.PID != 0 || run.ProcessIdentity != "" || run.Continuation == nil {
+		if (!run.ResumePending || run.ProcessIdentity != "") && (run.PID != 0 || run.ProcessIdentity != "") || run.Continuation == nil {
 			return fmt.Errorf("state contains suspended issue #%d without a verified stopped continuation", run.Issue)
 		}
 	}
-	if run.ResumePending && ((run.Status != scheduler.StatusSuspended && run.Status != scheduler.StatusNeedsHuman) || run.PID != 0 || run.ProcessIdentity != "" || run.Continuation == nil && run.Status != scheduler.StatusNeedsHuman && !recoverUnsafeContinuation) {
+	if run.ResumePending && ((run.Status != scheduler.StatusSuspended && run.Status != scheduler.StatusNeedsHuman) || run.PID < 0 || run.ProcessIdentity != "" || run.Continuation == nil && run.Status != scheduler.StatusNeedsHuman && !recoverUnsafeContinuation) {
 		return fmt.Errorf("state contains Run %q with an invalid pending Resume", run.RunID)
 	}
 	if !knownFailureClass(run.FailureClass) {
 		return fmt.Errorf("state contains Run %q with unknown failure class %q", run.RunID, run.FailureClass)
+	}
+	if run.Workflow != "" && run.Workflow != "afk" && run.Workflow != "ship-it" || run.Workflow == "afk" && run.WorkflowStage != "" && run.WorkflowStage != "afk-coordinator" || run.Workflow == "ship-it" && run.WorkflowStage == "afk-coordinator" {
+		return fmt.Errorf("state contains Run %q with invalid monotonic workflow identity", run.RunID)
 	}
 	if run.ProviderContinuationAttempts < 0 || run.ProviderContinuationAttempts > 1 {
 		return fmt.Errorf("state contains Run %q with an invalid provider continuation budget", run.RunID)

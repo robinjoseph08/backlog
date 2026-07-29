@@ -68,7 +68,7 @@ func RecoveredCompletionPolicy(runID string) retirement.Policy {
 // RetireRecoveredCompletion performs complete retirement with a freshly
 // inspected plan. Each successful external stage is durable and rerunnable.
 func (r *AutomaticReconciler) RetireRecoveredCompletion(ctx context.Context, run scheduler.Run) (bool, error) {
-	if run.RecoveryCount == 0 {
+	if !run.RecoveredRetirementRequired && run.RecoveryCount == 0 {
 		return false, nil
 	}
 	module, err := retirement.New(r.config, RecoveredCompletionPolicy(run.RunID))

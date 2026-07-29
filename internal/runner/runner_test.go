@@ -2316,6 +2316,77 @@ func TestRunnerStartupAutomaticallyResolvesBeforeAdmissionAndNaturalExhaustion(t
 	}
 }
 
+func TestRunnerPrioritizesPartialRecoveredCompletionRetirementBeforeExternalResolution(t *testing.T) {
+	run := scheduler.Run{
+		Issue: 98, RunID: "partial-recovered-98", Status: scheduler.StatusResolvingExternally,
+		WorkerMode: scheduler.WorkerModeRPC, Branch: "agent/issue-98-partial-recovered-98",
+		RecoveredRetirementRequired: true,
+	}
+	store := &memoryStore{value: state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
+		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+	}}
+	github := &fakeGitHub{completionFunc: func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
+		return mergedOutcome(run.Issue), nil
+	}}
+	externalCalls := 0
+	runner := testRunner(github, newFakeWorkers(), store, 1)
+	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+		externalCalls++
+		return true, errors.New("generic policy must not run")
+	})
+	retirementCalls := 0
+	runner.CompletionRetirement = recoveredCompletionRetirerFunc(func(_ context.Context, selected scheduler.Run) (bool, error) {
+		retirementCalls++
+		current := store.LoadValue()
+		completed := findRun(current.Runs, selected.RunID)
+		completed.Status = scheduler.StatusMerged
+		completed.PullRequest = mergedOutcome(run.Issue).PullRequest
+		replaceRun(&current, completed)
+		removeLease(&current, completed.RunID)
+		return true, store.Save(current)
+	})
+	current := store.LoadValue()
+	if err := runner.reconcileExternalResolutions(context.Background(), &current, nil); err != nil {
+		t.Fatal(err)
+	}
+	if retirementCalls != 1 || externalCalls != 0 || len(current.Leases) != 0 || current.Runs[0].Status != scheduler.StatusMerged {
+		t.Fatalf("recovered retirement priority = retirement %d external %d state %#v", retirementCalls, externalCalls, current)
+	}
+}
+
+func TestRunnerRetiresArmedRecoveryAfterWaitingRestartAndMerge(t *testing.T) {
+	run := scheduler.Run{
+		Issue: 99, RunID: "waiting-recovered-99", Status: scheduler.StatusWaitingForMerge,
+		WorkerMode: scheduler.WorkerModeRPC, Branch: "agent/issue-99-waiting-recovered-99",
+		PullRequest: mergedOutcome(99).PullRequest, RecoveredRetirementRequired: true,
+	}
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}}
+	runner := testRunner(&fakeGitHub{completionFunc: func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
+		return mergedOutcome(run.Issue), nil
+	}}, newFakeWorkers(), store, 1)
+	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
+		return true, errors.New("generic policy must not run")
+	})
+	called := false
+	runner.CompletionRetirement = recoveredCompletionRetirerFunc(func(_ context.Context, selected scheduler.Run) (bool, error) {
+		called = true
+		current := store.LoadValue()
+		completed := findRun(current.Runs, selected.RunID)
+		completed.Status = scheduler.StatusMerged
+		replaceRun(&current, completed)
+		removeLease(&current, completed.RunID)
+		return true, store.Save(current)
+	})
+	current := store.LoadValue()
+	if err := runner.reconcile(context.Background(), &current, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !called || current.Runs[0].Status != scheduler.StatusMerged || len(current.Leases) != 0 {
+		t.Fatalf("waiting restart retirement = called %t state %#v", called, current)
+	}
+}
+
 func TestRunnerReloadsAutomaticResolutionProgressBeforeReturningCancellation(t *testing.T) {
 	t.Parallel()
 
@@ -2712,8 +2783,9 @@ func TestRunnerReportsUnverifiedSettledExitPersistenceFailureWithoutWaitingTwice
 	workers.settledCloseLeavesGroup = true
 	// Automatic-resolution startup and reconciled initialization are saves 1
 	// and 2; admission, worktree, logs, identity, and the initial outcome are
-	// saves 3 through 8. Retaining the unverified process group is save 9.
-	store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 9}
+	// saves 3 through 8. The settled continuation boundary is save 9, and
+	// retaining the unverified process group is save 10.
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 10}
 	runner := testRunner(github, workers, store, 1)
 	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
 		return true, errors.New("must not inspect an unverified process group")
@@ -3168,6 +3240,61 @@ func TestRunnerResumesSuspendedRunBeforeNewCandidateWithSameIdentity(t *testing.
 	workers.complete(61, worker.Result{ExitCode: 0})
 	workers.waitForStarts(t, 62)
 	workers.complete(62, worker.Result{ExitCode: 1, Err: errors.New("stop fixture")})
+	assertInterventionRequired(t, <-done, 1)
+}
+
+func TestRunnerMigratesLiteralV4RunningContinuationAndResumesDeadWorker(t *testing.T) {
+	root := t.TempDir()
+	worktreePath, sessionDir := filepath.Join(root, "worktree"), filepath.Join(root, "sessions")
+	if err := os.MkdirAll(filepath.Join(worktreePath, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runID, sessionID := "literal-v4-running", "literal-v4-session"
+	branch := "agent/issue-112-literal-v4-running"
+	sessionFile := filepath.Join(sessionDir, "session.jsonl")
+	sessionData := []byte(fmt.Sprintf("{\"type\":\"session\",\"version\":3,\"id\":%q,\"cwd\":%q}\n{\"type\":\"message\",\"id\":\"leaf\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"/skill:afk 112\"}}\n", sessionID, worktreePath))
+	if err := os.WriteFile(sessionFile, sessionData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checkpointFile := filepath.Join(sessionDir, "backlog-afk-checkpoint-v1.json")
+	checkpointData := []byte(fmt.Sprintf("{\"version\":1,\"workflow\":\"afk\",\"stage\":\"afk-coordinator\",\"issue\":112,\"runId\":%q,\"sessionId\":%q,\"worktree\":%q}\n", runID, sessionID, worktreePath))
+	if err := os.WriteFile(checkpointFile, checkpointData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sessionHash, checkpointHash := sha256.Sum256(sessionData), sha256.Sum256(checkpointData)
+	statePath := filepath.Join(root, "state.json")
+	fixture := fmt.Sprintf(`{"version":4,"repo":"acme/widgets","defaultBranch":"main","maxConcurrentIssues":1,"runs":[{"issue":112,"runId":%q,"status":"running","workerMode":"rpc","pid":4112,"processIdentity":"4112:old","branch":%q,"worktree":%q,"sessionName":"afk #112","sessionId":%q,"sessionDir":%q,"continuation":{"sessionId":%q,"sessionFile":%q,"worktree":%q,"leafId":"leaf","entryCount":1,"sha256":%q,"workflow":"afk","workflowStage":"afk-coordinator","checkpointFile":%q,"checkpointSha256":%q,"checkpointStatus":"active","verifiedAt":"2026-07-29T00:01:00Z"},"startedAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-29T00:01:00Z"}],"leases":[{"leaseId":%q,"issue":112,"runId":%q}]}`, runID, branch, worktreePath, sessionID, sessionDir, sessionID, sessionFile, worktreePath, hex.EncodeToString(sessionHash[:]), checkpointFile, hex.EncodeToString(checkpointHash[:]), runID, runID)
+	if err := os.WriteFile(statePath, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workers := newFakeWorkers()
+	workers.startupCloseResult.GroupExited = true
+	fileStore := state.FileStore{Path: statePath}
+	runner := &Runner{
+		Config: Config{Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1, PollInterval: 5 * time.Millisecond, SessionsDir: sessionDir},
+		GitHub: &fakeGitHub{}, Store: fileStore, Worktrees: &fakeWorktrees{}, Workers: workers, Output: io.Discard,
+		Now: func() time.Time { return time.Date(2026, 7, 29, 0, 2, 0, 0, time.UTC) }, NewRunID: func(issue int) string { return fmt.Sprintf("run-%d", issue) },
+		PIDAlive: func(int) bool { return false }, ProcessGroupAlive: func(int) (bool, error) { return false, nil },
+		PIDIdentity: func(_ context.Context, pid int) (string, error) { return fmt.Sprintf("%d:new", pid), nil },
+	}
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 112)
+	for deadline := time.Now().Add(2 * time.Second); workers.releaseCount() != 1 && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+	migrated, err := fileStore.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := findActiveRun(&migrated, 112)
+	if active.Status != scheduler.StatusRunning || active.WorkerGeneration != 2 || active.PID != 1112 || active.ProcessIdentity != "1112:new" || workers.releaseCount() != 1 {
+		t.Fatalf("migrated resumed Run = %#v, releases %d", active, workers.releaseCount())
+	}
+	workers.complete(112, worker.Result{ExitCode: 1, Err: errors.New("stop fixture")})
 	assertInterventionRequired(t, <-done, 1)
 }
 
@@ -3834,6 +3961,62 @@ func TestRunnerFreshlyVerifiesEveryRecoveryIdentityBeforeStartAndRelease(t *test
 	}
 }
 
+func TestRunnerLateMergedOrArmedOutcomeOutranksGatedPRIdentityDrift(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		outcome ghadapter.CompletionOutcome
+		status  scheduler.Status
+	}{
+		{name: "absent to merged", outcome: mergedOutcome(107), status: scheduler.StatusMerged},
+		{name: "absent to armed", outcome: ghadapter.CompletionOutcome{PRFound: true, PullRequest: "https://example.test/pull/107", HeadCommit: strings.Repeat("b", 40), AutoMergeArmed: true}, status: scheduler.StatusWaitingForMerge},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			run := resumableRun(t, 107, "late-outcome-107")
+			run.RecoveredRetirementRequired = true
+			run.Continuation.LocalCommit = strings.Repeat("a", 40)
+			run.Continuation.RemoteBranchState = "absent"
+			workers := newFakeWorkers()
+			workers.startupCloseResult.GroupExited = true
+			store := &memoryStore{value: state.State{Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}}
+			calls := 0
+			github := &fakeGitHub{completionFunc: func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
+				calls++
+				if calls == 1 {
+					return ghadapter.CompletionOutcome{}, nil
+				}
+				return test.outcome, nil
+			}}
+			runner := testRunner(github, workers, store, 1)
+			runner.Output = io.Discard
+			gitCalls := 0
+			runner.VerifyResumeGit = func(context.Context, scheduler.Run) (string, bool, string, error) {
+				gitCalls++
+				return strings.Repeat("a", 40), gitCalls > 1, map[bool]string{true: strings.Repeat("b", 40)}[gitCalls > 1], nil
+			}
+			if test.status == scheduler.StatusMerged {
+				runner.CompletionRetirement = recoveredCompletionRetirerFunc(func(_ context.Context, selected scheduler.Run) (bool, error) {
+					current := store.LoadValue()
+					completed := findRun(current.Runs, selected.RunID)
+					completed.Status = scheduler.StatusMerged
+					completed.PullRequest = test.outcome.PullRequest
+					replaceRun(&current, completed)
+					removeLease(&current, completed.RunID)
+					return true, store.Save(current)
+				})
+			}
+			current := store.LoadValue()
+			process, err := runner.resume(context.Background(), context.Background(), &current, run)
+			if err != nil || process != nil || workers.releaseCount() != 0 {
+				t.Fatalf("late outcome = process %v error %v releases %d", process, err, workers.releaseCount())
+			}
+			got := store.LoadValue()
+			if got.Runs[0].Status != test.status || test.status == scheduler.StatusMerged && len(got.Leases) != 0 || test.status == scheduler.StatusWaitingForMerge && (len(got.Leases) != 1 || !got.Runs[0].RecoveredRetirementRequired) {
+				t.Fatalf("late outcome state = %#v", got)
+			}
+		})
+	}
+}
+
 func TestRunnerAbortsGatedReplacementOnFreshIssueLabelWorktreeOrStoppedWorkerDrift(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -3920,7 +4103,7 @@ func TestRunnerRoutesPostResumeSettlementCompletionAfterStoppedProofToRetirement
 	completionCalls := 0
 	github := &fakeGitHub{completionFunc: func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
 		completionCalls++
-		if completionCalls >= 4 {
+		if workers.releaseCount() == 1 {
 			return mergedOutcome(run.Issue), nil
 		}
 		return ghadapter.CompletionOutcome{}, nil
@@ -4133,7 +4316,16 @@ while IFS= read -r ignored; do :; done
 	store := &memoryStore{value: state.State{Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}}
 	base := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	var clock atomic.Int64
-	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+	pullRequest := "https://example.test/pull/106"
+	completionCalls := 0
+	github := &fakeGitHub{completionFunc: func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
+		completionCalls++
+		if completionCalls >= 4 {
+			return ghadapter.CompletionOutcome{PRFound: true, PullRequest: pullRequest}, nil
+		}
+		return ghadapter.CompletionOutcome{}, nil
+	}}
+	runner := testRunner(github, newFakeWorkers(), store, 1)
 	runner.Workers = realWorkers
 	runner.Now = func() time.Time { return base.Add(time.Duration(clock.Load()) * time.Second) }
 	wake := newControlledCandidateRetryTimer()
@@ -4154,8 +4346,8 @@ while IFS= read -r ignored; do :; done
 		t.Fatal("first structured provider exhaustion did not schedule a cooldown")
 	}
 	first := store.LoadValue().Runs[0]
-	if first.Status != scheduler.StatusSuspended || first.ProviderContinuationAttempts != 1 || first.FailureClass != scheduler.FailureProviderExhaustion || first.Continuation == nil || first.Continuation.Workflow != "afk" || filepath.Base(first.Continuation.CheckpointFile) != "backlog-afk-checkpoint-v1.json" {
-		t.Fatalf("first structured exhaustion = %#v", first)
+	if first.Status != scheduler.StatusSuspended || first.ProviderContinuationAttempts != 1 || first.FailureClass != scheduler.FailureProviderExhaustion || first.PullRequest != pullRequest || first.Continuation == nil || first.Continuation.Workflow != "afk" || filepath.Base(first.Continuation.CheckpointFile) != "backlog-afk-checkpoint-v1.json" {
+		t.Fatalf("first structured exhaustion with unarmed expected pull request = %#v", first)
 	}
 	clock.Store(30)
 	wake.ticks <- base.Add(30 * time.Second)
@@ -4168,6 +4360,64 @@ while IFS= read -r ignored; do :; done
 	got := store.LoadValue().Runs[0]
 	if got.Status != scheduler.StatusNeedsHuman || got.ProviderContinuationAttempts != 1 || got.FailureClass != scheduler.FailureProviderExhaustion || got.Continuation == nil || got.Continuation.WorkerGeneration != got.WorkerGeneration || !strings.Contains(got.Error, "one bounded Backlog continuation") || realWorkers.startCount() != 2 {
 		t.Fatalf("second structured exhaustion = %#v, starts=%d", got, realWorkers.startCount())
+	}
+}
+
+func TestRunnerRealResumedSettlementNeverFallsBackFromShipItToAFK(t *testing.T) {
+	run := resumableRun(t, 111, "ship-it-monotonic-111")
+	gitDir := filepath.Join(run.Worktree, ".git")
+	if err := os.Mkdir(gitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := filepath.Join(gitDir, "ship-it-checkpoint-v1.md")
+	checkpointData := []byte(fmt.Sprintf("# Ship-it checkpoint v1\n\nStatus: active\nStage: normal-review\nCoordinator session: %s\nWorking directory: %s\nBranch: %s\n", run.SessionID, run.Worktree, run.Branch))
+	if err := os.WriteFile(checkpoint, checkpointData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, err := filepath.EvalSymlinks(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpointHash := sha256.Sum256(checkpointData)
+	run.Workflow, run.WorkflowStage = "ship-it", "normal-review"
+	run.Continuation.Workflow, run.Continuation.WorkflowStage = "ship-it", "normal-review"
+	run.Continuation.CheckpointFile, run.Continuation.CheckpointSHA256 = checkpoint, hex.EncodeToString(checkpointHash[:])
+	run.Continuation.CheckpointStatus = "active"
+	content, err := os.ReadFile(run.Continuation.SessionFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(content)), "\n")
+	entry := lines[len(lines)-1]
+	stateData := fmt.Sprintf(`{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":%q,"sessionId":%q}`, run.Continuation.SessionFile, run.SessionID)
+	entriesData := fmt.Sprintf(`{"entries":[%s],"leafId":"leaf"}`, entry)
+	script := filepath.Join(t.TempDir(), "pi")
+	scriptBody := `#!/bin/sh
+set -eu
+IFS= read -r prompt
+rm -f ` + fmt.Sprintf("%q", checkpoint) + `
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"auto_retry_start","attempt":1}' '{"type":"auto_retry_end","attempt":1,"success":false}' '{"type":"agent_settled"}'
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-suspend-state","type":"response","command":"get_state","success":true,"data":` + stateData + `}'
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":` + entriesData + `}'
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-suspend-final-state","type":"response","command":"get_state","success":true,"data":` + stateData + `}'
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-suspend-stable-entries","type":"response","command":"get_entries","success":true,"data":` + entriesData + `}'
+while IFS= read -r ignored; do :; done
+`
+	if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}}
+	realWorkers := &supervisedTestWorkers{supervisor: worker.Supervisor{Executable: script, LogsDir: t.TempDir(), TerminationGrace: time.Second}}
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+	runner.Workers = realWorkers
+	assertInterventionRequired(t, runner.Run(context.Background()), 1)
+	got := store.LoadValue().Runs[0]
+	if got.Status != scheduler.StatusNeedsHuman || got.FailureClass != scheduler.FailureUnsafeContinuation || got.ProviderContinuationAttempts != 0 || got.Workflow != "ship-it" || !strings.Contains(got.Error, "ship-it checkpoint is missing") || realWorkers.startCount() != 1 {
+		t.Fatalf("monotonic ship-it settlement = %#v, starts %d", got, realWorkers.startCount())
 	}
 }
 
@@ -4308,7 +4558,7 @@ func TestRunnerRetainsUnverifiedReplacementAfterIdentityPersistenceFailure(t *te
 	store := &memoryStore{value: state.State{
 		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main",
 		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: "lease-88", Issue: 88, RunID: run.RunID}},
-	}, failAtSave: 2}
+	}, failAtSave: 3}
 	runner := testRunner(&fakeGitHub{}, workers, store, 1)
 	runner.Output = io.Discard
 	current := store.LoadValue()
@@ -4338,7 +4588,12 @@ func TestRunnerInterruptedReplacementIdentityMarksSuspensionIncomplete(t *testin
 	runner.Output = io.Discard
 	operationCtx, cancel := context.WithCancel(context.Background())
 	cancel()
-	runner.PIDIdentity = func(ctx context.Context, _ int) (string, error) { return "", ctx.Err() }
+	gatedIdentityObserved := false
+	runner.PIDIdentity = func(ctx context.Context, pid int) (string, error) {
+		persisted := store.LoadValue().Runs[0]
+		gatedIdentityObserved = persisted.ResumePending && persisted.PID == pid && persisted.WorkerGeneration == run.WorkerGeneration+1
+		return "", ctx.Err()
+	}
 	current := store.LoadValue()
 
 	process, err := runner.resume(context.Background(), operationCtx, &current, run)
@@ -4346,8 +4601,8 @@ func TestRunnerInterruptedReplacementIdentityMarksSuspensionIncomplete(t *testin
 		t.Fatalf("interrupted Resume = %#v, %v", process, err)
 	}
 	got := store.LoadValue()
-	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID == 0 || len(got.Leases) != 1 || !runner.suspensionFailed.Load() {
-		t.Fatalf("interrupted replacement identity = %#v", got)
+	if got.Runs[0].Status != scheduler.StatusNeedsHuman || got.Runs[0].PID == 0 || len(got.Leases) != 1 || !runner.suspensionFailed.Load() || !gatedIdentityObserved {
+		t.Fatalf("interrupted replacement identity = %#v, gated observed %t", got, gatedIdentityObserved)
 	}
 	err = runner.suspendOwned(&current, map[int]WorkerProcess{}, 143)
 	var signalExit *SignalExit

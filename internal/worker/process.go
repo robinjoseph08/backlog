@@ -41,12 +41,13 @@ type Request struct {
 }
 
 type ContinuationRequest struct {
-	Issue      int
-	RunID      string
-	Branch     string
-	SessionID  string
-	SessionDir string
-	Worktree   string
+	Issue            int
+	RunID            string
+	Branch           string
+	SessionID        string
+	SessionDir       string
+	Worktree         string
+	ExpectedWorkflow string
 }
 
 type Continuation struct {
@@ -940,6 +941,9 @@ func inspectWorkflowCheckpointMode(expected ContinuationRequest, entries []json.
 	// #nosec G703 -- checkpointFile is a fixed basename under the resolved worktree Git directory.
 	checkpointInfo, err := os.Lstat(checkpointFile)
 	if errors.Is(err, os.ErrNotExist) {
+		if expected.ExpectedWorkflow == "ship-it" {
+			return "", "", "", "", "", "", errors.New("ship-it checkpoint is missing after the Run entered ship-it")
+		}
 		return inspectAFKCheckpoint(expected, entries, gitDir, captureAFK)
 	}
 	if err != nil {
@@ -1063,8 +1067,8 @@ func inspectAFKCheckpoint(expected ContinuationRequest, entries []json.RawMessag
 	if err != nil {
 		return "", "", "", "", "", "", fmt.Errorf("read AFK stage checkpoint: %w", err)
 	}
-	var value afkCheckpoint
-	if err := json.Unmarshal(data, &value); err != nil || value.Version != 1 || value.Workflow != "afk" || value.Stage != "afk-coordinator" {
+	value, err := decodeAFKCheckpoint(data)
+	if err != nil || value.Version != 1 || value.Workflow != "afk" || value.Stage != "afk-coordinator" {
 		return "", "", "", "", "", "", errors.New("AFK stage checkpoint is malformed or unsupported")
 	}
 	if value.Issue != expected.Issue || value.RunID != expected.RunID || value.SessionID != expected.SessionID || value.Worktree != expected.Worktree {
@@ -1072,6 +1076,57 @@ func inspectAFKCheckpoint(expected ContinuationRequest, entries []json.RawMessag
 	}
 	hash := sha256.Sum256(data)
 	return "afk", value.Stage, checkpointFile, hex.EncodeToString(hash[:]), "active", "", nil
+}
+
+func decodeAFKCheckpoint(data []byte) (afkCheckpoint, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return afkCheckpoint{}, errors.New("checkpoint must be one JSON object")
+	}
+	allowed := map[string]bool{
+		"version": true, "workflow": true, "stage": true, "issue": true,
+		"runId": true, "sessionId": true, "worktree": true,
+	}
+	fields := make(map[string]json.RawMessage, len(allowed))
+	for decoder.More() {
+		token, err := decoder.Token()
+		key, ok := token.(string)
+		if err != nil || !ok || !allowed[key] || fields[key] != nil {
+			return afkCheckpoint{}, errors.New("checkpoint contains duplicate, unknown, or noncanonical fields")
+		}
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			return afkCheckpoint{}, err
+		}
+		fields[key] = raw
+	}
+	if _, err := decoder.Token(); err != nil || len(fields) != len(allowed) {
+		return afkCheckpoint{}, errors.New("checkpoint does not contain the exact canonical schema")
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		return afkCheckpoint{}, err
+	}
+	var value afkCheckpoint
+	decode := func(key string, target any) error { return json.Unmarshal(fields[key], target) }
+	if err := errors.Join(
+		decode("version", &value.Version), decode("workflow", &value.Workflow), decode("stage", &value.Stage),
+		decode("issue", &value.Issue), decode("runId", &value.RunID), decode("sessionId", &value.SessionID), decode("worktree", &value.Worktree),
+	); err != nil {
+		return afkCheckpoint{}, err
+	}
+	return value, nil
+}
+
+func ensureJSONEOF(decoder *json.Decoder) error {
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("checkpoint contains trailing JSON")
+		}
+		return err
+	}
+	return nil
 }
 
 func inspectCheckpointBlockers(checkpointFile string) (kind, cause, fingerprint string, err error) {

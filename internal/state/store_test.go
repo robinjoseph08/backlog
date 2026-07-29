@@ -95,9 +95,9 @@ func TestFileStoreMigratesLiteralV4RunningSuspendedAndFailedRunsToV5(t *testing.
   "defaultBranch": "main",
   "maxConcurrentIssues": 3,
   "runs": [
-    {"issue":41,"runId":"running-v4","status":"running","workerMode":"rpc","pid":4100,"processIdentity":"4100:running-start","branch":"agent/issue-41-running-v4","worktree":"/worktrees/running-v4","sessionId":"backlog-running-v4","sessionDir":"/sessions/running-v4","startedAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-29T00:01:00Z"},
+    {"issue":41,"runId":"running-v4","status":"running","workerMode":"rpc","pid":4100,"processIdentity":"4100:running-start","branch":"agent/issue-41-running-v4","worktree":"/worktrees/running-v4","sessionId":"backlog-running-v4","sessionDir":"/sessions/running-v4","continuation":{"sessionId":"backlog-running-v4","sessionFile":"/sessions/running-v4/session.jsonl","worktree":"/worktrees/running-v4","leafId":"leaf","entryCount":2,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","verifiedAt":"2026-07-29T00:01:00Z"},"startedAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-29T00:01:00Z"},
     {"issue":42,"runId":"suspended-v4","status":"suspended","workerMode":"rpc","branch":"agent/issue-42-suspended-v4","worktree":"/worktrees/suspended-v4","sessionId":"backlog-suspended-v4","sessionDir":"/sessions/suspended-v4","continuation":{"sessionId":"backlog-suspended-v4","sessionFile":"/sessions/suspended-v4/session.jsonl","worktree":"/worktrees/suspended-v4","leafId":"leaf","entryCount":2,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verifiedAt":"2026-07-29T00:02:00Z"},"startedAt":"2026-07-29T00:00:00Z","suspendedAt":"2026-07-29T00:02:01Z","updatedAt":"2026-07-29T00:02:01Z"},
-    {"issue":43,"runId":"failed-v4","status":"failed","workerMode":"rpc","pid":4300,"processIdentity":"4300:failed-start","branch":"agent/issue-43-failed-v4","worktree":"/worktrees/failed-v4","sessionId":"backlog-failed-v4","sessionDir":"/sessions/failed-v4","error":"validation failed","startedAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-29T00:03:00Z"}
+    {"issue":43,"runId":"failed-v4","status":"failed","workerMode":"rpc","processIdentity":"4300:failed-start","branch":"agent/issue-43-failed-v4","worktree":"/worktrees/failed-v4","sessionId":"backlog-failed-v4","sessionDir":"/sessions/failed-v4","error":"validation failed","startedAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-29T00:03:00Z"}
   ],
   "leases": [
     {"leaseId":"running-v4","issue":41,"runId":"running-v4"},
@@ -123,12 +123,16 @@ func TestFileStoreMigratesLiteralV4RunningSuspendedAndFailedRunsToV5(t *testing.
 	if err != nil || string(unchanged) != fixture {
 		t.Fatalf("V4 Preview mutated source: %v\n%s", err, unchanged)
 	}
+	running := preview.Runs[0]
+	if running.WorkerGeneration != 1 || running.Continuation == nil || running.Continuation.WorkerGeneration != 1 {
+		t.Fatalf("migrated running continuation generation = %#v", running)
+	}
 	suspended := preview.Runs[1]
 	if suspended.WorkerGeneration != 1 || suspended.StoppedWorkerGeneration != 1 || suspended.WorkerStoppedAt == nil || suspended.Continuation.WorkerGeneration != 1 {
 		t.Fatalf("migrated suspended Resume proof = %#v", suspended)
 	}
 	failed := preview.Runs[2]
-	if failed.StoppedWorkerPID != 4300 || failed.StoppedWorkerProcessIdentity != "4300:failed-start" || failed.PID != 4300 || failed.ProcessIdentity != "4300:failed-start" {
+	if failed.StoppedWorkerPID != 4300 || failed.StoppedWorkerProcessIdentity != "4300:failed-start" || failed.PID != 0 || failed.ProcessIdentity != "" {
 		t.Fatalf("migrated failed offline Recovery identity = %#v", failed)
 	}
 	got, err := store.Load()

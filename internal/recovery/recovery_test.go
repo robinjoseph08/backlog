@@ -115,6 +115,31 @@ func TestRecoveryAcceptsConclusiveAbsenceFromRetainedProcessIdentity(t *testing.
 	}
 }
 
+func TestRecoveryRefusesPendingOrCurrentReplacementIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*scheduler.Run)
+		want   string
+	}{
+		{name: "pending", mutate: func(run *scheduler.Run) { run.ResumePending = true }, want: "pending replacement"},
+		{name: "current PID", mutate: func(run *scheduler.Run) { run.PID = 777 }, want: "current Worker"},
+		{name: "current process identity", mutate: func(run *scheduler.Run) { run.ProcessIdentity = "777:current" }, want: "current Worker"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			run, store := recoverableFixture(t)
+			test.mutate(&run)
+			store.value.Runs[0] = run
+			module := newTestModule(t, store, fakeGitHub{issue: openIssue(run.Issue)}, func(int) (bool, error) { return false, nil }, time.Now())
+			if _, err := module.Inspect(context.Background(), run.RunID); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Recovery refusal = %v, want %q", err, test.want)
+			}
+			if len(store.value.Leases) != 1 || store.value.Runs[0].Status != scheduler.StatusFailed {
+				t.Fatalf("Recovery refusal mutated ownership: %#v", store.value)
+			}
+		})
+	}
+}
+
 func TestRecoveryRefusesLiveOrUncertainWorkerWithoutChangingLease(t *testing.T) {
 	run, store := recoverableFixture(t)
 	run.StoppedWorkerPID = 123
@@ -249,7 +274,7 @@ func TestRecoveryReconcilesArmedExpectedPullRequestWithoutLaunchingContinuation(
 	if _, err := module.Recover(context.Background(), plan); err != nil {
 		t.Fatalf("recover: %v", err)
 	}
-	if got := store.value.Runs[0]; got.Status != scheduler.StatusWaitingForMerge || got.PullRequest != github.pulls[0].URL || len(store.value.Leases) != 1 {
+	if got := store.value.Runs[0]; got.Status != scheduler.StatusWaitingForMerge || got.PullRequest != github.pulls[0].URL || !got.RecoveredRetirementRequired || len(store.value.Leases) != 1 {
 		t.Fatalf("waiting reconciliation = %#v", store.value)
 	}
 }
@@ -358,7 +383,7 @@ func TestRecoveryLateArmedPullRequestOutranksChangedPlan(t *testing.T) {
 	if err != nil || result.Outcome != OutcomeWaiting {
 		t.Fatalf("late waiting outcome = %#v, %v", result, err)
 	}
-	if store.value.Runs[0].Status != scheduler.StatusWaitingForMerge || len(store.value.Leases) != 1 {
+	if store.value.Runs[0].Status != scheduler.StatusWaitingForMerge || !store.value.Runs[0].RecoveredRetirementRequired || len(store.value.Leases) != 1 {
 		t.Fatalf("late waiting transition = %#v", store.value)
 	}
 }

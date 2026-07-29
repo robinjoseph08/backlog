@@ -169,6 +169,9 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 		return Plan{}, fmt.Errorf("recorded pull request %s was not found for Run branch %s", snapshot.Run.PullRequest, snapshot.Run.Branch)
 	}
 	if len(mergedPulls) != 0 && snapshot.Run.Status != policy.TerminalStatus && policy.AllowMergedCompletion {
+		if (snapshot.Run.RecoveredRetirementRequired || snapshot.Run.RecoveryCount > 0) && !policy.RetireMergedCompletionArtifacts {
+			return Plan{}, fmt.Errorf("recovered Completion requires the full recovered retirement policy")
+		}
 		if snapshot.Issue.Open {
 			return Plan{}, fmt.Errorf("issue #%d is open; Completion requires a verified GitHub closure", snapshot.Issue.Number)
 		}
