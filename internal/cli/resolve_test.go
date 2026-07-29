@@ -1927,6 +1927,126 @@ exec `+quote(gh)+` "$@"
 	if current.Runs[0].Status != scheduler.StatusMerged || current.Runs[0].CompletedAt == nil || len(current.Leases) != 0 {
 		t.Fatalf("closure-reason Completion race state = %#v", current)
 	}
+	if branch, err := inspectRemoteBranch(context.Background(), fixture.git, fixture.repository, fixture.branch); err != nil || branch.Present {
+		t.Fatalf("closure-reason Completion race remote branch = %#v, %v", branch, err)
+	}
+	var github struct {
+		Labels []string `json:"labels"`
+	}
+	data, err := os.ReadFile(fixture.githubState)
+	if err != nil || json.Unmarshal(data, &github) != nil {
+		t.Fatalf("read closure-reason Completion race labels: %v", err)
+	}
+	if strings.Join(github.Labels, ",") != "spec" {
+		t.Fatalf("closure-reason Completion race retained labels: %v", github.Labels)
+	}
+}
+
+func TestCompiledResolvePreservesRetiredArtifactCommitIdentityAcrossLateMerge(t *testing.T) {
+	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusFailed, false, false, false)
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.Runs[0].PullRequest = ""
+	if err := fixture.store.Save(current); err != nil {
+		t.Fatal(err)
+	}
+	gh := githubArtifactResolveGitHub(t, fixture)
+	replacement := strings.Repeat("b", 40)
+	racingGitHub := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "pr list --repo acme/widgets --state all --head `+fixture.branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    if git --git-dir=`+quote(fixture.remote)+` show-ref --verify --quiet refs/heads/`+fixture.branch+`; then
+      printf '%s\n' '[]'
+    else
+      printf '%s\n' '[{"number":99,"url":"https://github.com/acme/widgets/pull/99","state":"MERGED","mergedAt":"2026-07-29T14:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"`+fixture.branch+`","headRefOid":"`+replacement+`","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]'
+    fi
+    exit 0 ;;
+esac
+exec `+quote(gh)+` "$@"
+`)
+
+	binary := buildExecutable(t, t.TempDir())
+	command := exec.Command(binary, githubArtifactResolveArgs(fixture, fixture.git, racingGitHub, "--yes")...)
+	output, err := command.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "approved remote branch commit identity does not match the merged expected pull request head") {
+		t.Fatalf("retired-artifact late merge error = %v\n%s", err, output)
+	}
+	current, err = fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusResolvingExternally || current.Runs[0].CompletedAt != nil || len(current.Leases) != 1 {
+		t.Fatalf("retired-artifact late merge released ownership: %#v", current)
+	}
+	if branch, err := inspectRemoteBranch(context.Background(), fixture.git, fixture.repository, fixture.branch); err != nil || branch.Present {
+		t.Fatalf("approved remote branch was not retired before late merge = %#v, %v", branch, err)
+	}
+	if strings.Contains(string(output), "Completion recorded") {
+		t.Fatalf("retired-artifact late merge reported Completion: %s", output)
+	}
+}
+
+func TestCompiledResolveRefusesUnapprovedCleanupIntroducedByLateMerge(t *testing.T) {
+	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusFailed, false, false, false)
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.Runs[0].PullRequest = ""
+	if err := fixture.store.Save(current); err != nil {
+		t.Fatal(err)
+	}
+	gh := githubArtifactResolveGitHub(t, fixture)
+	fixture.updateGitHubState(t, `.labels=["spec"]`)
+	commit := strings.TrimSpace(gitOutput(t, fixture.repository, "rev-parse", "origin/"+fixture.branch))
+	mutation := filepath.Join(t.TempDir(), "unapproved-label-mutation")
+	racingGitHub := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    if git --git-dir=`+quote(fixture.remote)+` show-ref --verify --quiet refs/heads/`+fixture.branch+`; then
+      labels='[{"name":"spec"}]'
+    else
+      labels='[{"name":"in-progress"},{"name":"spec"}]'
+    fi
+    printf '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","labels":%s}\n' "$labels"
+    exit 0 ;;
+  "pr list --repo acme/widgets --state all --head `+fixture.branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    if git --git-dir=`+quote(fixture.remote)+` show-ref --verify --quiet refs/heads/`+fixture.branch+`; then
+      printf '%s\n' '[]'
+    else
+      printf '%s\n' '[{"number":99,"url":"https://github.com/acme/widgets/pull/99","state":"MERGED","mergedAt":"2026-07-29T14:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"`+fixture.branch+`","headRefOid":"`+commit+`","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]'
+    fi
+    exit 0 ;;
+  "issue edit 42 --repo acme/widgets --remove-label in-progress")
+    touch `+quote(mutation)+`
+    exec `+quote(gh)+` "$@" ;;
+esac
+exec `+quote(gh)+` "$@"
+`)
+
+	binary := buildExecutable(t, t.TempDir())
+	command := exec.Command(binary, githubArtifactResolveArgs(fixture, fixture.git, racingGitHub, "--yes")...)
+	output, err := command.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "merged Completion requires unapproved retirement action") {
+		t.Fatalf("unapproved late-merge cleanup error = %v\n%s", err, output)
+	}
+	current, err = fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusResolvingExternally || current.Runs[0].CompletedAt != nil || len(current.Leases) != 1 {
+		t.Fatalf("unapproved late-merge cleanup released ownership: %#v", current)
+	}
+	if _, err := os.Stat(mutation); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unapproved late-merge cleanup mutated a label: %v", err)
+	}
+	if strings.Contains(string(output), "Completion recorded") {
+		t.Fatalf("unapproved late-merge cleanup reported Completion: %s", output)
+	}
 }
 
 func TestCompiledResolveRefusesCompletionAfterExpectedPullRequestCommitChanges(t *testing.T) {

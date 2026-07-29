@@ -530,10 +530,18 @@ func (e Service) verifyGitHubIdentityContinuityWithCompletion(expected, actual S
 			if pull.URL != owned.URL || pull.Branch != owned.Branch || pull.Commit != owned.Commit {
 				return fmt.Errorf("pull request #%d branch or expected commit identity changed while %s", pull.Number, e.policy.ProgressStatus)
 			}
+			if allowClosureReasonChange && pull.State == PullRequestMerged {
+				if err := verifyApprovedArtifactCommitIdentity(expected, pull.Commit); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 		if addedMergedPull || expected.Run.PullRequest != "" || expected.Run.Branch == "" || pull.Branch != expected.Run.Branch || pull.State != PullRequestMerged {
 			return fmt.Errorf("pull request identity set changed while %s GitHub artifacts", e.policy.ProgressStatus)
+		}
+		if err := verifyApprovedArtifactCommitIdentity(expected, pull.Commit); err != nil {
+			return err
 		}
 		addedMergedPull = true
 	}
@@ -568,6 +576,24 @@ func (e Service) verifyGitHubIdentityContinuityWithCompletion(expected, actual S
 		}
 	} else if expected.Session.Archived || expected.Session.Present && !actual.Session.Present {
 		return fmt.Errorf("Pi session archive disappeared while %s Run %s", e.policy.ProgressStatus, expected.Run.RunID)
+	}
+	return nil
+}
+
+func verifyApprovedArtifactCommitIdentity(approved Snapshot, mergedCommit string) error {
+	artifacts := []struct {
+		description string
+		commit      string
+		present     bool
+	}{
+		{description: "remote branch", commit: approved.RemoteBranch.Commit, present: approved.RemoteBranch.Present},
+		{description: "local branch", commit: approved.LocalBranch.Commit, present: approved.LocalBranch.Present},
+		{description: "local worktree", commit: approved.Worktree.Commit, present: approved.Worktree.Present},
+	}
+	for _, artifact := range artifacts {
+		if artifact.present && artifact.commit != mergedCommit {
+			return fmt.Errorf("approved %s commit identity does not match the merged expected pull request head", artifact.description)
+		}
 	}
 	return nil
 }
