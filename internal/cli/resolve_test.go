@@ -150,6 +150,68 @@ func assertResolveStateBindingsAbsent(t *testing.T, repository string) {
 	}
 }
 
+type cleanHistoricalCompletionResolveFixture struct {
+	repository, stateDir, git, gh, githubState string
+	store                                      state.FileStore
+}
+
+func newCleanHistoricalCompletionResolveFixture(t *testing.T) cleanHistoricalCompletionResolveFixture {
+	t.Helper()
+	root := t.TempDir()
+	repository := filepath.Join(root, "repo")
+	remote := filepath.Join(root, "remote.git")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", "-b", "main", repository)
+	runGit(t, repository, "config", "user.name", "Resolve Test")
+	runGit(t, repository, "config", "user.email", "resolve@example.test")
+	if err := os.WriteFile(filepath.Join(repository, "tracked"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repository, "add", "tracked")
+	runGit(t, repository, "commit", "-m", "base")
+	runGit(t, repository, "remote", "add", "origin", remote)
+	runGit(t, repository, "push", "-u", "origin", "main")
+
+	completedAt := time.Date(2026, 7, 29, 14, 0, 0, 0, time.UTC)
+	branch := "agent/issue-42-run-clean"
+	pullRequest := "https://github.com/acme/widgets/pull/99"
+	stateDir := filepath.Join(root, "state")
+	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
+	if err := store.Save(state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
+		Runs: []scheduler.Run{{
+			Issue: 42, RunID: "run-clean", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint,
+			Branch: branch, Worktree: filepath.Join(stateDir, "worktrees", "issue-42-run-clean"), PullRequest: pullRequest,
+			CompletedAt: &completedAt, UpdatedAt: completedAt,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	githubState := filepath.Join(root, "github.json")
+	if err := os.WriteFile(githubState, []byte(`{"labels":["spec"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	commit := strings.TrimSpace(gitOutput(t, repository, "rev-parse", "main"))
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+state=`+quote(githubState)+`
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef") printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    labels=$(jq -c '[.labels[] | {name:.}]' "$state")
+    printf '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","labels":%s}\n' "$labels" ;;
+  "issue view 42 --repo acme/widgets --json number,url,state,stateReason")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","stateReason":"COMPLETED"}' ;;
+  "pr list --repo acme/widgets --state all --head `+branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    printf '%s\n' '[{"number":99,"url":"`+pullRequest+`","state":"MERGED","mergedAt":"2026-07-29T14:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"`+branch+`","headRefOid":"`+commit+`","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	return cleanHistoricalCompletionResolveFixture{
+		repository: repository, stateDir: stateDir, git: githubGit(t), gh: gh, githubState: githubState, store: store,
+	}
+}
+
 func localArtifactResolveGitHub(t *testing.T, fixture localArtifactResetFixture) string {
 	t.Helper()
 	if err := os.WriteFile(fixture.githubState, []byte(`{"labels":["in-progress","ready-for-agent","spec"]}`), 0o600); err != nil {
@@ -1095,6 +1157,26 @@ esac
 	}
 	if fileDigest(t, fixture.store.Path) != beforeState || fileDigest(t, fixture.githubState) != beforeGitHub || gitSnapshot(t, fixture.repository) != beforeRefs || filesystemSnapshot(t, fixture.archiveDir) != beforeArchive {
 		t.Fatal("Historical Completion no-op rerun performed a mutation")
+	}
+	assertResolveStateBindingsAbsent(t, fixture.repository)
+}
+
+func TestCompiledResolveInitiallyCleanHistoricalCompletionNoOpDoesNotCreateStateBindings(t *testing.T) {
+	fixture := newCleanHistoricalCompletionResolveFixture(t)
+	binary := buildExecutable(t, t.TempDir())
+	args := []string{"resolve", "run-clean", "--yes", "--repo-dir", fixture.repository, "--state-dir", fixture.stateDir, "--git", fixture.git, "--gh", fixture.gh}
+
+	assertResolveStateBindingsAbsent(t, fixture.repository)
+	beforeState := fileDigest(t, fixture.store.Path)
+	beforeGitHub := fileDigest(t, fixture.githubState)
+	beforeRefs := gitSnapshot(t, fixture.repository)
+	beforeStateDirectory := filesystemSnapshot(t, fixture.stateDir)
+	output, err := exec.Command(binary, args...).CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "Required actions:\n  None.") {
+		t.Fatalf("initially clean Historical Completion no-op: %v\n%s", err, output)
+	}
+	if fileDigest(t, fixture.store.Path) != beforeState || fileDigest(t, fixture.githubState) != beforeGitHub || gitSnapshot(t, fixture.repository) != beforeRefs || filesystemSnapshot(t, fixture.stateDir) != beforeStateDirectory {
+		t.Fatal("initially clean Historical Completion no-op performed a mutation")
 	}
 	assertResolveStateBindingsAbsent(t, fixture.repository)
 }
