@@ -3,6 +3,7 @@
 package resolution
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -17,27 +18,29 @@ import (
 // merged pull request from the expected Run branch establishes Completion.
 func Policy(selector string) retirement.Policy {
 	return retirement.Policy{
-		Operation:        "External Resolution",
-		SelectRun:        func(current state.State) (scheduler.Run, scheduler.Lease, error) { return selectRun(current, selector) },
-		ValidateSnapshot: validateSnapshot,
+		Operation:                        "External Resolution",
+		SelectRun:                        func(current state.State) (scheduler.Run, scheduler.Lease, error) { return selectRun(current, selector) },
+		ValidateSnapshot:                 validateSnapshot,
+		ValidateMergedCompletionSnapshot: validateMergedCompletionSnapshot,
 		EligibleStatuses: []scheduler.Status{
 			scheduler.StatusClaimed, scheduler.StatusWorktreeReady, scheduler.StatusRunning,
 			scheduler.StatusWaitingForMerge, scheduler.StatusFailed, scheduler.StatusSuspended,
 			scheduler.StatusNeedsHuman, scheduler.StatusResetting,
 			scheduler.StatusResolvingExternally, scheduler.StatusResolvedExternally,
 		},
-		CanTransition:              canTransition,
-		Explanation:                Explanation,
-		ExplanationAction:          "explain External Resolution",
-		Labels:                     retirement.LabelOutcome{Remove: []string{"in-progress", "ready-for-agent"}},
-		ProgressStatus:             scheduler.StatusResolvingExternally,
-		TerminalStatus:             scheduler.StatusResolvedExternally,
-		RecordMissingLogWarn:       true,
-		RequireClosureReason:       true,
-		AllowMergedCompletion:      true,
-		VerifyHistoricalOnly:       true,
-		MarkProgressBeforeMutation: true,
-		RequireClosedExplanation:   true,
+		CanTransition:                   canTransition,
+		Explanation:                     Explanation,
+		ExplanationAction:               "explain External Resolution",
+		Labels:                          retirement.LabelOutcome{Remove: []string{"in-progress", "ready-for-agent"}},
+		ProgressStatus:                  scheduler.StatusResolvingExternally,
+		TerminalStatus:                  scheduler.StatusResolvedExternally,
+		RecordMissingLogWarn:            true,
+		RequireClosureReason:            true,
+		AllowMergedCompletion:           true,
+		RetireMergedCompletionArtifacts: true,
+		VerifyHistoricalOnly:            true,
+		MarkProgressBeforeMutation:      true,
+		RequireClosedExplanation:        true,
 		FinalizeMetadata: func(run *scheduler.Run, snapshot retirement.Snapshot, now time.Time) {
 			run.ResolvedExternallyAt = &now
 			run.ClosureReason = snapshot.Issue.ClosureReason
@@ -61,6 +64,13 @@ func canTransition(from, to scheduler.Status) bool {
 	default:
 		return false
 	}
+}
+
+func validateMergedCompletionSnapshot(snapshot retirement.Snapshot) error {
+	if snapshot.Run.RecoveredRetirementRequired || snapshot.Run.RecoveryCount > 0 {
+		return errors.New("recovered Completion requires the full recovered retirement policy")
+	}
+	return nil
 }
 
 func validateSnapshot(snapshot retirement.Snapshot) error {

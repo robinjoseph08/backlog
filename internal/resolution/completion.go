@@ -36,19 +36,8 @@ func RecoveredCompletionPolicy(runID string) retirement.Policy {
 			}
 			return scheduler.Run{}, scheduler.Lease{}, fmt.Errorf("Run %q no longer owns its Lease", runID)
 		},
-		ValidateSnapshot: func(snapshot retirement.Snapshot) error {
-			if snapshot.Issue.Open || len(snapshot.PullRequests) != 1 || snapshot.PullRequests[0].State != retirement.PullRequestMerged || snapshot.Run.PullRequest != "" && snapshot.PullRequests[0].URL != snapshot.Run.PullRequest {
-				return errors.New("Recovered Completion requires one merged expected pull request and a closed issue")
-			}
-			pullCommit := snapshot.PullRequests[0].Commit
-			if snapshot.RemoteBranch.Present && snapshot.RemoteBranch.Commit != pullCommit || snapshot.LocalBranch.Present && snapshot.LocalBranch.Commit != pullCommit || snapshot.Worktree.Present && snapshot.Worktree.Commit != pullCommit {
-				return errors.New("Recovered Completion artifact commit identity does not match the merged pull request head")
-			}
-			if snapshot.Run.Status == scheduler.StatusMerged && (snapshot.RemoteBranch.Present || snapshot.LocalBranch.Present || snapshot.Worktree.Present || snapshot.Session.Present) {
-				return errors.New("historical Recovered Completion still has active owned artifacts")
-			}
-			return nil
-		},
+		ValidateSnapshot:                 validateRecoveredCompletionSnapshot,
+		ValidateMergedCompletionSnapshot: validateRecoveredCompletionSnapshot,
 		EligibleStatuses: []scheduler.Status{
 			scheduler.StatusFailed, scheduler.StatusNeedsHuman, scheduler.StatusSuspended,
 			scheduler.StatusWaitingForMerge, scheduler.StatusResolvingExternally, scheduler.StatusMerged,
@@ -63,6 +52,20 @@ func RecoveredCompletionPolicy(runID string) retirement.Policy {
 		RetireMergedCompletionArtifacts: true,
 		VerifyHistoricalOnly:            true,
 	}
+}
+
+func validateRecoveredCompletionSnapshot(snapshot retirement.Snapshot) error {
+	if snapshot.Issue.Open || len(snapshot.PullRequests) != 1 || snapshot.PullRequests[0].State != retirement.PullRequestMerged || snapshot.Run.PullRequest != "" && snapshot.PullRequests[0].URL != snapshot.Run.PullRequest {
+		return errors.New("Recovered Completion requires one merged expected pull request and a closed issue")
+	}
+	pullCommit := snapshot.PullRequests[0].Commit
+	if snapshot.RemoteBranch.Present && snapshot.RemoteBranch.Commit != pullCommit || snapshot.LocalBranch.Present && snapshot.LocalBranch.Commit != pullCommit || snapshot.Worktree.Present && snapshot.Worktree.Commit != pullCommit {
+		return errors.New("Recovered Completion artifact commit identity does not match the merged pull request head")
+	}
+	if snapshot.Run.Status == scheduler.StatusMerged && (snapshot.RemoteBranch.Present || snapshot.LocalBranch.Present || snapshot.Worktree.Present || snapshot.Session.Present) {
+		return errors.New("historical Recovered Completion still has active owned artifacts")
+	}
+	return nil
 }
 
 // RetireRecoveredCompletion performs complete retirement with a freshly

@@ -193,8 +193,10 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 		}
 		plan := Plan{Snapshot: snapshot, Operation: policy.Operation, TerminalState: scheduler.StatusMerged}
 		if policy.RetireMergedCompletionArtifacts {
-			if err := policy.ValidateSnapshot(snapshot); err != nil {
-				return Plan{}, err
+			if policy.ValidateMergedCompletionSnapshot != nil {
+				if err := policy.ValidateMergedCompletionSnapshot(snapshot); err != nil {
+					return Plan{}, err
+				}
 			}
 			if snapshot.RemoteBranch.Present {
 				plan.Actions = append(plan.Actions, plannedAction(actionDeleteRemoteBranch, fmt.Sprintf("delete remote branch %s at %s", snapshot.RemoteBranch.Name, snapshot.RemoteBranch.Commit)))
