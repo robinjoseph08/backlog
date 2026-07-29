@@ -30,13 +30,15 @@ func resolveCommandWithInput(ctx context.Context, args []string, stdin io.Reader
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: backlog resolve <run-id|positive-issue-number> [flags]")
 		fmt.Fprintln(stderr, "")
-		fmt.Fprintln(stderr, "Completion takes precedence when GitHub verifies a closed issue and the Run's")
+		fmt.Fprintln(stderr, "Completion is preferred when GitHub verifies a closed issue and the Run's")
 		fmt.Fprintln(stderr, "recorded pull request is merged. When the Run has no recorded pull request,")
-		fmt.Fprintln(stderr, "exactly one merged pull request discovered from its expected branch also")
-		fmt.Fprintln(stderr, "establishes Completion. Completion retires owned branches, worktrees, and active")
-		fmt.Fprintln(stderr, "Pi sessions before recording the merged outcome and releasing the Lease.")
-		fmt.Fprintln(stderr, "Multiple unrecorded merged pull requests are ambiguous; resolve refuses them,")
-		fmt.Fprintln(stderr, "retains the Lease, and requires operator intervention.")
+		fmt.Fprintln(stderr, "exactly one merged pull request discovered from its expected branch may establish")
+		fmt.Fprintln(stderr, "Completion. Recovered Runs require the stricter Recovered Completion path, and")
+		fmt.Fprintln(stderr, "present branch and worktree commits must match the merged pull request head.")
+		fmt.Fprintln(stderr, "Failed validation retains the Lease for operator intervention. Verified Completion")
+		fmt.Fprintln(stderr, "retires owned branches, worktrees, and active Pi sessions before recording the")
+		fmt.Fprintln(stderr, "merged outcome and releasing the Lease. Multiple unrecorded merged pull requests")
+		fmt.Fprintln(stderr, "are ambiguous and are refused with the Lease retained.")
 		fmt.Fprintln(stderr, "Otherwise, recognize a supported GitHub issue closure as External Resolution")
 		fmt.Fprintln(stderr, "of an incomplete leased Run. Safely retire owned unmerged pull requests, remote")
 		fmt.Fprintln(stderr, "and local branches, worktrees, and active Pi sessions; remove managed active")
@@ -133,12 +135,12 @@ func resolveCommandWithInput(ctx context.Context, args []string, stdin io.Reader
 	} else {
 		reader := bufio.NewReader(stdin)
 		for {
-			confirmed, err := confirmResolve(ctx, reader, stdout)
+			confirmed, err := confirmResolve(ctx, reader, stdout, plan.Operation)
 			if err != nil {
 				return err
 			}
 			if !confirmed {
-				_, err := fmt.Fprintln(stdout, "External Resolution cancelled; no changes made.")
+				_, err := fmt.Fprintf(stdout, "%s cancelled; no changes made.\n", plan.Operation)
 				return err
 			}
 			fresh, err := module.Inspect(ctx)
@@ -214,11 +216,11 @@ func (w *resolveOutputWriter) Write(data []byte) (int, error) {
 
 func (w *resolveOutputWriter) Err() error { return w.err }
 
-func confirmResolve(ctx context.Context, reader *bufio.Reader, output io.Writer) (bool, error) {
-	if _, err := fmt.Fprint(output, "Proceed with External Resolution? [y/N] "); err != nil {
+func confirmResolve(ctx context.Context, reader *bufio.Reader, output io.Writer, operation string) (bool, error) {
+	if _, err := fmt.Fprintf(output, "Proceed with %s? [y/N] ", operation); err != nil {
 		return false, err
 	}
-	return readConfirmation(ctx, reader, "External Resolution")
+	return readConfirmation(ctx, reader, operation)
 }
 
 func splitResolveArguments(args []string) (string, []string, error) {

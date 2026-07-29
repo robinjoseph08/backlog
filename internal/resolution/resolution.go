@@ -13,12 +13,13 @@ import (
 	"github.com/robinjoseph08/backlog/internal/state"
 )
 
-// Policy recognizes a GitHub-verified closure as External Resolution unless
-// the recorded pull request is merged or, when none was recorded, exactly one
-// merged pull request from the expected Run branch establishes Completion.
+// Policy recognizes a GitHub-verified closure as External Resolution. A merged
+// expected pull request establishes Completion only after fail-closed recovered
+// state and owned-artifact identity checks pass.
 func Policy(selector string) retirement.Policy {
 	return retirement.Policy{
 		Operation:                        "External Resolution",
+		CompletionOperation:              "Completion",
 		SelectRun:                        func(current state.State) (scheduler.Run, scheduler.Lease, error) { return selectRun(current, selector) },
 		ValidateSnapshot:                 validateSnapshot,
 		ValidateMergedCompletionSnapshot: validateMergedCompletionSnapshot,

@@ -191,7 +191,7 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 				return Plan{}, fmt.Errorf("merged pull request is not the expected pull request %s", snapshot.Run.PullRequest)
 			}
 		}
-		plan := Plan{Snapshot: snapshot, Operation: policy.Operation, TerminalState: scheduler.StatusMerged}
+		plan := Plan{Snapshot: snapshot, Operation: policy.CompletionOperation, TerminalState: scheduler.StatusMerged}
 		if policy.RetireMergedCompletionArtifacts {
 			if policy.ValidateMergedCompletionSnapshot != nil {
 				if err := policy.ValidateMergedCompletionSnapshot(snapshot, merged); err != nil {

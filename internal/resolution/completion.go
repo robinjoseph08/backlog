@@ -14,7 +14,8 @@ import (
 // the same complete, fail-closed retirement service used by lifecycle commands.
 func RecoveredCompletionPolicy(runID string) retirement.Policy {
 	return retirement.Policy{
-		Operation: "Recovered Completion",
+		Operation:           "Recovered Completion",
+		CompletionOperation: "Recovered Completion",
 		SelectRun: func(current state.State) (scheduler.Run, scheduler.Lease, error) {
 			var selected scheduler.Run
 			for _, run := range current.Runs {

@@ -14,6 +14,7 @@ import (
 // safety-critical inspection, mutation, revalidation, and verification.
 type Policy struct {
 	Operation                        string
+	CompletionOperation              string
 	SelectRun                        func(state.State) (scheduler.Run, scheduler.Lease, error)
 	ValidateSnapshot                 func(Snapshot) error
 	ValidateMergedCompletionSnapshot func(Snapshot, PullRequest) error
@@ -45,6 +46,9 @@ type LabelOutcome struct {
 func (p Policy) validate() error {
 	if strings.TrimSpace(p.Operation) == "" || p.SelectRun == nil || p.ValidateSnapshot == nil || p.CanTransition == nil || p.Explanation == nil || strings.TrimSpace(p.ExplanationAction) == "" {
 		return fmt.Errorf("owned Run retirement policy is incomplete")
+	}
+	if p.AllowMergedCompletion && strings.TrimSpace(p.CompletionOperation) == "" {
+		return fmt.Errorf("owned Run retirement policy has no Completion operation")
 	}
 	if p.ProgressStatus == "" || p.TerminalStatus == "" || len(p.EligibleStatuses) == 0 ||
 		!p.statusEligible(p.ProgressStatus) || !p.statusEligible(p.TerminalStatus) {

@@ -321,6 +321,93 @@ func TestExternalResolutionCannotFinalizeRecoveredCompletionWithWeakerPolicy(t *
 	}
 }
 
+func TestRecoveredCompletionPolicyValidatesCompletionEvidence(t *testing.T) {
+	const (
+		branch      = "agent/run"
+		pullRequest = "https://github.com/acme/widgets/pull/9"
+	)
+	head := strings.Repeat("a", 40)
+	baseline := func() retirement.Snapshot {
+		return retirement.Snapshot{
+			Run: scheduler.Run{
+				Issue: 42, RunID: "run", Status: scheduler.StatusFailed, Branch: branch,
+				PullRequest: pullRequest, Worktree: "/state/worktrees/run", WorkerMode: scheduler.WorkerModeRPC,
+				SessionID: "backlog-run", SessionDir: "/state/sessions/run", RecoveryCount: 1,
+			},
+			Lease:        scheduler.Lease{LeaseID: "lease", Issue: 42, RunID: "run"},
+			Issue:        retirement.Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", Labels: []string{"in-progress"}},
+			PullRequests: []retirement.PullRequest{{Number: 9, URL: pullRequest, Branch: branch, Commit: head, State: retirement.PullRequestMerged}},
+			RemoteBranch: retirement.Branch{Name: branch, Commit: head, Present: true},
+			LocalBranch:  retirement.Branch{Name: branch, Commit: head, Present: true},
+			Worktree:     retirement.Worktree{Path: "/state/worktrees/run", Branch: branch, Commit: head, Present: true},
+			Session:      retirement.Session{ID: "backlog-run", Dir: "/state/sessions/run", ArchiveDir: "/state/history/sessions/run", Present: true},
+		}
+	}
+
+	plan, err := retirement.Build(RecoveredCompletionPolicy("run"), baseline())
+	if err != nil || plan.TerminalState != scheduler.StatusMerged || plan.Operation != "Recovered Completion" {
+		t.Fatalf("valid Recovered Completion plan = %#v, error = %v", plan, err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*retirement.Snapshot)
+		want   string
+	}{
+		{name: "closed issue", mutate: func(snapshot *retirement.Snapshot) { snapshot.Issue.Open = true }, want: "verified GitHub closure"},
+		{name: "exactly one pull request", mutate: func(snapshot *retirement.Snapshot) {
+			snapshot.PullRequests = append(snapshot.PullRequests, retirement.PullRequest{Number: 10, URL: "https://github.com/acme/widgets/pull/10", Branch: branch, Commit: head, State: retirement.PullRequestOpen})
+		}, want: "one merged expected pull request and a closed issue"},
+		{name: "expected pull request", mutate: func(snapshot *retirement.Snapshot) {
+			snapshot.Run.PullRequest = "https://github.com/acme/widgets/pull/10"
+		}, want: "recorded pull request"},
+		{name: "remote commit", mutate: func(snapshot *retirement.Snapshot) { snapshot.RemoteBranch.Commit = strings.Repeat("b", 40) }, want: "artifact commit identity"},
+		{name: "local commit", mutate: func(snapshot *retirement.Snapshot) { snapshot.LocalBranch.Commit = strings.Repeat("b", 40) }, want: "artifact commit identity"},
+		{name: "worktree commit", mutate: func(snapshot *retirement.Snapshot) { snapshot.Worktree.Commit = strings.Repeat("b", 40) }, want: "artifact commit identity"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := baseline()
+			test.mutate(&snapshot)
+			if plan, err := retirement.Build(RecoveredCompletionPolicy("run"), snapshot); err == nil || !strings.Contains(err.Error(), test.want) || len(plan.Actions) != 0 {
+				t.Fatalf("unsafe Recovered Completion plan = %#v, error = %v, want %q", plan, err, test.want)
+			}
+		})
+	}
+
+	historical := baseline()
+	historical.Run.Status = scheduler.StatusMerged
+	historical.Lease = scheduler.Lease{}
+	historical.Issue.Labels = nil
+	historical.RemoteBranch.Present = false
+	historical.LocalBranch.Present = false
+	historical.Worktree.Present = false
+	historical.Session.Present = false
+	historical.Session.Archived = true
+	if plan, err := retirement.Build(RecoveredCompletionPolicy("run"), historical); err != nil || len(plan.Actions) != 0 {
+		t.Fatalf("retired Historical Recovered Completion plan = %#v, error = %v", plan, err)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*retirement.Snapshot)
+	}{
+		{name: "remote branch", mutate: func(snapshot *retirement.Snapshot) { snapshot.RemoteBranch.Present = true }},
+		{name: "local branch", mutate: func(snapshot *retirement.Snapshot) { snapshot.LocalBranch.Present = true }},
+		{name: "worktree", mutate: func(snapshot *retirement.Snapshot) { snapshot.Worktree.Present = true }},
+		{name: "active session", mutate: func(snapshot *retirement.Snapshot) {
+			snapshot.Session.Present = true
+			snapshot.Session.Archived = false
+		}},
+	} {
+		t.Run("historical "+test.name, func(t *testing.T) {
+			snapshot := historical
+			test.mutate(&snapshot)
+			if plan, err := retirement.Build(RecoveredCompletionPolicy("run"), snapshot); err == nil || !strings.Contains(err.Error(), "historical Recovered Completion still has active owned artifacts") || len(plan.Actions) != 0 {
+				t.Fatalf("active Historical Recovered Completion plan = %#v, error = %v", plan, err)
+			}
+		})
+	}
+}
+
 func TestExpectedBranchPullRequestIdentityForCompletion(t *testing.T) {
 	const (
 		branch   = "agent/run"

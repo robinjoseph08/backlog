@@ -24,20 +24,24 @@ import (
 	"github.com/robinjoseph08/backlog/internal/state"
 )
 
-func TestResolveHelpDescribesCompletionPrecedenceAndCompleteArtifactRetirement(t *testing.T) {
+func TestResolveHelpDescribesCompletionSafetyAndCompleteArtifactRetirement(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if exit := Main(context.Background(), []string{"resolve", "--help"}, &stdout, &stderr); exit != 0 {
 		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
 	}
 	for _, want := range []string{
-		"Completion takes precedence",
-		"Completion retires owned branches, worktrees, and active",
-		"before recording the merged outcome and releasing the Lease",
+		"Completion is preferred",
+		"Verified Completion",
+		"retires owned branches, worktrees, and active Pi sessions",
+		"before recording the",
+		"merged outcome and releasing the Lease",
 		"no recorded pull request",
 		"exactly one merged pull request discovered from its expected branch",
-		"Multiple unrecorded merged pull requests are ambiguous",
-		"retains the Lease",
-		"requires operator intervention",
+		"Recovered Runs require the stricter Recovered Completion path",
+		"commits must match the merged pull request head",
+		"Failed validation retains the Lease",
+		"Multiple unrecorded merged pull requests",
+		"are ambiguous and are refused with the Lease retained",
 		"Safely retire owned unmerged pull requests",
 		"remote",
 		"local branches",
@@ -370,7 +374,7 @@ func TestResolveConfirmationStopsWaitingWhenContextIsCancelled(t *testing.T) {
 	})
 	done := make(chan error, 1)
 	go func() {
-		_, err := confirmResolve(ctx, bufio.NewReader(reader), stdout)
+		_, err := confirmResolve(ctx, bufio.NewReader(reader), stdout, "External Resolution")
 		done <- err
 	}()
 	<-prompted
@@ -913,6 +917,9 @@ esac
 		t.Fatalf("compiled Completion dry-run: %v\n%s", err, output)
 	}
 	plan := string(output)
+	if !strings.Contains(plan, "Completion Plan for issue #42") || strings.Contains(plan, "External Resolution Plan for issue #42") {
+		t.Fatalf("merged outcome used misleading plan terminology:\n%s", plan)
+	}
 	ordered := []string{
 		"mark Run run-local resolving-externally while retaining Lease lease-local",
 		"delete remote branch " + fixture.branch,
@@ -932,10 +939,12 @@ esac
 		position = next
 	}
 
-	mutation := exec.Command(binary, append(args, "--yes")...)
-	output, err = mutation.CombinedOutput()
-	if err != nil || !strings.Contains(string(output), "Completion recorded for Run run-local") {
-		t.Fatalf("compiled Completion retirement: %v\n%s", err, output)
+	var stdout, stderr bytes.Buffer
+	err = resolveCommandWithInput(context.Background(), args[1:], strings.NewReader("yes\n"), true, &stdout, &stderr)
+	if err != nil || !strings.Contains(stdout.String(), "Proceed with Completion? [y/N]") ||
+		strings.Contains(stdout.String(), "Proceed with External Resolution? [y/N]") ||
+		!strings.Contains(stdout.String(), "Completion recorded for Run run-local") {
+		t.Fatalf("interactive Completion retirement: %v, stderr=%q, stdout=%q", err, stderr.String(), stdout.String())
 	}
 	persisted, err := fixture.store.Load()
 	if err != nil {

@@ -358,7 +358,7 @@ func continuationRequest(run scheduler.Run) worker.ContinuationRequest {
 
 func verifyIssue(issue ghadapter.OwnedRunIssue) error {
 	if issue.State != "open" {
-		return errors.New("issue is not open; Completion or External Resolution takes precedence over Recovery")
+		return errors.New("issue is not open; verify Completion or External Resolution before Recovery")
 	}
 	labels := make(map[string]bool, len(issue.Labels))
 	for _, label := range issue.Labels {
