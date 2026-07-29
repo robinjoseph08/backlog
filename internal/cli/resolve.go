@@ -44,6 +44,8 @@ func resolveCommandWithInput(ctx context.Context, args []string, stdin io.Reader
 		fmt.Fprintln(stderr, "of an incomplete leased Run. Safely retire owned unmerged pull requests, remote")
 		fmt.Fprintln(stderr, "and local branches, worktrees, and active Pi sessions; remove managed active")
 		fmt.Fprintln(stderr, "and Candidate labels; preserve diagnostics; then release the Lease.")
+		fmt.Fprintln(stderr, "Historical merged Runs are also eligible for verified remaining Completion cleanup,")
+		fmt.Fprintln(stderr, "including verification-only no-op reruns after cleanup. Their Completion metadata and absent Lease are preserved.")
 		fmt.Fprintln(stderr, "Dry-run is read-only. Interactive confirmation defaults to no.")
 		fmt.Fprintln(stderr, "Non-interactive mutation requires --yes.")
 		fmt.Fprintln(stderr, "")
@@ -54,7 +56,7 @@ func resolveCommandWithInput(ctx context.Context, args []string, stdin io.Reader
 	gitExecutable := flags.String("git", "git", "git executable")
 	ghExecutable := flags.String("gh", "gh", "gh executable")
 	dryRun := flags.Bool("dry-run", false, "print the current Resolution Plan without mutation")
-	yes := flags.Bool("yes", false, "confirm External Resolution without an interactive prompt")
+	yes := flags.Bool("yes", false, "confirm Resolve without an interactive prompt")
 	for _, arg := range args {
 		if arg == "-h" || arg == "--help" {
 			return flags.Parse([]string{arg})
@@ -84,11 +86,11 @@ func resolveCommandWithInput(ctx context.Context, args []string, stdin io.Reader
 	}
 	lock, err := acquireResetReadLock(commonDirectory)
 	if err != nil {
-		return fmt.Errorf("External Resolution refused while Runner owns repository coordination; the supervising Runner handles automatic reconciliation at startup, during watch polling, and after normal Worker settlement: %w", err)
+		return fmt.Errorf("Resolve refused while Runner owns repository coordination; the supervising Runner handles automatic reconciliation at startup, during watch polling, and after normal Worker settlement: %w", err)
 	}
 	defer func() { _ = lock.Release() }()
 	if !*dryRun && !*yes && !interactive {
-		return errors.New("non-interactive External Resolution requires --yes")
+		return errors.New("non-interactive Resolve requires --yes")
 	}
 
 	resolvedState, err := repositoryStateDirectory(commonDirectory, repositoryRoot, *stateDir)
@@ -163,7 +165,7 @@ func resolveCommandWithInput(ctx context.Context, args []string, stdin io.Reader
 	if err := output.Err(); err != nil {
 		return err
 	}
-	if plan.Snapshot.Run.Status != scheduler.StatusResolvedExternally {
+	if len(plan.Actions) != 0 && plan.Snapshot.Run.Status != scheduler.StatusResolvedExternally {
 		if err := ensureResetStateBinding(commonDirectory, resolvedState); err != nil {
 			return err
 		}
@@ -171,10 +173,14 @@ func resolveCommandWithInput(ctx context.Context, args []string, stdin io.Reader
 	if err := module.Retire(ctx, plan); err != nil {
 		return err
 	}
-	return writeResolveOutcome(stdout, store, plan.Snapshot.Run.RunID)
+	return writeResolveOutcomeForOperation(stdout, store, plan.Snapshot.Run.RunID, plan.Snapshot.Run.Status == scheduler.StatusMerged)
 }
 
 func writeResolveOutcome(output io.Writer, store state.FileStore, runID string) error {
+	return writeResolveOutcomeForOperation(output, store, runID, false)
+}
+
+func writeResolveOutcomeForOperation(output io.Writer, store state.FileStore, runID string, historicalCompletion bool) error {
 	current, err := store.Load()
 	if err != nil {
 		return fmt.Errorf("read completed Resolution outcome: %w", err)
@@ -185,7 +191,11 @@ func writeResolveOutcome(output io.Writer, store state.FileStore, runID string) 
 		}
 		switch run.Status {
 		case scheduler.StatusMerged:
-			_, err = fmt.Fprintf(output, "Completion recorded for Run %s from merged expected pull request %s. No replacement Run was created.\n", run.RunID, run.PullRequest)
+			if historicalCompletion {
+				_, err = fmt.Fprintf(output, "Completion cleanup verified for Historical Run %s. Existing Completion outcome and pull request %s were preserved.\n", run.RunID, run.PullRequest)
+			} else {
+				_, err = fmt.Fprintf(output, "Completion recorded for Run %s from merged expected pull request %s. No replacement Run was created.\n", run.RunID, run.PullRequest)
+			}
 		case scheduler.StatusResolvedExternally:
 			_, err = fmt.Fprintf(output, "External Resolution complete for Run %s. No replacement Run was created.\n", run.RunID)
 		default:
@@ -210,7 +220,7 @@ func (w *resolveOutputWriter) Write(data []byte) (int, error) {
 		err = io.ErrShortWrite
 	}
 	if err != nil {
-		w.err = fmt.Errorf("write External Resolution output: %w", err)
+		w.err = fmt.Errorf("write Resolve output: %w", err)
 	}
 	return written, err
 }

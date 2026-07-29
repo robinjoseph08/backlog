@@ -296,6 +296,38 @@ func runRetirementGit(t *testing.T, directory string, args ...string) {
 	}
 }
 
+func TestInspectWorktreeChangedDetectsIgnoredFiles(t *testing.T) {
+	t.Parallel()
+	worktree := t.TempDir()
+	runRetirementGit(t, worktree, "init")
+	if err := os.WriteFile(filepath.Join(worktree, ".gitignore"), []byte("credentials.json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runRetirementGit(t, worktree, "add", ".gitignore")
+	runRetirementGit(t, worktree, "-c", "user.name=Backlog Test", "-c", "user.email=backlog@example.test", "commit", "-m", "baseline")
+
+	changed, err := inspectWorktreeChanged(context.Background(), "git", worktree)
+	if err != nil || changed {
+		t.Fatalf("clean worktree changed = %t, error = %v", changed, err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "credentials.json"), []byte("secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changed, err = inspectWorktreeChanged(context.Background(), "git", worktree)
+	if err != nil || !changed {
+		t.Fatalf("ignored credentials changed = %t, error = %v", changed, err)
+	}
+}
+
+func TestInspectWorktreeChangedFailsClosed(t *testing.T) {
+	t.Parallel()
+	worktree := t.TempDir()
+	git := writeRetirementExecutable(t, "#!/bin/sh\necho 'status unavailable' >&2\nexit 9\n")
+	if _, err := inspectWorktreeChanged(context.Background(), git, worktree); err == nil || !strings.Contains(err.Error(), "inspect worktree") || !strings.Contains(err.Error(), "git exited 9") {
+		t.Fatalf("worktree change inspection error = %v", err)
+	}
+}
+
 func retirementGitOutput(t *testing.T, directory string, args ...string) string {
 	t.Helper()
 	command := exec.Command("git", append([]string{"-C", directory}, args...)...)

@@ -191,9 +191,9 @@ func validateInspectedGitHubIdentity(snapshot Snapshot) error {
 }
 
 func (e Service) validateMutation(plan Plan) error {
-	if plan.Snapshot.Run.Status == e.policy.TerminalStatus {
+	if plan.Snapshot.Run.Status == e.policy.TerminalStatus || plan.Snapshot.Run.Status == scheduler.StatusMerged && e.policy.AllowHistoricalCompletionCleanup && len(plan.Actions) == 0 {
 		if err := e.verifyOwnedFinalState(plan.Snapshot); err != nil {
-			return fmt.Errorf("historical %s Run has incomplete final state: %w", e.policy.TerminalStatus, err)
+			return fmt.Errorf("historical %s Run has incomplete final state: %w", plan.Snapshot.Run.Status, err)
 		}
 	}
 	status := plan.Snapshot.Run.Status
@@ -266,6 +266,9 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 		}
 
 		if len(plan.Actions) == 0 {
+			if isHistoricalCompletionCleanup(e.policy, plan) {
+				return e.finalizeHistoricalCompletionCleanup(ctx, plan)
+			}
 			return e.finalize(ctx, plan)
 		}
 		action := plan.Actions[0]
@@ -444,6 +447,8 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			return e.finalize(ctx, plan)
 		case actionFinalizeCompletion:
 			return e.finalizeCompletion(ctx, plan, action.pullRequest)
+		case actionFinalizeHistoricalCompletionCleanup:
+			return e.finalizeHistoricalCompletionCleanup(ctx, plan)
 		default:
 			return fmt.Errorf("%s Plan contains an unknown action", e.policy.Operation)
 		}
@@ -929,6 +934,83 @@ func (e Service) markProgress(expected Snapshot) error {
 	return e.store.Save(current)
 }
 
+func isHistoricalCompletionCleanup(policy Policy, plan Plan) bool {
+	return policy.AllowHistoricalCompletionCleanup && plan.Snapshot.Run.Status == scheduler.StatusMerged && plan.TerminalState == scheduler.StatusMerged
+}
+
+func (e Service) finalizeHistoricalCompletionCleanup(ctx context.Context, verified Plan) error {
+	fresh, err := e.inspect(ctx)
+	if err != nil {
+		return err
+	}
+	if !isHistoricalCompletionCleanup(e.policy, fresh) {
+		return errors.New("Historical Completion cleanup identity changed before final verification")
+	}
+	if err := e.verifyCompletionIdentityContinuity(verified.Snapshot, fresh.Snapshot); err != nil {
+		return err
+	}
+	if !e.policy.labelsSatisfied(fresh.Snapshot.Issue.Labels) {
+		return errors.New("managed issue label postconditions were not verified")
+	}
+	if err := e.verifyOwnedFinalState(fresh.Snapshot); err != nil {
+		return err
+	}
+	if !fresh.Snapshot.Run.CleanupPending {
+		if len(fresh.Actions) != 0 {
+			return errors.New("fully cleaned Historical Completion still requires actions")
+		}
+		return e.verifyHistoricalCompletionMetadata(fresh.Snapshot.Run, fresh.Snapshot.Run)
+	}
+	if len(fresh.Actions) != 1 || fresh.Actions[0].kind != actionFinalizeHistoricalCompletionCleanup {
+		return errors.New("Historical Completion cleanup Plan changed immediately before clearing pending cleanup")
+	}
+
+	current, _, err := e.store.Preview()
+	if err != nil {
+		return err
+	}
+	run, lease, err := e.policy.SelectRun(current)
+	if err != nil {
+		return err
+	}
+	if run.RunID != fresh.Snapshot.Run.RunID || !reflect.DeepEqual(run, fresh.Snapshot.Run) || lease != (scheduler.Lease{}) {
+		return errors.New("Historical Completion identity or metadata changed before clearing pending cleanup")
+	}
+	expected := run
+	expected.CleanupPending = false
+	for index := range current.Runs {
+		if current.Runs[index].RunID == run.RunID {
+			current.Runs[index] = expected
+			break
+		}
+	}
+	if err := e.store.Save(current); err != nil {
+		return fmt.Errorf("clear pending Historical Completion cleanup: %w", err)
+	}
+	persisted, _, err := e.store.Preview()
+	if err != nil {
+		return fmt.Errorf("verify cleared Historical Completion cleanup: %w", err)
+	}
+	for _, persistedLease := range persisted.Leases {
+		if persistedLease.RunID == expected.RunID {
+			return fmt.Errorf("Historical Completion Run %s acquired Lease %s during cleanup", expected.RunID, persistedLease.LeaseID)
+		}
+	}
+	for _, persistedRun := range persisted.Runs {
+		if persistedRun.RunID == expected.RunID {
+			return e.verifyHistoricalCompletionMetadata(persistedRun, expected)
+		}
+	}
+	return fmt.Errorf("Historical Completion Run %s is absent after cleanup", expected.RunID)
+}
+
+func (e Service) verifyHistoricalCompletionMetadata(actual, expected scheduler.Run) error {
+	if !reflect.DeepEqual(actual, expected) {
+		return fmt.Errorf("historical Completion metadata for Run %s changed during cleanup", expected.RunID)
+	}
+	return nil
+}
+
 func (e Service) finalizeCompletion(ctx context.Context, verified Plan, pullNumber int) error {
 	if verified.Snapshot.Session.Archived {
 		if err := syncArchivedSession(verified.Snapshot.Session, e.stateDirectory, e.filesystemSync); err != nil {
@@ -1104,7 +1186,18 @@ func missingLogWarning(run scheduler.Run) string {
 }
 
 func (e Service) verifyOwnedFinalState(snapshot Snapshot) error {
-	if e.policy.AllowMergedCompletion && e.policy.TerminalStatus == scheduler.StatusMerged {
+	if snapshot.Run.Status == scheduler.StatusMerged && e.policy.AllowHistoricalCompletionCleanup {
+		expectedMerged := false
+		for _, pull := range snapshot.PullRequests {
+			if pull.URL == snapshot.Run.PullRequest && pull.State == PullRequestMerged {
+				expectedMerged = true
+				break
+			}
+		}
+		if !expectedMerged || snapshot.Issue.Open {
+			return errors.New("Historical Completion final state does not have its merged expected pull request and closed issue")
+		}
+	} else if e.policy.AllowMergedCompletion && e.policy.TerminalStatus == scheduler.StatusMerged {
 		if len(snapshot.PullRequests) != 1 || snapshot.PullRequests[0].State != PullRequestMerged || snapshot.PullRequests[0].URL != snapshot.Run.PullRequest || snapshot.Issue.Open {
 			return errors.New("Completion final state is not one merged expected pull request with a closed issue")
 		}
@@ -1461,7 +1554,22 @@ func inspectLocalResources(ctx context.Context, gitExecutable, repositoryRoot, c
 	if err := verifyRegisteredWorktree(ctx, gitExecutable, run, commonDirectory, registered.Commit); err != nil {
 		return Branch{}, Worktree{}, err
 	}
-	return local, Worktree{Path: run.Worktree, Branch: run.Branch, Commit: registered.Commit, Present: true}, nil
+	changed, err := inspectWorktreeChanged(ctx, gitExecutable, run.Worktree)
+	if err != nil {
+		return Branch{}, Worktree{}, err
+	}
+	return local, Worktree{Path: run.Worktree, Branch: run.Branch, Commit: registered.Commit, Present: true, Changed: changed}, nil
+}
+
+func inspectWorktreeChanged(ctx context.Context, gitExecutable, worktreePath string) (bool, error) {
+	output, exit, err := runGitInspection(ctx, gitExecutable, worktreePath, "--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching")
+	if err != nil || exit != 0 {
+		if err == nil {
+			err = fmt.Errorf("git exited %d", exit)
+		}
+		return false, fmt.Errorf("inspect worktree %s changes: %w", worktreePath, err)
+	}
+	return len(output) != 0, nil
 }
 
 func verifyRegisteredWorktree(ctx context.Context, gitExecutable string, run scheduler.Run, commonDirectory, commit string) error {

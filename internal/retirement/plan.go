@@ -46,6 +46,7 @@ type Worktree struct {
 	Branch  string
 	Commit  string
 	Present bool
+	Changed bool
 }
 
 type Session struct {
@@ -86,6 +87,7 @@ const (
 	actionAddIssueLabel
 	actionFinalize
 	actionFinalizeCompletion
+	actionFinalizeHistoricalCompletionCleanup
 )
 
 // Action is one ordered mutation authorized by a Plan. Its executable identity
@@ -130,7 +132,7 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 	if err := validateIdentity(policy, snapshot); err != nil {
 		return Plan{}, err
 	}
-	if snapshot.Run.Status == scheduler.StatusMerged && snapshot.Run.Status != policy.TerminalStatus {
+	if snapshot.Run.Status == scheduler.StatusMerged && snapshot.Run.Status != policy.TerminalStatus && !policy.AllowHistoricalCompletionCleanup {
 		return Plan{}, fmt.Errorf("Run %s is merged; merged work cannot be %s", snapshot.Run.RunID, policy.Operation)
 	}
 	pullRequests := append([]PullRequest(nil), snapshot.PullRequests...)
@@ -167,6 +169,9 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 	}
 	if !foundRecorded {
 		return Plan{}, fmt.Errorf("recorded pull request %s was not found for Run branch %s", snapshot.Run.PullRequest, snapshot.Run.Branch)
+	}
+	if snapshot.Run.Status == scheduler.StatusMerged && policy.AllowHistoricalCompletionCleanup {
+		return buildHistoricalCompletionCleanup(policy, snapshot, mergedPulls)
 	}
 	if len(mergedPulls) != 0 && snapshot.Run.Status != policy.TerminalStatus && policy.AllowMergedCompletion {
 		if (snapshot.Run.RecoveredRetirementRequired || snapshot.Run.RecoveryCount > 0) && !policy.RetireMergedCompletionArtifacts {
@@ -313,6 +318,52 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 	return plan, nil
 }
 
+func buildHistoricalCompletionCleanup(policy Policy, snapshot Snapshot, mergedPulls []PullRequest) (Plan, error) {
+	if snapshot.Run.PullRequest == "" {
+		return Plan{}, fmt.Errorf("Historical merged Run %s has no recorded expected pull request", snapshot.Run.RunID)
+	}
+	if snapshot.Issue.Open {
+		return Plan{}, fmt.Errorf("issue #%d is open; Historical Completion cleanup requires a verified GitHub closure", snapshot.Issue.Number)
+	}
+	var merged PullRequest
+	for _, pull := range mergedPulls {
+		if pull.URL == snapshot.Run.PullRequest {
+			merged = pull
+			break
+		}
+	}
+	if merged.URL == "" {
+		return Plan{}, fmt.Errorf("Historical merged Run %s expected pull request %s is not merged", snapshot.Run.RunID, snapshot.Run.PullRequest)
+	}
+	if policy.ValidateHistoricalCompletionSnapshot != nil {
+		if err := policy.ValidateHistoricalCompletionSnapshot(snapshot, merged); err != nil {
+			return Plan{}, err
+		}
+	}
+
+	plan := Plan{Snapshot: snapshot, Operation: "Completion Cleanup", TerminalState: scheduler.StatusMerged}
+	if snapshot.RemoteBranch.Present {
+		plan.Actions = append(plan.Actions, plannedAction(actionDeleteRemoteBranch, fmt.Sprintf("delete remote branch %s at %s", snapshot.RemoteBranch.Name, snapshot.RemoteBranch.Commit)))
+	}
+	if snapshot.Worktree.Present {
+		plan.Actions = append(plan.Actions, plannedAction(actionRemoveLocalWorktree, fmt.Sprintf("remove local worktree %s for %s at %s", snapshot.Worktree.Path, snapshot.Worktree.Branch, snapshot.Worktree.Commit)))
+	}
+	if snapshot.LocalBranch.Present {
+		plan.Actions = append(plan.Actions, plannedAction(actionDeleteLocalBranch, fmt.Sprintf("delete local branch %s at %s", snapshot.LocalBranch.Name, snapshot.LocalBranch.Commit)))
+	}
+	if snapshot.Session.Present {
+		plan.Actions = append(plan.Actions, plannedAction(actionArchiveSession, fmt.Sprintf("archive Pi session %s from %s to %s", snapshot.Session.ID, snapshot.Session.Dir, snapshot.Session.ArchiveDir)))
+	}
+	_, removeLabels := policy.desiredLabels(snapshot.Issue.Labels)
+	for _, label := range removeLabels {
+		plan.Actions = append(plan.Actions, plannedLabelAction(actionRemoveIssueLabel, label, fmt.Sprintf("remove issue label %s from %s", label, snapshot.Issue.URL)))
+	}
+	if snapshot.Run.CleanupPending {
+		plan.Actions = append(plan.Actions, plannedAction(actionFinalizeHistoricalCompletionCleanup, fmt.Sprintf("clear pending Completion cleanup for Historical Run %s", snapshot.Run.RunID)))
+	}
+	return plan, nil
+}
+
 // NextPullRequest returns the owned open pull request targeted by the next
 // retirement action. A waiting-for-merge Run must handle its recorded pull
 // request before retirement can advance to other pull requests for its branch.
@@ -351,9 +402,9 @@ func validateIdentity(policy Policy, snapshot Snapshot) error {
 	if issue.Number != run.Issue {
 		return fmt.Errorf("Run %s and issue identity do not match", run.RunID)
 	}
-	if run.Status == policy.TerminalStatus {
+	if run.Status == policy.TerminalStatus || run.Status == scheduler.StatusMerged && policy.AllowHistoricalCompletionCleanup {
 		if lease.LeaseID != "" || lease.Issue != 0 || lease.RunID != "" {
-			return fmt.Errorf("%s Run %s still has an active Lease", policy.TerminalStatus, run.RunID)
+			return fmt.Errorf("Historical Run %s still has an active Lease", run.RunID)
 		}
 	} else if lease.LeaseID == "" || lease.Issue != run.Issue || lease.RunID != run.RunID {
 		return fmt.Errorf("Run %s, Lease %s, and issue identity do not match", run.RunID, lease.LeaseID)
