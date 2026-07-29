@@ -194,9 +194,15 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 		plan := Plan{Snapshot: snapshot, Operation: policy.Operation, TerminalState: scheduler.StatusMerged}
 		if policy.RetireMergedCompletionArtifacts {
 			if policy.ValidateMergedCompletionSnapshot != nil {
-				if err := policy.ValidateMergedCompletionSnapshot(snapshot); err != nil {
+				if err := policy.ValidateMergedCompletionSnapshot(snapshot, merged); err != nil {
 					return Plan{}, err
 				}
+			}
+			_, removeLabels := policy.desiredLabels(snapshot.Issue.Labels)
+			needsCleanup := snapshot.RemoteBranch.Present || snapshot.Worktree.Present || snapshot.LocalBranch.Present ||
+				snapshot.Session.Present || len(removeLabels) > 0
+			if needsCleanup && policy.MarkProgressBeforeMutation && snapshot.Run.Status != policy.ProgressStatus {
+				plan.Actions = append(plan.Actions, plannedAction(actionMarkProgress, fmt.Sprintf("mark Run %s %s while retaining Lease %s", snapshot.Run.RunID, policy.ProgressStatus, snapshot.Lease.LeaseID)))
 			}
 			if snapshot.RemoteBranch.Present {
 				plan.Actions = append(plan.Actions, plannedAction(actionDeleteRemoteBranch, fmt.Sprintf("delete remote branch %s at %s", snapshot.RemoteBranch.Name, snapshot.RemoteBranch.Commit)))
@@ -210,7 +216,6 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 			if snapshot.Session.Present {
 				plan.Actions = append(plan.Actions, plannedAction(actionArchiveSession, fmt.Sprintf("archive Pi session %s from %s to %s", snapshot.Session.ID, snapshot.Session.Dir, snapshot.Session.ArchiveDir)))
 			}
-			_, removeLabels := policy.desiredLabels(snapshot.Issue.Labels)
 			for _, label := range removeLabels {
 				plan.Actions = append(plan.Actions, plannedLabelAction(actionRemoveIssueLabel, label, fmt.Sprintf("remove issue label %s from %s", label, snapshot.Issue.URL)))
 			}

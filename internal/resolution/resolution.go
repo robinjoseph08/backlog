@@ -66,9 +66,14 @@ func canTransition(from, to scheduler.Status) bool {
 	}
 }
 
-func validateMergedCompletionSnapshot(snapshot retirement.Snapshot) error {
+func validateMergedCompletionSnapshot(snapshot retirement.Snapshot, merged retirement.PullRequest) error {
 	if snapshot.Run.RecoveredRetirementRequired || snapshot.Run.RecoveryCount > 0 {
 		return errors.New("recovered Completion requires the full recovered retirement policy")
+	}
+	if snapshot.RemoteBranch.Present && snapshot.RemoteBranch.Commit != merged.Commit ||
+		snapshot.LocalBranch.Present && snapshot.LocalBranch.Commit != merged.Commit ||
+		snapshot.Worktree.Present && snapshot.Worktree.Commit != merged.Commit {
+		return errors.New("Completion artifact commit identity does not match the merged expected pull request head")
 	}
 	return nil
 }

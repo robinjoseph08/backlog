@@ -16,7 +16,7 @@ type Policy struct {
 	Operation                        string
 	SelectRun                        func(state.State) (scheduler.Run, scheduler.Lease, error)
 	ValidateSnapshot                 func(Snapshot) error
-	ValidateMergedCompletionSnapshot func(Snapshot) error
+	ValidateMergedCompletionSnapshot func(Snapshot, PullRequest) error
 	EligibleStatuses                 []scheduler.Status
 	CanTransition                    func(scheduler.Status, scheduler.Status) bool
 	Explanation                      func(scheduler.Run) string

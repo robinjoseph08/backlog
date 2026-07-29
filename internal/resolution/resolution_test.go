@@ -241,6 +241,69 @@ func TestMergedExpectedPullRequestPlansCompletionBeforeClosureReasonEligibility(
 	}
 }
 
+func TestMergedCompletionPlansDurableProgressBeforeDestructiveCleanup(t *testing.T) {
+	commit := strings.Repeat("a", 40)
+	snapshot := retirement.Snapshot{
+		Run: scheduler.Run{
+			Issue: 42, RunID: "run", Status: scheduler.StatusFailed,
+			PullRequest: "https://github.com/acme/widgets/pull/9", Branch: "agent/run",
+		},
+		Lease:        scheduler.Lease{LeaseID: "lease", Issue: 42, RunID: "run"},
+		Issue:        retirement.Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", ClosureReason: "completed"},
+		PullRequests: []retirement.PullRequest{{Number: 9, URL: "https://github.com/acme/widgets/pull/9", Branch: "agent/run", Commit: commit, State: retirement.PullRequestMerged}},
+		RemoteBranch: retirement.Branch{Name: "agent/run", Commit: commit, Present: true},
+	}
+
+	plan, err := retirement.Build(Policy("run"), snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Actions) != 3 || !strings.Contains(plan.Actions[0].String(), "mark Run run resolving-externally") ||
+		!strings.Contains(plan.Actions[1].String(), "delete remote branch agent/run") ||
+		!strings.Contains(plan.Actions[2].String(), "record Completion") {
+		t.Fatalf("merged Completion cleanup order = %#v", plan.Actions)
+	}
+}
+
+func TestMergedCompletionRefusesMismatchedArtifactCommitIdentity(t *testing.T) {
+	const branch = "agent/run"
+	mergedCommit := strings.Repeat("a", 40)
+	mismatchedCommit := strings.Repeat("b", 40)
+	for _, test := range []struct {
+		name   string
+		mutate func(*retirement.Snapshot)
+	}{
+		{name: "remote branch", mutate: func(snapshot *retirement.Snapshot) {
+			snapshot.RemoteBranch = retirement.Branch{Name: branch, Commit: mismatchedCommit, Present: true}
+		}},
+		{name: "local branch", mutate: func(snapshot *retirement.Snapshot) {
+			snapshot.LocalBranch = retirement.Branch{Name: branch, Commit: mismatchedCommit, Present: true}
+		}},
+		{name: "worktree", mutate: func(snapshot *retirement.Snapshot) {
+			snapshot.Run.Worktree = "/state/worktrees/run"
+			snapshot.Worktree = retirement.Worktree{Path: snapshot.Run.Worktree, Branch: branch, Commit: mismatchedCommit, Present: true}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := retirement.Snapshot{
+				Run: scheduler.Run{
+					Issue: 42, RunID: "run", Status: scheduler.StatusFailed,
+					PullRequest: "https://github.com/acme/widgets/pull/9", Branch: branch,
+				},
+				Lease:        scheduler.Lease{LeaseID: "lease", Issue: 42, RunID: "run"},
+				Issue:        retirement.Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", ClosureReason: "completed"},
+				PullRequests: []retirement.PullRequest{{Number: 9, URL: "https://github.com/acme/widgets/pull/9", Branch: branch, Commit: mergedCommit, State: retirement.PullRequestMerged}},
+			}
+			test.mutate(&snapshot)
+
+			plan, err := retirement.Build(Policy("run"), snapshot)
+			if err == nil || !strings.Contains(err.Error(), "artifact commit identity does not match the merged expected pull request head") || len(plan.Actions) != 0 {
+				t.Fatalf("mismatched merged Completion plan = %#v, error = %v", plan, err)
+			}
+		})
+	}
+}
+
 func TestExternalResolutionCannotFinalizeRecoveredCompletionWithWeakerPolicy(t *testing.T) {
 	snapshot := retirement.Snapshot{
 		Run: scheduler.Run{

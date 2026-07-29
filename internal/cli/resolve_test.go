@@ -877,6 +877,14 @@ func TestCompiledResolveRetiresOwnedArtifactsBeforeRecordingCompletion(t *testin
 		t.Fatal(err)
 	}
 	commit := strings.TrimSpace(gitOutput(t, fixture.repository, "rev-parse", fixture.branch))
+	git := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  *" push origin --force-with-lease=refs/heads/`+fixture.branch+`:"*)
+    jq -e '.runs[] | select(.runId == "run-local" and .status == "resolving-externally")' `+quote(fixture.store.Path)+` >/dev/null ;;
+esac
+exec `+quote(fixture.git)+` "$@"
+`)
 	gh := writeExecutable(t, `#!/bin/sh
 set -eu
 state=`+quote(fixture.githubState)+`
@@ -897,7 +905,7 @@ case "$*" in
 esac
 `)
 	binary := buildExecutable(t, t.TempDir())
-	args := []string{"resolve", "run-local", "--repo-dir", fixture.repository, "--state-dir", fixture.stateDir, "--git", fixture.git, "--gh", gh}
+	args := []string{"resolve", "run-local", "--repo-dir", fixture.repository, "--state-dir", fixture.stateDir, "--git", git, "--gh", gh}
 
 	dryRun := exec.Command(binary, append(args, "--dry-run")...)
 	output, err := dryRun.CombinedOutput()
@@ -906,6 +914,7 @@ esac
 	}
 	plan := string(output)
 	ordered := []string{
+		"mark Run run-local resolving-externally while retaining Lease lease-local",
 		"delete remote branch " + fixture.branch,
 		"remove local worktree " + fixture.worktree,
 		"delete local branch " + fixture.branch,
@@ -942,7 +951,7 @@ esac
 	if output, err := exec.Command("git", "-C", fixture.repository, "show-ref", "--verify", "--quiet", "refs/heads/"+fixture.branch).CombinedOutput(); err == nil {
 		t.Fatalf("local branch survived Completion: %s", output)
 	}
-	if branch, err := inspectRemoteBranch(context.Background(), fixture.git, fixture.repository, fixture.branch); err != nil || branch.Present {
+	if branch, err := inspectRemoteBranch(context.Background(), git, fixture.repository, fixture.branch); err != nil || branch.Present {
 		t.Fatalf("remote branch after Completion = %#v, %v", branch, err)
 	}
 	if _, err := os.Stat(fixture.sessionDir); !errors.Is(err, os.ErrNotExist) {
@@ -1945,7 +1954,7 @@ exec `+quote(gh)+` "$@"
 	binary := buildExecutable(t, t.TempDir())
 	command := exec.Command(binary, githubArtifactResolveArgs(fixture, fixture.git, racingGitHub, "--yes")...)
 	output, err := command.CombinedOutput()
-	if err == nil || !strings.Contains(string(output), "expected commit identity changed") {
+	if err == nil || !strings.Contains(string(output), "artifact commit identity does not match the merged expected pull request head") {
 		t.Fatalf("force-pushed merge error = %v\n%s", err, output)
 	}
 	current, loadErr := fixture.store.Load()
