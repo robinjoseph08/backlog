@@ -130,7 +130,7 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 	if err := validateIdentity(policy, snapshot); err != nil {
 		return Plan{}, err
 	}
-	if snapshot.Run.Status == scheduler.StatusMerged {
+	if snapshot.Run.Status == scheduler.StatusMerged && snapshot.Run.Status != policy.TerminalStatus {
 		return Plan{}, fmt.Errorf("Run %s is merged; merged work cannot be %s", snapshot.Run.RunID, policy.Operation)
 	}
 	pullRequests := append([]PullRequest(nil), snapshot.PullRequests...)
@@ -169,6 +169,9 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 		return Plan{}, fmt.Errorf("recorded pull request %s was not found for Run branch %s", snapshot.Run.PullRequest, snapshot.Run.Branch)
 	}
 	if len(mergedPulls) != 0 && snapshot.Run.Status != policy.TerminalStatus && policy.AllowMergedCompletion {
+		if (snapshot.Run.RecoveredRetirementRequired || snapshot.Run.RecoveryCount > 0) && !policy.RetireMergedCompletionArtifacts {
+			return Plan{}, fmt.Errorf("recovered Completion requires the full recovered retirement policy")
+		}
 		if snapshot.Issue.Open {
 			return Plan{}, fmt.Errorf("issue #%d is open; Completion requires a verified GitHub closure", snapshot.Issue.Number)
 		}
@@ -188,11 +191,31 @@ func Build(policy Policy, snapshot Snapshot) (Plan, error) {
 				return Plan{}, fmt.Errorf("merged pull request is not the expected pull request %s", snapshot.Run.PullRequest)
 			}
 		}
-		return Plan{
-			Snapshot: snapshot, Operation: policy.Operation, TerminalState: scheduler.StatusMerged,
-			Actions: []Action{plannedPullRequestAction(actionFinalizeCompletion, merged,
-				fmt.Sprintf("record Completion from merged expected pull request #%d (%s) and release Lease %s", merged.Number, merged.URL, snapshot.Lease.LeaseID))},
-		}, nil
+		plan := Plan{Snapshot: snapshot, Operation: policy.Operation, TerminalState: scheduler.StatusMerged}
+		if policy.RetireMergedCompletionArtifacts {
+			if err := policy.ValidateSnapshot(snapshot); err != nil {
+				return Plan{}, err
+			}
+			if snapshot.RemoteBranch.Present {
+				plan.Actions = append(plan.Actions, plannedAction(actionDeleteRemoteBranch, fmt.Sprintf("delete remote branch %s at %s", snapshot.RemoteBranch.Name, snapshot.RemoteBranch.Commit)))
+			}
+			if snapshot.Worktree.Present {
+				plan.Actions = append(plan.Actions, plannedAction(actionRemoveLocalWorktree, fmt.Sprintf("remove local worktree %s for %s at %s", snapshot.Worktree.Path, snapshot.Worktree.Branch, snapshot.Worktree.Commit)))
+			}
+			if snapshot.LocalBranch.Present {
+				plan.Actions = append(plan.Actions, plannedAction(actionDeleteLocalBranch, fmt.Sprintf("delete local branch %s at %s", snapshot.LocalBranch.Name, snapshot.LocalBranch.Commit)))
+			}
+			if snapshot.Session.Present {
+				plan.Actions = append(plan.Actions, plannedAction(actionArchiveSession, fmt.Sprintf("archive Pi session %s from %s to %s", snapshot.Session.ID, snapshot.Session.Dir, snapshot.Session.ArchiveDir)))
+			}
+			_, removeLabels := policy.desiredLabels(snapshot.Issue.Labels)
+			for _, label := range removeLabels {
+				plan.Actions = append(plan.Actions, plannedLabelAction(actionRemoveIssueLabel, label, fmt.Sprintf("remove issue label %s from %s", label, snapshot.Issue.URL)))
+			}
+		}
+		plan.Actions = append(plan.Actions, plannedPullRequestAction(actionFinalizeCompletion, merged,
+			fmt.Sprintf("record Completion from merged expected pull request #%d (%s) and release Lease %s", merged.Number, merged.URL, snapshot.Lease.LeaseID)))
+		return plan, nil
 	}
 	if err := policy.ValidateSnapshot(snapshot); err != nil {
 		return Plan{}, err

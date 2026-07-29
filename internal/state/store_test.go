@@ -52,6 +52,102 @@ func TestFileStoreRoundTripsStateAtomically(t *testing.T) {
 	}
 }
 
+func TestFileStoreRoundTripsCompleteRecoverySafetyMetadata(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	run := scheduler.Run{
+		Issue: 98, IssueTitle: "Recovery", IssueURL: "https://github.com/acme/widgets/issues/98",
+		RunID: "run-98", Status: scheduler.StatusSuspended, WorkerMode: scheduler.WorkerModeRPC,
+		WorkerGeneration: 3, StoppedWorkerGeneration: 3, StoppedWorkerPID: 999999, StoppedWorkerProcessIdentity: "999999:stopped-start", WorkerStoppedAt: &now,
+		Branch: "agent/issue-98-run-98", Worktree: filepath.Join(root, "worktree"), SessionName: "afk #98",
+		SessionID: "session-98", SessionDir: filepath.Join(root, "sessions"),
+		LogPath: filepath.Join(root, "run.jsonl"), StderrPath: filepath.Join(root, "run.stderr"),
+		PullRequest: "https://github.com/acme/widgets/pull/98", Error: "diagnostic", FailureClass: scheduler.FailureValidation,
+		WorkflowStage: "afk-coordinator", PreservedCause: "provider cause", ProviderContinuationAttempts: 1,
+		RecoveryCount: 1, FirstRecoveredAt: &now, LastRecoveredAt: &now, StartedAt: now.Add(-time.Hour), UpdatedAt: now,
+	}
+	run.Continuation = &scheduler.ContinuationBoundary{
+		SessionID: run.SessionID, SessionFile: filepath.Join(run.SessionDir, "session.jsonl"), Worktree: run.Worktree,
+		LeafID: "leaf", EntryCount: 4, SHA256: strings.Repeat("a", 64), Workflow: "afk", WorkflowStage: "afk-coordinator",
+		WorkerGeneration: 3, LocalCommit: strings.Repeat("b", 40), RemoteBranchState: "present", RemoteCommit: strings.Repeat("c", 40),
+		PullRequest: run.PullRequest, PullRequestHead: strings.Repeat("c", 40), CheckpointFile: filepath.Join(root, "backlog-afk-checkpoint-v1.json"), CheckpointSHA256: strings.Repeat("d", 64), CheckpointStatus: "active", VerifiedAt: now,
+	}
+	lease := scheduler.Lease{LeaseID: "lease-exact-98", Issue: run.Issue, RunID: run.RunID}
+	want := State{Version: CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 2, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{lease}}
+	store := FileStore{Path: filepath.Join(root, "state.json")}
+	if err := store.Save(want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Recovery metadata round trip:\ngot  %#v\nwant %#v", got, want)
+	}
+}
+
+func TestFileStoreMigratesLiteralV4RunningSuspendedAndFailedRunsToV5(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	fixture := `{
+  "version": 4,
+  "repo": "acme/widgets",
+  "defaultBranch": "main",
+  "maxConcurrentIssues": 3,
+  "runs": [
+    {"issue":41,"runId":"running-v4","status":"running","workerMode":"rpc","pid":4100,"processIdentity":"4100:running-start","branch":"agent/issue-41-running-v4","worktree":"/worktrees/running-v4","sessionId":"backlog-running-v4","sessionDir":"/sessions/running-v4","continuation":{"sessionId":"backlog-running-v4","sessionFile":"/sessions/running-v4/session.jsonl","worktree":"/worktrees/running-v4","leafId":"leaf","entryCount":2,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","verifiedAt":"2026-07-29T00:01:00Z"},"startedAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-29T00:01:00Z"},
+    {"issue":42,"runId":"suspended-v4","status":"suspended","workerMode":"rpc","branch":"agent/issue-42-suspended-v4","worktree":"/worktrees/suspended-v4","sessionId":"backlog-suspended-v4","sessionDir":"/sessions/suspended-v4","continuation":{"sessionId":"backlog-suspended-v4","sessionFile":"/sessions/suspended-v4/session.jsonl","worktree":"/worktrees/suspended-v4","leafId":"leaf","entryCount":2,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verifiedAt":"2026-07-29T00:02:00Z"},"startedAt":"2026-07-29T00:00:00Z","suspendedAt":"2026-07-29T00:02:01Z","updatedAt":"2026-07-29T00:02:01Z"},
+    {"issue":43,"runId":"failed-v4","status":"failed","workerMode":"rpc","processIdentity":"4300:failed-start","branch":"agent/issue-43-failed-v4","worktree":"/worktrees/failed-v4","sessionId":"backlog-failed-v4","sessionDir":"/sessions/failed-v4","error":"validation failed","startedAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-29T00:03:00Z"}
+  ],
+  "leases": [
+    {"leaseId":"running-v4","issue":41,"runId":"running-v4"},
+    {"leaseId":"suspended-v4","issue":42,"runId":"suspended-v4"},
+    {"leaseId":"failed-v4","issue":43,"runId":"failed-v4"}
+  ]
+}`
+	if strings.Contains(fixture, "workerGeneration") || strings.Contains(fixture, "failureClass") || strings.Contains(fixture, "recoveryCount") {
+		t.Fatal("literal V4 fixture contains V5-only fields")
+	}
+	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := FileStore{Path: path}
+	preview, migrationRequired, err := store.Preview()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !migrationRequired || preview.Version != CurrentVersion || len(preview.Runs) != 3 {
+		t.Fatalf("V4 Preview = %#v, migration=%t", preview, migrationRequired)
+	}
+	unchanged, err := os.ReadFile(path)
+	if err != nil || string(unchanged) != fixture {
+		t.Fatalf("V4 Preview mutated source: %v\n%s", err, unchanged)
+	}
+	running := preview.Runs[0]
+	if running.WorkerGeneration != 1 || running.Continuation == nil || running.Continuation.WorkerGeneration != 1 {
+		t.Fatalf("migrated running continuation generation = %#v", running)
+	}
+	suspended := preview.Runs[1]
+	if suspended.WorkerGeneration != 1 || suspended.StoppedWorkerGeneration != 1 || suspended.WorkerStoppedAt == nil || suspended.Continuation.WorkerGeneration != 1 {
+		t.Fatalf("migrated suspended Resume proof = %#v", suspended)
+	}
+	failed := preview.Runs[2]
+	if failed.StoppedWorkerPID != 4300 || failed.StoppedWorkerProcessIdentity != "4300:failed-start" || failed.PID != 0 || failed.ProcessIdentity != "" {
+		t.Fatalf("migrated failed offline Recovery identity = %#v", failed)
+	}
+	got, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, preview) {
+		t.Fatalf("persisted V5 differs from Preview:\ngot=%#v\npreview=%#v", got, preview)
+	}
+	persisted, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(persisted), `"version": 5`) || !strings.Contains(string(persisted), `"stoppedWorkerPid": 4300`) {
+		t.Fatalf("V5 migration persistence = %s, %v", persisted, err)
+	}
+}
+
 func TestFileStorePreviewDoesNotPersistV1Migration(t *testing.T) {
 	t.Parallel()
 
@@ -77,7 +173,7 @@ func TestFileStorePreviewDoesNotPersistV1Migration(t *testing.T) {
 	}
 }
 
-func TestFileStoreReportsV4TargetWhenV1MigrationPersistenceFails(t *testing.T) {
+func TestFileStoreReportsV5TargetWhenV1MigrationPersistenceFails(t *testing.T) {
 	t.Parallel()
 
 	directory := t.TempDir()
@@ -92,7 +188,7 @@ func TestFileStoreReportsV4TargetWhenV1MigrationPersistenceFails(t *testing.T) {
 	defer os.Chmod(directory, 0o700)
 
 	_, err := (FileStore{Path: path}).Load()
-	if err == nil || !strings.Contains(err.Error(), "persist version 4 state migration") {
+	if err == nil || !strings.Contains(err.Error(), "persist version 5 state migration") {
 		t.Fatalf("V1 migration persistence error = %v", err)
 	}
 }
@@ -299,8 +395,8 @@ func TestFileStoreMigratesV2ToV3WithoutAcknowledgingOutcomesOrLosingMetadata(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(persisted), `"version": 4`) {
-		t.Fatalf("V4 migration was not persisted: %s", persisted)
+	if !strings.Contains(string(persisted), `"version": 5`) {
+		t.Fatalf("V5 migration was not persisted: %s", persisted)
 	}
 }
 
@@ -347,10 +443,10 @@ func TestFileStoreRejectsUnsupportedNewerStateVersion(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "state.json")
-	if err := os.WriteFile(path, []byte(`{"version":5,"runs":[],"leases":[]}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"version":6,"runs":[],"leases":[]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := (FileStore{Path: path}).Load(); err == nil || !strings.Contains(err.Error(), "unsupported state version 5") {
+	if _, err := (FileStore{Path: path}).Load(); err == nil || !strings.Contains(err.Error(), "unsupported state version 6") {
 		t.Fatalf("newer state error = %v", err)
 	}
 }
@@ -627,6 +723,40 @@ func TestFileStoreLoadsUnsafeSuspensionForNeedsHumanRecovery(t *testing.T) {
 			}
 			if len(loaded.Leases) != 1 {
 				t.Fatalf("unsafe suspension Lease = %#v", loaded.Leases)
+			}
+		})
+	}
+}
+
+func TestFileStoreRejectsMalformedRecoveryAndProviderMetadata(t *testing.T) {
+	t.Parallel()
+	now := time.Now().UTC()
+	base := scheduler.Run{Issue: 10, RunID: "run-10", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint}
+	tests := []struct {
+		name   string
+		mutate func(*scheduler.Run)
+		want   string
+	}{
+		{name: "unknown failure class", mutate: func(run *scheduler.Run) { run.FailureClass = "unknown" }, want: "failure class"},
+		{name: "stopped PID without identity", mutate: func(run *scheduler.Run) { run.StoppedWorkerPID = 123; run.StoppedWorkerProcessIdentity = "" }, want: "stop proof"},
+		{name: "stopped identity without generation", mutate: func(run *scheduler.Run) {
+			run.StoppedWorkerPID = 123
+			run.StoppedWorkerProcessIdentity = "123:start"
+			run.StoppedWorkerGeneration = 0
+			run.WorkerStoppedAt = nil
+		}, want: "stop proof"},
+		{name: "provider budget overflow", mutate: func(run *scheduler.Run) { run.ProviderContinuationAttempts = 2 }, want: "provider continuation budget"},
+		{name: "cooldown outside suspension", mutate: func(run *scheduler.Run) { run.ProviderContinuationAttempts = 1; run.ResumeAfter = &now }, want: "cooldown"},
+		{name: "count without timestamps", mutate: func(run *scheduler.Run) { run.RecoveryCount = 1 }, want: "Recovery metadata"},
+		{name: "timestamps without count", mutate: func(run *scheduler.Run) { run.FirstRecoveredAt = &now; run.LastRecoveredAt = &now }, want: "Recovery metadata"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			run := base
+			test.mutate(&run)
+			err := (FileStore{Path: filepath.Join(t.TempDir(), "state.json")}).Save(State{Version: CurrentVersion, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %q", err, test.want)
 			}
 		})
 	}

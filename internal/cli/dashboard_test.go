@@ -1662,8 +1662,8 @@ case "$*" in
     printf '%s\n' '{"number":45,"title":"Observable Worker","body":"","state":"OPEN","url":"https://github.com/acme/widgets/issues/45","createdAt":"2026-07-26T17:00:00Z"}' ;;
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/45/comments?per_page=100 --paginate --slurp"|\
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/45/dependencies/blocked_by?per_page=100 --paginate --slurp") printf '%s\n' '[[]]' ;;
-  "pr list --repo acme/widgets --state all --head agent/issue-45-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
-    head=$8; printf '[{"number":145,"url":"https://github.com/acme/widgets/pull/145","state":"MERGED","mergedAt":"2026-07-26T17:01:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"%s","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]\n' "$head" ;;
+  "pr list --repo acme/widgets --state all --head agent/issue-45-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    head=$8; printf '[{"number":145,"url":"https://github.com/acme/widgets/pull/145","state":"MERGED","mergedAt":"2026-07-26T17:01:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"%s","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]\n' "$head" ;;
   "issue view 45 --repo acme/widgets --json number,state,title,url") touch `+quote(closedMarker)+`; printf '%s\n' '{"number":45,"state":"CLOSED","title":"Observable Worker","url":"https://github.com/acme/widgets/issues/45"}' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
@@ -1739,8 +1739,8 @@ func TestTerminalDashboardKeepsRunFinishedDuringInvocation(t *testing.T) {
 set -eu
 case "$*" in
   "repo view --json nameWithOwner,defaultBranchRef") printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
-  "pr list --repo acme/widgets --state all --head agent/issue-44-run-44 --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
-    printf '%s\n' '[{"number":144,"url":"https://github.com/acme/widgets/pull/144","state":"MERGED","mergedAt":"2026-07-26T17:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-44-run-44","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+  "pr list --repo acme/widgets --state all --head agent/issue-44-run-44 --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    printf '%s\n' '[{"number":144,"url":"https://github.com/acme/widgets/pull/144","state":"MERGED","mergedAt":"2026-07-26T17:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-44-run-44","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
   "issue view 44 --repo acme/widgets --json number,state,title,url") printf '%s\n' '{"number":44,"state":"CLOSED","title":"Merge while watching","url":"https://github.com/acme/widgets/issues/44"}' ;;
   "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url") printf '%s\n' '[]' ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
@@ -1922,6 +1922,37 @@ func TestDashboardPresentsQuietAgeAndUnavailableTurnsFromSharedProgress(t *testi
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("attention dashboard output lost %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestDashboardProjectsStructuredRecoveryDiagnosticsAndProviderDeadline(t *testing.T) {
+	now := time.Date(2026, 7, 29, 4, 0, 0, 0, time.UTC)
+	resumeAfter := now.Add(30 * time.Second)
+	run := scheduler.Run{
+		Issue: 98, RunID: "provider-recovery", Status: scheduler.StatusSuspended,
+		FailureClass: scheduler.FailureProviderExhaustion, WorkflowStage: "normal-review",
+		ProviderContinuationAttempts: 1, ResumeAfter: &resumeAfter, RecoveryCount: 2,
+		Error: "provider retries exhausted",
+	}
+	observed := statusRun{run: run, observation: runObservation{run: run, observed: now}}
+	var standard strings.Builder
+	renderDashboardSection(&standard, statusActive, "Active Runs", []statusRun{observed}, now, dashboardStyler{})
+	builder := dashboardBodyBuilder{}
+	projections := map[string]string{
+		"standard": standard.String(),
+		"compact":  compactDashboardRun(observed, now, false, 1000),
+		"expanded": builder.expandedDashboardRun(observed, now),
+	}
+	for name, projection := range projections {
+		for _, want := range []string{
+			"Failure class: provider-exhaustion", "Workflow stage: normal-review",
+			"Provider cooldown until: " + resumeAfter.Format(time.RFC3339),
+			"Provider continuations: 1 of 1", "Explicit recoveries: 2",
+		} {
+			if !strings.Contains(projection, want) {
+				t.Fatalf("%s dashboard projection omitted %q:\n%s", name, want, projection)
+			}
 		}
 	}
 }

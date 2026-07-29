@@ -327,6 +327,9 @@ func (p *statusPrinter) run(observed statusRun) {
 		}
 		p.printf("    Progress: suspended; %s\n", resume)
 		p.printTime("Suspended", run.SuspendedAt)
+		if run.Error != "" {
+			p.printReason(run)
+		}
 	case scheduler.StatusResetting:
 		p.printf("    Intervention: Reset is incomplete; rerun backlog reset; Worker not active\n")
 		p.printReason(run)
@@ -386,6 +389,30 @@ func (p *statusPrinter) printBranch(run scheduler.Run) {
 
 func (p *statusPrinter) printReason(run scheduler.Run) {
 	p.printf("    Diagnostic: %s\n", valueOr(strings.TrimSpace(plainStatusValue(run.Error)), "n/a"))
+	if run.FailureClass != "" {
+		p.printf("    Failure class: %s\n", plainStatusValue(string(run.FailureClass)))
+	}
+	if run.WorkflowStage != "" {
+		p.printf("    Workflow stage: %s\n", plainStatusValue(run.WorkflowStage))
+	}
+	if run.BlockerKind != "" {
+		p.printf("    Blocker kind: %s\n", plainStatusValue(run.BlockerKind))
+	}
+	if run.BlockerCause != "" {
+		p.printf("    Blocker cause: %s\n", plainStatusValue(run.BlockerCause))
+	}
+	if run.BlockerFingerprint != "" {
+		p.printf("    Blocker fingerprint: %s\n", plainStatusValue(run.BlockerFingerprint))
+	}
+	if run.ResumeAfter != nil {
+		p.printTime("Provider cooldown until", run.ResumeAfter)
+	}
+	if run.ProviderContinuationAttempts > 0 {
+		p.printf("    Provider continuations: %d of 1\n", run.ProviderContinuationAttempts)
+	}
+	if run.RecoveryCount > 0 {
+		p.printf("    Explicit recoveries: %d\n", run.RecoveryCount)
+	}
 }
 
 func displayedRunIsSuspending(run scheduler.Run, process followObservation) bool {

@@ -828,6 +828,9 @@ func (e Service) completeMergedPlan(ctx context.Context, plan Plan) (bool, error
 	if !e.policy.AllowMergedCompletion || plan.TerminalState != scheduler.StatusMerged {
 		return false, nil
 	}
+	if e.policy.RetireMergedCompletionArtifacts && (len(plan.Actions) != 1 || plan.Actions[0].kind != actionFinalizeCompletion) {
+		return false, nil
+	}
 	if len(plan.Actions) != 1 || plan.Actions[0].kind != actionFinalizeCompletion {
 		return true, errors.New("merged expected pull request did not produce an executable Completion plan")
 	}
@@ -1035,12 +1038,18 @@ func missingLogWarning(run scheduler.Run) string {
 }
 
 func (e Service) verifyOwnedFinalState(snapshot Snapshot) error {
-	for _, pull := range snapshot.PullRequests {
-		if pull.State != PullRequestClosed || pull.AutoMergeArmed {
-			return fmt.Errorf("pull request #%d final state is not verified closed, unmerged, and auto-merge unarmed", pull.Number)
+	if e.policy.AllowMergedCompletion && e.policy.TerminalStatus == scheduler.StatusMerged {
+		if len(snapshot.PullRequests) != 1 || snapshot.PullRequests[0].State != PullRequestMerged || snapshot.PullRequests[0].URL != snapshot.Run.PullRequest || snapshot.Issue.Open {
+			return errors.New("Completion final state is not one merged expected pull request with a closed issue")
 		}
-		if e.policy.RequireClosedExplanation && !pull.Explained {
-			return fmt.Errorf("pull request #%d final state is missing its verified %s explanation", pull.Number, e.policy.Operation)
+	} else {
+		for _, pull := range snapshot.PullRequests {
+			if pull.State != PullRequestClosed || pull.AutoMergeArmed {
+				return fmt.Errorf("pull request #%d final state is not verified closed, unmerged, and auto-merge unarmed", pull.Number)
+			}
+			if e.policy.RequireClosedExplanation && !pull.Explained {
+				return fmt.Errorf("pull request #%d final state is missing its verified %s explanation", pull.Number, e.policy.Operation)
+			}
 		}
 	}
 	if snapshot.RemoteBranch.Present {
@@ -1125,20 +1134,27 @@ func inspectWorkerAbsent(run scheduler.Run) error {
 		return errors.New("replacement Worker launch is pending; Worker absence is uncertain")
 	}
 	if run.ProcessIdentity == "" {
-		if run.PID == 0 {
-			return nil
-		}
-		return fmt.Errorf("Run %s has incomplete Worker identity", run.RunID)
-	}
-	pid, err := processidentity.PID(run.ProcessIdentity)
-	if err != nil {
 		if run.PID != 0 {
-			return fmt.Errorf("Worker PID %d has uncertain identity %q: %w", run.PID, run.ProcessIdentity, err)
+			return fmt.Errorf("Run %s has incomplete Worker identity", run.RunID)
 		}
-		return fmt.Errorf("Run %s has uncertain retained Worker identity: %w", run.RunID, err)
+		if run.StoppedWorkerProcessIdentity == "" {
+			if run.StoppedWorkerPID == 0 {
+				return nil
+			}
+			return fmt.Errorf("Run %s has incomplete stopped Worker identity", run.RunID)
+		}
+		return inspectRecordedWorkerAbsent(run.RunID, run.StoppedWorkerPID, run.StoppedWorkerProcessIdentity, "stopped ")
 	}
-	if run.PID != 0 && run.PID != pid {
-		return fmt.Errorf("Run %s has contradictory Worker identity: recorded PID %d does not match process identity PID %d", run.RunID, run.PID, pid)
+	return inspectRecordedWorkerAbsent(run.RunID, run.PID, run.ProcessIdentity, "")
+}
+
+func inspectRecordedWorkerAbsent(runID string, recordedPID int, expectedIdentity, qualifier string) error {
+	pid, err := processidentity.PID(expectedIdentity)
+	if err != nil {
+		return fmt.Errorf("%sWorker PID %d has uncertain identity %q: %w", qualifier, recordedPID, expectedIdentity, err)
+	}
+	if recordedPID != 0 && recordedPID != pid {
+		return fmt.Errorf("Run %s has contradictory %sWorker identity: recorded PID %d does not match process identity PID %d", runID, qualifier, recordedPID, pid)
 	}
 	processAlive, err := processidentity.Alive(pid)
 	if err != nil {
@@ -1152,16 +1168,16 @@ func inspectWorkerAbsent(run scheduler.Run) error {
 		return nil
 	}
 	if !processAlive || !groupAlive {
-		return fmt.Errorf("Worker PID/process-group liveness is uncertain for Run %s", run.RunID)
+		return fmt.Errorf("%sWorker PID/process-group liveness is uncertain for Run %s", qualifier, runID)
 	}
 	identity, err := processidentity.Start(pid)
 	if err != nil {
 		return fmt.Errorf("verify live Worker identity: %w", err)
 	}
-	if identity != run.ProcessIdentity {
-		return fmt.Errorf("Worker PID %d is live with uncertain identity %q instead of %q", pid, identity, run.ProcessIdentity)
+	if identity != expectedIdentity {
+		return fmt.Errorf("%sWorker PID %d is live with uncertain identity %q instead of %q", qualifier, pid, identity, expectedIdentity)
 	}
-	return fmt.Errorf("Worker for Run %s is live at PID %d", run.RunID, pid)
+	return fmt.Errorf("%sWorker for Run %s is live at PID %d", qualifier, runID, pid)
 }
 
 func absentWorkerSummary(run scheduler.Run) string {
@@ -1553,7 +1569,13 @@ func inspectSessionDirectory(directory string, run scheduler.Run) ([]string, boo
 		if entry.IsDir() {
 			return nil
 		}
-		if !entry.Type().IsRegular() || filepath.Ext(path) != ".jsonl" {
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("Pi session directory contains unknown resource %s", path)
+		}
+		if path == filepath.Join(directory, "backlog-afk-checkpoint-v1.json") {
+			return nil
+		}
+		if filepath.Ext(path) != ".jsonl" {
 			return fmt.Errorf("Pi session directory contains unknown resource %s", path)
 		}
 		files = append(files, path)

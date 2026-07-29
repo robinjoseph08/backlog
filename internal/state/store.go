@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -16,11 +17,12 @@ import (
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
 
-const CurrentVersion = 4
+const CurrentVersion = 5
 
 const legacyVersion = 1
 const versionWithLeases = 2
-const previousVersion = 3
+const versionWithAcknowledgments = 3
+const previousVersion = 4
 const sha256HexLength = 64
 
 type State struct {
@@ -96,12 +98,15 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 			return State{}, false, err
 		}
 		return value, false, nil
-	case previousVersion, versionWithLeases:
+	case previousVersion, versionWithAcknowledgments, versionWithLeases:
 		value, err := decodeCurrentState(encoded)
 		if err != nil {
 			return State{}, false, fmt.Errorf("decode version %d state: %w", header.Version, err)
 		}
 		value.Version = CurrentVersion
+		if header.Version == previousVersion {
+			migrateV4WorkerProof(&value)
+		}
 		if header.Version == versionWithLeases {
 			for index := range value.Runs {
 				value.Runs[index].AcknowledgedAt = nil
@@ -112,7 +117,7 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 		}
 		if persistMigration {
 			if err := s.Save(value); err != nil {
-				return State{}, false, fmt.Errorf("persist version 4 state migration: %w", err)
+				return State{}, false, fmt.Errorf("persist version 5 state migration: %w", err)
 			}
 		}
 		return value, true, nil
@@ -127,12 +132,70 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 		}
 		if persistMigration {
 			if err := s.Save(value); err != nil {
-				return State{}, false, fmt.Errorf("persist version 4 state migration: %w", err)
+				return State{}, false, fmt.Errorf("persist version 5 state migration: %w", err)
 			}
 		}
 		return value, true, nil
 	default:
 		return State{}, false, fmt.Errorf("unsupported state version %d", header.Version)
+	}
+}
+
+func migrateV4WorkerProof(value *State) {
+	for index := range value.Runs {
+		run := &value.Runs[index]
+		if run.Workflow == "" && run.Continuation != nil {
+			run.Workflow = run.Continuation.Workflow
+		}
+		if run.RecoveryCount > 0 {
+			run.RecoveredRetirementRequired = true
+		}
+		if run.Status == scheduler.StatusRunning && run.WorkerMode == scheduler.WorkerModeRPC && run.Continuation != nil {
+			if run.WorkerGeneration == 0 {
+				run.WorkerGeneration = 1
+			}
+			if run.Continuation.WorkerGeneration == 0 {
+				run.Continuation.WorkerGeneration = run.WorkerGeneration
+			}
+		}
+		if run.Status != scheduler.StatusRunning && run.ProcessIdentity != "" {
+			pidText, started, found := strings.Cut(run.ProcessIdentity, ":")
+			identityPID, err := strconv.Atoi(pidText)
+			if found && err == nil && identityPID > 0 && strings.TrimSpace(started) != "" && (run.PID == 0 || run.PID == identityPID) {
+				if run.WorkerGeneration == 0 {
+					run.WorkerGeneration = 1
+				}
+				run.StoppedWorkerGeneration = run.WorkerGeneration
+				run.StoppedWorkerPID = identityPID
+				run.StoppedWorkerProcessIdentity = run.ProcessIdentity
+				stoppedAt := run.UpdatedAt
+				if stoppedAt.IsZero() {
+					stoppedAt = run.StartedAt
+				}
+				if !stoppedAt.IsZero() {
+					run.WorkerStoppedAt = &stoppedAt
+					run.PID = 0
+					run.ProcessIdentity = ""
+				}
+			}
+		}
+		if run.Status != scheduler.StatusSuspended || run.Continuation == nil {
+			continue
+		}
+		if run.WorkerGeneration == 0 {
+			run.WorkerGeneration = 1
+		}
+		run.StoppedWorkerGeneration = run.WorkerGeneration
+		if run.Continuation.WorkerGeneration == 0 {
+			run.Continuation.WorkerGeneration = run.WorkerGeneration
+		}
+		stoppedAt := run.Continuation.VerifiedAt
+		if stoppedAt.IsZero() && run.SuspendedAt != nil {
+			stoppedAt = *run.SuspendedAt
+		}
+		if !stoppedAt.IsZero() {
+			run.WorkerStoppedAt = &stoppedAt
+		}
 	}
 }
 
@@ -461,20 +524,79 @@ func validateRun(run scheduler.Run, requireWorkerMode, recoverUnsafeContinuation
 			boundary.SessionFile == "" || boundary.LeafID == "" || boundary.EntryCount <= 0 || len(boundary.SHA256) != sha256HexLength || hashErr != nil || boundary.VerifiedAt.IsZero() {
 			return fmt.Errorf("state contains Run %q with an invalid continuation boundary", run.RunID)
 		}
+		checkpointHash, checkpointHashErr := hex.DecodeString(boundary.CheckpointSHA256)
+		switch boundary.Workflow {
+		case "":
+			if boundary.WorkflowStage != "" || boundary.CheckpointFile != "" || boundary.CheckpointSHA256 != "" || boundary.CheckpointStatus != "" || boundary.CheckpointFailureClass != "" || boundary.CheckpointBlockerKind != "" || boundary.CheckpointBlockerCause != "" || boundary.CheckpointBlockerFingerprint != "" {
+				return fmt.Errorf("state contains Run %q with incomplete continuation workflow identity", run.RunID)
+			}
+		case "afk":
+			legacyInvocationOnly := boundary.CheckpointFile == "" && boundary.CheckpointSHA256 == ""
+			durableMarker := filepath.Base(boundary.CheckpointFile) == "backlog-afk-checkpoint-v1.json" && len(boundary.CheckpointSHA256) == sha256HexLength && checkpointHashErr == nil
+			if boundary.WorkflowStage != "afk-coordinator" || (!legacyInvocationOnly && !durableMarker) || boundary.CheckpointStatus != "active" || boundary.CheckpointFailureClass != "" || boundary.CheckpointBlockerKind != "" || boundary.CheckpointBlockerCause != "" || boundary.CheckpointBlockerFingerprint != "" {
+				return fmt.Errorf("state contains Run %q with invalid AFK continuation identity", run.RunID)
+			}
+		case "ship-it":
+			if boundary.WorkflowStage == "" || boundary.CheckpointFile == "" || len(boundary.CheckpointSHA256) != sha256HexLength || checkpointHashErr != nil || len(checkpointHash) != sha256HexLength/2 ||
+				(boundary.CheckpointStatus != "active" && boundary.CheckpointStatus != "blocked") || !knownFailureClass(scheduler.FailureClass(boundary.CheckpointFailureClass)) {
+				return fmt.Errorf("state contains Run %q with invalid ship-it continuation identity", run.RunID)
+			}
+		default:
+			return fmt.Errorf("state contains Run %q with unsupported continuation workflow %q", run.RunID, boundary.Workflow)
+		}
+		if boundary.WorkerGeneration < 0 || boundary.WorkerGeneration > run.WorkerGeneration || boundary.RemoteBranchState != "" && boundary.RemoteBranchState != "present" && boundary.RemoteBranchState != "absent" ||
+			boundary.RemoteBranchState == "present" && boundary.RemoteCommit == "" || boundary.RemoteBranchState == "absent" && boundary.RemoteCommit != "" ||
+			boundary.PullRequest == "" && boundary.PullRequestHead != "" || boundary.PullRequest != "" && boundary.PullRequestHead == "" {
+			return fmt.Errorf("state contains Run %q with invalid continuation generation or repository identity", run.RunID)
+		}
+		if run.Workflow != "" && run.Workflow != boundary.Workflow || run.WorkflowStage != "" && run.WorkflowStage != boundary.WorkflowStage {
+			return fmt.Errorf("state contains Run %q with mismatched workflow metadata", run.RunID)
+		}
 		relative, err := filepath.Rel(run.SessionDir, boundary.SessionFile)
 		if err != nil || relative == "." || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 			return fmt.Errorf("state contains Run %q with a continuation file outside its session directory", run.RunID)
 		}
 	}
+	if run.WorkerGeneration < 0 || run.StoppedWorkerGeneration < 0 || run.StoppedWorkerGeneration > run.WorkerGeneration ||
+		run.StoppedWorkerGeneration > 0 && (run.WorkerStoppedAt == nil || run.WorkerStoppedAt.IsZero()) || run.WorkerStoppedAt != nil && run.StoppedWorkerGeneration == 0 ||
+		run.StoppedWorkerPID < 0 || (run.StoppedWorkerPID == 0) != (run.StoppedWorkerProcessIdentity == "") || run.StoppedWorkerPID > 0 && run.StoppedWorkerGeneration == 0 {
+		return fmt.Errorf("state contains Run %q with invalid Worker generation stop proof", run.RunID)
+	}
 	if run.Status == scheduler.StatusSuspended && !unsafeContinuation {
-		if run.PID != 0 || run.ProcessIdentity != "" || run.Continuation == nil {
+		if (!run.ResumePending || run.ProcessIdentity != "") && (run.PID != 0 || run.ProcessIdentity != "") || run.Continuation == nil {
 			return fmt.Errorf("state contains suspended issue #%d without a verified stopped continuation", run.Issue)
 		}
 	}
-	if run.ResumePending && ((run.Status != scheduler.StatusSuspended && run.Status != scheduler.StatusNeedsHuman) || run.PID != 0 || run.ProcessIdentity != "" || run.Continuation == nil && run.Status != scheduler.StatusNeedsHuman && !recoverUnsafeContinuation) {
+	if run.ResumePending && ((run.Status != scheduler.StatusSuspended && run.Status != scheduler.StatusNeedsHuman) || run.PID < 0 || run.ProcessIdentity != "" || run.Continuation == nil && run.Status != scheduler.StatusNeedsHuman && !recoverUnsafeContinuation) {
 		return fmt.Errorf("state contains Run %q with an invalid pending Resume", run.RunID)
 	}
+	if !knownFailureClass(run.FailureClass) {
+		return fmt.Errorf("state contains Run %q with unknown failure class %q", run.RunID, run.FailureClass)
+	}
+	if run.Workflow != "" && run.Workflow != "afk" && run.Workflow != "ship-it" || run.Workflow == "afk" && run.WorkflowStage != "" && run.WorkflowStage != "afk-coordinator" || run.Workflow == "ship-it" && run.WorkflowStage == "afk-coordinator" {
+		return fmt.Errorf("state contains Run %q with invalid monotonic workflow identity", run.RunID)
+	}
+	if run.ProviderContinuationAttempts < 0 || run.ProviderContinuationAttempts > 1 {
+		return fmt.Errorf("state contains Run %q with an invalid provider continuation budget", run.RunID)
+	}
+	if run.ResumeAfter != nil && (run.ResumeAfter.IsZero() || run.Status != scheduler.StatusSuspended || run.ProviderContinuationAttempts != 1) {
+		return fmt.Errorf("state contains Run %q with an invalid provider continuation cooldown", run.RunID)
+	}
+	if run.RecoveryCount < 0 || run.RecoveryCount == 0 && (run.FirstRecoveredAt != nil || run.LastRecoveredAt != nil) ||
+		run.RecoveryCount > 0 && (run.FirstRecoveredAt == nil || run.LastRecoveredAt == nil || run.FirstRecoveredAt.IsZero() || run.LastRecoveredAt.IsZero() || run.LastRecoveredAt.Before(*run.FirstRecoveredAt)) {
+		return fmt.Errorf("state contains Run %q with invalid Recovery metadata", run.RunID)
+	}
 	return nil
+}
+
+func knownFailureClass(class scheduler.FailureClass) bool {
+	switch class {
+	case "", scheduler.FailureProviderExhaustion, scheduler.FailureBaseAdvancement, scheduler.FailureValidation,
+		scheduler.FailureRepairBudgetExhaustion, scheduler.FailureUnsafeContinuation:
+		return true
+	default:
+		return false
+	}
 }
 
 func knownStatus(status scheduler.Status) bool {

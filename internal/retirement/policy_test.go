@@ -62,8 +62,9 @@ func TestModuleRetiresWithDistinctExternalResolutionPolicy(t *testing.T) {
 	progressLabel := filepath.Join(root, "progress-label")
 	openPullRequest := filepath.Join(root, "open-pull-request")
 	commentedPullRequest := filepath.Join(root, "commented-pull-request")
+	failProgressLabelRemoval := filepath.Join(root, "fail-progress-label-removal")
 	mutationLog := filepath.Join(root, "mutations")
-	for _, path := range []string{readyLabel, progressLabel, openPullRequest} {
+	for _, path := range []string{readyLabel, progressLabel, openPullRequest, failProgressLabelRemoval} {
 		if err := os.WriteFile(path, nil, 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -108,6 +109,11 @@ case "$*" in
     printf '%s\n' 'remove:ready-for-agent' >> `+shellQuote(mutationLog)+`
     rm -f `+shellQuote(readyLabel)+` ;;
   "issue edit 42 --repo acme/widgets --remove-label in-progress")
+    if [ -f `+shellQuote(failProgressLabelRemoval)+` ]; then
+      rm -f `+shellQuote(failProgressLabelRemoval)+`
+      echo 'deterministic label removal failure' >&2
+      exit 8
+    fi
     printf '%s\n' 'remove:in-progress' >> `+shellQuote(mutationLog)+`
     rm -f `+shellQuote(progressLabel)+` ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
@@ -180,8 +186,25 @@ esac
 		!strings.Contains(output.String(), "Issue: https://github.com/acme/widgets/issues/42 (closed; labels: in-progress, ready-for-agent, unrelated)") {
 		t.Fatalf("External Resolution plan output = %q", output.String())
 	}
-	if err := module.Retire(context.Background(), approved); err != nil {
-		t.Fatalf("External Resolution retirement: %v", err)
+	if err := module.Retire(context.Background(), approved); err == nil || !strings.Contains(err.Error(), "deterministic label removal failure") {
+		t.Fatalf("partial External Resolution retirement = %v", err)
+	}
+	if len(store.current.Leases) != 1 || store.current.Runs[0].Status != statusResolvingExternally {
+		t.Fatalf("partial retirement released ownership = %#v", store.current)
+	}
+	remaining, err := module.Inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRemaining := []string{
+		"remove issue label in-progress from https://github.com/acme/widgets/issues/42",
+		"mark Run run-42 resolved-externally and release Lease lease-42",
+	}
+	if strings.Join(actionDescriptions(remaining), "\n") != strings.Join(wantRemaining, "\n") {
+		t.Fatalf("partial retirement rerun actions = %q, want only remaining %q", actionDescriptions(remaining), wantRemaining)
+	}
+	if err := module.Retire(context.Background(), remaining); err != nil {
+		t.Fatalf("rerun partial External Resolution retirement: %v", err)
 	}
 	if len(store.saved) != 2 || store.saved[0].Runs[0].Status != statusResolvingExternally || len(store.saved[0].Leases) != 1 {
 		t.Fatalf("External Resolution progress state = %#v", store.saved)

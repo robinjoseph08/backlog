@@ -638,8 +638,8 @@ func TestClientVerifiesCompletionFromPullRequestAndIssue(t *testing.T) {
 
 	gh := fakeGH(t, `
 case "$*" in
-  "pr list --repo acme/widgets --state all --head agent/issue-42-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
-    printf '%s\n' '[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"MERGED","mergedAt":"2026-01-03T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-42-run","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+  "pr list --repo acme/widgets --state all --head agent/issue-42-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    printf '%s\n' '[{"number":100,"url":"https://github.com/acme/widgets/pull/100","state":"MERGED","mergedAt":"2026-01-03T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-42-run","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
   "issue view 42 --repo acme/widgets --json number,state,title,url")
     printf '%s\n' '{"number":42,"state":"CLOSED","title":"done","url":"https://github.com/acme/widgets/issues/42"}' ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
@@ -650,7 +650,7 @@ esac`)
 	if err != nil {
 		t.Fatalf("completion: %v", err)
 	}
-	if !got.Merged || !got.IssueClosed || got.PullRequest != "https://github.com/acme/widgets/pull/100" {
+	if !got.Merged || !got.IssueClosed || got.PullRequest != "https://github.com/acme/widgets/pull/100" || got.HeadCommit != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
 		t.Fatalf("got %#v, want verified completion", got)
 	}
 }
@@ -660,8 +660,8 @@ func TestClientRecognizesArmedAutoMergeAsUnderstoodWait(t *testing.T) {
 
 	gh := fakeGH(t, `
 case "$*" in
-  "pr list --repo acme/widgets --state all --head agent/issue-7-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
-    printf '%s\n' '[{"number":101,"url":"https://github.com/acme/widgets/pull/101","state":"OPEN","mergedAt":null,"autoMergeRequest":{"mergeMethod":"SQUASH"},"isDraft":false,"headRefName":"agent/issue-7-run","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+  "pr list --repo acme/widgets --state all --head agent/issue-7-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    printf '%s\n' '[{"number":101,"url":"https://github.com/acme/widgets/pull/101","state":"OPEN","mergedAt":null,"autoMergeRequest":{"mergeMethod":"SQUASH"},"isDraft":false,"headRefName":"agent/issue-7-run","headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
   "issue view 7 --repo acme/widgets --json number,state,title,url")
     printf '%s\n' '{"number":7,"state":"OPEN","title":"waiting","url":"https://github.com/acme/widgets/issues/7"}' ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
@@ -756,7 +756,7 @@ func TestClientCompletionRefusesMismatchedIssueIdentity(t *testing.T) {
 
 	gh := fakeGH(t, `
 case "$*" in
-  "pr list --repo acme/widgets --state all --head agent/issue-42-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+  "pr list --repo acme/widgets --state all --head agent/issue-42-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
     printf '%s\n' '[]' ;;
   "issue view 42 --repo acme/widgets --json number,state,title,url")
     printf '%s\n' '{"number":41,"state":"OPEN","title":"wrong issue","url":"https://github.com/acme/widgets/issues/42"}' ;;
@@ -792,7 +792,7 @@ func TestClientCompletionRefusesDuplicateIssueIdentityFields(t *testing.T) {
 			t.Parallel()
 			gh := fakeGH(t, `
 case "$*" in
-  "pr list --repo acme/widgets --state all --head agent/issue-42-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+  "pr list --repo acme/widgets --state all --head agent/issue-42-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
     printf '%s\n' '[]' ;;
   "issue view 42 --repo acme/widgets --json number,state,title,url")
     printf '%s\n' '`+test.response+`' ;;
@@ -815,7 +815,7 @@ func TestClientCompletionRefusesCaseVariantPullRequestIdentity(t *testing.T) {
 
 	gh := fakeGH(t, `
 case "$*" in
-  "pr list --repo acme/widgets --state all --head agent/issue-9-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+  "pr list --repo acme/widgets --state all --head agent/issue-9-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
     printf '%s\n' '[{"number":109,"url":"https://github.com/acme/widgets/pull/109","state":"MERGED","mergedAt":"2026-01-03T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-9-run","headRepositoryOwner":{"login":"other","Login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
 esac`)
@@ -834,7 +834,7 @@ func TestClientCompletionRefusesSameBranchFromFork(t *testing.T) {
 
 	gh := fakeGH(t, `
 case "$*" in
-  "pr list --repo acme/widgets --state all --head agent/issue-9-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRepositoryOwner,headRepository")
+  "pr list --repo acme/widgets --state all --head agent/issue-9-run --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
     printf '%s\n' '[{"number":109,"url":"https://github.com/acme/widgets/pull/109","state":"MERGED","mergedAt":"2026-01-03T00:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"agent/issue-9-run","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/fork"}}]' ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
 esac`)

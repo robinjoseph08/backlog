@@ -211,7 +211,7 @@ func TestResolveDryRunAndCancellationDoNotMigrateBindOrMutate(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			encoded = bytes.Replace(encoded, []byte(`"version": 4`), []byte(`"version": 3`), 1)
+			encoded = bytes.Replace(encoded, []byte(`"version": 5`), []byte(`"version": 3`), 1)
 			if err := os.WriteFile(fixture.store.Path, encoded, 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -2110,7 +2110,7 @@ func TestCompiledResolveMigratesV3AndStatusAndFollowExposeResolution(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded = bytes.Replace(encoded, []byte(`"version": 4`), []byte(`"version": 3`), 1)
+	encoded = bytes.Replace(encoded, []byte(`"version": 5`), []byte(`"version": 3`), 1)
 	if err := os.WriteFile(fixture.store.Path, encoded, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -2124,7 +2124,7 @@ func TestCompiledResolveMigratesV3AndStatusAndFollowExposeResolution(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(persisted, []byte(`"version": 4`)) {
+	if !bytes.Contains(persisted, []byte(`"version": 5`)) {
 		t.Fatalf("compiled resolve did not persist v3 migration:\n%s", persisted)
 	}
 	migrated, err := fixture.store.Load()

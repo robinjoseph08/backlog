@@ -241,6 +241,23 @@ func TestMergedExpectedPullRequestPlansCompletionBeforeClosureReasonEligibility(
 	}
 }
 
+func TestExternalResolutionCannotFinalizeRecoveredCompletionWithWeakerPolicy(t *testing.T) {
+	snapshot := retirement.Snapshot{
+		Run: scheduler.Run{
+			Issue: 42, RunID: "run", Status: scheduler.StatusResolvingExternally,
+			PullRequest: "https://github.com/acme/widgets/pull/9", Branch: "agent/run",
+			RecoveredRetirementRequired: true,
+		},
+		Lease:        scheduler.Lease{LeaseID: "lease", Issue: 42, RunID: "run"},
+		Issue:        retirement.Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", ClosureReason: "completed", Labels: []string{"in-progress"}},
+		PullRequests: []retirement.PullRequest{{Number: 9, URL: "https://github.com/acme/widgets/pull/9", Branch: "agent/run", Commit: strings.Repeat("a", 40), State: retirement.PullRequestMerged}},
+		RemoteBranch: retirement.Branch{Name: "agent/run", Commit: strings.Repeat("a", 40), Present: true},
+	}
+	if plan, err := retirement.Build(Policy("run"), snapshot); err == nil || !strings.Contains(err.Error(), "full recovered retirement policy") || plan.TerminalState == scheduler.StatusMerged {
+		t.Fatalf("weaker recovered Completion plan = %#v, error = %v", plan, err)
+	}
+}
+
 func TestExpectedBranchPullRequestIdentityForCompletion(t *testing.T) {
 	const (
 		branch   = "agent/run"

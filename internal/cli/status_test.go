@@ -261,6 +261,39 @@ func TestStatusConciseProjectionAndFullHistoryAreCompleteOrderedAndExplicit(t *t
 	}
 }
 
+func TestStatusProjectsStructuredRecoveryDiagnosticsInConciseAndFullViews(t *testing.T) {
+	now := time.Date(2026, 7, 29, 4, 0, 0, 0, time.UTC)
+	firstRecovery := now.Add(-time.Hour)
+	resumeAfter := now.Add(30 * time.Second)
+	runs := []scheduler.Run{
+		{Issue: 201, RunID: "provider", Status: scheduler.StatusSuspended, FailureClass: scheduler.FailureProviderExhaustion, WorkflowStage: "normal-review", ProviderContinuationAttempts: 1, ResumeAfter: &resumeAfter, Error: "provider retries exhausted", UpdatedAt: now},
+		{Issue: 202, RunID: "base", Status: scheduler.StatusFailed, FailureClass: scheduler.FailureBaseAdvancement, WorkflowStage: "integration-refresh", Error: "base advanced", UpdatedAt: now.Add(-time.Minute)},
+		{Issue: 203, RunID: "validation", Status: scheduler.StatusFailed, FailureClass: scheduler.FailureValidation, WorkflowStage: "validation", Error: "validation failed", UpdatedAt: now.Add(-2 * time.Minute)},
+		{Issue: 204, RunID: "repair", Status: scheduler.StatusFailed, FailureClass: scheduler.FailureRepairBudgetExhaustion, WorkflowStage: "blocked", BlockerKind: "evidence-unavailable", BlockerCause: "hosted evidence absent", BlockerFingerprint: "browser-check", RecoveryCount: 2, FirstRecoveredAt: &firstRecovery, LastRecoveredAt: &now, Error: "repair budget exhausted", UpdatedAt: now.Add(-3 * time.Minute)},
+		{Issue: 205, RunID: "unsafe", Status: scheduler.StatusNeedsHuman, FailureClass: scheduler.FailureUnsafeContinuation, WorkflowStage: "publish", Error: "checkpoint hash changed", UpdatedAt: now.Add(-4 * time.Minute)},
+	}
+	current := state.State{Version: state.CurrentVersion, Runs: runs, Leases: []scheduler.Lease{
+		{LeaseID: "provider", Issue: 201, RunID: "provider"}, {LeaseID: "unsafe", Issue: 205, RunID: "unsafe"},
+	}}
+	for _, full := range []bool{false, true} {
+		var output bytes.Buffer
+		if err := printPlainStatusProjection(&output, current, &sequenceFollowSource{}, now, full); err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{
+			"Failure class: provider-exhaustion", "Failure class: base-advancement", "Failure class: validation-failure",
+			"Failure class: repair-budget-exhaustion", "Failure class: unsafe-continuation-evidence",
+			"Workflow stage: normal-review", "Workflow stage: integration-refresh", "Workflow stage: validation", "Workflow stage: blocked", "Workflow stage: publish",
+			"Blocker kind: evidence-unavailable", "Blocker cause: hosted evidence absent", "Blocker fingerprint: browser-check",
+			"Provider cooldown until: " + resumeAfter.Format(time.RFC3339), "Provider continuations: 1 of 1", "Explicit recoveries: 2",
+		} {
+			if !strings.Contains(output.String(), want) {
+				t.Fatalf("status full=%t missing %q:\n%s", full, want, output.String())
+			}
+		}
+	}
+}
+
 func TestStatusKeepsOperationalSectionsUnboundedAndOrdersEverySectionNewestFirst(t *testing.T) {
 	base := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
 	runs := []scheduler.Run{

@@ -45,48 +45,93 @@ type Candidate struct {
 	Blockers  []Blocker
 }
 
+type FailureClass string
+
+const (
+	FailureProviderExhaustion     FailureClass = "provider-exhaustion"
+	FailureBaseAdvancement        FailureClass = "base-advancement"
+	FailureValidation             FailureClass = "validation-failure"
+	FailureRepairBudgetExhaustion FailureClass = "repair-budget-exhaustion"
+	FailureUnsafeContinuation     FailureClass = "unsafe-continuation-evidence"
+)
+
 type ContinuationBoundary struct {
-	SessionID   string    `json:"sessionId"`
-	SessionFile string    `json:"sessionFile"`
-	Worktree    string    `json:"worktree"`
-	LeafID      string    `json:"leafId"`
-	EntryCount  int       `json:"entryCount"`
-	SHA256      string    `json:"sha256"`
-	VerifiedAt  time.Time `json:"verifiedAt"`
+	SessionID                    string    `json:"sessionId"`
+	SessionFile                  string    `json:"sessionFile"`
+	Worktree                     string    `json:"worktree"`
+	LeafID                       string    `json:"leafId"`
+	EntryCount                   int       `json:"entryCount"`
+	SHA256                       string    `json:"sha256"`
+	Workflow                     string    `json:"workflow,omitempty"`
+	WorkflowStage                string    `json:"workflowStage,omitempty"`
+	CheckpointFile               string    `json:"checkpointFile,omitempty"`
+	CheckpointSHA256             string    `json:"checkpointSha256,omitempty"`
+	WorkerGeneration             int       `json:"workerGeneration,omitempty"`
+	LocalCommit                  string    `json:"localCommit,omitempty"`
+	RemoteBranchState            string    `json:"remoteBranchState,omitempty"`
+	RemoteCommit                 string    `json:"remoteCommit,omitempty"`
+	PullRequest                  string    `json:"pullRequest,omitempty"`
+	PullRequestHead              string    `json:"pullRequestHead,omitempty"`
+	CheckpointStatus             string    `json:"checkpointStatus,omitempty"`
+	CheckpointFailureClass       string    `json:"checkpointFailure,omitempty"`
+	CheckpointBlockerKind        string    `json:"checkpointBlockerKind,omitempty"`
+	CheckpointBlockerCause       string    `json:"checkpointBlockerCause,omitempty"`
+	CheckpointBlockerFingerprint string    `json:"checkpointBlockerFingerprint,omitempty"`
+	VerifiedAt                   time.Time `json:"verifiedAt"`
+	LogPath                      string    `json:"-"`
+	StderrPath                   string    `json:"-"`
 }
 
 type Run struct {
-	Issue                int                   `json:"issue"`
-	IssueTitle           string                `json:"issueTitle,omitempty"`
-	IssueURL             string                `json:"issueUrl,omitempty"`
-	RunID                string                `json:"runId"`
-	Status               Status                `json:"status"`
-	WorkerMode           WorkerMode            `json:"workerMode"`
-	PID                  int                   `json:"pid,omitempty"`
-	ProcessIdentity      string                `json:"processIdentity,omitempty"`
-	Branch               string                `json:"branch,omitempty"`
-	Worktree             string                `json:"worktree,omitempty"`
-	SessionName          string                `json:"sessionName,omitempty"`
-	SessionID            string                `json:"sessionId,omitempty"`
-	SessionDir           string                `json:"sessionDir,omitempty"`
-	Continuation         *ContinuationBoundary `json:"continuation,omitempty"`
-	ResumePending        bool                  `json:"resumePending,omitempty"`
-	LogPath              string                `json:"logPath,omitempty"`
-	StderrPath           string                `json:"stderrPath,omitempty"`
-	WorkerLogOpen        bool                  `json:"workerLogOpen,omitempty"`
-	CleanupPending       bool                  `json:"cleanupPending,omitempty"`
-	PullRequest          string                `json:"pullRequest,omitempty"`
-	Error                string                `json:"error,omitempty"`
-	StartedAt            time.Time             `json:"startedAt"`
-	WorkerStartedAt      time.Time             `json:"workerStartedAt,omitempty"`
-	SuspendingAt         *time.Time            `json:"suspendingAt,omitempty"`
-	SuspendedAt          *time.Time            `json:"suspendedAt,omitempty"`
-	UpdatedAt            time.Time             `json:"updatedAt"`
-	CompletedAt          *time.Time            `json:"completedAt,omitempty"`
-	AcknowledgedAt       *time.Time            `json:"acknowledgedAt,omitempty"`
-	ResolvedExternallyAt *time.Time            `json:"resolvedExternallyAt,omitempty"`
-	ClosureReason        string                `json:"closureReason,omitempty"`
-	DiagnosticWarning    string                `json:"diagnosticWarning,omitempty"`
+	Issue                        int                   `json:"issue"`
+	IssueTitle                   string                `json:"issueTitle,omitempty"`
+	IssueURL                     string                `json:"issueUrl,omitempty"`
+	RunID                        string                `json:"runId"`
+	Status                       Status                `json:"status"`
+	WorkerMode                   WorkerMode            `json:"workerMode"`
+	PID                          int                   `json:"pid,omitempty"`
+	ProcessIdentity              string                `json:"processIdentity,omitempty"`
+	WorkerGeneration             int                   `json:"workerGeneration,omitempty"`
+	StoppedWorkerGeneration      int                   `json:"stoppedWorkerGeneration,omitempty"`
+	StoppedWorkerPID             int                   `json:"stoppedWorkerPid,omitempty"`
+	StoppedWorkerProcessIdentity string                `json:"stoppedWorkerProcessIdentity,omitempty"`
+	WorkerStoppedAt              *time.Time            `json:"workerStoppedAt,omitempty"`
+	Branch                       string                `json:"branch,omitempty"`
+	Worktree                     string                `json:"worktree,omitempty"`
+	SessionName                  string                `json:"sessionName,omitempty"`
+	SessionID                    string                `json:"sessionId,omitempty"`
+	SessionDir                   string                `json:"sessionDir,omitempty"`
+	Continuation                 *ContinuationBoundary `json:"continuation,omitempty"`
+	ResumePending                bool                  `json:"resumePending,omitempty"`
+	LogPath                      string                `json:"logPath,omitempty"`
+	StderrPath                   string                `json:"stderrPath,omitempty"`
+	WorkerLogOpen                bool                  `json:"workerLogOpen,omitempty"`
+	CleanupPending               bool                  `json:"cleanupPending,omitempty"`
+	PullRequest                  string                `json:"pullRequest,omitempty"`
+	Error                        string                `json:"error,omitempty"`
+	StartedAt                    time.Time             `json:"startedAt"`
+	WorkerStartedAt              time.Time             `json:"workerStartedAt,omitempty"`
+	SuspendingAt                 *time.Time            `json:"suspendingAt,omitempty"`
+	SuspendedAt                  *time.Time            `json:"suspendedAt,omitempty"`
+	UpdatedAt                    time.Time             `json:"updatedAt"`
+	CompletedAt                  *time.Time            `json:"completedAt,omitempty"`
+	AcknowledgedAt               *time.Time            `json:"acknowledgedAt,omitempty"`
+	ResolvedExternallyAt         *time.Time            `json:"resolvedExternallyAt,omitempty"`
+	ClosureReason                string                `json:"closureReason,omitempty"`
+	DiagnosticWarning            string                `json:"diagnosticWarning,omitempty"`
+	FailureClass                 FailureClass          `json:"failureClass,omitempty"`
+	Workflow                     string                `json:"workflow,omitempty"`
+	WorkflowStage                string                `json:"workflowStage,omitempty"`
+	PreservedCause               string                `json:"preservedCause,omitempty"`
+	BlockerKind                  string                `json:"blockerKind,omitempty"`
+	BlockerCause                 string                `json:"blockerCause,omitempty"`
+	BlockerFingerprint           string                `json:"blockerFingerprint,omitempty"`
+	ProviderContinuationAttempts int                   `json:"providerContinuationAttempts,omitempty"`
+	ResumeAfter                  *time.Time            `json:"resumeAfter,omitempty"`
+	RecoveryCount                int                   `json:"recoveryCount,omitempty"`
+	RecoveredRetirementRequired  bool                  `json:"recoveredRetirementRequired,omitempty"`
+	FirstRecoveredAt             *time.Time            `json:"firstRecoveredAt,omitempty"`
+	LastRecoveredAt              *time.Time            `json:"lastRecoveredAt,omitempty"`
 }
 
 type Lease struct {
