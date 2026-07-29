@@ -246,7 +246,7 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 	if err := e.validateMutation(plan); err != nil {
 		return err
 	}
-	if completed, err := e.completeMergedPlanWithContinuity(ctx, approved.Snapshot, plan); completed {
+	if completed, err := e.completeMergedPlanWithContinuity(ctx, approved, plan); completed {
 		return err
 	}
 	if !executablePlansEqual(approved, plan) {
@@ -261,7 +261,7 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 		if err := e.validateMutation(plan); err != nil {
 			return err
 		}
-		if err := e.verifyGitHubIdentityContinuity(approved.Snapshot, plan.Snapshot); err != nil {
+		if err := e.verifyPlanIdentityContinuity(approved, plan.Snapshot); err != nil {
 			return err
 		}
 
@@ -458,10 +458,10 @@ func (e Service) revalidatePlan(ctx context.Context, current, approved Plan, act
 	if err := e.validateMutation(fresh); err != nil {
 		return Plan{}, false, err
 	}
-	if completed, err := e.completeMergedPlanWithContinuity(ctx, approved.Snapshot, fresh); completed {
+	if completed, err := e.completeMergedPlanWithContinuity(ctx, approved, fresh); completed {
 		return Plan{}, true, err
 	}
-	if err := e.verifyGitHubIdentityContinuity(approved.Snapshot, fresh.Snapshot); err != nil {
+	if err := e.verifyPlanIdentityContinuity(approved, fresh.Snapshot); err != nil {
 		return Plan{}, false, err
 	}
 	if !executablePlansEqual(current, fresh) {
@@ -482,6 +482,10 @@ func (e Service) revalidateAction(ctx context.Context, current, approved Plan, a
 }
 
 func executablePlansEqual(left, right Plan) bool {
+	if left.TerminalState == scheduler.StatusMerged && right.TerminalState == scheduler.StatusMerged {
+		left.Snapshot.Issue.ClosureReason = ""
+		right.Snapshot.Issue.ClosureReason = ""
+	}
 	if !PlansEqual(left, right) || len(left.Actions) != len(right.Actions) {
 		return false
 	}
@@ -493,14 +497,30 @@ func executablePlansEqual(left, right Plan) bool {
 	return true
 }
 
+func (e Service) verifyPlanIdentityContinuity(approved Plan, actual Snapshot) error {
+	if approved.TerminalState == scheduler.StatusMerged {
+		return e.verifyCompletionIdentityContinuity(approved.Snapshot, actual)
+	}
+	return e.verifyGitHubIdentityContinuity(approved.Snapshot, actual)
+}
+
 func (e Service) verifyGitHubIdentityContinuity(expected, actual Snapshot) error {
+	return e.verifyGitHubIdentityContinuityWithCompletion(expected, actual, false)
+}
+
+func (e Service) verifyCompletionIdentityContinuity(expected, actual Snapshot) error {
+	return e.verifyGitHubIdentityContinuityWithCompletion(expected, actual, true)
+}
+
+func (e Service) verifyGitHubIdentityContinuityWithCompletion(expected, actual Snapshot, allowClosureReasonChange bool) error {
 	if expected.Repository == "" || expected.Repository != actual.Repository {
 		return fmt.Errorf("repository identity changed while %s Run artifacts", e.policy.ProgressStatus)
 	}
 	if expected.Run.RunID != actual.Run.RunID || expected.Run.Branch != actual.Run.Branch || expected.Run.PullRequest != actual.Run.PullRequest || expected.Lease != actual.Lease {
 		return fmt.Errorf("Run or Lease identity changed while %s Run artifacts", e.policy.ProgressStatus)
 	}
-	if expected.Issue.Number != actual.Issue.Number || expected.Issue.URL != actual.Issue.URL || expected.Issue.Open != actual.Issue.Open || expected.Issue.ClosureReason != actual.Issue.ClosureReason {
+	if expected.Issue.Number != actual.Issue.Number || expected.Issue.URL != actual.Issue.URL || expected.Issue.Open != actual.Issue.Open ||
+		!allowClosureReasonChange && expected.Issue.ClosureReason != actual.Issue.ClosureReason {
 		return fmt.Errorf("issue identity, state, or closure reason changed while %s Run artifacts", e.policy.ProgressStatus)
 	}
 	expectedPulls := make(map[int]PullRequest, len(expected.PullRequests))
@@ -514,10 +534,18 @@ func (e Service) verifyGitHubIdentityContinuity(expected, actual Snapshot) error
 			if pull.URL != owned.URL || pull.Branch != owned.Branch || pull.Commit != owned.Commit {
 				return fmt.Errorf("pull request #%d branch or expected commit identity changed while %s", pull.Number, e.policy.ProgressStatus)
 			}
+			if allowClosureReasonChange && pull.State == PullRequestMerged {
+				if err := verifyApprovedArtifactCommitIdentity(expected, pull.Commit); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 		if addedMergedPull || expected.Run.PullRequest != "" || expected.Run.Branch == "" || pull.Branch != expected.Run.Branch || pull.State != PullRequestMerged {
 			return fmt.Errorf("pull request identity set changed while %s GitHub artifacts", e.policy.ProgressStatus)
+		}
+		if err := verifyApprovedArtifactCommitIdentity(expected, pull.Commit); err != nil {
+			return err
 		}
 		addedMergedPull = true
 	}
@@ -552,6 +580,24 @@ func (e Service) verifyGitHubIdentityContinuity(expected, actual Snapshot) error
 		}
 	} else if expected.Session.Archived || expected.Session.Present && !actual.Session.Present {
 		return fmt.Errorf("Pi session archive disappeared while %s Run %s", e.policy.ProgressStatus, expected.Run.RunID)
+	}
+	return nil
+}
+
+func verifyApprovedArtifactCommitIdentity(approved Snapshot, mergedCommit string) error {
+	artifacts := []struct {
+		description string
+		commit      string
+		present     bool
+	}{
+		{description: "remote branch", commit: approved.RemoteBranch.Commit, present: approved.RemoteBranch.Present},
+		{description: "local branch", commit: approved.LocalBranch.Commit, present: approved.LocalBranch.Present},
+		{description: "local worktree", commit: approved.Worktree.Commit, present: approved.Worktree.Present},
+	}
+	for _, artifact := range artifacts {
+		if artifact.present && artifact.commit != mergedCommit {
+			return fmt.Errorf("approved %s commit identity does not match the merged expected pull request head", artifact.description)
+		}
 	}
 	return nil
 }
@@ -790,10 +836,10 @@ func (e Service) inspectMutationPostcondition(ctx context.Context, approved Plan
 	if err != nil {
 		return Plan{}, false, err
 	}
-	if completed, err := e.completeMergedPlanWithContinuity(ctx, approved.Snapshot, after); completed {
+	if completed, err := e.completeMergedPlanWithContinuity(ctx, approved, after); completed {
 		return Plan{}, true, err
 	}
-	if err := e.verifyGitHubIdentityContinuity(approved.Snapshot, after.Snapshot); err != nil {
+	if err := e.verifyPlanIdentityContinuity(approved, after.Snapshot); err != nil {
 		return Plan{}, false, err
 	}
 	return after, false, nil
@@ -811,30 +857,45 @@ func (e Service) completeLateMerge(ctx context.Context, approved Plan) (bool, er
 	if err != nil {
 		return false, nil
 	}
-	return e.completeMergedPlanWithContinuity(ctx, approved.Snapshot, fresh)
+	return e.completeMergedPlanWithContinuity(ctx, approved, fresh)
 }
 
-func (e Service) completeMergedPlanWithContinuity(ctx context.Context, approved Snapshot, plan Plan) (bool, error) {
+func (e Service) completeMergedPlanWithContinuity(ctx context.Context, approved Plan, plan Plan) (bool, error) {
 	if !e.policy.AllowMergedCompletion || plan.TerminalState != scheduler.StatusMerged {
 		return false, nil
 	}
-	if err := e.verifyGitHubIdentityContinuity(approved, plan.Snapshot); err != nil {
+	if err := e.verifyCompletionIdentityContinuity(approved.Snapshot, plan.Snapshot); err != nil {
 		return true, err
 	}
-	return e.completeMergedPlan(ctx, plan)
-}
-
-func (e Service) completeMergedPlan(ctx context.Context, plan Plan) (bool, error) {
-	if !e.policy.AllowMergedCompletion || plan.TerminalState != scheduler.StatusMerged {
+	if approved.TerminalState == scheduler.StatusMerged {
 		return false, nil
 	}
-	if e.policy.RetireMergedCompletionArtifacts && (len(plan.Actions) != 1 || plan.Actions[0].kind != actionFinalizeCompletion) {
-		return false, nil
+	if e.policy.RetireMergedCompletionArtifacts && len(plan.Actions) > 1 {
+		if err := verifyMergedCompletionActionsAuthorized(approved, plan); err != nil {
+			return true, err
+		}
+		return true, e.apply(ctx, plan)
 	}
 	if len(plan.Actions) != 1 || plan.Actions[0].kind != actionFinalizeCompletion {
 		return true, errors.New("merged expected pull request did not produce an executable Completion plan")
 	}
 	return true, e.finalizeCompletion(ctx, plan, plan.Actions[0].pullRequest)
+}
+
+func verifyMergedCompletionActionsAuthorized(approved, completion Plan) error {
+	authorized := make(map[Action]bool, len(approved.Actions))
+	for _, action := range approved.Actions {
+		authorized[action] = true
+	}
+	for _, action := range completion.Actions {
+		if action.kind == actionFinalizeCompletion {
+			continue
+		}
+		if !authorized[action] {
+			return fmt.Errorf("merged Completion requires unapproved retirement action: %s", action)
+		}
+	}
+	return nil
 }
 
 func (e Service) markProgress(expected Snapshot) error {
@@ -869,6 +930,11 @@ func (e Service) markProgress(expected Snapshot) error {
 }
 
 func (e Service) finalizeCompletion(ctx context.Context, verified Plan, pullNumber int) error {
+	if verified.Snapshot.Session.Archived {
+		if err := syncArchivedSession(verified.Snapshot.Session, e.stateDirectory, e.filesystemSync); err != nil {
+			return fmt.Errorf("verify durable Pi session archive: %w", err)
+		}
+	}
 	fresh, err := e.inspect(ctx)
 	if err != nil {
 		return err
@@ -944,10 +1010,10 @@ func (e Service) finalize(ctx context.Context, verified Plan) error {
 	if err != nil {
 		return err
 	}
-	if completed, err := e.completeMergedPlanWithContinuity(ctx, verified.Snapshot, fresh); completed {
+	if completed, err := e.completeMergedPlanWithContinuity(ctx, verified, fresh); completed {
 		return err
 	}
-	if err := e.verifyGitHubIdentityContinuity(verified.Snapshot, fresh.Snapshot); err != nil {
+	if err := e.verifyPlanIdentityContinuity(verified, fresh.Snapshot); err != nil {
 		return err
 	}
 	if !executablePlansEqual(verified, fresh) {

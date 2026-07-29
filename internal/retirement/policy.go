@@ -13,25 +13,27 @@ import (
 // Policy supplies lifecycle-specific decisions while Service owns all
 // safety-critical inspection, mutation, revalidation, and verification.
 type Policy struct {
-	Operation                       string
-	SelectRun                       func(state.State) (scheduler.Run, scheduler.Lease, error)
-	ValidateSnapshot                func(Snapshot) error
-	EligibleStatuses                []scheduler.Status
-	CanTransition                   func(scheduler.Status, scheduler.Status) bool
-	Explanation                     func(scheduler.Run) string
-	ExplanationAction               string
-	Labels                          LabelOutcome
-	ProgressStatus                  scheduler.Status
-	TerminalStatus                  scheduler.Status
-	RequireDurableLogs              bool
-	RecordMissingLogWarn            bool
-	RequireClosureReason            bool
-	AllowMergedCompletion           bool
-	RetireMergedCompletionArtifacts bool
-	VerifyHistoricalOnly            bool
-	MarkProgressBeforeMutation      bool
-	RequireClosedExplanation        bool
-	FinalizeMetadata                func(*scheduler.Run, Snapshot, time.Time)
+	Operation                        string
+	CompletionOperation              string
+	SelectRun                        func(state.State) (scheduler.Run, scheduler.Lease, error)
+	ValidateSnapshot                 func(Snapshot) error
+	ValidateMergedCompletionSnapshot func(Snapshot, PullRequest) error
+	EligibleStatuses                 []scheduler.Status
+	CanTransition                    func(scheduler.Status, scheduler.Status) bool
+	Explanation                      func(scheduler.Run) string
+	ExplanationAction                string
+	Labels                           LabelOutcome
+	ProgressStatus                   scheduler.Status
+	TerminalStatus                   scheduler.Status
+	RequireDurableLogs               bool
+	RecordMissingLogWarn             bool
+	RequireClosureReason             bool
+	AllowMergedCompletion            bool
+	RetireMergedCompletionArtifacts  bool
+	VerifyHistoricalOnly             bool
+	MarkProgressBeforeMutation       bool
+	RequireClosedExplanation         bool
+	FinalizeMetadata                 func(*scheduler.Run, Snapshot, time.Time)
 }
 
 // LabelOutcome identifies managed labels that must be present or absent when
@@ -44,6 +46,9 @@ type LabelOutcome struct {
 func (p Policy) validate() error {
 	if strings.TrimSpace(p.Operation) == "" || p.SelectRun == nil || p.ValidateSnapshot == nil || p.CanTransition == nil || p.Explanation == nil || strings.TrimSpace(p.ExplanationAction) == "" {
 		return fmt.Errorf("owned Run retirement policy is incomplete")
+	}
+	if p.AllowMergedCompletion && strings.TrimSpace(p.CompletionOperation) == "" {
+		return fmt.Errorf("owned Run retirement policy has no Completion operation")
 	}
 	if p.ProgressStatus == "" || p.TerminalStatus == "" || len(p.EligibleStatuses) == 0 ||
 		!p.statusEligible(p.ProgressStatus) || !p.statusEligible(p.TerminalStatus) {

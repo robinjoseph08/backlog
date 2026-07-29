@@ -27,7 +27,8 @@ func TestRecoverHelpDescribesFailClosedLifecycle(t *testing.T) {
 	for _, want := range []string{
 		"Usage: backlog recover <run-id|positive-issue-number> [flags]",
 		"durable leaf/hash", "workflow checkpoint", "Suspended", "Dry-run is read-only",
-		"Completion and armed auto-merge", "take precedence",
+		"Verified Completion and armed auto-merge", "considered before suspension",
+		"one merged expected pull request", "closed issue", "matching artifact commits",
 		"Interactive confirmation defaults to no", "Non-interactive mutation requires --yes",
 	} {
 		if !strings.Contains(stderr.String(), want) {

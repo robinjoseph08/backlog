@@ -3,6 +3,7 @@
 package resolution
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -12,32 +13,35 @@ import (
 	"github.com/robinjoseph08/backlog/internal/state"
 )
 
-// Policy recognizes a GitHub-verified closure as External Resolution unless
-// the recorded pull request is merged or, when none was recorded, exactly one
-// merged pull request from the expected Run branch establishes Completion.
+// Policy recognizes a GitHub-verified closure as External Resolution. A merged
+// expected pull request establishes Completion only after fail-closed recovered
+// state and owned-artifact identity checks pass.
 func Policy(selector string) retirement.Policy {
 	return retirement.Policy{
-		Operation:        "External Resolution",
-		SelectRun:        func(current state.State) (scheduler.Run, scheduler.Lease, error) { return selectRun(current, selector) },
-		ValidateSnapshot: validateSnapshot,
+		Operation:                        "External Resolution",
+		CompletionOperation:              "Completion",
+		SelectRun:                        func(current state.State) (scheduler.Run, scheduler.Lease, error) { return selectRun(current, selector) },
+		ValidateSnapshot:                 validateSnapshot,
+		ValidateMergedCompletionSnapshot: validateMergedCompletionSnapshot,
 		EligibleStatuses: []scheduler.Status{
 			scheduler.StatusClaimed, scheduler.StatusWorktreeReady, scheduler.StatusRunning,
 			scheduler.StatusWaitingForMerge, scheduler.StatusFailed, scheduler.StatusSuspended,
 			scheduler.StatusNeedsHuman, scheduler.StatusResetting,
 			scheduler.StatusResolvingExternally, scheduler.StatusResolvedExternally,
 		},
-		CanTransition:              canTransition,
-		Explanation:                Explanation,
-		ExplanationAction:          "explain External Resolution",
-		Labels:                     retirement.LabelOutcome{Remove: []string{"in-progress", "ready-for-agent"}},
-		ProgressStatus:             scheduler.StatusResolvingExternally,
-		TerminalStatus:             scheduler.StatusResolvedExternally,
-		RecordMissingLogWarn:       true,
-		RequireClosureReason:       true,
-		AllowMergedCompletion:      true,
-		VerifyHistoricalOnly:       true,
-		MarkProgressBeforeMutation: true,
-		RequireClosedExplanation:   true,
+		CanTransition:                   canTransition,
+		Explanation:                     Explanation,
+		ExplanationAction:               "explain External Resolution",
+		Labels:                          retirement.LabelOutcome{Remove: []string{"in-progress", "ready-for-agent"}},
+		ProgressStatus:                  scheduler.StatusResolvingExternally,
+		TerminalStatus:                  scheduler.StatusResolvedExternally,
+		RecordMissingLogWarn:            true,
+		RequireClosureReason:            true,
+		AllowMergedCompletion:           true,
+		RetireMergedCompletionArtifacts: true,
+		VerifyHistoricalOnly:            true,
+		MarkProgressBeforeMutation:      true,
+		RequireClosedExplanation:        true,
 		FinalizeMetadata: func(run *scheduler.Run, snapshot retirement.Snapshot, now time.Time) {
 			run.ResolvedExternallyAt = &now
 			run.ClosureReason = snapshot.Issue.ClosureReason
@@ -61,6 +65,18 @@ func canTransition(from, to scheduler.Status) bool {
 	default:
 		return false
 	}
+}
+
+func validateMergedCompletionSnapshot(snapshot retirement.Snapshot, merged retirement.PullRequest) error {
+	if snapshot.Run.RecoveredRetirementRequired || snapshot.Run.RecoveryCount > 0 {
+		return errors.New("recovered Completion requires the full recovered retirement policy")
+	}
+	if snapshot.RemoteBranch.Present && snapshot.RemoteBranch.Commit != merged.Commit ||
+		snapshot.LocalBranch.Present && snapshot.LocalBranch.Commit != merged.Commit ||
+		snapshot.Worktree.Present && snapshot.Worktree.Commit != merged.Commit {
+		return errors.New("Completion artifact commit identity does not match the merged expected pull request head")
+	}
+	return nil
 }
 
 func validateSnapshot(snapshot retirement.Snapshot) error {

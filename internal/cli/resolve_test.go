@@ -24,18 +24,24 @@ import (
 	"github.com/robinjoseph08/backlog/internal/state"
 )
 
-func TestResolveHelpDescribesCompletionPrecedenceAndCompleteArtifactRetirement(t *testing.T) {
+func TestResolveHelpDescribesCompletionSafetyAndCompleteArtifactRetirement(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if exit := Main(context.Background(), []string{"resolve", "--help"}, &stdout, &stderr); exit != 0 {
 		t.Fatalf("exit = %d, stderr = %q", exit, stderr.String())
 	}
 	for _, want := range []string{
-		"Completion takes precedence",
+		"Completion is preferred",
+		"Verified Completion",
+		"retires owned branches, worktrees, active Pi sessions, and managed labels",
+		"`in-progress` and `ready-for-agent` before recording the merged outcome",
+		"merged outcome and releasing the Lease",
 		"no recorded pull request",
 		"exactly one merged pull request discovered from its expected branch",
-		"Multiple unrecorded merged pull requests are ambiguous",
-		"retains the Lease",
-		"requires operator intervention",
+		"Recovered Runs require the stricter Recovered Completion path",
+		"commits must match the merged pull request head",
+		"Failed validation retains the Lease",
+		"Multiple unrecorded merged pull requests",
+		"are ambiguous and are refused with the Lease retained",
 		"Safely retire owned unmerged pull requests",
 		"remote",
 		"local branches",
@@ -368,7 +374,7 @@ func TestResolveConfirmationStopsWaitingWhenContextIsCancelled(t *testing.T) {
 	})
 	done := make(chan error, 1)
 	go func() {
-		_, err := confirmResolve(ctx, bufio.NewReader(reader), stdout)
+		_, err := confirmResolve(ctx, bufio.NewReader(reader), stdout, "External Resolution")
 		done <- err
 	}()
 	<-prompted
@@ -856,6 +862,217 @@ func TestResolvedExternallyRerunIsVerificationOnly(t *testing.T) {
 			}
 			assertResolveStateBindingsAbsent(t, fixture.repository)
 		})
+	}
+}
+
+func TestCompiledResolveRetiresOwnedArtifactsBeforeRecordingCompletion(t *testing.T) {
+	fixture := newLocalArtifactResetFixture(t, false)
+	runGit(t, fixture.repository, "push", "origin", fixture.branch)
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pullRequest := "https://github.com/acme/widgets/pull/99"
+	current.Runs[0].PullRequest = pullRequest
+	if err := fixture.store.Save(current); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fixture.githubState, []byte(`{"labels":["in-progress","ready-for-agent","spec"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	commit := strings.TrimSpace(gitOutput(t, fixture.repository, "rev-parse", fixture.branch))
+	git := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  *" push origin --force-with-lease=refs/heads/`+fixture.branch+`:"*)
+    jq -e '.runs[] | select(.runId == "run-local" and .status == "resolving-externally")' `+quote(fixture.store.Path)+` >/dev/null ;;
+esac
+exec `+quote(fixture.git)+` "$@"
+`)
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+state=`+quote(fixture.githubState)+`
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef") printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    labels=$(jq -c '[.labels[] | {name:.}]' "$state")
+    printf '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","labels":%s}\n' "$labels" ;;
+  "issue view 42 --repo acme/widgets --json number,url,state,stateReason")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","stateReason":"COMPLETED"}' ;;
+  "pr list --repo acme/widgets --state all --head `+fixture.branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    printf '%s\n' '[{"number":99,"url":"`+pullRequest+`","state":"MERGED","mergedAt":"2026-07-29T14:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"`+fixture.branch+`","headRefOid":"`+commit+`","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+  "issue edit 42 --repo acme/widgets --remove-label in-progress")
+    temporary="$state.tmp"; jq '.labels |= map(select(. != "in-progress"))' "$state" > "$temporary"; mv "$temporary" "$state" ;;
+  "issue edit 42 --repo acme/widgets --remove-label ready-for-agent")
+    temporary="$state.tmp"; jq '.labels |= map(select(. != "ready-for-agent"))' "$state" > "$temporary"; mv "$temporary" "$state" ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	binary := buildExecutable(t, t.TempDir())
+	args := []string{"resolve", "run-local", "--repo-dir", fixture.repository, "--state-dir", fixture.stateDir, "--git", git, "--gh", gh}
+
+	dryRun := exec.Command(binary, append(args, "--dry-run")...)
+	output, err := dryRun.CombinedOutput()
+	if err != nil {
+		t.Fatalf("compiled Completion dry-run: %v\n%s", err, output)
+	}
+	plan := string(output)
+	if !strings.Contains(plan, "Completion Plan for issue #42") || strings.Contains(plan, "External Resolution Plan for issue #42") {
+		t.Fatalf("merged outcome used misleading plan terminology:\n%s", plan)
+	}
+	ordered := []string{
+		"mark Run run-local resolving-externally while retaining Lease lease-local",
+		"delete remote branch " + fixture.branch,
+		"remove local worktree " + fixture.worktree,
+		"delete local branch " + fixture.branch,
+		"archive Pi session backlog-run-local",
+		"remove issue label in-progress",
+		"remove issue label ready-for-agent",
+		"record Completion from merged expected pull request #99",
+	}
+	position := -1
+	for _, action := range ordered {
+		next := strings.Index(plan, action)
+		if next <= position {
+			t.Fatalf("Completion Plan action %q missing or out of order:\n%s", action, plan)
+		}
+		position = next
+	}
+
+	var stdout, stderr bytes.Buffer
+	err = resolveCommandWithInput(context.Background(), args[1:], strings.NewReader("yes\n"), true, &stdout, &stderr)
+	if err != nil || !strings.Contains(stdout.String(), "Proceed with Completion? [y/N]") ||
+		strings.Contains(stdout.String(), "Proceed with External Resolution? [y/N]") ||
+		!strings.Contains(stdout.String(), "Completion recorded for Run run-local") {
+		t.Fatalf("interactive Completion retirement: %v, stderr=%q, stdout=%q", err, stderr.String(), stdout.String())
+	}
+	persisted, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := persisted.Runs[0]
+	if run.Status != scheduler.StatusMerged || run.CompletedAt == nil || run.CleanupPending || len(persisted.Leases) != 0 {
+		t.Fatalf("Completion state = %#v", persisted)
+	}
+	if _, err := os.Stat(fixture.worktree); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("worktree survived Completion: %v", err)
+	}
+	if output, err := exec.Command("git", "-C", fixture.repository, "show-ref", "--verify", "--quiet", "refs/heads/"+fixture.branch).CombinedOutput(); err == nil {
+		t.Fatalf("local branch survived Completion: %s", output)
+	}
+	if branch, err := inspectRemoteBranch(context.Background(), git, fixture.repository, fixture.branch); err != nil || branch.Present {
+		t.Fatalf("remote branch after Completion = %#v, %v", branch, err)
+	}
+	if _, err := os.Stat(fixture.sessionDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("active session survived Completion: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(fixture.archiveDir, "session.jsonl")); err != nil {
+		t.Fatalf("Completion session archive missing: %v", err)
+	}
+	var github struct {
+		Labels []string `json:"labels"`
+	}
+	data, _ := os.ReadFile(fixture.githubState)
+	_ = json.Unmarshal(data, &github)
+	if strings.Join(github.Labels, ",") != "spec" {
+		t.Fatalf("preserved GitHub labels = %v", github.Labels)
+	}
+}
+
+func TestCompletionRetriesArchivedSessionSynchronizationBeforeReleasingLease(t *testing.T) {
+	fixture := newResolveFixture(t, []string{"spec"}, "COMPLETED")
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &current.Runs[1]
+	run.WorkerMode = scheduler.WorkerModeRPC
+	run.Branch = "agent/issue-42-run-42"
+	run.Worktree = filepath.Join(fixture.stateDir, "worktrees", "issue-42-run-42")
+	run.SessionID = "backlog-run-42"
+	run.SessionDir = filepath.Join(fixture.stateDir, "sessions", "run-42")
+	run.PullRequest = "https://github.com/acme/widgets/pull/9"
+	archiveDir := filepath.Join(fixture.stateDir, "history", "sessions", "run-42")
+	if err := os.MkdirAll(filepath.Dir(run.SessionDir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(archiveDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(archiveDir, "session.jsonl"), []byte(fmt.Sprintf("{\"type\":\"session\",\"id\":%q,\"cwd\":%q}\n", run.SessionID, run.Worktree)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.store.Save(current); err != nil {
+		t.Fatal(err)
+	}
+	commit := strings.Repeat("a", 40)
+	fixture.git = writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  *" remote get-url origin") printf '%s\n' 'git@github.com:acme/widgets.git' ;;
+  *" ls-remote --exit-code --heads origin refs/heads/`+run.Branch+`") exit 2 ;;
+  *" for-each-ref --format=%(objectname) refs/heads/`+run.Branch+`") exit 0 ;;
+  *) exec git "$@" ;;
+esac
+`)
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "pr list --repo acme/widgets --state all --head `+run.Branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    printf '%s\n' '[{"number":9,"url":"`+run.PullRequest+`","state":"MERGED","mergedAt":"2026-07-29T14:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"`+run.Branch+`","headRefOid":"`+commit+`","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+  *) exec `+quote(fixture.gh)+` "$@" ;;
+esac
+`)
+	commonDirectory, err := gitCommonDirectory(context.Background(), fixture.git, fixture.repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newModule := func(syncPath func(string) error) retirement.Module {
+		module, moduleErr := retirement.New(retirement.Config{
+			Store: fixture.store, GitHub: ghadapter.Client{Executable: gh, Dir: fixture.repository},
+			RepositoryRoot: fixture.repository, CommonDirectory: commonDirectory,
+			StateDirectory: fixture.stateDir, GitExecutable: fixture.git, SyncPath: syncPath,
+		}, resolution.Policy("run-42"))
+		if moduleErr != nil {
+			t.Fatal(moduleErr)
+		}
+		return module
+	}
+
+	module := newModule(func(string) error { return errors.New("injected archive sync retry failure") })
+	approved, err := module.Inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := module.Retire(context.Background(), approved); err == nil || !strings.Contains(err.Error(), "injected archive sync retry failure") {
+		t.Fatalf("Completion archive sync retry error = %v", err)
+	}
+	current, err = fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[1].Status != scheduler.StatusFailed || len(current.Leases) != 1 {
+		t.Fatalf("archive sync retry failure released Completion ownership: %#v", current)
+	}
+
+	syncCalls := 0
+	module = newModule(func(path string) error {
+		syncCalls++
+		return syncFilesystemPath(path)
+	})
+	approved, err = module.Inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := module.Retire(context.Background(), approved); err != nil {
+		t.Fatalf("rerun Completion after archive sync failure: %v", err)
+	}
+	current, err = fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if syncCalls == 0 || current.Runs[1].Status != scheduler.StatusMerged || len(current.Leases) != 0 {
+		t.Fatalf("rerun Completion durability state = %#v, sync calls = %d", current, syncCalls)
 	}
 }
 
@@ -1680,6 +1897,260 @@ exec `+quote(gh)+` "$@"
 	}
 }
 
+func TestCompiledResolveAllowsClosureReasonChangeWhenExpectedPullRequestMerges(t *testing.T) {
+	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusWaitingForMerge, false, false, false)
+	gh := githubArtifactResolveGitHub(t, fixture)
+	counter := filepath.Join(t.TempDir(), "pull-request-inspections")
+	racingGitHub := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,stateReason")
+    if jq -e '.merged' `+quote(fixture.githubState)+` >/dev/null; then
+      printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","stateReason":"FUTURE"}'
+      exit 0
+    fi ;;
+  "pr list --repo acme/widgets --state all --head `+fixture.branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    count=0
+    if [ -f `+quote(counter)+` ]; then count=$(cat `+quote(counter)+`); fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > `+quote(counter)+`
+    if [ "$count" -eq 3 ]; then
+      temporary=`+quote(fixture.githubState)+`.tmp
+      jq '.pr="MERGED" | .merged=true | .auto=false' `+quote(fixture.githubState)+` > "$temporary"
+      mv "$temporary" `+quote(fixture.githubState)+`
+    fi ;;
+esac
+exec `+quote(gh)+` "$@"
+`)
+
+	binary := buildExecutable(t, t.TempDir())
+	command := exec.Command(binary, githubArtifactResolveArgs(fixture, fixture.git, racingGitHub, "--yes")...)
+	output, err := command.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "Completion recorded for Run run-github") {
+		t.Fatalf("closure-reason Completion race: %v\n%s", err, output)
+	}
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusMerged || current.Runs[0].CompletedAt == nil || len(current.Leases) != 0 {
+		t.Fatalf("closure-reason Completion race state = %#v", current)
+	}
+	if branch, err := inspectRemoteBranch(context.Background(), fixture.git, fixture.repository, fixture.branch); err != nil || branch.Present {
+		t.Fatalf("closure-reason Completion race remote branch = %#v, %v", branch, err)
+	}
+	var github struct {
+		Labels []string `json:"labels"`
+	}
+	data, err := os.ReadFile(fixture.githubState)
+	if err != nil || json.Unmarshal(data, &github) != nil {
+		t.Fatalf("read closure-reason Completion race labels: %v", err)
+	}
+	if strings.Join(github.Labels, ",") != "spec" {
+		t.Fatalf("closure-reason Completion race retained labels: %v", github.Labels)
+	}
+}
+
+func TestCompiledResolveAllowsClosureReasonChangeAfterCompletionCleanupStarts(t *testing.T) {
+	binary := buildExecutable(t, t.TempDir())
+	for _, test := range []struct {
+		name       string
+		activation func(githubArtifactResetFixture) string
+	}{
+		{
+			name: "during cleanup revalidation",
+			activation: func(fixture githubArtifactResetFixture) string {
+				return `git --git-dir=` + quote(fixture.remote) + ` show-ref --verify --quiet refs/heads/` + fixture.branch + ` || active=true`
+			},
+		},
+		{
+			name: "immediately before finalization",
+			activation: func(fixture githubArtifactResetFixture) string {
+				return `jq -e '.labels == ["spec"]' ` + quote(fixture.githubState) + ` >/dev/null && active=true || :`
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newGitHubArtifactResetFixture(t, scheduler.StatusWaitingForMerge, false, false, false)
+			gh := githubArtifactResolveGitHub(t, fixture)
+			pullCounter := filepath.Join(t.TempDir(), "pull-request-inspections")
+			driftCounter := filepath.Join(t.TempDir(), "post-cleanup-closure-inspections")
+			for _, counter := range []string{pullCounter, driftCounter} {
+				if err := os.WriteFile(counter, []byte("0\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			racingGitHub := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,stateReason")
+    active=false
+    `+test.activation(fixture)+`
+    [ "$active" != true ] || {
+      count=$(cat `+quote(driftCounter)+`)
+      count=$((count + 1))
+      printf '%s\n' "$count" > `+quote(driftCounter)+`
+      case "$count" in
+        1|2) ;;
+        *)
+          printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","stateReason":"FUTURE"}'
+          exit 0 ;;
+      esac
+    } ;;
+  "pr list --repo acme/widgets --state all --head `+fixture.branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    count=$(cat `+quote(pullCounter)+`)
+    count=$((count + 1))
+    printf '%s\n' "$count" > `+quote(pullCounter)+`
+    [ "$count" -ne 3 ] || {
+      temporary=`+quote(fixture.githubState)+`.tmp
+      jq '.pr="MERGED" | .merged=true | .auto=false' `+quote(fixture.githubState)+` > "$temporary"
+      mv "$temporary" `+quote(fixture.githubState)+`
+    } ;;
+esac
+exec `+quote(gh)+` "$@"
+`)
+
+			command := exec.Command(binary, githubArtifactResolveArgs(fixture, fixture.git, racingGitHub, "--yes")...)
+			output, err := command.CombinedOutput()
+			if err != nil || !strings.Contains(string(output), "Completion recorded for Run run-github") {
+				t.Fatalf("later closure-reason Completion race: %v\n%s", err, output)
+			}
+			current, err := fixture.store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if current.Runs[0].Status != scheduler.StatusMerged || current.Runs[0].CompletedAt == nil || len(current.Leases) != 0 {
+				t.Fatalf("later closure-reason Completion state = %#v", current)
+			}
+			if branch, err := inspectRemoteBranch(context.Background(), fixture.git, fixture.repository, fixture.branch); err != nil || branch.Present {
+				t.Fatalf("later closure-reason Completion remote branch = %#v, %v", branch, err)
+			}
+			var github struct {
+				Labels []string `json:"labels"`
+			}
+			githubData, err := os.ReadFile(fixture.githubState)
+			if err != nil || json.Unmarshal(githubData, &github) != nil {
+				t.Fatalf("read later closure-reason Completion labels: %v", err)
+			}
+			if strings.Join(github.Labels, ",") != "spec" {
+				t.Fatalf("later closure-reason Completion retained labels: %v", github.Labels)
+			}
+			data, err := os.ReadFile(driftCounter)
+			count, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+			if err != nil || parseErr != nil || count < 3 {
+				t.Fatalf("later closure-reason drift was not observed after cleanup began: count=%q, err=%v, parse=%v", data, err, parseErr)
+			}
+		})
+	}
+}
+
+func TestCompiledResolvePreservesRetiredArtifactCommitIdentityAcrossLateMerge(t *testing.T) {
+	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusFailed, false, false, false)
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.Runs[0].PullRequest = ""
+	if err := fixture.store.Save(current); err != nil {
+		t.Fatal(err)
+	}
+	gh := githubArtifactResolveGitHub(t, fixture)
+	replacement := strings.Repeat("b", 40)
+	racingGitHub := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "pr list --repo acme/widgets --state all --head `+fixture.branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    if git --git-dir=`+quote(fixture.remote)+` show-ref --verify --quiet refs/heads/`+fixture.branch+`; then
+      printf '%s\n' '[]'
+    else
+      printf '%s\n' '[{"number":99,"url":"https://github.com/acme/widgets/pull/99","state":"MERGED","mergedAt":"2026-07-29T14:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"`+fixture.branch+`","headRefOid":"`+replacement+`","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]'
+    fi
+    exit 0 ;;
+esac
+exec `+quote(gh)+` "$@"
+`)
+
+	binary := buildExecutable(t, t.TempDir())
+	command := exec.Command(binary, githubArtifactResolveArgs(fixture, fixture.git, racingGitHub, "--yes")...)
+	output, err := command.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "approved remote branch commit identity does not match the merged expected pull request head") {
+		t.Fatalf("retired-artifact late merge error = %v\n%s", err, output)
+	}
+	current, err = fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusResolvingExternally || current.Runs[0].CompletedAt != nil || len(current.Leases) != 1 {
+		t.Fatalf("retired-artifact late merge released ownership: %#v", current)
+	}
+	if branch, err := inspectRemoteBranch(context.Background(), fixture.git, fixture.repository, fixture.branch); err != nil || branch.Present {
+		t.Fatalf("approved remote branch was not retired before late merge = %#v, %v", branch, err)
+	}
+	if strings.Contains(string(output), "Completion recorded") {
+		t.Fatalf("retired-artifact late merge reported Completion: %s", output)
+	}
+}
+
+func TestCompiledResolveRefusesUnapprovedCleanupIntroducedByLateMerge(t *testing.T) {
+	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusFailed, false, false, false)
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.Runs[0].PullRequest = ""
+	if err := fixture.store.Save(current); err != nil {
+		t.Fatal(err)
+	}
+	gh := githubArtifactResolveGitHub(t, fixture)
+	fixture.updateGitHubState(t, `.labels=["spec"]`)
+	commit := strings.TrimSpace(gitOutput(t, fixture.repository, "rev-parse", "origin/"+fixture.branch))
+	mutation := filepath.Join(t.TempDir(), "unapproved-label-mutation")
+	racingGitHub := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    if git --git-dir=`+quote(fixture.remote)+` show-ref --verify --quiet refs/heads/`+fixture.branch+`; then
+      labels='[{"name":"spec"}]'
+    else
+      labels='[{"name":"in-progress"},{"name":"spec"}]'
+    fi
+    printf '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","labels":%s}\n' "$labels"
+    exit 0 ;;
+  "pr list --repo acme/widgets --state all --head `+fixture.branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    if git --git-dir=`+quote(fixture.remote)+` show-ref --verify --quiet refs/heads/`+fixture.branch+`; then
+      printf '%s\n' '[]'
+    else
+      printf '%s\n' '[{"number":99,"url":"https://github.com/acme/widgets/pull/99","state":"MERGED","mergedAt":"2026-07-29T14:00:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"`+fixture.branch+`","headRefOid":"`+commit+`","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]'
+    fi
+    exit 0 ;;
+  "issue edit 42 --repo acme/widgets --remove-label in-progress")
+    touch `+quote(mutation)+`
+    exec `+quote(gh)+` "$@" ;;
+esac
+exec `+quote(gh)+` "$@"
+`)
+
+	binary := buildExecutable(t, t.TempDir())
+	command := exec.Command(binary, githubArtifactResolveArgs(fixture, fixture.git, racingGitHub, "--yes")...)
+	output, err := command.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "merged Completion requires unapproved retirement action") {
+		t.Fatalf("unapproved late-merge cleanup error = %v\n%s", err, output)
+	}
+	current, err = fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Runs[0].Status != scheduler.StatusResolvingExternally || current.Runs[0].CompletedAt != nil || len(current.Leases) != 1 {
+		t.Fatalf("unapproved late-merge cleanup released ownership: %#v", current)
+	}
+	if _, err := os.Stat(mutation); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unapproved late-merge cleanup mutated a label: %v", err)
+	}
+	if strings.Contains(string(output), "Completion recorded") {
+		t.Fatalf("unapproved late-merge cleanup reported Completion: %s", output)
+	}
+}
+
 func TestCompiledResolveRefusesCompletionAfterExpectedPullRequestCommitChanges(t *testing.T) {
 	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusWaitingForMerge, false, false, false)
 	gh := githubArtifactResolveGitHub(t, fixture)
@@ -1705,7 +2176,7 @@ exec `+quote(gh)+` "$@"
 	binary := buildExecutable(t, t.TempDir())
 	command := exec.Command(binary, githubArtifactResolveArgs(fixture, fixture.git, racingGitHub, "--yes")...)
 	output, err := command.CombinedOutput()
-	if err == nil || !strings.Contains(string(output), "expected commit identity changed") {
+	if err == nil || !strings.Contains(string(output), "artifact commit identity does not match the merged expected pull request head") {
 		t.Fatalf("force-pushed merge error = %v\n%s", err, output)
 	}
 	current, loadErr := fixture.store.Load()
@@ -1722,16 +2193,22 @@ exec `+quote(gh)+` "$@"
 
 func TestCompiledResolveRecordsCompletionWhenExpectedPullRequestMergesDuringDisarm(t *testing.T) {
 	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusWaitingForMerge, false, true, false)
+	fixture.updateGitHubState(t, `.labels=["in-progress"]`)
 	gh := writeExecutable(t, `#!/bin/sh
 set -eu
 case "$*" in
   "issue view 42 --repo acme/widgets --json number,url,state,labels")
-    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","labels":[{"name":"in-progress"}]}' ;;
+    labels=$(jq -c '[.labels[] | {name:.}]' `+quote(fixture.githubState)+`)
+    printf '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","labels":%s}\n' "$labels" ;;
   "issue view 42 --repo acme/widgets --json number,url,state,stateReason")
     printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","stateReason":"COMPLETED"}' ;;
   "pr merge 99 --repo acme/widgets --disable-auto")
     jq -e '.runs[] | select(.runId == "run-github" and .status == "resolving-externally")' `+quote(fixture.store.Path)+` >/dev/null
     exec `+quote(fixture.gh)+` "$@" ;;
+  "issue edit 42 --repo acme/widgets --remove-label in-progress")
+    temporary=`+quote(fixture.githubState)+`.tmp
+    jq '.labels |= map(select(. != "in-progress"))' `+quote(fixture.githubState)+` > "$temporary"
+    mv "$temporary" `+quote(fixture.githubState)+` ;;
   *) exec `+quote(fixture.gh)+` "$@" ;;
 esac
 `)
@@ -1758,6 +2235,19 @@ esac
 	github := fixture.githubStateValue(t)
 	if !github.Merged || github.PR != "MERGED" {
 		t.Fatalf("merge race pull request state = %#v", github)
+	}
+	if branch, err := inspectRemoteBranch(context.Background(), fixture.git, fixture.repository, fixture.branch); err != nil || branch.Present {
+		t.Fatalf("merge race remote branch = %#v, %v", branch, err)
+	}
+	var labels struct {
+		Labels []string `json:"labels"`
+	}
+	data, err := os.ReadFile(fixture.githubState)
+	if err != nil || json.Unmarshal(data, &labels) != nil {
+		t.Fatalf("read merge race labels: %v", err)
+	}
+	if len(labels.Labels) != 0 {
+		t.Fatalf("merge race retained managed labels: %v", labels.Labels)
 	}
 }
 
@@ -1975,11 +2465,16 @@ case "$*" in
   "repo view --json nameWithOwner,defaultBranchRef")
     printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
   "issue view 42 --repo acme/widgets --json number,url,state,labels")
-    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","labels":[{"name":"in-progress"},{"name":"spec"}]}' ;;
+    labels=$(jq -c '[.labels[] | {name:.}]' `+quote(fixture.githubState)+`)
+    printf '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","labels":%s}\n' "$labels" ;;
   "issue view 42 --repo acme/widgets --json number,url,state,stateReason")
     printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","stateReason":`+test.reasonJSON+`}' ;;
   "pr list --repo acme/widgets --state all --head `+branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
     printf '%s\n' '[{"number":9,"url":"`+pullRequest+`","state":"MERGED","mergedAt":"2026-07-28T01:01:00Z","autoMergeRequest":null,"isDraft":false,"headRefName":"`+branch+`","headRefOid":"`+commit+`","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]' ;;
+  "issue edit 42 --repo acme/widgets --remove-label in-progress")
+    temporary=`+quote(fixture.githubState)+`.tmp
+    jq '.labels |= map(select(. != "in-progress"))' `+quote(fixture.githubState)+` > "$temporary"
+    mv "$temporary" `+quote(fixture.githubState)+` ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
 esac
 `)
