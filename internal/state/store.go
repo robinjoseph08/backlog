@@ -16,11 +16,12 @@ import (
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
 
-const CurrentVersion = 4
+const CurrentVersion = 5
 
 const legacyVersion = 1
 const versionWithLeases = 2
-const previousVersion = 3
+const versionWithAcknowledgments = 3
+const previousVersion = 4
 const sha256HexLength = 64
 
 type State struct {
@@ -96,7 +97,7 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 			return State{}, false, err
 		}
 		return value, false, nil
-	case previousVersion, versionWithLeases:
+	case previousVersion, versionWithAcknowledgments, versionWithLeases:
 		value, err := decodeCurrentState(encoded)
 		if err != nil {
 			return State{}, false, fmt.Errorf("decode version %d state: %w", header.Version, err)
@@ -112,7 +113,7 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 		}
 		if persistMigration {
 			if err := s.Save(value); err != nil {
-				return State{}, false, fmt.Errorf("persist version 4 state migration: %w", err)
+				return State{}, false, fmt.Errorf("persist version 5 state migration: %w", err)
 			}
 		}
 		return value, true, nil
@@ -127,7 +128,7 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 		}
 		if persistMigration {
 			if err := s.Save(value); err != nil {
-				return State{}, false, fmt.Errorf("persist version 4 state migration: %w", err)
+				return State{}, false, fmt.Errorf("persist version 5 state migration: %w", err)
 			}
 		}
 		return value, true, nil
@@ -464,16 +465,18 @@ func validateRun(run scheduler.Run, requireWorkerMode, recoverUnsafeContinuation
 		checkpointHash, checkpointHashErr := hex.DecodeString(boundary.CheckpointSHA256)
 		switch boundary.Workflow {
 		case "":
-			if boundary.WorkflowStage != "" || boundary.CheckpointFile != "" || boundary.CheckpointSHA256 != "" || boundary.CheckpointStatus != "" || boundary.CheckpointFailure != "" {
+			if boundary.WorkflowStage != "" || boundary.CheckpointFile != "" || boundary.CheckpointSHA256 != "" || boundary.CheckpointStatus != "" || boundary.CheckpointFailureClass != "" || boundary.CheckpointBlockerKind != "" || boundary.CheckpointBlockerCause != "" || boundary.CheckpointBlockerFingerprint != "" {
 				return fmt.Errorf("state contains Run %q with incomplete continuation workflow identity", run.RunID)
 			}
 		case "afk":
-			if boundary.WorkflowStage != "afk-coordinator" || boundary.CheckpointFile != "" || boundary.CheckpointSHA256 != "" || boundary.CheckpointStatus != "active" || boundary.CheckpointFailure != "" {
+			legacyInvocationOnly := boundary.CheckpointFile == "" && boundary.CheckpointSHA256 == ""
+			durableMarker := filepath.Base(boundary.CheckpointFile) == "backlog-afk-checkpoint-v1.json" && len(boundary.CheckpointSHA256) == sha256HexLength && checkpointHashErr == nil
+			if boundary.WorkflowStage != "afk-coordinator" || (!legacyInvocationOnly && !durableMarker) || boundary.CheckpointStatus != "active" || boundary.CheckpointFailureClass != "" || boundary.CheckpointBlockerKind != "" || boundary.CheckpointBlockerCause != "" || boundary.CheckpointBlockerFingerprint != "" {
 				return fmt.Errorf("state contains Run %q with invalid AFK continuation identity", run.RunID)
 			}
 		case "ship-it":
 			if boundary.WorkflowStage == "" || boundary.CheckpointFile == "" || len(boundary.CheckpointSHA256) != sha256HexLength || checkpointHashErr != nil || len(checkpointHash) != sha256HexLength/2 ||
-				(boundary.CheckpointStatus != "active" && boundary.CheckpointStatus != "blocked") || !knownFailureClass(scheduler.FailureClass(boundary.CheckpointFailure)) {
+				(boundary.CheckpointStatus != "active" && boundary.CheckpointStatus != "blocked") || !knownFailureClass(scheduler.FailureClass(boundary.CheckpointFailureClass)) {
 				return fmt.Errorf("state contains Run %q with invalid ship-it continuation identity", run.RunID)
 			}
 		default:

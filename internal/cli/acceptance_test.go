@@ -240,6 +240,8 @@ IFS= read -r entries
 printf '{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"/skill:afk %s"}}],"leafId":"leaf"}}\n' "$issue"
 IFS= read -r final_state
 printf '{"id":"backlog-suspend-final-state","type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":"%s","sessionId":"%s"}}\n' "$session_file" "$session_id"
+IFS= read -r stable_entries
+printf '{"id":"backlog-suspend-stable-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"/skill:afk %s"}}],"leafId":"leaf"}}\n' "$issue"
 while IFS= read -r ignored; do :; done
 `)
 
@@ -534,6 +536,8 @@ IFS= read -r entries
 printf '%s\n' '{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"/skill:afk 33"}}],"leafId":"leaf"}}'
 IFS= read -r final_state
 printf '{"id":"backlog-suspend-final-state","type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":"%s","sessionId":"%s"}}\n' "$session_file" "$session_id"
+IFS= read -r stable_entries
+printf '%s\n' '{"id":"backlog-suspend-stable-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"/skill:afk 33"}}],"leafId":"leaf"}}'
 while IFS= read -r ignored; do :; done
 `)
 
@@ -1498,7 +1502,7 @@ esac
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(persistedAfterRun), `"version": 4`) || strings.Contains(string(persistedAfterRun), `"paused"`) {
+	if !strings.Contains(string(persistedAfterRun), `"version": 5`) || strings.Contains(string(persistedAfterRun), `"paused"`) {
 		t.Fatalf("Runner did not persist legacy migration:\n%s", persistedAfterRun)
 	}
 	final, err := (state.FileStore{Path: statePath}).Load()

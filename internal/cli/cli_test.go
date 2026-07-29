@@ -384,8 +384,8 @@ func TestStatusRejectsInvalidAndUnsupportedStateWithoutMutation(t *testing.T) {
 		},
 		{
 			name:       "unsupported state version",
-			fixture:    `{"version":5,"runs":[],"leases":[]}`,
-			diagnostic: "unsupported state version 5",
+			fixture:    `{"version":6,"runs":[],"leases":[]}`,
+			diagnostic: "unsupported state version 6",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {

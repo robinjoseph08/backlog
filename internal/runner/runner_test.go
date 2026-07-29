@@ -3704,39 +3704,133 @@ func TestProviderContinuationRejectsStaleBoundaryFromPriorWorkerGeneration(t *te
 	}
 }
 
-func TestRunnerFreshlyVerifiesRecoveryRepositoryIdentityBeforeStartAndRelease(t *testing.T) {
-	for _, phase := range []string{"start", "release"} {
-		t.Run(phase, func(t *testing.T) {
-			run := resumableRun(t, 103, "identity-103")
-			run.WorkerGeneration = 1
-			run.Continuation.WorkerGeneration = 1
-			run.Continuation.LocalCommit = strings.Repeat("a", 40)
-			run.Continuation.RemoteBranchState = "absent"
-			workers := newFakeWorkers()
-			workers.startupCloseResult.GroupExited = true
-			store := &memoryStore{value: state.State{Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}}
-			runner := testRunner(&fakeGitHub{}, workers, store, 1)
-			runner.Output = io.Discard
-			calls := 0
-			runner.VerifyResumeGit = func(context.Context, scheduler.Run) (string, bool, string, error) {
-				calls++
-				if phase == "start" || calls > 1 {
-					return strings.Repeat("b", 40), false, "", nil
+func TestRunnerWakesAtProviderResumeDeadlineIndependentOfPollInterval(t *testing.T) {
+	run := resumableRun(t, 104, "wake-104")
+	start := time.Date(2026, 7, 29, 2, 0, 0, 0, time.UTC)
+	resumeAfter := start.Add(30 * time.Second)
+	run.ProviderContinuationAttempts = 1
+	run.ResumeAfter = &resumeAfter
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}}
+	workers := newFakeWorkers()
+	released := make(chan struct{}, 1)
+	workers.onRelease = func(int) { released <- struct{}{} }
+	runner := testRunner(&fakeGitHub{}, workers, store, 1)
+	runner.Config.Watch = true
+	runner.Config.PollInterval = time.Hour
+	var clock atomic.Int64
+	clock.Store(start.UnixNano())
+	runner.Now = func() time.Time { return time.Unix(0, clock.Load()).UTC() }
+	timer := newControlledCandidateRetryTimer()
+	created := make(chan time.Duration, 1)
+	runner.newResumeWakeTimer = func(delay time.Duration) candidateRetryTimer {
+		created <- delay
+		return timer
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	if delay := <-created; delay != 30*time.Second {
+		t.Fatalf("Resume wake delay = %s", delay)
+	}
+	select {
+	case <-workers.startChanged:
+		t.Fatal("replacement Worker launched before cooldown wake")
+	default:
+	}
+	clock.Store(resumeAfter.UnixNano())
+	timer.ticks <- resumeAfter
+	select {
+	case <-workers.startChanged:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement Worker did not launch at ResumeAfter")
+	}
+	select {
+	case <-released:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement Worker was not released after cooldown wake")
+	}
+	if workers.releaseCount() != 1 {
+		t.Fatalf("replacement release count = %d", workers.releaseCount())
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Runner shutdown after timer test: %v", err)
+	}
+}
+
+func TestRunnerFreshlyVerifiesEveryRecoveryIdentityBeforeStartAndRelease(t *testing.T) {
+	type identities struct {
+		local         string
+		remotePresent bool
+		remote        string
+		outcome       ghadapter.CompletionOutcome
+	}
+	baseLocal, baseRemote, changed := strings.Repeat("a", 40), strings.Repeat("b", 40), strings.Repeat("c", 40)
+	for _, test := range []struct {
+		name   string
+		base   identities
+		mutate func(*identities)
+	}{
+		{name: "local OID", base: identities{local: baseLocal}, mutate: func(v *identities) { v.local = changed }},
+		{name: "remote presence", base: identities{local: baseLocal}, mutate: func(v *identities) { v.remotePresent, v.remote = true, baseRemote }},
+		{name: "remote OID", base: identities{local: baseLocal, remotePresent: true, remote: baseRemote}, mutate: func(v *identities) { v.remote = changed }},
+		{name: "PR presence", base: identities{local: baseLocal}, mutate: func(v *identities) {
+			v.outcome = ghadapter.CompletionOutcome{PRFound: true, PullRequest: "https://example.test/pull/103", HeadCommit: baseRemote}
+		}},
+		{name: "PR URL", base: identities{local: baseLocal, outcome: ghadapter.CompletionOutcome{PRFound: true, PullRequest: "https://example.test/pull/103", HeadCommit: baseRemote}}, mutate: func(v *identities) { v.outcome.PullRequest += "-changed" }},
+		{name: "PR head", base: identities{local: baseLocal, outcome: ghadapter.CompletionOutcome{PRFound: true, PullRequest: "https://example.test/pull/103", HeadCommit: baseRemote}}, mutate: func(v *identities) { v.outcome.HeadCommit = changed }},
+	} {
+		for _, phase := range []string{"pre-start", "pre-release"} {
+			t.Run(test.name+"/"+phase, func(t *testing.T) {
+				run := resumableRun(t, 103, "identity-103")
+				run.WorkerGeneration = 1
+				run.Continuation.WorkerGeneration = 1
+				run.Continuation.LocalCommit = test.base.local
+				if test.base.remotePresent {
+					run.Continuation.RemoteBranchState, run.Continuation.RemoteCommit = "present", test.base.remote
+				} else {
+					run.Continuation.RemoteBranchState = "absent"
 				}
-				return strings.Repeat("a", 40), false, "", nil
-			}
-			current := store.LoadValue()
-			process, err := runner.resume(context.Background(), context.Background(), &current, run)
-			if err != nil || process != nil || workers.releaseCount() != 0 || store.LoadValue().Runs[0].Status != scheduler.StatusNeedsHuman {
-				t.Fatalf("%s identity drift = %v, %v, state=%#v", phase, process, err, store.LoadValue())
-			}
-			if phase == "start" && workers.wasStarted(run.Issue) {
-				t.Fatal("Worker started before drift refusal")
-			}
-			if phase == "release" && !workers.wasStarted(run.Issue) {
-				t.Fatal("release-gated Worker was not started")
-			}
-		})
+				if test.base.outcome.PRFound {
+					run.Continuation.PullRequest, run.Continuation.PullRequestHead, run.PullRequest = test.base.outcome.PullRequest, test.base.outcome.HeadCommit, test.base.outcome.PullRequest
+				}
+				workers := newFakeWorkers()
+				workers.startupCloseResult.GroupExited = true
+				store := &memoryStore{value: state.State{Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}}
+				calls := 0
+				github := &fakeGitHub{completionFunc: func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
+					calls++
+					value := test.base
+					if phase == "pre-start" || calls > 1 {
+						test.mutate(&value)
+					}
+					return value.outcome, nil
+				}}
+				runner := testRunner(github, workers, store, 1)
+				runner.Output = io.Discard
+				gitCalls := 0
+				runner.VerifyResumeGit = func(context.Context, scheduler.Run) (string, bool, string, error) {
+					gitCalls++
+					value := test.base
+					if phase == "pre-start" || gitCalls > 1 {
+						test.mutate(&value)
+					}
+					return value.local, value.remotePresent, value.remote, nil
+				}
+				current := store.LoadValue()
+				process, err := runner.resume(context.Background(), context.Background(), &current, run)
+				got := store.LoadValue()
+				if err != nil || process != nil || workers.releaseCount() != 0 || got.Runs[0].Status != scheduler.StatusNeedsHuman || len(got.Leases) != 1 {
+					t.Fatalf("%s drift = %v, %v, state=%#v", phase, process, err, got)
+				}
+				if phase == "pre-start" && workers.wasStarted(run.Issue) {
+					t.Fatal("Worker started before drift refusal")
+				}
+				if phase == "pre-release" && !workers.wasStarted(run.Issue) {
+					t.Fatal("release-gated Worker was not started")
+				}
+			})
+		}
 	}
 }
 
@@ -3778,6 +3872,88 @@ func TestRunnerSettledCheckpointFailurePersistsUnsafeClassificationBeforeProvide
 				t.Fatalf("settled checkpoint failure = %#v, checkpoints=%d", got, workers.checkpointCount)
 			}
 		})
+	}
+}
+
+func TestRunnerStructuredProviderExhaustionCrossesWorkerCheckpointAndPolicyTwice(t *testing.T) {
+	run := resumableRun(t, 106, "provider-integration-106")
+	run.WorkerGeneration = 1
+	run.StoppedWorkerGeneration = 1
+	stopped := time.Now().Add(-time.Minute)
+	run.WorkerStoppedAt = &stopped
+	run.Continuation.WorkerGeneration = 1
+	entry := fmt.Sprintf(`{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"/skill:afk %d"}}`, run.Issue)
+	header := fmt.Sprintf(`{"type":"session","version":3,"id":%q,"cwd":%q}`, run.SessionID, run.Worktree)
+	sessionContent := header + "\n" + entry + "\n"
+	if err := os.WriteFile(run.Continuation.SessionFile, []byte(sessionContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256([]byte(sessionContent))
+	run.Continuation.LeafID = "leaf"
+	run.Continuation.EntryCount = 1
+	run.Continuation.SHA256 = hex.EncodeToString(hash[:])
+
+	stateData := fmt.Sprintf(`{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":%q,"sessionId":%q}`, run.Continuation.SessionFile, run.SessionID)
+	entriesData := fmt.Sprintf(`{"entries":[%s],"leafId":"leaf"}`, entry)
+	script := filepath.Join(t.TempDir(), "pi")
+	scriptBody := `#!/bin/sh
+set -eu
+IFS= read -r prompt
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}'
+printf '%s\n' '{"type":"auto_retry_start","attempt":1}' '{"type":"auto_retry_end","attempt":1,"success":false}' '{"type":"agent_settled"}'
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-suspend-state","type":"response","command":"get_state","success":true,"data":` + stateData + `}'
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":` + entriesData + `}'
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-suspend-final-state","type":"response","command":"get_state","success":true,"data":` + stateData + `}'
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-suspend-stable-entries","type":"response","command":"get_entries","success":true,"data":` + entriesData + `}'
+while IFS= read -r ignored; do :; done
+`
+	if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	realWorkers := &supervisedTestWorkers{supervisor: worker.Supervisor{Executable: script, LogsDir: t.TempDir(), TerminationGrace: time.Second}}
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}}
+	base := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	var clock atomic.Int64
+	runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+	runner.Workers = realWorkers
+	runner.Now = func() time.Time { return base.Add(time.Duration(clock.Load()) * time.Second) }
+	wake := newControlledCandidateRetryTimer()
+	wakeCreated := make(chan time.Duration, 1)
+	runner.newResumeWakeTimer = func(delay time.Duration) candidateRetryTimer {
+		wakeCreated <- delay
+		return wake
+	}
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+
+	select {
+	case delay := <-wakeCreated:
+		if delay != 30*time.Second {
+			t.Fatalf("provider cooldown = %s", delay)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("first structured provider exhaustion did not schedule a cooldown")
+	}
+	first := store.LoadValue().Runs[0]
+	if first.Status != scheduler.StatusSuspended || first.ProviderContinuationAttempts != 1 || first.FailureClass != scheduler.FailureProviderExhaustion || first.Continuation == nil || first.Continuation.Workflow != "afk" || filepath.Base(first.Continuation.CheckpointFile) != "backlog-afk-checkpoint-v1.json" {
+		t.Fatalf("first structured exhaustion = %#v", first)
+	}
+	clock.Store(30)
+	wake.ticks <- base.Add(30 * time.Second)
+	select {
+	case err := <-done:
+		assertInterventionRequired(t, err, 1)
+	case <-time.After(5 * time.Second):
+		t.Fatal("second structured provider exhaustion did not finish")
+	}
+	got := store.LoadValue().Runs[0]
+	if got.Status != scheduler.StatusNeedsHuman || got.ProviderContinuationAttempts != 1 || got.FailureClass != scheduler.FailureProviderExhaustion || got.Continuation == nil || got.Continuation.WorkerGeneration != got.WorkerGeneration || !strings.Contains(got.Error, "one bounded Backlog continuation") || realWorkers.startCount() != 2 {
+		t.Fatalf("second structured exhaustion = %#v, starts=%d", got, realWorkers.startCount())
 	}
 }
 
@@ -5706,6 +5882,25 @@ func (p *fakeProcess) CloseContext(ctx context.Context, authorizeKill func() err
 	result.GroupExited = true
 	return result
 }
+
+type supervisedTestWorkers struct {
+	supervisor worker.Supervisor
+	starts     atomic.Int32
+}
+
+func (w *supervisedTestWorkers) Start(ctx context.Context, request worker.Request) (WorkerProcess, error) {
+	process, err := w.supervisor.Start(ctx, request)
+	if err == nil {
+		w.starts.Add(1)
+	}
+	return process, err
+}
+
+func (w *supervisedTestWorkers) Release(runID string) error {
+	return w.supervisor.Release(runID)
+}
+
+func (w *supervisedTestWorkers) startCount() int { return int(w.starts.Load()) }
 
 type fakeWorkers struct {
 	mu                      sync.Mutex

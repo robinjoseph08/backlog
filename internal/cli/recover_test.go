@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -75,6 +76,109 @@ func (r *mutatingRecoveryInput) Read(buffer []byte) (int, error) {
 	return r.reader.Read(buffer)
 }
 
+func TestCompiledRecoverLateCompletionRetiresArtifactsLabelsAndLeaseIdempotently(t *testing.T) {
+	fixture := newLocalArtifactResetFixture(t, false)
+	runGit(t, fixture.worktree, "push", "origin", fixture.branch)
+	current, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &current.Runs[0]
+	run.PullRequest = "https://github.com/acme/widgets/pull/99"
+	run.WorkerGeneration = 1
+	run.StoppedWorkerGeneration = 1
+	stopped := time.Now().Add(-time.Minute).UTC()
+	run.WorkerStoppedAt = &stopped
+	run.Error = "retained diagnostic before late Completion"
+	sessionFile := filepath.Join(run.SessionDir, "session.jsonl")
+	session := fmt.Sprintf("{\"type\":\"session\",\"version\":3,\"id\":%q,\"cwd\":%q}\n{\"type\":\"message\",\"id\":\"leaf\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"/skill:afk 42\"}}\n", run.SessionID, run.Worktree)
+	if err := os.WriteFile(sessionFile, []byte(session), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	marker := fmt.Sprintf("{\"version\":1,\"workflow\":\"afk\",\"stage\":\"afk-coordinator\",\"issue\":42,\"runId\":%q,\"sessionId\":%q,\"worktree\":%q}\n", run.RunID, run.SessionID, run.Worktree)
+	if err := os.WriteFile(filepath.Join(run.SessionDir, "backlog-afk-checkpoint-v1.json"), []byte(marker), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.store.Save(current); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fixture.githubState, []byte(`{"labels":["in-progress","spec"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	merged := filepath.Join(t.TempDir(), "merged")
+	head := strings.TrimSpace(gitOutput(t, fixture.worktree, "rev-parse", "HEAD"))
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+state=`+quote(fixture.githubState)+`
+merged=`+quote(merged)+`
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef")
+    printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue view 42 --repo acme/widgets --json number,url,state,labels")
+    labels=$(jq -c '[.labels[] | {name:.}]' "$state")
+    status=OPEN; if [ -f "$merged" ]; then status=CLOSED; fi
+    printf '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"%s","labels":%s}\n' "$status" "$labels" ;;
+  "pr list --repo acme/widgets --state all --head `+fixture.branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    status=OPEN; mergedAt=null
+    if [ -f "$merged" ]; then status=MERGED; mergedAt='"2026-07-29T00:00:00Z"'; else touch "$merged"; fi
+    printf '[{"number":99,"url":"https://github.com/acme/widgets/pull/99","state":"%s","mergedAt":%s,"autoMergeRequest":null,"isDraft":false,"headRefName":"`+fixture.branch+`","headRefOid":"`+head+`","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]\n' "$status" "$mergedAt" ;;
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/99/comments?per_page=100 --paginate --slurp") printf '%s\n' '[[]]' ;;
+  "issue edit 42 --repo acme/widgets --remove-label in-progress")
+    temporary="$state.tmp"; jq '.labels |= map(select(. != "in-progress"))' "$state" > "$temporary"; mv "$temporary" "$state" ;;
+  "issue edit 42 --repo acme/widgets --remove-label ready-for-agent")
+    temporary="$state.tmp"; jq '.labels |= map(select(. != "ready-for-agent"))' "$state" > "$temporary"; mv "$temporary" "$state" ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	binary := buildExecutable(t, t.TempDir())
+	arguments := []string{"recover", run.RunID, "--yes", "--repo-dir", fixture.repository, "--state-dir", fixture.stateDir, "--git", fixture.git, "--gh", gh}
+	command := func() string {
+		output, commandErr := exec.Command(binary, arguments...).CombinedOutput()
+		if commandErr != nil {
+			t.Fatalf("compiled late Completion Recovery: %v\n%s", commandErr, output)
+		}
+		return string(output)
+	}
+	output := command()
+	if !strings.Contains(output, "Recovery Plan changed after confirmation") || !strings.Contains(output, "Completion recorded for Run "+run.RunID+" from merged expected pull request "+run.PullRequest) {
+		t.Fatalf("late Completion output:\n%s", output)
+	}
+	persisted, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := persisted.Runs[0]
+	if got.Status != scheduler.StatusMerged || got.PullRequest != run.PullRequest || got.CompletedAt == nil || got.CleanupPending || len(persisted.Leases) != 0 {
+		t.Fatalf("late Completion state = %#v", persisted)
+	}
+	if branch, inspectErr := inspectRemoteBranch(context.Background(), fixture.git, fixture.repository, fixture.branch); inspectErr != nil || branch.Present {
+		t.Fatalf("remote branch after Completion = %#v, %v", branch, inspectErr)
+	}
+	if _, statErr := os.Stat(fixture.worktree); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("worktree after Completion = %v", statErr)
+	}
+	if _, statErr := os.Stat(fixture.sessionDir); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("active session after Completion = %v", statErr)
+	}
+	if _, statErr := os.Stat(fixture.archiveDir); statErr != nil {
+		t.Fatalf("historical session after Completion = %v", statErr)
+	}
+	var githubState struct {
+		Labels []string `json:"labels"`
+	}
+	encoded, err := os.ReadFile(fixture.githubState)
+	if err != nil || json.Unmarshal(encoded, &githubState) != nil || strings.Join(githubState.Labels, ",") != "spec" {
+		t.Fatalf("managed labels after Completion = %s, %v", encoded, err)
+	}
+	beforeRerun := fileDigest(t, fixture.store.Path)
+	if rerun := command(); !strings.Contains(rerun, "Completion recorded for Run "+run.RunID) {
+		t.Fatalf("idempotent Completion output:\n%s", rerun)
+	}
+	if afterRerun := fileDigest(t, fixture.store.Path); afterRerun != beforeRerun {
+		t.Fatalf("idempotent Completion changed state: %x != %x", afterRerun, beforeRerun)
+	}
+}
+
 func TestCompiledRecoverDryRunAndIdempotentMutationPreserveRunIdentities(t *testing.T) {
 	root := t.TempDir()
 	repository := filepath.Join(root, "repo")
@@ -114,6 +218,10 @@ func TestCompiledRecoverDryRunAndIdempotentMutationPreserveRunIdentities(t *test
 	sessionFile := filepath.Join(sessionDir, "session.jsonl")
 	session := fmt.Sprintf("{\"type\":\"session\",\"version\":3,\"id\":%q,\"cwd\":%q}\n{\"type\":\"message\",\"id\":\"leaf\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"/skill:afk 42\"}}\n", sessionID, worktreePath)
 	if err := os.WriteFile(sessionFile, []byte(session), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	marker := fmt.Sprintf("{\"version\":1,\"workflow\":\"afk\",\"stage\":\"afk-coordinator\",\"issue\":42,\"runId\":%q,\"sessionId\":%q,\"worktree\":%q}\n", runID, sessionID, worktreePath)
+	if err := os.WriteFile(filepath.Join(sessionDir, "backlog-afk-checkpoint-v1.json"), []byte(marker), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}

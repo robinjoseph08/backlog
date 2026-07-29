@@ -191,7 +191,7 @@ func TestRecoveryRefusesPendingToolAndChangedWorkflowCheckpoint(t *testing.T) {
 
 	run, store = recoverableFixture(t)
 	gitDir := filepath.Join(run.Worktree, ".git")
-	if err := os.Mkdir(gitDir, 0o700); err != nil {
+	if err := os.MkdirAll(gitDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	checkpoint := filepath.Join(gitDir, "ship-it-checkpoint-v1.md")
@@ -334,6 +334,101 @@ func TestRecoveryLateExpectedBranchMergeOutranksChangedPlan(t *testing.T) {
 	}
 }
 
+func TestRecoveryLateArmedPullRequestOutranksChangedPlan(t *testing.T) {
+	run, store := recoverableFixture(t)
+	calls := 0
+	pull := ghadapter.OwnedRunPullRequest{Number: 10, URL: "https://github.com/acme/widgets/pull/10", Branch: run.Branch, Commit: strings.Repeat("b", 40), State: "open"}
+	github := fakeGitHub{inspect: func() (ghadapter.OwnedRunIssue, []ghadapter.OwnedRunPullRequest, error) {
+		calls++
+		if calls > 1 {
+			pull.AutoMergeArmed = true
+		}
+		return openIssue(run.Issue), []ghadapter.OwnedRunPullRequest{pull}, nil
+	}}
+	module := newTestModule(t, store, github, func(int) (bool, error) { return false, nil }, time.Now())
+	plan, err := module.Inspect(context.Background(), run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := module.Recover(context.Background(), plan)
+	if err != nil || result.Outcome != OutcomeWaiting {
+		t.Fatalf("late waiting outcome = %#v, %v", result, err)
+	}
+	if store.value.Runs[0].Status != scheduler.StatusWaitingForMerge || len(store.value.Leases) != 1 {
+		t.Fatalf("late waiting transition = %#v", store.value)
+	}
+}
+
+func TestAlreadyRecoveredRefusesRepositoryAndPullRequestIdentityDrift(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*GitIdentity, *[]ghadapter.OwnedRunPullRequest)
+	}{
+		{name: "local OID", mutate: func(git *GitIdentity, _ *[]ghadapter.OwnedRunPullRequest) { git.LocalCommit = strings.Repeat("c", 40) }},
+		{name: "remote presence", mutate: func(git *GitIdentity, _ *[]ghadapter.OwnedRunPullRequest) {
+			git.RemotePresent, git.RemoteCommit = false, ""
+		}},
+		{name: "remote OID", mutate: func(git *GitIdentity, _ *[]ghadapter.OwnedRunPullRequest) { git.RemoteCommit = strings.Repeat("c", 40) }},
+		{name: "pull request presence", mutate: func(_ *GitIdentity, pulls *[]ghadapter.OwnedRunPullRequest) { *pulls = nil }},
+		{name: "pull request URL", mutate: func(_ *GitIdentity, pulls *[]ghadapter.OwnedRunPullRequest) { (*pulls)[0].URL += "-changed" }},
+		{name: "pull request head", mutate: func(_ *GitIdentity, pulls *[]ghadapter.OwnedRunPullRequest) {
+			(*pulls)[0].Commit = strings.Repeat("c", 40)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			run, store := recoverableFixture(t)
+			identity := GitIdentity{LocalCommit: strings.Repeat("a", 40), RemotePresent: true, RemoteCommit: strings.Repeat("b", 40)}
+			pulls := []ghadapter.OwnedRunPullRequest{{Number: 8, URL: "https://github.com/acme/widgets/pull/8", Branch: run.Branch, Commit: identity.RemoteCommit, State: "open"}}
+			module, err := New(Config{Store: store, GitHub: fakeGitHub{issue: openIssue(run.Issue), pulls: pulls}, Worktrees: fakeWorktrees{}, Git: fakeGit{identity: identity}, Repo: "acme/widgets", Now: time.Now, ProcessAlive: func(int) (bool, error) { return false, nil }, ProcessGroupAlive: func(int) (bool, error) { return false, nil }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, err := module.Inspect(context.Background(), run.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := module.Recover(context.Background(), plan); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(&identity, &pulls)
+			module, err = New(Config{Store: store, GitHub: fakeGitHub{issue: openIssue(run.Issue), pulls: pulls}, Worktrees: fakeWorktrees{}, Git: fakeGit{identity: identity}, Repo: "acme/widgets", Now: time.Now, ProcessAlive: func(int) (bool, error) { return false, nil }, ProcessGroupAlive: func(int) (bool, error) { return false, nil }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := module.Inspect(context.Background(), run.RunID); err == nil {
+				t.Fatal("identity drift was accepted")
+			}
+			if store.value.Runs[0].Status != scheduler.StatusSuspended || len(store.value.Leases) != 1 {
+				t.Fatal("identity drift changed ownership")
+			}
+		})
+	}
+}
+
+func TestWritePlanRendersOutcomeSpecificActions(t *testing.T) {
+	base := Plan{Run: scheduler.Run{Issue: 42, RunID: "run-42", Branch: "branch", Worktree: "/worktree", SessionID: "session"}, Boundary: scheduler.ContinuationBoundary{Workflow: "afk", WorkflowStage: "afk-coordinator", LeafID: "leaf", EntryCount: 1, SHA256: "hash"}, PullRequest: "https://example.test/pull/42", PullRequestHead: "head"}
+	for _, test := range []struct {
+		outcome Outcome
+		want    string
+		absent  string
+	}{
+		{OutcomeSuspend, "establish Run as Suspended", "Retirement actions"},
+		{OutcomeAlready, "leave Run already Suspended", "Retirement actions"},
+		{OutcomeWaiting, "transition Run to waiting-for-merge", "Retirement actions"},
+		{OutcomeCompletion, "release exactly this Run's Lease", "Preserve: existing Lease"},
+	} {
+		var output strings.Builder
+		plan := base
+		plan.Outcome = test.outcome
+		if err := WritePlan(&output, plan); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(output.String(), test.want) || strings.Contains(output.String(), test.absent) {
+			t.Fatalf("%s plan:\n%s", test.outcome, output.String())
+		}
+	}
+}
+
 func TestPlansEqualIncludesLeaseAndSafetyMetadata(t *testing.T) {
 	run, store := recoverableFixture(t)
 	module := newTestModule(t, store, fakeGitHub{issue: openIssue(run.Issue)}, func(int) (bool, error) { return false, nil }, time.Now())
@@ -365,7 +460,7 @@ func recoverableFixture(t *testing.T) (scheduler.Run, *memoryStore) {
 	root := t.TempDir()
 	worktreePath := filepath.Join(root, "worktree")
 	sessionDir := filepath.Join(root, "sessions")
-	if err := os.MkdirAll(worktreePath, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(worktreePath, ".git"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
@@ -374,6 +469,10 @@ func recoverableFixture(t *testing.T) (scheduler.Run, *memoryStore) {
 	sessionFile := filepath.Join(sessionDir, "session.jsonl")
 	content := fmt.Sprintf("{\"type\":\"session\",\"version\":3,\"id\":\"session-42\",\"cwd\":%q}\n{\"type\":\"message\",\"id\":\"leaf\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"/skill:afk 42\"}}\n", worktreePath)
 	if err := os.WriteFile(sessionFile, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	afKMarker := fmt.Sprintf("{\"version\":1,\"workflow\":\"afk\",\"stage\":\"afk-coordinator\",\"issue\":42,\"runId\":\"run-42\",\"sessionId\":\"session-42\",\"worktree\":%q}\n", worktreePath)
+	if err := os.WriteFile(filepath.Join(sessionDir, "backlog-afk-checkpoint-v1.json"), []byte(afKMarker), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	run := scheduler.Run{

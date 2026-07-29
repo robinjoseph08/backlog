@@ -1005,7 +1005,7 @@ func TestProcessSuspendVerifiesAndSyncsContinuationBoundary(t *testing.T) {
 	sessionDir := filepath.Join(root, "sessions")
 	sessionFile := filepath.Join(sessionDir, "session.jsonl")
 	started := filepath.Join(root, "started")
-	if err := os.MkdirAll(worktree, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(worktree, ".git"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	header := `{"type":"session","version":3,"id":"backlog-run-50","timestamp":"2026-07-23T00:00:00Z","cwd":` + strconv.Quote(worktree) + `}`
@@ -1028,6 +1028,8 @@ IFS= read -r get_entries
 printf '%s\n' '{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":`+entriesJSON+`,"leafId":"result"}}'
 IFS= read -r final_state
 printf '%s\n' '{"id":"backlog-suspend-final-state","type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":`+strings.ReplaceAll(strconv.Quote(sessionFile), `'`, `\'`)+`,"sessionId":"backlog-run-50"}}'
+IFS= read -r stable_entries
+printf '%s\n' '{"id":"backlog-suspend-stable-entries","type":"response","command":"get_entries","success":true,"data":{"entries":`+entriesJSON+`,"leafId":"result"}}'
 while IFS= read -r ignored; do :; done
 `)
 	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(
@@ -1062,7 +1064,7 @@ func TestProcessCheckpointSettledCapturesBoundaryWithoutAbort(t *testing.T) {
 	sessionDir := filepath.Join(root, "sessions")
 	sessionFile := filepath.Join(sessionDir, "session.jsonl")
 	firstCommand := filepath.Join(root, "first-command")
-	if err := os.MkdirAll(worktree, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(worktree, ".git"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
@@ -1084,6 +1086,8 @@ IFS= read -r entries
 printf '%s\n' `+shellQuote(`{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[`+entry+`],"leafId":"leaf"}}`)+`
 IFS= read -r final
 printf '%s\n' `+shellQuote(`{"id":"backlog-suspend-final-state","type":"response","command":"get_state","success":true,"data":`+stateData+`}`)+`
+IFS= read -r stable_entries
+printf '%s\n' `+shellQuote(`{"id":"backlog-suspend-stable-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[`+entry+`],"leafId":"leaf"}}`)+`
 while IFS= read -r ignored; do :; done
 `)
 	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(context.Background(), request(54, "run-settled", worktree, sessionDir))
@@ -1115,21 +1119,72 @@ while IFS= read -r ignored; do :; done
 	}
 }
 
+func TestCheckpointSettledRefusesSessionAppendBetweenStabilityQueries(t *testing.T) {
+	root := t.TempDir()
+	worktree := filepath.Join(root, "worktree")
+	sessionDir := filepath.Join(root, "sessions")
+	sessionFile := filepath.Join(sessionDir, "session.jsonl")
+	if err := os.MkdirAll(filepath.Join(worktree, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	header := `{"type":"session","version":3,"id":"backlog-race","cwd":` + strconv.Quote(worktree) + `}`
+	entry := `{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"/skill:afk 55"}}`
+	appended := `{"type":"message","id":"late","parentId":"leaf","message":{"role":"assistant","content":"late"}}`
+	stateData := `{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(sessionFile) + `,"sessionId":"backlog-race"}`
+	pi := fakePi(t, `
+IFS= read -r prompt
+printf '%s\n' `+shellQuote(header)+` `+shellQuote(entry)+` > `+shellQuote(sessionFile)+`
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+IFS= read -r state
+printf '%s\n' `+shellQuote(`{"id":"backlog-suspend-state","type":"response","command":"get_state","success":true,"data":`+stateData+`}`)+`
+IFS= read -r entries
+printf '%s\n' `+shellQuote(`{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[`+entry+`],"leafId":"leaf"}}`)+`
+IFS= read -r final
+printf '%s\n' `+shellQuote(appended)+` >> `+shellQuote(sessionFile)+`
+printf '%s\n' `+shellQuote(`{"id":"backlog-suspend-final-state","type":"response","command":"get_state","success":true,"data":`+stateData+`}`)+`
+IFS= read -r stable
+printf '%s\n' `+shellQuote(`{"id":"backlog-suspend-stable-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[`+entry+`,`+appended+`],"leafId":"late"}}`)+`
+while IFS= read -r ignored; do :; done
+`)
+	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(context.Background(), request(55, "race", worktree, sessionDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if result := process.Wait(); !result.Settled {
+		t.Fatalf("wait = %#v", result)
+	}
+	_, err = process.CheckpointSettled(context.Background(), ContinuationRequest{Issue: 55, RunID: "race", Branch: "agent/race", SessionID: "backlog-race", SessionDir: sessionDir, Worktree: worktree})
+	if err == nil || (!strings.Contains(err.Error(), "stable") && !strings.Contains(err.Error(), "changed")) {
+		t.Fatalf("append race error = %v", err)
+	}
+	_ = process.Close()
+}
+
 func TestWorkflowCheckpointRequiresDurableOwnedAFKOrStrictShipItSchema(t *testing.T) {
 	worktree := t.TempDir()
-	request := ContinuationRequest{Issue: 42, RunID: "run-42", Branch: "agent/issue-42-run-42", SessionID: "session-42", Worktree: worktree}
+	request := ContinuationRequest{Issue: 42, RunID: "run-42", Branch: "agent/issue-42-run-42", SessionID: "session-42", SessionDir: t.TempDir(), Worktree: worktree}
 	unowned := []json.RawMessage{json.RawMessage(`{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"continue"}}`)}
-	if _, _, _, _, _, _, err := inspectWorkflowCheckpoint(request, unowned); err == nil || !strings.Contains(err.Error(), "owned AFK") {
+	if _, _, _, _, _, _, err := inspectWorkflowCheckpoint(request, unowned); err == nil || !strings.Contains(err.Error(), "AFK stage checkpoint") {
 		t.Fatalf("missing durable workflow evidence = %v", err)
 	}
 	owned := []json.RawMessage{json.RawMessage(`{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"/skill:afk 42"}}`)}
-	workflow, stage, checkpointFile, checkpointSHA, status, failure, err := inspectWorkflowCheckpoint(request, owned)
-	if err != nil || workflow != "afk" || stage != "afk-coordinator" || status != "active" || checkpointFile != "" || checkpointSHA != "" || failure != "" {
-		t.Fatalf("owned AFK evidence = %q/%q/%q/%q/%q/%q, %v", workflow, stage, checkpointFile, checkpointSHA, status, failure, err)
+	if _, _, _, _, _, _, err := inspectWorkflowCheckpoint(request, owned); err == nil || !strings.Contains(err.Error(), "AFK stage checkpoint") {
+		t.Fatalf("invocation-only AFK evidence = %v, want refusal", err)
 	}
 	gitDir := filepath.Join(worktree, ".git")
 	if err := os.Mkdir(gitDir, 0o700); err != nil {
 		t.Fatal(err)
+	}
+	marker := fmt.Sprintf("{\"version\":1,\"workflow\":\"afk\",\"stage\":\"afk-coordinator\",\"issue\":42,\"runId\":\"run-42\",\"sessionId\":\"session-42\",\"worktree\":%q}\n", worktree)
+	if err := os.WriteFile(filepath.Join(request.SessionDir, "backlog-afk-checkpoint-v1.json"), []byte(marker), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workflow, stage, checkpointFile, checkpointSHA, status, failure, err := inspectWorkflowCheckpoint(request, owned)
+	if err != nil || workflow != "afk" || stage != "afk-coordinator" || status != "active" || filepath.Base(checkpointFile) != "backlog-afk-checkpoint-v1.json" || checkpointSHA == "" || failure != "" {
+		t.Fatalf("owned AFK checkpoint = %q/%q/%q/%q/%q/%q, %v", workflow, stage, checkpointFile, checkpointSHA, status, failure, err)
 	}
 	checkpoint := filepath.Join(gitDir, "ship-it-checkpoint-v1.md")
 	valid := func(status, stage, session, directory, branch, failure string) []byte {
@@ -1165,6 +1220,18 @@ func TestWorkflowCheckpointRequiresDurableOwnedAFKOrStrictShipItSchema(t *testin
 	workflow, stage, checkpointFile, checkpointSHA, status, failure, err = inspectWorkflowCheckpoint(request, owned)
 	if err != nil || workflow != "ship-it" || stage != "blocked" || filepath.Base(checkpointFile) != filepath.Base(checkpoint) || checkpointSHA == "" || status != "blocked" || failure != "repair-budget-exhaustion" {
 		t.Fatalf("structured blocked checkpoint = %q/%q/%q/%q/%q/%q, %v", workflow, stage, checkpointFile, checkpointSHA, status, failure, err)
+	}
+	for _, blocker := range []string{"evidence-unavailable", "hosted-check-no-progress"} {
+		blocked := valid("blocked", "blocked", request.SessionID, worktree, request.Branch, "")
+		blocked = append(blocked, []byte("Blocker kind: "+blocker+"\nBlocker cause: hosted evidence did not advance\nBlocker fingerprint: check-123\n")...)
+		if err := os.WriteFile(checkpoint, blocked, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		workflow, _, checkpointFile, _, _, failure, err = inspectWorkflowCheckpoint(request, owned)
+		kind, cause, fingerprint, blockerErr := inspectCheckpointBlockers(checkpointFile)
+		if err != nil || blockerErr != nil || workflow != "ship-it" || failure != "" || kind != blocker || cause != "hosted evidence did not advance" || fingerprint != "check-123" {
+			t.Fatalf("supported blocker %q = workflow %q failure %q kind/cause/fingerprint %q/%q/%q, errors %v/%v", blocker, workflow, failure, kind, cause, fingerprint, err, blockerErr)
+		}
 	}
 }
 

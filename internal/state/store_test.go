@@ -70,7 +70,7 @@ func TestFileStoreRoundTripsCompleteRecoverySafetyMetadata(t *testing.T) {
 		SessionID: run.SessionID, SessionFile: filepath.Join(run.SessionDir, "session.jsonl"), Worktree: run.Worktree,
 		LeafID: "leaf", EntryCount: 4, SHA256: strings.Repeat("a", 64), Workflow: "afk", WorkflowStage: "afk-coordinator",
 		WorkerGeneration: 3, LocalCommit: strings.Repeat("b", 40), RemoteBranchState: "present", RemoteCommit: strings.Repeat("c", 40),
-		PullRequest: run.PullRequest, PullRequestHead: strings.Repeat("c", 40), CheckpointStatus: "active", VerifiedAt: now,
+		PullRequest: run.PullRequest, PullRequestHead: strings.Repeat("c", 40), CheckpointFile: filepath.Join(root, "backlog-afk-checkpoint-v1.json"), CheckpointSHA256: strings.Repeat("d", 64), CheckpointStatus: "active", VerifiedAt: now,
 	}
 	lease := scheduler.Lease{LeaseID: "lease-exact-98", Issue: run.Issue, RunID: run.RunID}
 	want := State{Version: CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 2, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{lease}}
@@ -84,6 +84,32 @@ func TestFileStoreRoundTripsCompleteRecoverySafetyMetadata(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Recovery metadata round trip:\ngot  %#v\nwant %#v", got, want)
+	}
+}
+
+func TestFileStoreMigratesV4ToV5WithoutLosingRecoveryMetadata(t *testing.T) {
+	now := time.Date(2026, 7, 29, 1, 2, 3, 0, time.UTC)
+	run := scheduler.Run{Issue: 98, RunID: "run-98", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModeRPC, SessionID: "session-98", SessionDir: "/sessions/run-98", FailureClass: scheduler.FailureValidation, WorkflowStage: "blocked", PreservedCause: "original", BlockerKind: "evidence-unavailable", BlockerCause: "hosted evidence absent", BlockerFingerprint: "check-98", RecoveryCount: 1, FirstRecoveredAt: &now, LastRecoveredAt: &now, StartedAt: now.Add(-time.Hour), UpdatedAt: now}
+	fixture := State{Version: previousVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}
+	encoded, err := json.Marshal(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := (FileStore{Path: path}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.Version = CurrentVersion
+	if !reflect.DeepEqual(got, fixture) {
+		t.Fatalf("V4 migration lost Recovery state:\ngot  %#v\nwant %#v", got, fixture)
+	}
+	persisted, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(persisted), `"version": 5`) {
+		t.Fatalf("V5 migration persistence = %s, %v", persisted, err)
 	}
 }
 
@@ -112,7 +138,7 @@ func TestFileStorePreviewDoesNotPersistV1Migration(t *testing.T) {
 	}
 }
 
-func TestFileStoreReportsV4TargetWhenV1MigrationPersistenceFails(t *testing.T) {
+func TestFileStoreReportsV5TargetWhenV1MigrationPersistenceFails(t *testing.T) {
 	t.Parallel()
 
 	directory := t.TempDir()
@@ -127,7 +153,7 @@ func TestFileStoreReportsV4TargetWhenV1MigrationPersistenceFails(t *testing.T) {
 	defer os.Chmod(directory, 0o700)
 
 	_, err := (FileStore{Path: path}).Load()
-	if err == nil || !strings.Contains(err.Error(), "persist version 4 state migration") {
+	if err == nil || !strings.Contains(err.Error(), "persist version 5 state migration") {
 		t.Fatalf("V1 migration persistence error = %v", err)
 	}
 }
@@ -334,8 +360,8 @@ func TestFileStoreMigratesV2ToV3WithoutAcknowledgingOutcomesOrLosingMetadata(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(persisted), `"version": 4`) {
-		t.Fatalf("V4 migration was not persisted: %s", persisted)
+	if !strings.Contains(string(persisted), `"version": 5`) {
+		t.Fatalf("V5 migration was not persisted: %s", persisted)
 	}
 }
 
@@ -382,10 +408,10 @@ func TestFileStoreRejectsUnsupportedNewerStateVersion(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "state.json")
-	if err := os.WriteFile(path, []byte(`{"version":5,"runs":[],"leases":[]}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"version":6,"runs":[],"leases":[]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := (FileStore{Path: path}).Load(); err == nil || !strings.Contains(err.Error(), "unsupported state version 5") {
+	if _, err := (FileStore{Path: path}).Load(); err == nil || !strings.Contains(err.Error(), "unsupported state version 6") {
 		t.Fatalf("newer state error = %v", err)
 	}
 }

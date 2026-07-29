@@ -99,7 +99,17 @@ func (m *Module) Inspect(ctx context.Context, selector string) (Plan, error) {
 	}
 	lease, leased := findLease(current, run)
 	if !leased {
-		return Plan{}, fmt.Errorf("Run %q no longer owns its Lease", run.RunID)
+		if run.Status != scheduler.StatusMerged || run.PullRequest == "" {
+			return Plan{}, fmt.Errorf("Run %q no longer owns its Lease", run.RunID)
+		}
+		issue, pulls, inspectErr := m.config.GitHub.OwnedRunResources(ctx, m.config.Repo, run.Issue, run.Branch)
+		if inspectErr != nil {
+			return Plan{}, fmt.Errorf("verify historical Recovery Completion: %w", inspectErr)
+		}
+		if issue.State != "closed" || len(pulls) != 1 || !pulls[0].Merged || pulls[0].URL != run.PullRequest {
+			return Plan{}, errors.New("historical Recovery Completion no longer matches one merged expected pull request and closed issue")
+		}
+		return Plan{Run: run, Outcome: OutcomeCompletion, PullRequest: run.PullRequest, PullRequestHead: pulls[0].Commit}, nil
 	}
 	already := run.Status == scheduler.StatusSuspended && run.RecoveryCount > 0
 	if run.Status != scheduler.StatusFailed && run.Status != scheduler.StatusNeedsHuman && !already {
@@ -185,7 +195,9 @@ func (m *Module) Inspect(ctx context.Context, selector string) (Plan, error) {
 			LeafID: boundary.LeafID, EntryCount: boundary.EntryCount, SHA256: boundary.SHA256,
 			Workflow: boundary.Workflow, WorkflowStage: boundary.WorkflowStage,
 			CheckpointFile: boundary.CheckpointFile, CheckpointSHA256: boundary.CheckpointSHA256,
-			CheckpointStatus: boundary.CheckpointStatus, CheckpointFailure: boundary.CheckpointFailure,
+			CheckpointStatus: boundary.CheckpointStatus, CheckpointFailureClass: boundary.CheckpointFailureClass,
+			CheckpointBlockerKind: boundary.CheckpointBlockerKind, CheckpointBlockerCause: boundary.CheckpointBlockerCause,
+			CheckpointBlockerFingerprint: boundary.CheckpointBlockerFingerprint,
 		}
 		if err = worker.VerifyContinuation(continuationRequest(run), continuation); err != nil {
 			return Plan{}, fmt.Errorf("verify persisted continuation evidence: %w", err)
@@ -202,8 +214,10 @@ func (m *Module) Inspect(ctx context.Context, selector string) (Plan, error) {
 		LeafID: continuation.LeafID, EntryCount: continuation.EntryCount, SHA256: continuation.SHA256,
 		Workflow: continuation.Workflow, WorkflowStage: continuation.WorkflowStage,
 		CheckpointFile: continuation.CheckpointFile, CheckpointSHA256: continuation.CheckpointSHA256,
-		CheckpointStatus: continuation.CheckpointStatus, CheckpointFailure: continuation.CheckpointFailure,
-		WorkerGeneration: run.WorkerGeneration, LocalCommit: identity.LocalCommit,
+		CheckpointStatus: continuation.CheckpointStatus, CheckpointFailureClass: continuation.CheckpointFailureClass,
+		CheckpointBlockerKind: continuation.CheckpointBlockerKind, CheckpointBlockerCause: continuation.CheckpointBlockerCause,
+		CheckpointBlockerFingerprint: continuation.CheckpointBlockerFingerprint,
+		WorkerGeneration:             run.WorkerGeneration, LocalCommit: identity.LocalCommit,
 		RemoteBranchState: map[bool]string{true: "present", false: "absent"}[identity.RemotePresent], RemoteCommit: identity.RemoteCommit,
 		PullRequest: pullRequest, VerifiedAt: m.config.Now().UTC(),
 	}
@@ -213,6 +227,10 @@ func (m *Module) Inspect(ctx context.Context, selector string) (Plan, error) {
 		boundary.PullRequestHead = pullHead
 	}
 	if already {
+		persisted := run.Continuation
+		if persisted.LocalCommit != identity.LocalCommit || persisted.RemoteBranchState != boundary.RemoteBranchState || persisted.RemoteCommit != identity.RemoteCommit || persisted.PullRequest != boundary.PullRequest || persisted.PullRequestHead != boundary.PullRequestHead {
+			return Plan{}, errors.New("repository or pull request identity drifted since the persisted Recovery continuation")
+		}
 		outcome = OutcomeAlready
 	}
 	return Plan{
@@ -231,7 +249,9 @@ func (m *Module) Recover(ctx context.Context, expected Plan) (Plan, error) {
 		if fresh.Outcome == OutcomeCompletion {
 			return fresh, nil
 		}
-		return Plan{}, errors.New("Recovery Plan changed after confirmation; inspect and confirm the current plan")
+		if fresh.Outcome != OutcomeWaiting {
+			return Plan{}, errors.New("Recovery Plan changed after confirmation; inspect and confirm the current plan")
+		}
 	}
 	if fresh.Outcome == OutcomeAlready {
 		return fresh, nil
@@ -242,7 +262,9 @@ func (m *Module) Recover(ctx context.Context, expected Plan) (Plan, error) {
 			LeafID: fresh.Boundary.LeafID, EntryCount: fresh.Boundary.EntryCount, SHA256: fresh.Boundary.SHA256,
 			Workflow: fresh.Boundary.Workflow, WorkflowStage: fresh.Boundary.WorkflowStage,
 			CheckpointFile: fresh.Boundary.CheckpointFile, CheckpointSHA256: fresh.Boundary.CheckpointSHA256,
-			CheckpointStatus: fresh.Boundary.CheckpointStatus, CheckpointFailure: fresh.Boundary.CheckpointFailure,
+			CheckpointStatus: fresh.Boundary.CheckpointStatus, CheckpointFailureClass: fresh.Boundary.CheckpointFailureClass,
+			CheckpointBlockerKind: fresh.Boundary.CheckpointBlockerKind, CheckpointBlockerCause: fresh.Boundary.CheckpointBlockerCause,
+			CheckpointBlockerFingerprint: fresh.Boundary.CheckpointBlockerFingerprint,
 		}
 		if err := worker.SyncContinuation(continuationRequest(fresh.Run), continuation); err != nil {
 			return Plan{}, fmt.Errorf("synchronize offline continuation evidence: %w", err)
@@ -286,9 +308,12 @@ func (m *Module) Recover(ctx context.Context, expected Plan) (Plan, error) {
 		run.WorkerLogOpen = false
 		run.Continuation = &fresh.Boundary
 		run.WorkflowStage = fresh.Boundary.WorkflowStage
-		if fresh.Boundary.CheckpointFailure != "" {
-			run.FailureClass = scheduler.FailureClass(fresh.Boundary.CheckpointFailure)
+		if fresh.Boundary.CheckpointFailureClass != "" {
+			run.FailureClass = scheduler.FailureClass(fresh.Boundary.CheckpointFailureClass)
 		}
+		run.BlockerKind = fresh.Boundary.CheckpointBlockerKind
+		run.BlockerCause = fresh.Boundary.CheckpointBlockerCause
+		run.BlockerFingerprint = fresh.Boundary.CheckpointBlockerFingerprint
 		run.ResumeAfter = nil
 		run.SuspendedAt = &now
 		run.RecoveryCount++
@@ -440,13 +465,16 @@ func WritePlan(writer interface{ Write([]byte) (int, error) }, plan Plan) error 
 	lines := []string{
 		fmt.Sprintf("Recovery Plan for Run %s (issue #%d):", plan.Run.RunID, plan.Run.Issue),
 		fmt.Sprintf("  Outcome: %s", plan.Outcome),
-		fmt.Sprintf("  Preserve: Lease, branch %s, worktree %s, Pi session %s, and diagnostic logs", plan.Run.Branch, plan.Run.Worktree, plan.Run.SessionID),
 	}
-	if plan.LocalCommit != "" {
-		lines = append(lines, fmt.Sprintf("  Git identity: local %s; remote %s", plan.LocalCommit, remote))
-	}
-	if plan.Outcome == OutcomeSuspend || plan.Outcome == OutcomeAlready {
+	switch plan.Outcome {
+	case OutcomeSuspend, OutcomeAlready:
+		stateAction := "establish Run as Suspended"
+		if plan.Outcome == OutcomeAlready {
+			stateAction = "leave Run already Suspended"
+		}
 		lines = append(lines,
+			fmt.Sprintf("  Preserve: existing Lease, branch %s, worktree %s, Pi session %s, diagnostic logs, and original diagnostic", plan.Run.Branch, plan.Run.Worktree, plan.Run.SessionID),
+			"  State action: "+stateAction+" with no replacement Worker launch",
 			fmt.Sprintf("  Continuation: %s stage %s at leaf %s (%d entries, SHA-256 %s)", plan.Boundary.Workflow, plan.Boundary.WorkflowStage, plan.Boundary.LeafID, plan.Boundary.EntryCount, plan.Boundary.SHA256),
 			fmt.Sprintf("  Session file: %s", plan.Boundary.SessionFile),
 			"  Launch boundary: existing Resume will freshly recheck GitHub, Git, worktree, session, checkpoint, and process absence before starting a replacement Worker.",
@@ -455,8 +483,23 @@ func WritePlan(writer interface{ Write([]byte) (int, error) }, plan Plan) error 
 		if plan.Boundary.CheckpointFile != "" {
 			lines = append(lines, fmt.Sprintf("  Workflow checkpoint: %s (SHA-256 %s)", plan.Boundary.CheckpointFile, plan.Boundary.CheckpointSHA256))
 		}
+	case OutcomeWaiting:
+		lines = append(lines,
+			fmt.Sprintf("  Preserve: existing Lease, branch %s, worktree %s, Pi session %s, diagnostic logs, and original diagnostic", plan.Run.Branch, plan.Run.Worktree, plan.Run.SessionID),
+			"  State action: transition Run to waiting-for-merge and clear any cooldown; do not launch a replacement Worker",
+			fmt.Sprintf("  Pull request identity: %s at head %s with auto-merge armed", plan.PullRequest, plan.PullRequestHead),
+		)
+	case OutcomeCompletion:
+		lines = append(lines,
+			fmt.Sprintf("  Completion identity: merged pull request %s at head %s and closed issue #%d", plan.PullRequest, plan.PullRequestHead, plan.Run.Issue),
+			"  Retirement actions: remove Backlog-managed workflow labels; retire the owned remote branch, local worktree and branch, and active Pi session when present; preserve historical logs and diagnostics; record merged Completion and pull request identity; release exactly this Run's Lease",
+			"  State action: complete normal retirement with no replacement Worker launch",
+		)
 	}
-	if plan.PullRequest != "" {
+	if plan.LocalCommit != "" {
+		lines = append(lines, fmt.Sprintf("  Git identity: local %s; remote %s", plan.LocalCommit, remote))
+	}
+	if plan.PullRequest != "" && plan.Outcome != OutcomeWaiting && plan.Outcome != OutcomeCompletion {
 		lines = append(lines, "  Expected pull request: "+plan.PullRequest)
 	}
 	if plan.OriginalDiagnostic != "" {

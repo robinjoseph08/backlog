@@ -125,6 +125,7 @@ type Runner struct {
 
 	Now                    func() time.Time
 	newCandidateRetryTimer func(time.Duration) candidateRetryTimer
+	newResumeWakeTimer     func(time.Duration) candidateRetryTimer
 	NewRunID               func(issue int) string
 	PIDAlive               func(pid int) bool
 	ProcessGroupAlive      func(pid int) (bool, error)
@@ -322,8 +323,15 @@ func (r *Runner) Run(ctx context.Context) error {
 	if newCandidateRetryTimer == nil {
 		newCandidateRetryTimer = newSystemCandidateRetryTimer
 	}
+	var resumeWakeTimer candidateRetryTimer
 	var candidateRetryTimer candidateRetryTimer
 	var candidateRetry <-chan time.Time
+	newResumeWakeTimer := r.newResumeWakeTimer
+	if newResumeWakeTimer == nil {
+		newResumeWakeTimer = newSystemCandidateRetryTimer
+	}
+	var resumeWake <-chan time.Time
+	var resumeWakeAt time.Time
 	candidateDiscoveryFailures := 0
 	candidateSnapshotCompleted := false
 	var candidateDiscoveryFirstFailure time.Time
@@ -331,9 +339,29 @@ func (r *Runner) Run(ctx context.Context) error {
 		if candidateRetryTimer != nil {
 			candidateRetryTimer.stop()
 		}
+		if resumeWakeTimer != nil {
+			resumeWakeTimer.stop()
+		}
 	}()
 
 	for {
+		nextWake := earliestResumeAfter(&current)
+		if nextWake.IsZero() {
+			resumeWake = nil
+			resumeWakeAt = time.Time{}
+		} else if !nextWake.Equal(resumeWakeAt) {
+			delay := nextWake.Sub(r.Now().UTC())
+			if delay < 0 {
+				delay = 0
+			}
+			if resumeWakeTimer == nil {
+				resumeWakeTimer = newResumeWakeTimer(delay)
+			} else {
+				resumeWakeTimer.reset(delay)
+			}
+			resumeWake = resumeWakeTimer.channel()
+			resumeWakeAt = nextWake
+		}
 		select {
 		case event := <-signalEvents:
 			draining = r.handleSignal(event, len(localWorkers)) || draining
@@ -784,6 +812,9 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 		case <-candidateRetry:
 			candidateRetry = nil
+		case <-resumeWake:
+			resumeWake = nil
+			resumeWakeAt = time.Time{}
 		case <-poll.C:
 			if draining {
 				continue
@@ -1346,10 +1377,15 @@ func (r *Runner) checkpointSettledWorker(ctx context.Context, current *state.Sta
 		LeafID: boundary.LeafID, EntryCount: boundary.EntryCount, SHA256: boundary.SHA256,
 		Workflow: boundary.Workflow, WorkflowStage: boundary.WorkflowStage,
 		CheckpointFile: boundary.CheckpointFile, CheckpointSHA256: boundary.CheckpointSHA256,
-		CheckpointStatus: boundary.CheckpointStatus, CheckpointFailure: boundary.CheckpointFailure,
-		WorkerGeneration: run.WorkerGeneration, VerifiedAt: now,
+		CheckpointStatus: boundary.CheckpointStatus, CheckpointFailureClass: boundary.CheckpointFailureClass,
+		CheckpointBlockerKind: boundary.CheckpointBlockerKind, CheckpointBlockerCause: boundary.CheckpointBlockerCause,
+		CheckpointBlockerFingerprint: boundary.CheckpointBlockerFingerprint,
+		WorkerGeneration:             run.WorkerGeneration, VerifiedAt: now,
 	}
 	run.WorkflowStage = boundary.WorkflowStage
+	run.BlockerKind = boundary.CheckpointBlockerKind
+	run.BlockerCause = boundary.CheckpointBlockerCause
+	run.BlockerFingerprint = boundary.CheckpointBlockerFingerprint
 	run.UpdatedAt = now
 	replaceRun(current, run)
 	if err := r.Store.Save(*current); err != nil {
@@ -1423,7 +1459,9 @@ func verifyBoundaryArtifacts(run scheduler.Run, boundary scheduler.ContinuationB
 		LeafID: boundary.LeafID, EntryCount: boundary.EntryCount, SHA256: boundary.SHA256,
 		Workflow: boundary.Workflow, WorkflowStage: boundary.WorkflowStage,
 		CheckpointFile: boundary.CheckpointFile, CheckpointSHA256: boundary.CheckpointSHA256,
-		CheckpointStatus: boundary.CheckpointStatus, CheckpointFailure: boundary.CheckpointFailure,
+		CheckpointStatus: boundary.CheckpointStatus, CheckpointFailureClass: boundary.CheckpointFailureClass,
+		CheckpointBlockerKind: boundary.CheckpointBlockerKind, CheckpointBlockerCause: boundary.CheckpointBlockerCause,
+		CheckpointBlockerFingerprint: boundary.CheckpointBlockerFingerprint,
 	}); err != nil {
 		return fmt.Errorf("verify Pi continuation before Resume: %w", err)
 	}
@@ -2398,8 +2436,10 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 			EntryCount: result.boundary.EntryCount, SHA256: result.boundary.SHA256,
 			Workflow: result.boundary.Workflow, WorkflowStage: result.boundary.WorkflowStage,
 			CheckpointFile: result.boundary.CheckpointFile, CheckpointSHA256: result.boundary.CheckpointSHA256,
-			CheckpointStatus: result.boundary.CheckpointStatus, CheckpointFailure: result.boundary.CheckpointFailure,
-			WorkerGeneration: run.WorkerGeneration, VerifiedAt: now,
+			CheckpointStatus: result.boundary.CheckpointStatus, CheckpointFailureClass: result.boundary.CheckpointFailureClass,
+			CheckpointBlockerKind: result.boundary.CheckpointBlockerKind, CheckpointBlockerCause: result.boundary.CheckpointBlockerCause,
+			CheckpointBlockerFingerprint: result.boundary.CheckpointBlockerFingerprint,
+			WorkerGeneration:             run.WorkerGeneration, VerifiedAt: now,
 		}
 		if run.LogPath == "" {
 			run.LogPath = result.boundary.LogPath
@@ -2944,6 +2984,20 @@ func removeLease(current *state.State, runID string) {
 			return
 		}
 	}
+}
+
+func earliestResumeAfter(current *state.State) time.Time {
+	var earliest time.Time
+	for _, lease := range current.Leases {
+		run := findRun(current.Runs, lease.RunID)
+		if run.Status != scheduler.StatusSuspended || run.ResumePending || run.ResumeAfter == nil {
+			continue
+		}
+		if earliest.IsZero() || run.ResumeAfter.Before(earliest) {
+			earliest = *run.ResumeAfter
+		}
+	}
+	return earliest
 }
 
 func nextSuspendedRun(current *state.State, now func() time.Time) scheduler.Run {

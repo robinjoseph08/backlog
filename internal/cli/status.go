@@ -395,6 +395,15 @@ func (p *statusPrinter) printReason(run scheduler.Run) {
 	if run.WorkflowStage != "" {
 		p.printf("    Workflow stage: %s\n", plainStatusValue(run.WorkflowStage))
 	}
+	if run.BlockerKind != "" {
+		p.printf("    Blocker kind: %s\n", plainStatusValue(run.BlockerKind))
+	}
+	if run.BlockerCause != "" {
+		p.printf("    Blocker cause: %s\n", plainStatusValue(run.BlockerCause))
+	}
+	if run.BlockerFingerprint != "" {
+		p.printf("    Blocker fingerprint: %s\n", plainStatusValue(run.BlockerFingerprint))
+	}
 	if run.ProviderContinuationAttempts > 0 {
 		p.printf("    Provider continuations: %d of 1\n", run.ProviderContinuationAttempts)
 	}

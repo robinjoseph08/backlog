@@ -56,25 +56,28 @@ const (
 )
 
 type ContinuationBoundary struct {
-	SessionID         string    `json:"sessionId"`
-	SessionFile       string    `json:"sessionFile"`
-	Worktree          string    `json:"worktree"`
-	LeafID            string    `json:"leafId"`
-	EntryCount        int       `json:"entryCount"`
-	SHA256            string    `json:"sha256"`
-	Workflow          string    `json:"workflow,omitempty"`
-	WorkflowStage     string    `json:"workflowStage,omitempty"`
-	CheckpointFile    string    `json:"checkpointFile,omitempty"`
-	CheckpointSHA256  string    `json:"checkpointSha256,omitempty"`
-	WorkerGeneration  int       `json:"workerGeneration,omitempty"`
-	LocalCommit       string    `json:"localCommit,omitempty"`
-	RemoteBranchState string    `json:"remoteBranchState,omitempty"`
-	RemoteCommit      string    `json:"remoteCommit,omitempty"`
-	PullRequest       string    `json:"pullRequest,omitempty"`
-	PullRequestHead   string    `json:"pullRequestHead,omitempty"`
-	CheckpointStatus  string    `json:"checkpointStatus,omitempty"`
-	CheckpointFailure string    `json:"checkpointFailure,omitempty"`
-	VerifiedAt        time.Time `json:"verifiedAt"`
+	SessionID                    string    `json:"sessionId"`
+	SessionFile                  string    `json:"sessionFile"`
+	Worktree                     string    `json:"worktree"`
+	LeafID                       string    `json:"leafId"`
+	EntryCount                   int       `json:"entryCount"`
+	SHA256                       string    `json:"sha256"`
+	Workflow                     string    `json:"workflow,omitempty"`
+	WorkflowStage                string    `json:"workflowStage,omitempty"`
+	CheckpointFile               string    `json:"checkpointFile,omitempty"`
+	CheckpointSHA256             string    `json:"checkpointSha256,omitempty"`
+	WorkerGeneration             int       `json:"workerGeneration,omitempty"`
+	LocalCommit                  string    `json:"localCommit,omitempty"`
+	RemoteBranchState            string    `json:"remoteBranchState,omitempty"`
+	RemoteCommit                 string    `json:"remoteCommit,omitempty"`
+	PullRequest                  string    `json:"pullRequest,omitempty"`
+	PullRequestHead              string    `json:"pullRequestHead,omitempty"`
+	CheckpointStatus             string    `json:"checkpointStatus,omitempty"`
+	CheckpointFailureClass       string    `json:"checkpointFailure,omitempty"`
+	CheckpointBlockerKind        string    `json:"checkpointBlockerKind,omitempty"`
+	CheckpointBlockerCause       string    `json:"checkpointBlockerCause,omitempty"`
+	CheckpointBlockerFingerprint string    `json:"checkpointBlockerFingerprint,omitempty"`
+	VerifiedAt                   time.Time `json:"verifiedAt"`
 }
 
 type Run struct {
@@ -115,6 +118,9 @@ type Run struct {
 	FailureClass                 FailureClass          `json:"failureClass,omitempty"`
 	WorkflowStage                string                `json:"workflowStage,omitempty"`
 	PreservedCause               string                `json:"preservedCause,omitempty"`
+	BlockerKind                  string                `json:"blockerKind,omitempty"`
+	BlockerCause                 string                `json:"blockerCause,omitempty"`
+	BlockerFingerprint           string                `json:"blockerFingerprint,omitempty"`
 	ProviderContinuationAttempts int                   `json:"providerContinuationAttempts,omitempty"`
 	ResumeAfter                  *time.Time            `json:"resumeAfter,omitempty"`
 	RecoveryCount                int                   `json:"recoveryCount,omitempty"`

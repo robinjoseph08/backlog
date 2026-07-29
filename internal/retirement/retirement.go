@@ -828,6 +828,9 @@ func (e Service) completeMergedPlan(ctx context.Context, plan Plan) (bool, error
 	if !e.policy.AllowMergedCompletion || plan.TerminalState != scheduler.StatusMerged {
 		return false, nil
 	}
+	if e.policy.RetireMergedCompletionArtifacts && (len(plan.Actions) != 1 || plan.Actions[0].kind != actionFinalizeCompletion) {
+		return false, nil
+	}
 	if len(plan.Actions) != 1 || plan.Actions[0].kind != actionFinalizeCompletion {
 		return true, errors.New("merged expected pull request did not produce an executable Completion plan")
 	}
@@ -1035,12 +1038,18 @@ func missingLogWarning(run scheduler.Run) string {
 }
 
 func (e Service) verifyOwnedFinalState(snapshot Snapshot) error {
-	for _, pull := range snapshot.PullRequests {
-		if pull.State != PullRequestClosed || pull.AutoMergeArmed {
-			return fmt.Errorf("pull request #%d final state is not verified closed, unmerged, and auto-merge unarmed", pull.Number)
+	if e.policy.AllowMergedCompletion && e.policy.TerminalStatus == scheduler.StatusMerged {
+		if len(snapshot.PullRequests) != 1 || snapshot.PullRequests[0].State != PullRequestMerged || snapshot.PullRequests[0].URL != snapshot.Run.PullRequest || snapshot.Issue.Open {
+			return errors.New("Completion final state is not one merged expected pull request with a closed issue")
 		}
-		if e.policy.RequireClosedExplanation && !pull.Explained {
-			return fmt.Errorf("pull request #%d final state is missing its verified %s explanation", pull.Number, e.policy.Operation)
+	} else {
+		for _, pull := range snapshot.PullRequests {
+			if pull.State != PullRequestClosed || pull.AutoMergeArmed {
+				return fmt.Errorf("pull request #%d final state is not verified closed, unmerged, and auto-merge unarmed", pull.Number)
+			}
+			if e.policy.RequireClosedExplanation && !pull.Explained {
+				return fmt.Errorf("pull request #%d final state is missing its verified %s explanation", pull.Number, e.policy.Operation)
+			}
 		}
 	}
 	if snapshot.RemoteBranch.Present {
@@ -1553,7 +1562,13 @@ func inspectSessionDirectory(directory string, run scheduler.Run) ([]string, boo
 		if entry.IsDir() {
 			return nil
 		}
-		if !entry.Type().IsRegular() || filepath.Ext(path) != ".jsonl" {
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("Pi session directory contains unknown resource %s", path)
+		}
+		if path == filepath.Join(directory, "backlog-afk-checkpoint-v1.json") {
+			return nil
+		}
+		if filepath.Ext(path) != ".jsonl" {
 			return fmt.Errorf("Pi session directory contains unknown resource %s", path)
 		}
 		files = append(files, path)
