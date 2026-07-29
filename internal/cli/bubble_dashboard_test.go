@@ -2802,6 +2802,7 @@ func TestDashboardFinalOutcomeDistinguishesEveryExitPath(t *testing.T) {
 		{name: "force stop", forceStopping: true, err: &runner.SignalExit{Code: 130}, want: "Force stop complete"},
 		{name: "force stop failure", forceStopping: true, result: runner.ShutdownResultFailure, err: &runner.SignalExit{Code: 130, Cause: errors.New("kill failed")}, want: "Force stop finished with errors"},
 		{name: "Runner failure", err: errors.New("state unavailable"), want: "Error: state unavailable"},
+		{name: "parent cancellation", err: context.Canceled, want: "Error: context canceled"},
 		{name: "presentation failure", err: &PresentationFailure{Err: errors.New("renderer panic"), RunnerErr: &runner.SignalExit{Code: 143}}, want: "Error: presentation failed: renderer panic; Runner completion: signal shutdown (143)"},
 	} {
 		t.Run(test.name, func(t *testing.T) {

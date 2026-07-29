@@ -321,8 +321,8 @@ func TestOversizedAdmissionFailuresRemainCompleteInPlainOutputAndLatestTwentyDia
 		t.Fatal("Runner did not emit the oversized failure sequence")
 	}
 	cancel()
-	if err := <-runDone; err != nil {
-		t.Fatalf("Runner oversized failure sequence: %v", err)
+	if err := <-runDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Runner oversized failure sequence cancellation = %v, want context cancellation", err)
 	}
 	candidateRunner.WaitForOperationalEventDelivery()
 
@@ -495,8 +495,8 @@ func TestAdmissionBackpressureComposesRunnerPresentationAndDashboardBounds(t *te
 		return false
 	})
 	cancel()
-	if err := <-runDone; err != nil {
-		t.Fatalf("Runner under composed backpressure: %v", err)
+	if err := <-runDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Runner under composed backpressure cancellation = %v, want context cancellation", err)
 	}
 	candidateRunner.WaitForOperationalEventDelivery()
 

@@ -297,7 +297,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				event := <-signalEvents
 				draining = r.handleSignal(event, 0)
 			case ctx.Err() != nil:
-				return nil
+				return context.Cause(ctx)
 			default:
 				return err
 			}
@@ -347,7 +347,8 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 		}
 		if ctx.Err() != nil {
-			return r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped; worker was terminated and its worktree was retained")
+			shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped; worker was terminated and its worktree was retained")
+			return errors.Join(context.Cause(ctx), shutdownErr)
 		}
 
 		resumedWorker := false
@@ -745,7 +746,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				}
 				shutdownErr := r.shutdownOwned(cancelWorkers, &current, localWorkers, completions, "scheduler stopped after a reconciliation error; worktree retained")
 				if ctx.Err() != nil {
-					return shutdownErr
+					return errors.Join(context.Cause(ctx), shutdownErr)
 				}
 				return errors.Join(err, shutdownErr)
 			}

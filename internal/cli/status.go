@@ -148,9 +148,9 @@ func printRunFinalReport(output io.Writer, current state.State, source followSta
 	printer.printf("\nFinal aggregate summary\n")
 	printer.printf("Final outcome: %s\n", plainStatusValue(outcome))
 	printer.header(current)
-	printer.section("Completions produced", completions)
-	printer.section("Active", sections[statusActive])
-	printer.section("Attention Required", sections[statusAttention])
+	printer.finalReportSection("Completions produced", completions)
+	printer.finalReportSection("Active", sections[statusActive])
+	printer.finalReportSection("Attention Required", sections[statusAttention])
 	return printer.err
 }
 
@@ -236,6 +236,35 @@ func (p *statusPrinter) section(name string, runs []statusRun) {
 	}
 	for _, observed := range runs {
 		p.run(observed)
+	}
+}
+
+// finalReportSection preserves the Run and issue identities operators need
+// after the TUI exits without copying live observation telemetry to the normal
+// screen.
+func (p *statusPrinter) finalReportSection(name string, runs []statusRun) {
+	p.printf("\n%s (%d)\n", name, len(runs))
+	if len(runs) == 0 {
+		p.printf("  none\n")
+		return
+	}
+	for _, observed := range runs {
+		run := observed.run
+		identity := fmt.Sprintf("#%d", run.Issue)
+		if title := plainStatusValue(run.IssueTitle); title != "" {
+			identity += "  " + title
+		}
+		p.printf("  %s  %s\n", identity, run.Status)
+		if issueURL := plainStatusValue(run.IssueURL); issueURL != "" {
+			p.printf("    Issue: %s\n", issueURL)
+		}
+		p.printf("    Run: %s | State: %s\n", plainStatusValue(run.RunID), run.Status)
+		if run.PullRequest != "" && (run.Status == scheduler.StatusWaitingForMerge || run.Status == scheduler.StatusMerged) {
+			p.printf("    Pull request: %s\n", plainStatusValue(run.PullRequest))
+		}
+		if run.Error != "" && statusSectionFor(run, true) == statusAttention {
+			p.printReason(run)
+		}
 	}
 }
 

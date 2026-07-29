@@ -670,6 +670,57 @@ func TestPrintRunFinalReportIncludesOnlyInvocationCompletionsAndOutcome(t *testi
 	}
 }
 
+func TestPrintRunFinalReportOmitsLiveObservationTelemetry(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	logPath := filepath.Join(t.TempDir(), "retained-live.jsonl")
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeActivityEntries(t, activity.PathForLog(logPath), activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: now.Add(-time.Second), Kind: "tool",
+		Description: "Tool edit started", Operation: "edit", OperationChanged: true, TurnDelta: 2,
+		TokensKnown: true, TokenDelta: 1200,
+	})
+	processIdentity, err := pidStartIdentity(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs := []scheduler.Run{
+		{
+			Issue: 20, IssueTitle: "Still active", IssueURL: "https://example.test/issues/20",
+			RunID: "active-live", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint,
+			PID: os.Getpid(), ProcessIdentity: processIdentity, LogPath: logPath, StartedAt: now.Add(-time.Minute),
+		},
+		{
+			Issue: 21, IssueTitle: "Retained live Worker", IssueURL: "https://example.test/issues/21",
+			RunID: "attention-live", Status: scheduler.StatusNeedsHuman, WorkerMode: scheduler.WorkerModePrint,
+			PID: os.Getpid(), ProcessIdentity: processIdentity, Error: "verify retained Worker outcome",
+		},
+	}
+	current := state.State{Version: state.CurrentVersion, Runs: runs, Leases: []scheduler.Lease{
+		{LeaseID: "active-live", Issue: 20, RunID: "active-live"},
+		{LeaseID: "attention-live", Issue: 21, RunID: "attention-live"},
+	}}
+	var output bytes.Buffer
+	if err := printRunFinalReport(&output, current, &dashboardTestSource{current: current}, now, nil, "Error: context canceled"); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Final outcome: Error: context canceled", "Active (1)", "#20  Still active  running",
+		"Run: active-live | State: running", "Attention Required (1)", "#21  Retained live Worker  needs-human",
+		"Run: attention-live | State: needs-human", "Diagnostic: verify retained Worker outcome",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("final report missing %q:\n%s", want, output.String())
+		}
+	}
+	for _, omitted := range []string{"Worker liveness:", "retained Worker liveness:", "Activity age:", "Current deepest operation:", "Turns:", "Observed tokens:", "Elapsed:"} {
+		if strings.Contains(output.String(), omitted) {
+			t.Fatalf("final report retained live telemetry %q:\n%s", omitted, output.String())
+		}
+	}
+}
+
 func TestPrintRunFinalSummaryReturnsOutputFailure(t *testing.T) {
 	err := printRunFinalSummary(failingStatusWriter{}, state.State{Version: state.CurrentVersion}, &sequenceFollowSource{}, time.Now())
 	if err == nil || !strings.Contains(err.Error(), "status output failed") {
