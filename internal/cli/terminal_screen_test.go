@@ -19,6 +19,15 @@ func TestTerminalScreenTextAppliesCursorAddressedDashboardUpdates(t *testing.T) 
 	}
 }
 
+func TestTerminalScreenTextAppliesBubbleTeaInsertModeDelta(t *testing.T) {
+	output := "Runner stage: Running\r\nNext Ctrl-C: start Drain and stop Admission" +
+		"\x1b[1;15HDrai\x1b[4hn\x1b[4l\n\x1b[5Duspend unfinished Runs within the shared deadline"
+	want := "Runner stage: Draining\nNext Ctrl-C: suspend unfinished Runs within the shared deadline"
+	if got := terminalScreenText(output, 64, 2); got != want {
+		t.Fatalf("terminal screen:\n%s\nwant:\n%s", got, want)
+	}
+}
+
 func TestTerminalScreenTextScrollsConfiguredRegion(t *testing.T) {
 	const initial = "top\none\ntwo\nthree\nbottom"
 	tests := []struct {
@@ -49,6 +58,8 @@ type testTerminalScreen struct {
 	cells                   [][]rune
 	row, column             int
 	scrollTop, scrollBottom int
+	insertMode              bool
+	lineFeedColumn          int
 }
 
 // terminalScreenText applies the cursor and erase operations used by Bubble Tea
@@ -74,10 +85,11 @@ func newTestTerminalScreen(width, height int) *testTerminalScreen {
 			cells[row][column] = ' '
 		}
 	}
-	return &testTerminalScreen{cells: cells, scrollBottom: height - 1}
+	return &testTerminalScreen{cells: cells, scrollBottom: height - 1, lineFeedColumn: -1}
 }
 
 func (s *testTerminalScreen) print(value rune) {
+	s.lineFeedColumn = -1
 	if len(s.cells) == 0 || len(s.cells[0]) == 0 {
 		return
 	}
@@ -88,6 +100,9 @@ func (s *testTerminalScreen) print(value rune) {
 	if s.row < 0 || s.row >= len(s.cells) {
 		return
 	}
+	if s.insertMode {
+		copy(s.cells[s.row][s.column+1:], s.cells[s.row][s.column:])
+	}
 	s.cells[s.row][s.column] = value
 	s.column++
 }
@@ -96,20 +111,25 @@ func (s *testTerminalScreen) execute(control byte) {
 	switch control {
 	case '\n', '\v', '\f':
 		s.index()
+		s.lineFeedColumn = s.column
 		s.column = 0
 	case '\r':
+		s.lineFeedColumn = -1
 		s.column = 0
 	case '\b':
+		s.lineFeedColumn = -1
 		if s.column > 0 {
 			s.column--
 		}
 	case '\t':
+		s.lineFeedColumn = -1
 		s.column = min((s.column/8+1)*8, s.width()-1)
 	}
 	s.clampCursor()
 }
 
 func (s *testTerminalScreen) handleESC(command ansi.Cmd) {
+	s.lineFeedColumn = -1
 	if command.Final() != 'M' {
 		return
 	}
@@ -122,6 +142,13 @@ func (s *testTerminalScreen) handleESC(command ansi.Cmd) {
 }
 
 func (s *testTerminalScreen) handleCSI(command ansi.Cmd, params ansi.Params) {
+	// The captured writer can contain either a terminal-mapped newline or the
+	// renderer's raw line feed. A following relative move disambiguates the
+	// latter because Bubble Tea computes it from the preserved column.
+	if command.Final() == 'D' && s.lineFeedColumn >= 0 {
+		s.column = s.lineFeedColumn
+	}
+	s.lineFeedColumn = -1
 	parameter := func(index, defaultValue int) int {
 		value, _, _ := params.Param(index, defaultValue)
 		if value == 0 {
@@ -166,6 +193,14 @@ func (s *testTerminalScreen) handleCSI(command ansi.Cmd, params ansi.Params) {
 		if top >= 0 && top < bottom && bottom < len(s.cells) {
 			s.scrollTop, s.scrollBottom = top, bottom
 			s.row, s.column = 0, 0
+		}
+	case 'h', 'l':
+		if command.Prefix() == 0 {
+			params.ForEach(0, func(_ int, value int, _ bool) {
+				if value == 4 {
+					s.insertMode = command.Final() == 'h'
+				}
+			})
 		}
 	}
 	s.clampCursor()
