@@ -2212,6 +2212,12 @@ func (r *Runner) finalizeSettledWorker(ctx context.Context, current *state.State
 	if run.Status != scheduler.StatusMerged {
 		return nil
 	}
+	if run.RecoveryCount > 0 && !run.CleanupPending {
+		// Recovered Completion reaches Merged only through the full retirement
+		// service, which has already retired every owned artifact before releasing
+		// the Lease. Do not repeat its local cleanup with weaker postconditions.
+		return nil
+	}
 	assignment := worktree.Assignment{Path: run.Worktree, Branch: run.Branch}
 	if assignment.Path == "" || assignment.Branch == "" {
 		return nil
@@ -2690,15 +2696,38 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 			if workerLogIsClosed(closed.result) {
 				run.WorkerLogOpen = false
 			}
-			if outcome, exists := verifiedOutcomes[closed.issue]; exists && failureReasons[closed.issue] == "" {
-				if err := r.applyOutcome(ctx, current, run, outcome, true, false); err != nil {
-					clean = false
-					failureReasons[closed.issue] = fmt.Sprintf("apply GitHub outcome after Worker exit: %v", err)
-				}
-				run = findRun(current.Runs, run.RunID)
-			}
 			markStoppedRun(&run, r.Now().UTC())
 			run.UpdatedAt = r.Now().UTC()
+			if outcome, exists := verifiedOutcomes[closed.issue]; exists && failureReasons[closed.issue] == "" {
+				cleanupMerged := outcome.Merged && outcome.IssueClosed && run.RecoveryCount > 0
+				if cleanupMerged {
+					transitionStatus(&run, scheduler.StatusNeedsHuman)
+					run.PullRequest = outcome.PullRequest
+					run.Error = recoveredCompletionPendingShutdown
+					run.SuspendingAt = nil
+					replaceRun(current, run)
+					if err := r.Store.Save(*current); err != nil {
+						clean = false
+						failureReasons[closed.issue] = fmt.Sprintf("persist stopped Worker before Recovered Completion retirement: %v", err)
+					}
+				}
+				if failureReasons[closed.issue] == "" {
+					cleanupCtx := ctx
+					cancelCleanup := func() {}
+					if cleanupMerged {
+						cleanupCtx, cancelCleanup = r.suspensionCleanupContext()
+					}
+					if err := r.applyOutcome(cleanupCtx, current, run, outcome, true, cleanupMerged); err != nil {
+						clean = false
+						failureReasons[closed.issue] = fmt.Sprintf("apply GitHub outcome after Worker exit: %v", err)
+					}
+					cancelCleanup()
+					run = findRun(current.Runs, run.RunID)
+					if cleanupMerged && run.Status != scheduler.StatusMerged {
+						clean = false
+					}
+				}
+			}
 			if reason := failureReasons[closed.issue]; reason != "" {
 				run.Status = scheduler.StatusNeedsHuman
 				run.CompletedAt = nil

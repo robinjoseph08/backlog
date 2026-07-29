@@ -3959,8 +3959,57 @@ func TestRunnerRoutesPostResumeSettlementCompletionAfterStoppedProofToRetirement
 		t.Fatal(err)
 	}
 	got := store.LoadValue()
-	if got.Runs[0].Status != scheduler.StatusMerged || len(got.Leases) != 0 || workers.checkpointCount != 0 {
-		t.Fatalf("post-Resume Completion retirement = %#v, checkpoints=%d", got, workers.checkpointCount)
+	worktrees := runner.Worktrees.(*fakeWorktrees)
+	if got.Runs[0].Status != scheduler.StatusMerged || len(got.Leases) != 0 || workers.checkpointCount != 0 || worktrees.cleanupCount() != 0 {
+		t.Fatalf("post-Resume Completion retirement = %#v, checkpoints=%d, duplicate cleanups=%d", got, workers.checkpointCount, worktrees.cleanupCount())
+	}
+}
+
+func TestSuspensionRoutesRecoveredCompletionThroughFullRetirementAfterStoppedProof(t *testing.T) {
+	run := resumableRun(t, 110, "suspension-completion-110")
+	run.Status = scheduler.StatusRunning
+	run.RecoveryCount = 1
+	recoveredAt := time.Now().Add(-time.Minute).UTC()
+	run.FirstRecoveredAt, run.LastRecoveredAt = &recoveredAt, &recoveredAt
+	run.WorkerGeneration = 2
+	run.Continuation = nil
+	run.PID = 1000 + run.Issue
+	run.ProcessIdentity = fmt.Sprintf("identity-%d", run.PID)
+	workers := newFakeWorkers()
+	process, err := workers.Start(context.Background(), worker.Request{Issue: run.Issue, RunID: run.RunID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}}
+	github := &fakeGitHub{completionFunc: func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
+		return mergedOutcome(run.Issue), nil
+	}}
+	runner := testRunner(github, workers, store, 1)
+	runner.Config.SuspensionTimeout = time.Second
+	runner.Output = io.Discard
+	retirementCalled := false
+	runner.CompletionRetirement = recoveredCompletionRetirerFunc(func(_ context.Context, expected scheduler.Run) (bool, error) {
+		current := store.LoadValue()
+		observed := findRun(current.Runs, expected.RunID)
+		if observed.PID != 0 || observed.ProcessIdentity != "" || observed.StoppedWorkerGeneration != observed.WorkerGeneration || observed.WorkerStoppedAt == nil || observed.Status != scheduler.StatusNeedsHuman || len(current.Leases) != 1 {
+			return true, fmt.Errorf("retirement observed unsafe suspension preconditions: %#v", current)
+		}
+		retirementCalled = true
+		now := time.Now().UTC()
+		observed.Status, observed.PullRequest, observed.CompletedAt, observed.Error = scheduler.StatusMerged, mergedOutcome(run.Issue).PullRequest, &now, ""
+		replaceRun(&current, observed)
+		removeLease(&current, observed.RunID)
+		return true, store.Save(current)
+	})
+	current := store.LoadValue()
+	err = runner.suspendOwned(&current, map[int]WorkerProcess{run.Issue: process}, 130)
+	var signalExit *SignalExit
+	if !errors.As(err, &signalExit) || signalExit.Code != 130 || signalExit.Cause != nil {
+		t.Fatalf("suspension result = %v", err)
+	}
+	got := store.LoadValue()
+	if !retirementCalled || got.Runs[0].Status != scheduler.StatusMerged || len(got.Leases) != 0 || runner.Worktrees.(*fakeWorktrees).cleanupCount() != 0 {
+		t.Fatalf("suspension Recovered Completion = called=%t state=%#v duplicate cleanups=%d", retirementCalled, got, runner.Worktrees.(*fakeWorktrees).cleanupCount())
 	}
 }
 

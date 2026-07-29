@@ -105,12 +105,15 @@ func TestCompiledRecoverLateCompletionRetiresArtifactsLabelsAndLeaseIdempotently
 	if err := os.WriteFile(fixture.githubState, []byte(`{"labels":["in-progress","spec"]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	merged := filepath.Join(t.TempDir(), "merged")
+	mutationState := t.TempDir()
+	merged := filepath.Join(mutationState, "merged")
+	labelInterrupted := filepath.Join(mutationState, "label-interrupted")
 	head := strings.TrimSpace(gitOutput(t, fixture.worktree, "rev-parse", "HEAD"))
 	gh := writeExecutable(t, `#!/bin/sh
 set -eu
 state=`+quote(fixture.githubState)+`
 merged=`+quote(merged)+`
+label_interrupted=`+quote(labelInterrupted)+`
 case "$*" in
   "repo view --json nameWithOwner,defaultBranchRef")
     printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
@@ -124,7 +127,8 @@ case "$*" in
     printf '[{"number":99,"url":"https://github.com/acme/widgets/pull/99","state":"%s","mergedAt":%s,"autoMergeRequest":null,"isDraft":false,"headRefName":"`+fixture.branch+`","headRefOid":"`+head+`","headRepositoryOwner":{"login":"acme"},"headRepository":{"nameWithOwner":"acme/widgets"}}]\n' "$status" "$mergedAt" ;;
   "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/99/comments?per_page=100 --paginate --slurp") printf '%s\n' '[[]]' ;;
   "issue edit 42 --repo acme/widgets --remove-label in-progress")
-    temporary="$state.tmp"; jq '.labels |= map(select(. != "in-progress"))' "$state" > "$temporary"; mv "$temporary" "$state" ;;
+    temporary="$state.tmp"; jq '.labels |= map(select(. != "in-progress"))' "$state" > "$temporary"; mv "$temporary" "$state"
+    if [ ! -f "$label_interrupted" ]; then touch "$label_interrupted"; echo 'deterministic interruption after recovered Completion label stage' >&2; exit 1; fi ;;
   "issue edit 42 --repo acme/widgets --remove-label ready-for-agent")
     temporary="$state.tmp"; jq '.labels |= map(select(. != "ready-for-agent"))' "$state" > "$temporary"; mv "$temporary" "$state" ;;
   *) echo "unexpected gh: $*" >&2; exit 9 ;;
@@ -139,7 +143,11 @@ esac
 		}
 		return string(output)
 	}
-	output := command()
+	firstOutput, firstErr := exec.Command(binary, arguments...).CombinedOutput()
+	if firstErr == nil || !strings.Contains(string(firstOutput), "deterministic interruption after recovered Completion label stage") {
+		t.Fatalf("partial recovered Completion = %v\n%s", firstErr, firstOutput)
+	}
+	output := string(firstOutput)
 	for _, want := range []string{
 		"Recovery Plan changed after confirmation", "Recovered Completion Plan for issue #42",
 		"delete remote branch " + run.Branch + " at " + head,
@@ -147,7 +155,6 @@ esac
 		"delete local branch " + run.Branch + " at " + head,
 		"archive Pi session " + run.SessionID + " from " + run.SessionDir + " to " + fixture.archiveDir,
 		"remove issue label in-progress", "record Completion from merged expected pull request #99 (" + run.PullRequest + ") and release Lease lease-local",
-		"Completion recorded for Run " + run.RunID + " from merged expected pull request " + run.PullRequest,
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("late Completion output missing exact action %q:\n%s", want, output)
@@ -155,6 +162,36 @@ esac
 	}
 	if strings.Contains(output, "when present") {
 		t.Fatalf("late Completion output used a generic conditional action:\n%s", output)
+	}
+	partial, err := fixture.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if partial.Runs[0].Status == scheduler.StatusMerged || len(partial.Leases) != 1 {
+		t.Fatalf("partial recovered Completion released ownership: %#v", partial)
+	}
+	if branch, inspectErr := inspectRemoteBranch(context.Background(), fixture.git, fixture.repository, fixture.branch); inspectErr != nil || branch.Present {
+		t.Fatalf("partial recovered Completion repeated remote branch state = %#v, %v", branch, inspectErr)
+	}
+	if _, statErr := os.Stat(fixture.worktree); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("partial recovered Completion retained worktree: %v", statErr)
+	}
+	if _, statErr := os.Stat(fixture.archiveDir); statErr != nil {
+		t.Fatalf("partial recovered Completion did not durably archive session: %v", statErr)
+	}
+	output = command()
+	for _, completed := range []string{"delete remote branch", "remove local worktree", "delete local branch", "archive Pi session", "remove issue label"} {
+		if strings.Contains(output, completed) {
+			t.Fatalf("recovered Completion rerun repeated completed stage %q:\n%s", completed, output)
+		}
+	}
+	for _, want := range []string{
+		"record Completion from merged expected pull request #99",
+		"Completion recorded for Run " + run.RunID + " from merged expected pull request " + run.PullRequest,
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("recovered Completion rerun omitted %q:\n%s", want, output)
+		}
 	}
 	persisted, err := fixture.store.Load()
 	if err != nil {
