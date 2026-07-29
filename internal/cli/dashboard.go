@@ -189,6 +189,10 @@ func cloneDashboardState(current state.State) state.State {
 			value := *run.SuspendedAt
 			run.SuspendedAt = &value
 		}
+		if run.ResumeAfter != nil {
+			value := *run.ResumeAfter
+			run.ResumeAfter = &value
+		}
 		if run.CompletedAt != nil {
 			value := *run.CompletedAt
 			run.CompletedAt = &value
@@ -1058,6 +1062,7 @@ func (b *dashboardBodyBuilder) compactDashboardRun(observed statusRun, now time.
 	if run.Error != "" {
 		parts = append(parts, "Diagnostic: "+plainStatusValue(strings.TrimSpace(run.Error)))
 	}
+	parts = append(parts, dashboardLifecycleDiagnosticParts(run)...)
 	if progress.deepestOperation != "n/a" {
 		parts = append(parts, "Deepest operation: "+plainStatusValue(progress.deepestOperation))
 	}
@@ -1214,6 +1219,26 @@ func validDashboardRepository(repository string) bool {
 	return true
 }
 
+func dashboardLifecycleDiagnosticParts(run scheduler.Run) []string {
+	var parts []string
+	if run.FailureClass != "" {
+		parts = append(parts, "Failure class: "+plainStatusValue(string(run.FailureClass)))
+	}
+	if run.WorkflowStage != "" {
+		parts = append(parts, "Workflow stage: "+plainStatusValue(run.WorkflowStage))
+	}
+	if run.ResumeAfter != nil && !run.ResumeAfter.IsZero() {
+		parts = append(parts, "Provider cooldown until: "+run.ResumeAfter.UTC().Format(time.RFC3339))
+	}
+	if run.ProviderContinuationAttempts > 0 {
+		parts = append(parts, fmt.Sprintf("Provider continuations: %d of 1", run.ProviderContinuationAttempts))
+	}
+	if run.RecoveryCount > 0 {
+		parts = append(parts, fmt.Sprintf("Explicit recoveries: %d", run.RecoveryCount))
+	}
+	return parts
+}
+
 func dashboardRunExpectsWorker(run scheduler.Run) bool {
 	return run.Status == scheduler.StatusRunning
 }
@@ -1281,6 +1306,9 @@ func (b *dashboardBodyBuilder) expandedDashboardRun(observed statusRun, now time
 	fmt.Fprintf(&details, "    Observed tokens: %s\n", progress.observedTokens)
 	if run.Error != "" {
 		fmt.Fprintf(&details, "    Diagnostic: %s\n", plainStatusValue(strings.TrimSpace(run.Error)))
+	}
+	for _, diagnostic := range dashboardLifecycleDiagnosticParts(run) {
+		fmt.Fprintf(&details, "    %s\n", diagnostic)
 	}
 	return details.String()
 }
@@ -1725,6 +1753,10 @@ func (b *dashboardBodyBuilder) renderSection(section statusSection, name string,
 		if run.Error != "" {
 			line = "    Diagnostic: " + plainStatusValue(strings.TrimSpace(run.Error))
 			b.write(styler.render(dashboardSemanticAttention, line) + "\n")
+		}
+		if diagnostics := dashboardLifecycleDiagnosticParts(run); len(diagnostics) > 0 {
+			line = "    Lifecycle: " + strings.Join(diagnostics, " | ")
+			b.write(styler.render(dashboardSemanticMetadata, line) + "\n")
 		}
 	}
 }

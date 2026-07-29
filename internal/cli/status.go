@@ -404,6 +404,9 @@ func (p *statusPrinter) printReason(run scheduler.Run) {
 	if run.BlockerFingerprint != "" {
 		p.printf("    Blocker fingerprint: %s\n", plainStatusValue(run.BlockerFingerprint))
 	}
+	if run.ResumeAfter != nil {
+		p.printTime("Provider cooldown until", run.ResumeAfter)
+	}
 	if run.ProviderContinuationAttempts > 0 {
 		p.printf("    Provider continuations: %d of 1\n", run.ProviderContinuationAttempts)
 	}

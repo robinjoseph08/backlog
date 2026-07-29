@@ -1926,6 +1926,37 @@ func TestDashboardPresentsQuietAgeAndUnavailableTurnsFromSharedProgress(t *testi
 	}
 }
 
+func TestDashboardProjectsStructuredRecoveryDiagnosticsAndProviderDeadline(t *testing.T) {
+	now := time.Date(2026, 7, 29, 4, 0, 0, 0, time.UTC)
+	resumeAfter := now.Add(30 * time.Second)
+	run := scheduler.Run{
+		Issue: 98, RunID: "provider-recovery", Status: scheduler.StatusSuspended,
+		FailureClass: scheduler.FailureProviderExhaustion, WorkflowStage: "normal-review",
+		ProviderContinuationAttempts: 1, ResumeAfter: &resumeAfter, RecoveryCount: 2,
+		Error: "provider retries exhausted",
+	}
+	observed := statusRun{run: run, observation: runObservation{run: run, observed: now}}
+	var standard strings.Builder
+	renderDashboardSection(&standard, statusActive, "Active Runs", []statusRun{observed}, now, dashboardStyler{})
+	builder := dashboardBodyBuilder{}
+	projections := map[string]string{
+		"standard": standard.String(),
+		"compact":  compactDashboardRun(observed, now, false, 1000),
+		"expanded": builder.expandedDashboardRun(observed, now),
+	}
+	for name, projection := range projections {
+		for _, want := range []string{
+			"Failure class: provider-exhaustion", "Workflow stage: normal-review",
+			"Provider cooldown until: " + resumeAfter.Format(time.RFC3339),
+			"Provider continuations: 1 of 1", "Explicit recoveries: 2",
+		} {
+			if !strings.Contains(projection, want) {
+				t.Fatalf("%s dashboard projection omitted %q:\n%s", name, want, projection)
+			}
+		}
+	}
+}
+
 func TestDashboardElapsedTimerRedrawsWithoutStateActivity(t *testing.T) {
 	started := time.Now().Add(-time.Minute).Truncate(time.Second)
 	var clock atomic.Int64

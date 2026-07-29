@@ -264,8 +264,9 @@ func TestStatusConciseProjectionAndFullHistoryAreCompleteOrderedAndExplicit(t *t
 func TestStatusProjectsStructuredRecoveryDiagnosticsInConciseAndFullViews(t *testing.T) {
 	now := time.Date(2026, 7, 29, 4, 0, 0, 0, time.UTC)
 	firstRecovery := now.Add(-time.Hour)
+	resumeAfter := now.Add(30 * time.Second)
 	runs := []scheduler.Run{
-		{Issue: 201, RunID: "provider", Status: scheduler.StatusNeedsHuman, FailureClass: scheduler.FailureProviderExhaustion, WorkflowStage: "normal-review", ProviderContinuationAttempts: 1, Error: "provider retries exhausted", UpdatedAt: now},
+		{Issue: 201, RunID: "provider", Status: scheduler.StatusSuspended, FailureClass: scheduler.FailureProviderExhaustion, WorkflowStage: "normal-review", ProviderContinuationAttempts: 1, ResumeAfter: &resumeAfter, Error: "provider retries exhausted", UpdatedAt: now},
 		{Issue: 202, RunID: "base", Status: scheduler.StatusFailed, FailureClass: scheduler.FailureBaseAdvancement, WorkflowStage: "integration-refresh", Error: "base advanced", UpdatedAt: now.Add(-time.Minute)},
 		{Issue: 203, RunID: "validation", Status: scheduler.StatusFailed, FailureClass: scheduler.FailureValidation, WorkflowStage: "validation", Error: "validation failed", UpdatedAt: now.Add(-2 * time.Minute)},
 		{Issue: 204, RunID: "repair", Status: scheduler.StatusFailed, FailureClass: scheduler.FailureRepairBudgetExhaustion, WorkflowStage: "blocked", BlockerKind: "evidence-unavailable", BlockerCause: "hosted evidence absent", BlockerFingerprint: "browser-check", RecoveryCount: 2, FirstRecoveredAt: &firstRecovery, LastRecoveredAt: &now, Error: "repair budget exhausted", UpdatedAt: now.Add(-3 * time.Minute)},
@@ -284,7 +285,7 @@ func TestStatusProjectsStructuredRecoveryDiagnosticsInConciseAndFullViews(t *tes
 			"Failure class: repair-budget-exhaustion", "Failure class: unsafe-continuation-evidence",
 			"Workflow stage: normal-review", "Workflow stage: integration-refresh", "Workflow stage: validation", "Workflow stage: blocked", "Workflow stage: publish",
 			"Blocker kind: evidence-unavailable", "Blocker cause: hosted evidence absent", "Blocker fingerprint: browser-check",
-			"Provider continuations: 1 of 1", "Explicit recoveries: 2",
+			"Provider cooldown until: " + resumeAfter.Format(time.RFC3339), "Provider continuations: 1 of 1", "Explicit recoveries: 2",
 		} {
 			if !strings.Contains(output.String(), want) {
 				t.Fatalf("status full=%t missing %q:\n%s", full, want, output.String())

@@ -27,6 +27,7 @@ func TestRecoverHelpDescribesFailClosedLifecycle(t *testing.T) {
 	for _, want := range []string{
 		"Usage: backlog recover <run-id|positive-issue-number> [flags]",
 		"durable leaf/hash", "workflow checkpoint", "Suspended", "Dry-run is read-only",
+		"Completion and armed auto-merge", "take precedence",
 		"Interactive confirmation defaults to no", "Non-interactive mutation requires --yes",
 	} {
 		if !strings.Contains(stderr.String(), want) {
@@ -271,7 +272,8 @@ func TestCompiledRecoverDryRunAndIdempotentMutationPreserveRunIdentities(t *test
 		t.Fatal(err)
 	}
 	marker := fmt.Sprintf("{\"version\":1,\"workflow\":\"afk\",\"stage\":\"afk-coordinator\",\"issue\":42,\"runId\":%q,\"sessionId\":%q,\"worktree\":%q}\n", runID, sessionID, worktreePath)
-	if err := os.WriteFile(filepath.Join(sessionDir, "backlog-afk-checkpoint-v1.json"), []byte(marker), 0o600); err != nil {
+	checkpointFile := filepath.Join(sessionDir, "backlog-afk-checkpoint-v1.json")
+	if err := os.WriteFile(checkpointFile, []byte(marker), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
@@ -289,8 +291,10 @@ func TestCompiledRecoverDryRunAndIdempotentMutationPreserveRunIdentities(t *test
 	}); err != nil {
 		t.Fatal(err)
 	}
+	githubCalls := filepath.Join(root, "github-calls")
 	gh := writeExecutable(t, `#!/bin/sh
 set -eu
+printf '%s\n' "$*" >> `+quote(githubCalls)+`
 case "$*" in
   "issue view 42 --repo acme/widgets --json number,url,state,labels")
     printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"OPEN","labels":[{"name":"in-progress"},{"name":"spec"}]}' ;;
@@ -311,6 +315,16 @@ esac
 	}
 
 	before := fileDigest(t, store.Path)
+	beforeRefs := gitSnapshot(t, repository)
+	beforeRemoteRefs := gitOutput(t, repository, "ls-remote", "--heads", "origin")
+	beforeWorktreeStatus := gitOutput(t, worktreePath, "status", "--porcelain=v1", "--untracked-files=all")
+	beforeWorktreeFile := fileDigest(t, filepath.Join(worktreePath, "work.txt"))
+	beforeSession := fileDigest(t, sessionFile)
+	beforeCheckpoint := fileDigest(t, checkpointFile)
+	archiveDir := filepath.Join(stateDir, "history", "sessions", runID)
+	if _, err := os.Stat(archiveDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dry-run fixture unexpectedly has a session archive: %v", err)
+	}
 	output := command("--dry-run")
 	for _, want := range []string{"Recovery Plan for Run " + runID, "Outcome: suspend", "afk stage afk-coordinator", "Dry-run: no changes made."} {
 		if !strings.Contains(output, want) {
@@ -319,6 +333,30 @@ esac
 	}
 	if after := fileDigest(t, store.Path); after != before {
 		t.Fatalf("dry-run changed state: %x != %x", after, before)
+	}
+	if after := gitSnapshot(t, repository); after != beforeRefs {
+		t.Fatalf("dry-run changed local refs:\nbefore:\n%safter:\n%s", beforeRefs, after)
+	}
+	if after := gitOutput(t, repository, "ls-remote", "--heads", "origin"); after != beforeRemoteRefs {
+		t.Fatalf("dry-run changed remote refs:\nbefore:\n%safter:\n%s", beforeRemoteRefs, after)
+	}
+	if after := gitOutput(t, worktreePath, "status", "--porcelain=v1", "--untracked-files=all"); after != beforeWorktreeStatus || fileDigest(t, filepath.Join(worktreePath, "work.txt")) != beforeWorktreeFile {
+		t.Fatalf("dry-run changed retained worktree artifacts: before status %q, after %q", beforeWorktreeStatus, after)
+	}
+	if fileDigest(t, sessionFile) != beforeSession || fileDigest(t, checkpointFile) != beforeCheckpoint {
+		t.Fatal("dry-run changed Pi session or workflow checkpoint evidence")
+	}
+	if _, err := os.Stat(archiveDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dry-run created a historical session archive: %v", err)
+	}
+	githubReadCalls, readErr := os.ReadFile(githubCalls)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	wantGitHubReadCalls := "issue view 42 --repo acme/widgets --json number,url,state,labels\n" +
+		"pr list --repo acme/widgets --state all --head " + branch + " --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository\n"
+	if string(githubReadCalls) != wantGitHubReadCalls {
+		t.Fatalf("dry-run GitHub calls were not the bounded read-only inspection set:\n%s", githubReadCalls)
 	}
 
 	directArgs := []string{runID, "--repo-dir", repository, "--state-dir", stateDir, "--gh", gh}
