@@ -296,6 +296,15 @@ func runRetirementGit(t *testing.T, directory string, args ...string) {
 	}
 }
 
+func TestInspectWorktreeChangedFailsClosed(t *testing.T) {
+	t.Parallel()
+	worktree := t.TempDir()
+	git := writeRetirementExecutable(t, "#!/bin/sh\necho 'status unavailable' >&2\nexit 9\n")
+	if _, err := inspectWorktreeChanged(context.Background(), git, worktree); err == nil || !strings.Contains(err.Error(), "inspect worktree") || !strings.Contains(err.Error(), "git exited 9") {
+		t.Fatalf("worktree change inspection error = %v", err)
+	}
+}
+
 func retirementGitOutput(t *testing.T, directory string, args ...string) string {
 	t.Helper()
 	command := exec.Command("git", append([]string{"-C", directory}, args...)...)

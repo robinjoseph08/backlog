@@ -341,7 +341,7 @@ func (p *statusPrinter) run(observed statusRun) {
 		p.printf("    Pull request: %s\n", valueOr(plainStatusValue(run.PullRequest), "n/a"))
 		p.printTime("Completed", run.CompletedAt)
 		if run.CleanupPending {
-			p.printf("    Completion cleanup: pending; the next runner startup will retry\n")
+			p.printf("    Completion cleanup: pending; retry with backlog resolve or the next runner startup\n")
 		}
 		if run.Error != "" {
 			p.printReason(run)

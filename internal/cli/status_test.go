@@ -104,7 +104,7 @@ func TestStatusPresentsOperationalSectionsWithSharedRunObservation(t *testing.T)
 	completions := statusSectionOutput(t, output, "Recent Completions", "")
 	for _, want := range []string{
 		"#10  merged", "Completion: verified merged", "Pull request: https://example.test/pull/10",
-		"Completed: " + completedAt.Format(time.RFC3339), "Completion cleanup: pending; the next runner startup will retry",
+		"Completed: " + completedAt.Format(time.RFC3339), "Completion cleanup: pending; retry with backlog resolve or the next runner startup",
 		"completion verified; worktree cleanup remains pending",
 	} {
 		if !strings.Contains(completions, want) {

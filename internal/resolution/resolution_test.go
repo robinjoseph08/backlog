@@ -82,15 +82,14 @@ func TestPolicyEligibilityCoversIncompleteLeasedLifecycle(t *testing.T) {
 	if !eligible[scheduler.StatusResolvedExternally] {
 		t.Fatal("Historical External Resolution rerun is not eligible")
 	}
-	for _, status := range []scheduler.Status{scheduler.StatusReset, scheduler.StatusMerged} {
-		t.Run(string(status), func(t *testing.T) {
-			if eligible[status] {
-				t.Fatalf("terminal status %s is unexpectedly eligible", status)
-			}
-			if policy.CanTransition(status, scheduler.StatusResolvingExternally) || policy.CanTransition(status, scheduler.StatusResolvedExternally) {
-				t.Fatalf("terminal status %s has an External Resolution transition", status)
-			}
-		})
+	if !eligible[scheduler.StatusMerged] {
+		t.Fatal("Historical merged Completion cleanup is not eligible")
+	}
+	if policy.CanTransition(scheduler.StatusMerged, scheduler.StatusResolvingExternally) || policy.CanTransition(scheduler.StatusMerged, scheduler.StatusResolvedExternally) {
+		t.Fatal("Historical merged Completion cleanup has an External Resolution transition")
+	}
+	if eligible[scheduler.StatusReset] {
+		t.Fatal("reset Historical Run is unexpectedly eligible")
 	}
 }
 
@@ -262,6 +261,66 @@ func TestMergedCompletionPlansDurableProgressBeforeDestructiveCleanup(t *testing
 		!strings.Contains(plan.Actions[1].String(), "delete remote branch agent/run") ||
 		!strings.Contains(plan.Actions[2].String(), "record Completion") {
 		t.Fatalf("merged Completion cleanup order = %#v", plan.Actions)
+	}
+}
+
+func TestHistoricalMergedCompletionPlansRemainingCleanupWithoutLease(t *testing.T) {
+	commit := strings.Repeat("a", 40)
+	snapshot := retirement.Snapshot{
+		Run: scheduler.Run{
+			Issue: 42, RunID: "run", Status: scheduler.StatusMerged, CleanupPending: true,
+			PullRequest: "https://github.com/acme/widgets/pull/9", Branch: "agent/run",
+			Worktree: "/state/worktrees/run", WorkerMode: scheduler.WorkerModeRPC,
+			SessionID: "backlog-run", SessionDir: "/state/sessions/run",
+		},
+		Issue:        retirement.Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", Labels: []string{"in-progress", "spec"}},
+		PullRequests: []retirement.PullRequest{{Number: 9, URL: "https://github.com/acme/widgets/pull/9", Branch: "agent/run", Commit: commit, State: retirement.PullRequestMerged}},
+		LocalBranch:  retirement.Branch{Name: "agent/run", Commit: commit, Present: true},
+		Worktree:     retirement.Worktree{Path: "/state/worktrees/run", Branch: "agent/run", Commit: commit, Present: true},
+		Session:      retirement.Session{ID: "backlog-run", Dir: "/state/sessions/run", ArchiveDir: "/state/history/sessions/run", Present: true},
+	}
+
+	plan, err := retirement.Build(Policy("run"), snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var actions []string
+	for _, action := range plan.Actions {
+		actions = append(actions, action.String())
+	}
+	text := strings.Join(actions, "\n")
+	for _, want := range []string{"remove local worktree", "delete local branch", "archive Pi session", "remove issue label in-progress", "clear pending Completion cleanup"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("Historical Completion cleanup omitted %q: %s", want, text)
+		}
+	}
+	if plan.Operation != "Completion Cleanup" || plan.TerminalState != scheduler.StatusMerged || strings.Contains(text, "Lease") || strings.Contains(text, "resolving-externally") {
+		t.Fatalf("Historical Completion cleanup Plan = %#v", plan)
+	}
+
+	clean := snapshot
+	clean.Run.CleanupPending = false
+	clean.LocalBranch.Present = false
+	clean.Worktree.Present = false
+	clean.Session.Present = false
+	clean.Session.Archived = true
+	clean.Issue.Labels = []string{"spec"}
+	plan, err = retirement.Build(Policy("run"), clean)
+	if err != nil || len(plan.Actions) != 0 {
+		t.Fatalf("fully cleaned Historical Completion Plan = %#v, error = %v", plan, err)
+	}
+}
+
+func TestHistoricalMergedCompletionRefusesMismatchedArtifactCommitIdentity(t *testing.T) {
+	commit := strings.Repeat("a", 40)
+	snapshot := retirement.Snapshot{
+		Run:          scheduler.Run{Issue: 42, RunID: "run", Status: scheduler.StatusMerged, CleanupPending: true, PullRequest: "https://github.com/acme/widgets/pull/9", Branch: "agent/run"},
+		Issue:        retirement.Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42"},
+		PullRequests: []retirement.PullRequest{{Number: 9, URL: "https://github.com/acme/widgets/pull/9", Branch: "agent/run", Commit: commit, State: retirement.PullRequestMerged}},
+		LocalBranch:  retirement.Branch{Name: "agent/run", Commit: strings.Repeat("b", 40), Present: true},
+	}
+	if plan, err := retirement.Build(Policy("run"), snapshot); err == nil || !strings.Contains(err.Error(), "artifact commit identity") || len(plan.Actions) != 0 {
+		t.Fatalf("mismatched Historical Completion Plan = %#v, error = %v", plan, err)
 	}
 }
 
@@ -511,6 +570,7 @@ func TestSelectorUsesLeaseAndHistoricalRerunPreservesResolutionMetadata(t *testi
 	current := state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{
 		{Issue: 42, RunID: "old", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint},
 		{Issue: 42, RunID: "active", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint},
+		{Issue: 7, RunID: "pending-merged", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint, CleanupPending: true},
 		{Issue: 7, RunID: "historical", Status: scheduler.StatusResolvedExternally, WorkerMode: scheduler.WorkerModePrint, ResolvedExternallyAt: &resolvedAt, ClosureReason: "completed"},
 	}, Leases: []scheduler.Lease{{LeaseID: "active", Issue: 42, RunID: "active"}}}
 	run, lease, err := Policy("42").SelectRun(current)
@@ -520,5 +580,18 @@ func TestSelectorUsesLeaseAndHistoricalRerunPreservesResolutionMetadata(t *testi
 	run, lease, err = Policy("historical").SelectRun(current)
 	if err != nil || run.ResolvedExternallyAt != &resolvedAt || lease.LeaseID != "" {
 		t.Fatalf("historical selection = %#v %#v %v", run, lease, err)
+	}
+	run, lease, err = Policy("7").SelectRun(current)
+	if err != nil || run.RunID != "pending-merged" || lease.LeaseID != "" {
+		t.Fatalf("pending Historical Completion issue selection = %#v %#v %v", run, lease, err)
+	}
+	current.Runs[2].CleanupPending = false
+	run, lease, err = Policy("pending-merged").SelectRun(current)
+	if err != nil || run.RunID != "pending-merged" || lease.LeaseID != "" {
+		t.Fatalf("exact cleaned Historical Completion selection = %#v %#v %v", run, lease, err)
+	}
+	run, lease, err = Policy("7").SelectRun(current)
+	if err != nil || run.RunID != "pending-merged" || lease.LeaseID != "" {
+		t.Fatalf("cleaned Historical Completion issue selection = %#v %#v %v", run, lease, err)
 	}
 }

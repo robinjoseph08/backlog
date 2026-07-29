@@ -18,30 +18,33 @@ import (
 // state and owned-artifact identity checks pass.
 func Policy(selector string) retirement.Policy {
 	return retirement.Policy{
-		Operation:                        "External Resolution",
-		CompletionOperation:              "Completion",
-		SelectRun:                        func(current state.State) (scheduler.Run, scheduler.Lease, error) { return selectRun(current, selector) },
-		ValidateSnapshot:                 validateSnapshot,
-		ValidateMergedCompletionSnapshot: validateMergedCompletionSnapshot,
+		Operation:                            "External Resolution",
+		CompletionOperation:                  "Completion",
+		SelectRun:                            func(current state.State) (scheduler.Run, scheduler.Lease, error) { return selectRun(current, selector) },
+		ValidateSnapshot:                     validateSnapshot,
+		ValidateMergedCompletionSnapshot:     validateMergedCompletionSnapshot,
+		ValidateHistoricalCompletionSnapshot: validateHistoricalCompletionSnapshot,
 		EligibleStatuses: []scheduler.Status{
 			scheduler.StatusClaimed, scheduler.StatusWorktreeReady, scheduler.StatusRunning,
 			scheduler.StatusWaitingForMerge, scheduler.StatusFailed, scheduler.StatusSuspended,
 			scheduler.StatusNeedsHuman, scheduler.StatusResetting,
 			scheduler.StatusResolvingExternally, scheduler.StatusResolvedExternally,
+			scheduler.StatusMerged,
 		},
-		CanTransition:                   canTransition,
-		Explanation:                     Explanation,
-		ExplanationAction:               "explain External Resolution",
-		Labels:                          retirement.LabelOutcome{Remove: []string{"in-progress", "ready-for-agent"}},
-		ProgressStatus:                  scheduler.StatusResolvingExternally,
-		TerminalStatus:                  scheduler.StatusResolvedExternally,
-		RecordMissingLogWarn:            true,
-		RequireClosureReason:            true,
-		AllowMergedCompletion:           true,
-		RetireMergedCompletionArtifacts: true,
-		VerifyHistoricalOnly:            true,
-		MarkProgressBeforeMutation:      true,
-		RequireClosedExplanation:        true,
+		CanTransition:                    canTransition,
+		Explanation:                      Explanation,
+		ExplanationAction:                "explain External Resolution",
+		Labels:                           retirement.LabelOutcome{Remove: []string{"in-progress", "ready-for-agent"}},
+		ProgressStatus:                   scheduler.StatusResolvingExternally,
+		TerminalStatus:                   scheduler.StatusResolvedExternally,
+		RecordMissingLogWarn:             true,
+		RequireClosureReason:             true,
+		AllowMergedCompletion:            true,
+		RetireMergedCompletionArtifacts:  true,
+		AllowHistoricalCompletionCleanup: true,
+		VerifyHistoricalOnly:             true,
+		MarkProgressBeforeMutation:       true,
+		RequireClosedExplanation:         true,
 		FinalizeMetadata: func(run *scheduler.Run, snapshot retirement.Snapshot, now time.Time) {
 			run.ResolvedExternallyAt = &now
 			run.ClosureReason = snapshot.Issue.ClosureReason
@@ -70,6 +73,13 @@ func canTransition(from, to scheduler.Status) bool {
 func validateMergedCompletionSnapshot(snapshot retirement.Snapshot, merged retirement.PullRequest) error {
 	if snapshot.Run.RecoveredRetirementRequired || snapshot.Run.RecoveryCount > 0 {
 		return errors.New("recovered Completion requires the full recovered retirement policy")
+	}
+	return validateHistoricalCompletionSnapshot(snapshot, merged)
+}
+
+func validateHistoricalCompletionSnapshot(snapshot retirement.Snapshot, merged retirement.PullRequest) error {
+	if snapshot.Worktree.Changed {
+		return errors.New("Historical Completion worktree has uncommitted changes; cleanup will not force-remove changed artifacts")
 	}
 	if snapshot.RemoteBranch.Present && snapshot.RemoteBranch.Commit != merged.Commit ||
 		snapshot.LocalBranch.Present && snapshot.LocalBranch.Commit != merged.Commit ||
@@ -102,7 +112,7 @@ func selectRun(current state.State, selector string) (scheduler.Run, scheduler.L
 		if run.RunID != selector {
 			continue
 		}
-		if run.Status == scheduler.StatusResolvedExternally {
+		if run.Status == scheduler.StatusResolvedExternally || run.Status == scheduler.StatusMerged {
 			return historicalRun(current, run)
 		}
 		for _, lease := range current.Leases {
@@ -130,17 +140,29 @@ func selectRun(current state.State, selector string) (scheduler.Run, scheduler.L
 	}
 	for index := len(current.Runs) - 1; index >= 0; index-- {
 		run := current.Runs[index]
+		if run.Issue == issue && run.Status == scheduler.StatusMerged && run.CleanupPending {
+			return historicalRun(current, run)
+		}
+	}
+	for index := len(current.Runs) - 1; index >= 0; index-- {
+		run := current.Runs[index]
+		if run.Issue == issue && run.Status == scheduler.StatusMerged {
+			return historicalRun(current, run)
+		}
+	}
+	for index := len(current.Runs) - 1; index >= 0; index-- {
+		run := current.Runs[index]
 		if run.Issue == issue && run.Status == scheduler.StatusResolvedExternally {
 			return historicalRun(current, run)
 		}
 	}
-	return scheduler.Run{}, scheduler.Lease{}, fmt.Errorf("issue #%d has no incomplete leased Run or Historical External Resolution", issue)
+	return scheduler.Run{}, scheduler.Lease{}, fmt.Errorf("issue #%d has no incomplete leased Run or applicable Historical Resolution", issue)
 }
 
 func historicalRun(current state.State, run scheduler.Run) (scheduler.Run, scheduler.Lease, error) {
 	for _, lease := range current.Leases {
 		if lease.RunID == run.RunID {
-			return scheduler.Run{}, scheduler.Lease{}, fmt.Errorf("externally resolved Run %s still has old Lease %s", run.RunID, lease.LeaseID)
+			return scheduler.Run{}, scheduler.Lease{}, fmt.Errorf("Historical Run %s still has old Lease %s", run.RunID, lease.LeaseID)
 		}
 	}
 	return run, scheduler.Lease{}, nil
