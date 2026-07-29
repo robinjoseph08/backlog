@@ -330,9 +330,9 @@ func (s *bubbleDashboardSession) observeOperationalEvent(event runner.Operationa
 	s.finalMu.Unlock()
 }
 
-func (s *bubbleDashboardSession) setResult(err error) {
+func (s *bubbleDashboardSession) setResult(ctx context.Context, err error) {
 	s.finalMu.Lock()
-	s.resultErr = err
+	s.resultErr = dashboardResultError(ctx, err, s.naturalExit)
 	s.finalMu.Unlock()
 }
 
@@ -349,8 +349,8 @@ func (s *bubbleDashboardSession) printFinalSummary(output io.Writer) error {
 	return printRunFinalReport(output, current, source, s.now(), initialCompletions, outcome)
 }
 
-func dashboardResultError(ctx context.Context, err error) error {
-	if err != nil {
+func dashboardResultError(ctx context.Context, err error, natural bool) error {
+	if err != nil || natural {
 		return err
 	}
 	return context.Cause(ctx)

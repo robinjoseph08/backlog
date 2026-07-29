@@ -2055,7 +2055,7 @@ func TestBubbleDashboardFailureRestoresTerminalBeforeStaticErrorResult(t *testin
 			if !errors.As(err, &failure) || !strings.Contains(err.Error(), test.wantError) {
 				t.Fatalf("host failure = %v, want recovered presentation failure containing %q", err, test.wantError)
 			}
-			session.setResult(err)
+			session.setResult(context.Background(), err)
 			if summaryErr := session.printFinalSummary(output); summaryErr != nil {
 				t.Fatalf("static error result: %v", summaryErr)
 			}
@@ -2249,7 +2249,7 @@ func TestBubbleDashboardPostStartFailuresRestorePTYStateBeforeStaticErrorResult(
 			if !reflect.DeepEqual(restoredState, initialState) {
 				t.Fatalf("terminal state after %s = %#v, want %#v", test.name, restoredState, initialState)
 			}
-			session.setResult(err)
+			session.setResult(context.Background(), err)
 			if summaryErr := session.printFinalSummary(output); summaryErr != nil {
 				t.Fatalf("static %s result: %v", test.name, summaryErr)
 			}
@@ -2403,7 +2403,7 @@ func TestBubbleDashboardModelPanicAfterStartupRestoresTerminalBeforeStaticErrorR
 		t.Fatalf("post-start model panic result = %v, panicked = %t", err, panicked.Load())
 	}
 	panicEnabled.Store(false)
-	session.setResult(err)
+	session.setResult(context.Background(), err)
 	if summaryErr := session.printFinalSummary(&output); summaryErr != nil {
 		t.Fatalf("static model-panic result: %v", summaryErr)
 	}
@@ -2906,15 +2906,22 @@ func TestBubbleDashboardStoreDoesNotPublishFailedSave(t *testing.T) {
 func TestDashboardResultErrorSeparatesParentCancellationFromCommandStatus(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if got := dashboardResultError(ctx, nil); !errors.Is(got, context.Canceled) {
+	if got := dashboardResultError(ctx, nil, false); !errors.Is(got, context.Canceled) {
 		t.Fatalf("dashboard cancellation outcome = %v, want context cancellation", got)
 	}
 
 	cleanupErr := errors.New("persist interrupted Runs")
-	if got := dashboardResultError(ctx, cleanupErr); got != cleanupErr {
+	if got := dashboardResultError(ctx, cleanupErr, false); got != cleanupErr {
 		t.Fatalf("dashboard cleanup outcome = %v, want %v", got, cleanupErr)
 	}
-	if got := dashboardResultError(context.Background(), nil); got != nil {
+	if got := dashboardResultError(ctx, nil, true); got != nil {
+		t.Fatalf("late cancellation replaced natural exhaustion with %v", got)
+	}
+	intervention := &runner.InterventionRequired{Count: 1}
+	if got := dashboardResultError(ctx, intervention, true); got != intervention {
+		t.Fatalf("late cancellation replaced natural exhaustion with attention: %v", got)
+	}
+	if got := dashboardResultError(context.Background(), nil, false); got != nil {
 		t.Fatalf("dashboard result for a clean live context = %v, want nil", got)
 	}
 }

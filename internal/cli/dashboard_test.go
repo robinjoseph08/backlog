@@ -616,6 +616,72 @@ esac
 	}
 }
 
+type cancelOnDashboardRestoreOutput struct {
+	synchronizedBuffer
+	cancel   context.CancelFunc
+	canceled atomic.Bool
+}
+
+func (w *cancelOnDashboardRestoreOutput) Write(content []byte) (int, error) {
+	if bytes.Contains(content, []byte("\x1b[?1049l")) && w.canceled.CompareAndSwap(false, true) {
+		w.cancel()
+	}
+	return w.synchronizedBuffer.Write(content)
+}
+
+func TestAutomaticDashboardLateParentCancellationPreservesNaturalOutcome(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		attention bool
+		wantExit  int
+		wantFinal string
+	}{
+		{name: "natural exhaustion", wantFinal: "Final outcome: Natural exhaustion\n"},
+		{name: "natural exhaustion with attention", attention: true, wantExit: 1, wantFinal: "Final outcome: Natural exhaustion with Attention Required\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repository := initializeFollowRepository(t)
+			stateDir := t.TempDir()
+			current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1}
+			if test.attention {
+				run := scheduler.Run{Issue: 73, IssueTitle: "Operator decision", RunID: "run-73", Status: scheduler.StatusNeedsHuman, WorkerMode: scheduler.WorkerModePrint}
+				current.Runs = []scheduler.Run{run}
+				current.Leases = []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}
+			}
+			if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(current); err != nil {
+				t.Fatal(err)
+			}
+			gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef") printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url") printf '%s\n' '[]' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			stdout := cancelOnDashboardRestoreOutput{cancel: cancel}
+			var stderr bytes.Buffer
+			exit := MainWithSignalsAndTerminal(ctx, []string{
+				"run", "--repo-dir", repository, "--state-dir", stateDir, "--poll", "5ms", "--gh", gh,
+			}, &stdout, &stderr, nil, func(io.Writer) bool { return true })
+
+			if !stdout.canceled.Load() {
+				t.Fatal("test did not cancel the parent context during dashboard restoration")
+			}
+			if exit != test.wantExit || stderr.Len() != 0 {
+				t.Fatalf("late cancellation exit = %d, want %d; stderr = %q", exit, test.wantExit, stderr.String())
+			}
+			output := stdout.String()
+			summary := strings.Index(output, "Final aggregate summary")
+			if summary < 0 || !strings.Contains(output[summary:], test.wantFinal) || strings.Contains(output[summary:], "Final outcome: Error: context canceled") {
+				t.Fatalf("late cancellation replaced the recorded natural outcome: %q", output)
+			}
+		})
+	}
+}
+
 func TestAutomaticDashboardParentCancellationKeepsSuccessExitAndReportsCancellation(t *testing.T) {
 	repository := initializeFollowRepository(t)
 	stateDir := t.TempDir()
