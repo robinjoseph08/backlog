@@ -1562,7 +1562,7 @@ func inspectLocalResources(ctx context.Context, gitExecutable, repositoryRoot, c
 }
 
 func inspectWorktreeChanged(ctx context.Context, gitExecutable, worktreePath string) (bool, error) {
-	output, exit, err := runGitInspection(ctx, gitExecutable, worktreePath, "--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all")
+	output, exit, err := runGitInspection(ctx, gitExecutable, worktreePath, "--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching")
 	if err != nil || exit != 0 {
 		if err == nil {
 			err = fmt.Errorf("git exited %d", exit)

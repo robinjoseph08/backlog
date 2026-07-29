@@ -273,7 +273,7 @@ func TestHistoricalMergedCompletionPlansRemainingCleanupWithoutLease(t *testing.
 			Worktree: "/state/worktrees/run", WorkerMode: scheduler.WorkerModeRPC,
 			SessionID: "backlog-run", SessionDir: "/state/sessions/run",
 		},
-		Issue:        retirement.Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", Labels: []string{"in-progress", "spec"}},
+		Issue:        retirement.Issue{Number: 42, URL: "https://github.com/acme/widgets/issues/42", Labels: []string{"in-progress", "ready-for-agent", "spec"}},
 		PullRequests: []retirement.PullRequest{{Number: 9, URL: "https://github.com/acme/widgets/pull/9", Branch: "agent/run", Commit: commit, State: retirement.PullRequestMerged}},
 		LocalBranch:  retirement.Branch{Name: "agent/run", Commit: commit, Present: true},
 		Worktree:     retirement.Worktree{Path: "/state/worktrees/run", Branch: "agent/run", Commit: commit, Present: true},
@@ -289,7 +289,7 @@ func TestHistoricalMergedCompletionPlansRemainingCleanupWithoutLease(t *testing.
 		actions = append(actions, action.String())
 	}
 	text := strings.Join(actions, "\n")
-	for _, want := range []string{"remove local worktree", "delete local branch", "archive Pi session", "remove issue label in-progress", "clear pending Completion cleanup"} {
+	for _, want := range []string{"remove local worktree", "delete local branch", "archive Pi session", "remove issue label in-progress", "remove issue label ready-for-agent", "clear pending Completion cleanup"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("Historical Completion cleanup omitted %q: %s", want, text)
 		}
@@ -298,8 +298,27 @@ func TestHistoricalMergedCompletionPlansRemainingCleanupWithoutLease(t *testing.
 		t.Fatalf("Historical Completion cleanup Plan = %#v", plan)
 	}
 
-	clean := snapshot
-	clean.Run.CleanupPending = false
+	staleMetadata := snapshot
+	staleMetadata.Run.CleanupPending = false
+	plan, err = retirement.Build(Policy("run"), staleMetadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actions = actions[:0]
+	for _, action := range plan.Actions {
+		actions = append(actions, action.String())
+	}
+	text = strings.Join(actions, "\n")
+	for _, want := range []string{"remove local worktree", "delete local branch", "archive Pi session", "remove issue label in-progress", "remove issue label ready-for-agent"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("Historical Completion cleanup with stale metadata omitted %q: %s", want, text)
+		}
+	}
+	if strings.Contains(text, "clear pending Completion cleanup") {
+		t.Fatalf("Historical Completion cleanup with already-clear metadata planned finalization: %s", text)
+	}
+
+	clean := staleMetadata
 	clean.LocalBranch.Present = false
 	clean.Worktree.Present = false
 	clean.Session.Present = false
@@ -562,6 +581,18 @@ func TestMergedExpectedPullRequestStillRequiresClosedIssue(t *testing.T) {
 	}
 	if _, err := retirement.Build(Policy("run"), snapshot); err == nil || !strings.Contains(err.Error(), "Completion requires a verified GitHub closure") {
 		t.Fatalf("open issue Completion error = %v", err)
+	}
+}
+
+func TestSelectorRefusesHistoricalRunCleanupWhileNewerRunOwnsIssue(t *testing.T) {
+	current := state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{
+		{Issue: 42, RunID: "historical", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint},
+		{Issue: 42, RunID: "active", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModePrint},
+	}, Leases: []scheduler.Lease{{LeaseID: "active-lease", Issue: 42, RunID: "active"}}}
+
+	run, lease, err := Policy("historical").SelectRun(current)
+	if err == nil || !strings.Contains(err.Error(), "owned by leased Run active") || run.RunID != "" || lease.LeaseID != "" {
+		t.Fatalf("Historical Run selection with newer Lease = %#v %#v %v", run, lease, err)
 	}
 }
 

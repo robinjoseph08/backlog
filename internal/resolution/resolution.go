@@ -164,6 +164,9 @@ func historicalRun(current state.State, run scheduler.Run) (scheduler.Run, sched
 		if lease.RunID == run.RunID {
 			return scheduler.Run{}, scheduler.Lease{}, fmt.Errorf("Historical Run %s still has old Lease %s", run.RunID, lease.LeaseID)
 		}
+		if lease.Issue == run.Issue {
+			return scheduler.Run{}, scheduler.Lease{}, fmt.Errorf("issue #%d is owned by leased Run %s; Historical Run %s cleanup is unsafe", run.Issue, lease.RunID, run.RunID)
+		}
 	}
 	return run, scheduler.Lease{}, nil
 }
