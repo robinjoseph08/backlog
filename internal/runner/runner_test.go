@@ -1528,6 +1528,7 @@ func TestRunnerDrainSettlesRemainingWorkersAfterCompletionStateFailure(t *testin
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 28, 29)
+	workers.waitForCompletionWaiters(t, 28, 29)
 	signals <- os.Interrupt
 	output.waitFor(t, "Drain: admission stopped; 2 Workers remaining")
 	store.failNext()
