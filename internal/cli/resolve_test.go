@@ -1016,7 +1016,18 @@ esac
 		return append(values, extra...)
 	}
 
-	beforeDryRun := fileDigest(t, fixture.store.Path)
+	tracked := filepath.Join(fixture.worktree, "tracked")
+	trackedInfo, err := os.Stat(tracked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleTime := trackedInfo.ModTime().Add(2 * time.Second)
+	if err := os.Chtimes(tracked, staleTime, staleTime); err != nil {
+		t.Fatal(err)
+	}
+	worktreeIndex := strings.TrimSpace(gitOutput(t, fixture.worktree, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+	beforeDryRunState := fileDigest(t, fixture.store.Path)
+	beforeDryRunIndex := fileDigest(t, worktreeIndex)
 	output, err := exec.Command(binary, args("run-local", "--dry-run")...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("compiled Historical Completion dry-run: %v\n%s", err, output)
@@ -1027,8 +1038,11 @@ esac
 			t.Fatalf("Historical Completion dry-run omitted %q:\n%s", want, plan)
 		}
 	}
-	if fileDigest(t, fixture.store.Path) != beforeDryRun {
+	if fileDigest(t, fixture.store.Path) != beforeDryRunState {
 		t.Fatal("Historical Completion dry-run changed state")
+	}
+	if fileDigest(t, worktreeIndex) != beforeDryRunIndex {
+		t.Fatal("Historical Completion dry-run refreshed the worktree index")
 	}
 
 	output, err = exec.Command(binary, args("42", "--yes")...).CombinedOutput()
