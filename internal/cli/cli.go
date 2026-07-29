@@ -65,6 +65,7 @@ func MainWithTerminal(ctx context.Context, args []string, dependencies TerminalD
 		return 2
 	}
 	var err error
+	var ancillaryOutputErr error
 	switch args[0] {
 	case "run":
 		options, parseErr := parseRunOptions(args[1:], stderr)
@@ -91,8 +92,12 @@ func MainWithTerminal(ctx context.Context, args []string, dependencies TerminalD
 			return runCommand(ctx, options, stdout, signals, onOperationalEvent, dashboard, terminal.Now)
 		}, presentation)
 		if dashboard != nil {
+			naturalExit := dashboard.setResult(ctx, err)
 			if summaryErr := dashboard.printFinalSummary(stdout); summaryErr != nil {
-				err = errors.Join(err, summaryErr)
+				ancillaryOutputErr = summaryErr
+				if err != nil || naturalExit {
+					err = errors.Join(err, summaryErr)
+				}
 			}
 		}
 	case "status":
@@ -139,14 +144,23 @@ func MainWithTerminal(ctx context.Context, args []string, dependencies TerminalD
 		}
 		var signalExit *runner.SignalExit
 		if errors.As(err, &signalExit) {
+			if ancillaryOutputErr != nil {
+				fmt.Fprintln(stderr, "error:", ancillaryOutputErr)
+			}
 			return signalExit.Code
 		}
 		var intervention *runner.InterventionRequired
 		if errors.As(err, &intervention) {
+			if ancillaryOutputErr != nil {
+				fmt.Fprintln(stderr, "error:", ancillaryOutputErr)
+			}
 			return 1
 		}
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
+	}
+	if ancillaryOutputErr != nil {
+		fmt.Fprintln(stderr, "error:", ancillaryOutputErr)
 	}
 	return 0
 }
@@ -269,6 +283,9 @@ func runCommand(ctx context.Context, options runOptions, stdout io.Writer, signa
 			}
 			if forceStop {
 				fmt.Fprintln(stdout, "Force stop: additional signal accepted during setup; 0 Workers remaining")
+				if dashboard != nil {
+					dashboard.observeOperationalEvent(runner.ShutdownEvent{Stage: runner.ShutdownStageForceStopping})
+				}
 			}
 			switch setupExit {
 			case setupSignalDrainAccepted:
@@ -301,11 +318,21 @@ func runCommand(ctx context.Context, options runOptions, stdout io.Writer, signa
 	if err != nil {
 		return err
 	}
+	store := state.FileStore{Path: filepath.Join(resolvedStateDir, "state.json")}
+	summarySource := repositoryFollowSource{followStateSource: store, commonDirectory: commonDirectory}
 	lock, err := acquireRepositoryLock(commonDirectory)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = lock.Release() }()
+	var dashboardInitial state.State
+	if dashboard != nil && !options.plain {
+		dashboardInitial, _, err = store.Preview()
+		if err != nil {
+			return err
+		}
+		dashboard.configure(dashboardInitial, summarySource)
+	}
 	if err := bindStateDirectory(commonDirectory, resolvedStateDir); err != nil {
 		return err
 	}
@@ -320,6 +347,12 @@ func runCommand(ctx context.Context, options runOptions, stdout io.Writer, signa
 	if err != nil {
 		return err
 	}
+	if dashboard != nil && !options.plain && dashboardInitial.Repo == "" {
+		dashboardInitial.Repo = repository.Slug
+		dashboardInitial.DefaultBranch = repository.DefaultBranch
+		dashboardInitial.MaxConcurrentIssues = options.maxWorkers
+		dashboard.configure(dashboardInitial, summarySource)
+	}
 	worktrees := &worktree.Manager{
 		GitExecutable: options.gitExecutable,
 		RepositoryDir: repositoryRoot,
@@ -331,8 +364,6 @@ func runCommand(ctx context.Context, options runOptions, stdout io.Writer, signa
 		LogsDir:    filepath.Join(resolvedStateDir, "logs"),
 		Approve:    options.approve,
 	}
-	store := state.FileStore{Path: filepath.Join(resolvedStateDir, "state.json")}
-	summarySource := repositoryFollowSource{followStateSource: store, commonDirectory: commonDirectory}
 	supervision, err := establishRunnerSupervision(commonDirectory)
 	if err != nil {
 		return err
@@ -345,16 +376,6 @@ func runCommand(ctx context.Context, options runOptions, stdout io.Writer, signa
 		return printRunFinalSummary(stdout, current, summarySource, now())
 	}
 	if dashboard != nil && !options.plain {
-		initial, _, err := store.Preview()
-		if err != nil {
-			return err
-		}
-		if initial.Repo == "" {
-			initial.Repo = repository.Slug
-			initial.DefaultBranch = repository.DefaultBranch
-			initial.MaxConcurrentIssues = options.maxWorkers
-		}
-		dashboard.configure(initial, summarySource)
 		runnerStore = bubbleDashboardStore{FileStore: store, session: dashboard}
 		runnerOutput = dashboard
 		finalSummary = dashboard.captureFinalSummary
@@ -398,7 +419,7 @@ func runCommand(ctx context.Context, options runOptions, stdout io.Writer, signa
 	}
 	runErr := backlogRunner.Run(ctx)
 	backlogRunner.WaitForOperationalEventDelivery()
-	if dashboard != nil {
+	if dashboard != nil && ctx.Err() == nil {
 		if flushErr := dashboard.flush(ctx); flushErr != nil {
 			return errors.Join(runErr, flushErr)
 		}

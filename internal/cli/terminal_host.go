@@ -183,10 +183,10 @@ func oldestPresentationAdmissionFailure(events []runner.OperationalEvent) int {
 
 // presentationEventEvictionIndex prefers obsolete progress, then the oldest
 // nonterminal state. This retains a recent ordered lifecycle window and never
-// trades a terminal shutdown result for optional progress.
+// trades required shutdown classification for optional progress.
 func presentationEventEvictionIndex(events []runner.OperationalEvent) int {
 	for index, event := range events {
-		if presentationEventIsTerminal(event) || presentationEventIsLatestAdmissionTransition(events, index) {
+		if presentationEventIsRequiredShutdownClassification(event) || presentationEventIsLatestAdmissionTransition(events, index) {
 			continue
 		}
 		if presentationEventIsSuperseded(events, index) {
@@ -194,7 +194,7 @@ func presentationEventEvictionIndex(events []runner.OperationalEvent) int {
 		}
 	}
 	for index, event := range events {
-		if !presentationEventIsTerminal(event) && !presentationEventIsLatestAdmissionTransition(events, index) {
+		if !presentationEventIsRequiredShutdownClassification(event) && !presentationEventIsLatestAdmissionTransition(events, index) {
 			return index
 		}
 	}
@@ -233,7 +233,7 @@ func presentationEventIsSuperseded(events []runner.OperationalEvent, index int) 
 			}
 		}
 	case runner.ShutdownEvent:
-		if presentationEventIsTerminal(event) {
+		if presentationEventIsRequiredShutdownClassification(event) {
 			return false
 		}
 		for _, later := range events[index+1:] {
@@ -246,13 +246,14 @@ func presentationEventIsSuperseded(events []runner.OperationalEvent, index int) 
 	return false
 }
 
-func presentationEventIsTerminal(event runner.OperationalEvent) bool {
+func presentationEventIsRequiredShutdownClassification(event runner.OperationalEvent) bool {
 	shutdown, ok := event.(runner.ShutdownEvent)
 	if !ok {
 		return false
 	}
 	switch shutdown.Stage {
-	case runner.ShutdownStageDrainComplete, runner.ShutdownStageDrainIncomplete,
+	case runner.ShutdownStageForceStopping,
+		runner.ShutdownStageDrainComplete, runner.ShutdownStageDrainIncomplete,
 		runner.ShutdownStageSuspensionComplete, runner.ShutdownStageSuspensionIncomplete:
 		return true
 	default:

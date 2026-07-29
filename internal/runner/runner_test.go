@@ -1642,6 +1642,26 @@ func TestRunnerWaitsForOwnedWorkerBeforePersistingShutdown(t *testing.T) {
 	}
 }
 
+func TestRunnerCancellationPreservesShutdownFailure(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 40, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	shutdownErr := errors.New("abort unavailable")
+	workers.abortErr = shutdownErr
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	workers.waitForStarts(t, 40)
+	cancel()
+
+	if err := <-done; !errors.Is(err, shutdownErr) {
+		t.Fatalf("canceled Runner shutdown error = %v, want %v", err, shutdownErr)
+	}
+}
+
 func TestRunnerRetriesCandidateDiscoveryAfterFinalWorkerSettles(t *testing.T) {
 	t.Parallel()
 

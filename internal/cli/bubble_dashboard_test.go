@@ -7,8 +7,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -16,10 +20,12 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/creack/pty"
 	"github.com/robinjoseph08/backlog/internal/activity"
 	"github.com/robinjoseph08/backlog/internal/runner"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
+	"golang.org/x/term"
 )
 
 func TestBubbleDashboardModelResizesViewportAroundFixedLifecycleChrome(t *testing.T) {
@@ -2002,6 +2008,714 @@ func TestBubbleDashboardConstrainedFallbackKeepsGuidanceInFixedFooter(t *testing
 	}
 }
 
+type oneShotPresentationFailureWriter struct {
+	bytes.Buffer
+	panic  bool
+	failed bool
+}
+
+func (w *oneShotPresentationFailureWriter) Write(content []byte) (int, error) {
+	written, _ := w.Buffer.Write(content)
+	if w.failed || !bytes.Contains(content, []byte("Backlog Run Dashboard")) {
+		return written, nil
+	}
+	w.failed = true
+	if w.panic {
+		panic("terminal writer panic")
+	}
+	return written, errors.New("terminal output lost")
+}
+
+func TestBubbleDashboardFailureRestoresTerminalBeforeStaticErrorResult(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		panic     bool
+		wantError string
+	}{
+		{name: "output loss", wantError: "terminal output lost"},
+		{name: "recovered TUI panic", panic: true, wantError: "terminal output panic: terminal writer panic"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output := &oneShotPresentationFailureWriter{panic: test.panic}
+			session := newBubbleDashboardSession(time.Now)
+			host := runnerHost{terminal: TerminalDependencies{
+				Input: strings.NewReader(""), Output: output,
+				Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
+				ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+			}}
+			err := host.run(context.Background(), func(signals <-chan lifecycleSignal, _ func(runner.OperationalEvent)) error {
+				event := <-signals
+				if event.signal != syscall.SIGTERM {
+					t.Errorf("presentation failure signal = %v, want SIGTERM", event.signal)
+				}
+				event.accept()
+				return &runner.SignalExit{Code: 143}
+			}, session.presentation)
+			var failure *PresentationFailure
+			if !errors.As(err, &failure) || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("host failure = %v, want recovered presentation failure containing %q", err, test.wantError)
+			}
+			session.setResult(context.Background(), err)
+			if summaryErr := session.printFinalSummary(output); summaryErr != nil {
+				t.Fatalf("static error result: %v", summaryErr)
+			}
+
+			raw := output.String()
+			for _, control := range []string{"\x1b[?1049h", "\x1b[?1049l", "\x1b[?25l", "\x1b[?25h"} {
+				if !strings.Contains(raw, control) {
+					t.Fatalf("presentation failure output missing restoration control %q: %q", control, raw)
+				}
+			}
+			restore := strings.LastIndex(raw, "\x1b[?1049l")
+			summary := strings.Index(raw, "Final aggregate summary")
+			if restore < 0 || summary < restore || !strings.Contains(raw[summary:], "Final outcome: Error: presentation failed:") {
+				t.Fatalf("static error result was not printed after restoration: %q", raw)
+			}
+		})
+	}
+}
+
+type ptyPresentationInput struct {
+	*os.File
+	readFinished chan struct{}
+	finishOnce   sync.Once
+}
+
+func newPTYPresentationInput(file *os.File) *ptyPresentationInput {
+	return &ptyPresentationInput{File: file, readFinished: make(chan struct{})}
+}
+
+func (r *ptyPresentationInput) Read(content []byte) (int, error) {
+	defer r.finishOnce.Do(func() { close(r.readFinished) })
+	if len(content) == 0 {
+		return 0, nil
+	}
+	if _, err := r.File.Read(content[:1]); err != nil {
+		return 0, err
+	}
+	return 0, io.EOF
+}
+
+func (r *ptyPresentationInput) Close() error { return nil }
+
+// Bubble Tea v2.0.8's kill path closes its cancelreader without waiting for
+// the input loop. Finish all PTY descriptor access before tests induce it.
+func finishPTYPresentationInput(ctx context.Context, primary *os.File, input *ptyPresentationInput) error {
+	if _, err := primary.Write([]byte{0}); err != nil {
+		return fmt.Errorf("make PTY input readable: %w", err)
+	}
+	select {
+	case <-input.readFinished:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("finish PTY presentation input: %w", ctx.Err())
+	}
+}
+
+type ptyPresentationOutput struct {
+	*os.File
+	output                 synchronizedBuffer
+	enteredAlternateScreen chan struct{}
+	entered                atomic.Bool
+	fail                   atomic.Bool
+	failed                 atomic.Bool
+	failedWriteSize        atomic.Int64
+	failedWriteAttemptSize atomic.Int64
+}
+
+func newPTYPresentationOutput(file *os.File) *ptyPresentationOutput {
+	return &ptyPresentationOutput{File: file, enteredAlternateScreen: make(chan struct{})}
+}
+
+func (w *ptyPresentationOutput) Write(content []byte) (int, error) {
+	failThisWrite := len(content) > 1 && w.fail.Load() && w.failed.CompareAndSwap(false, true)
+	writeContent := content
+	if failThisWrite {
+		writeContent = content[:len(content)/2]
+	}
+	written, err := w.File.Write(writeContent)
+	_, _ = w.output.Write(writeContent[:written])
+	if bytes.Contains(writeContent[:written], []byte("\x1b[?1049h")) && w.entered.CompareAndSwap(false, true) {
+		close(w.enteredAlternateScreen)
+	}
+	if err == nil && failThisWrite {
+		w.failedWriteSize.Store(int64(written))
+		w.failedWriteAttemptSize.Store(int64(len(content)))
+		return written, errors.New("terminal output lost")
+	}
+	return written, err
+}
+
+func (w *ptyPresentationOutput) String() string { return w.output.String() }
+
+func TestBubbleDashboardPostStartFailuresRestorePTYStateBeforeStaticErrorResult(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		modelPanic bool
+	}{
+		{name: "output loss"},
+		{name: "model panic", modelPanic: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			primary, terminal, err := pty.Open()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer primary.Close()
+			defer terminal.Close()
+			if err := pty.Setsize(terminal, &pty.Winsize{Rows: 24, Cols: 80}); err != nil {
+				t.Fatal(err)
+			}
+
+			initialState, err := term.GetState(int(terminal.Fd()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			output := newPTYPresentationOutput(terminal)
+			input := newPTYPresentationInput(terminal)
+			go func() { _, _ = io.Copy(io.Discard, primary) }()
+
+			now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+			var panicEnabled atomic.Bool
+			var panicked atomic.Bool
+			clock := func() time.Time {
+				if panicEnabled.Load() {
+					panicked.Store(true)
+					panic("dashboard model panic")
+				}
+				return now
+			}
+			session := newBubbleDashboardSession(clock)
+			host := runnerHost{terminal: TerminalDependencies{
+				Input: input, Output: output,
+				Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
+				ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+				Now:          clock,
+			}}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			err = host.run(ctx, func(signals <-chan lifecycleSignal, _ func(runner.OperationalEvent)) error {
+				current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+				session.configure(current, &dashboardTestSource{current: current})
+				if startupErr := session.waitForStartup(ctx); startupErr != nil {
+					return startupErr
+				}
+				select {
+				case <-output.enteredAlternateScreen:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				if inputErr := finishPTYPresentationInput(ctx, primary, input); inputErr != nil {
+					return inputErr
+				}
+				if test.modelPanic {
+					panicEnabled.Store(true)
+					session.publish(dashboardElapsedMsg(now))
+				} else {
+					output.fail.Store(true)
+					updated := current
+					updated.Repo = "acme/updated-widgets"
+					session.publish(dashboardStateMsg(updated))
+				}
+				select {
+				case event := <-signals:
+					if event.signal != syscall.SIGTERM {
+						t.Errorf("presentation failure signal = %v, want SIGTERM", event.signal)
+					}
+					event.accept()
+					return &runner.SignalExit{Code: 143}
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}, session.presentation)
+			panicEnabled.Store(false)
+
+			var failure *PresentationFailure
+			if !errors.As(err, &failure) {
+				t.Fatalf("post-start presentation result = %v, want presentation failure", err)
+			}
+			if test.modelPanic {
+				if !panicked.Load() || !errors.Is(failure.Err, tea.ErrProgramPanic) {
+					t.Fatalf("model panic result = %v, panicked = %t", err, panicked.Load())
+				}
+			} else if written, attempted := output.failedWriteSize.Load(), output.failedWriteAttemptSize.Load(); !output.failed.Load() || written <= 0 || written >= attempted || !strings.Contains(failure.Err.Error(), "terminal output lost") {
+				t.Fatalf("output-loss result = %v, failed = %t, interrupted write = %d/%d bytes", err, output.failed.Load(), written, attempted)
+			}
+
+			restoredState, stateErr := term.GetState(int(terminal.Fd()))
+			if stateErr != nil {
+				t.Fatal(stateErr)
+			}
+			if !reflect.DeepEqual(restoredState, initialState) {
+				t.Fatalf("terminal state after %s = %#v, want %#v", test.name, restoredState, initialState)
+			}
+			session.setResult(context.Background(), err)
+			if summaryErr := session.printFinalSummary(output); summaryErr != nil {
+				t.Fatalf("static %s result: %v", test.name, summaryErr)
+			}
+			content := output.String()
+			enter := strings.Index(content, "\x1b[?1049h")
+			hideCursor := strings.Index(content, "\x1b[?25l")
+			restore := strings.LastIndex(content, "\x1b[?1049l")
+			showCursor := strings.LastIndex(content, "\x1b[?25h")
+			summary := strings.Index(content, "Final aggregate summary")
+			if enter < 0 || hideCursor < 0 || restore < enter || showCursor < hideCursor || summary < restore || summary < showCursor || !strings.Contains(content[summary:], "Final outcome: Error: presentation failed:") {
+				t.Fatalf("%s did not restore the normal screen and cursor before static output: %q", test.name, content)
+			}
+		})
+	}
+}
+
+func TestDefaultDashboardThreeExternalSIGINTsDuringSetupPrintForceStopAfterPTYRestoration(t *testing.T) {
+	root := t.TempDir()
+	setupStarted := filepath.Join(root, "git-started")
+	git := writeExecutable(t, `#!/bin/sh
+set -eu
+touch `+quote(setupStarted)+`
+exec sleep 30
+`)
+	primary, terminal, err := pty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer primary.Close()
+	defer terminal.Close()
+	if err := pty.Setsize(terminal, &pty.Winsize{Rows: 24, Cols: 80}); err != nil {
+		t.Fatal(err)
+	}
+	initialState, err := term.GetState(int(terminal.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := newPTYPresentationOutput(terminal)
+	input := newPTYPresentationInput(terminal)
+	go func() { _, _ = io.Copy(io.Discard, primary) }()
+	externalSignals := make(chan os.Signal)
+	var stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- MainWithTerminal(context.Background(), []string{"run", "--git", git}, TerminalDependencies{
+			Input: input, Output: output, ErrorOutput: &stderr,
+			IsTerminal: func() bool { return true },
+			Dimensions: func() (TerminalDimensions, error) {
+				return TerminalDimensions{Width: 80, Height: 24}, nil
+			},
+			ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+			Signals:      externalSignals,
+		})
+	}()
+	waitForFile(t, setupStarted)
+	select {
+	case <-output.enteredAlternateScreen:
+	case <-time.After(10 * time.Second):
+		t.Fatal("default dashboard did not enter the alternate screen during blocked setup")
+	}
+	inputCtx, cancelInput := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInput()
+	if err := finishPTYPresentationInput(inputCtx, primary, input); err != nil {
+		t.Fatal(err)
+	}
+	for stage := 1; stage <= 3; stage++ {
+		select {
+		case externalSignals <- os.Interrupt:
+		case exit := <-done:
+			t.Fatalf("default dashboard exited with %d before staged SIGINT %d", exit, stage)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("staged SIGINT %d was not accepted by the signal ingress", stage)
+		}
+	}
+
+	select {
+	case exit := <-done:
+		if exit != 130 {
+			t.Fatalf("setup force-stop exit = %d, want 130; output = %q; stderr = %q", exit, output.String(), stderr.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("default dashboard did not finish setup force stop")
+	}
+	restoredState, stateErr := term.GetState(int(terminal.Fd()))
+	if stateErr != nil {
+		t.Fatal(stateErr)
+	}
+	if !reflect.DeepEqual(restoredState, initialState) {
+		t.Fatalf("terminal state after setup force stop = %#v, want %#v", restoredState, initialState)
+	}
+
+	raw := output.String()
+	restore := strings.LastIndex(raw, "\x1b[?1049l")
+	showCursor := strings.LastIndex(raw, "\x1b[?25h")
+	summary := strings.Index(raw, "Final aggregate summary")
+	if restore < 0 || showCursor < 0 || summary < restore || summary < showCursor {
+		t.Fatalf("setup force-stop summary preceded normal-screen or cursor restoration: %q", raw)
+	}
+	if !strings.Contains(raw[summary:], "Final outcome: Force stop complete\n") || strings.Contains(raw[summary:], "Final outcome: Suspension complete") {
+		t.Fatalf("setup force-stop final outcome was not exact: %q", raw[summary:])
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("setup force stop wrote stderr: %q", stderr.String())
+	}
+}
+
+func TestBubbleDashboardModelPanicAfterStartupRestoresTerminalBeforeStaticErrorResult(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	var panicEnabled atomic.Bool
+	var panicked atomic.Bool
+	clock := func() time.Time {
+		if panicEnabled.Load() {
+			panicked.Store(true)
+			panic("dashboard model panic")
+		}
+		return now
+	}
+	var output synchronizedBuffer
+	session := newBubbleDashboardSession(clock)
+	host := runnerHost{terminal: TerminalDependencies{
+		Input: strings.NewReader(""), Output: &output,
+		Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
+		ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+		Now:          clock,
+	}}
+	err := host.run(context.Background(), func(signals <-chan lifecycleSignal, _ func(runner.OperationalEvent)) error {
+		current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+		session.configure(current, &dashboardTestSource{current: current})
+		if startupErr := session.waitForStartup(context.Background()); startupErr != nil {
+			return startupErr
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for !strings.Contains(output.String(), "\x1b[?1049h") {
+			if time.Now().After(deadline) {
+				return errors.New("dashboard did not enter the alternate screen before model panic")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		panicEnabled.Store(true)
+		session.publish(dashboardElapsedMsg(now))
+		event := <-signals
+		if event.signal != syscall.SIGTERM {
+			t.Errorf("model panic signal = %v, want SIGTERM", event.signal)
+		}
+		event.accept()
+		return &runner.SignalExit{Code: 143}
+	}, session.presentation)
+
+	var failure *PresentationFailure
+	if !panicked.Load() || !errors.As(err, &failure) || !errors.Is(failure.Err, tea.ErrProgramPanic) {
+		t.Fatalf("post-start model panic result = %v, panicked = %t", err, panicked.Load())
+	}
+	panicEnabled.Store(false)
+	session.setResult(context.Background(), err)
+	if summaryErr := session.printFinalSummary(&output); summaryErr != nil {
+		t.Fatalf("static model-panic result: %v", summaryErr)
+	}
+
+	raw := output.String()
+	restore := strings.LastIndex(raw, "\x1b[?1049l")
+	summary := strings.Index(raw, "Final aggregate summary")
+	if restore < 0 || summary < restore || !strings.Contains(raw[summary:], "Final outcome: Error: presentation failed:") {
+		t.Fatalf("model panic static result was not printed after restoration: %q", raw)
+	}
+}
+
+type shortPresentationWriter struct{}
+
+func (shortPresentationWriter) Write(content []byte) (int, error) {
+	return len(content) - 1, nil
+}
+
+func TestPresentationOutputMonitorTreatsShortWriteAsOutputLoss(t *testing.T) {
+	monitor := newPresentationOutputMonitor(shortPresentationWriter{})
+	if _, err := monitor.Write([]byte("dashboard")); !errors.Is(err, io.ErrShortWrite) || !errors.Is(monitor.failure(), io.ErrShortWrite) {
+		t.Fatalf("short terminal write = %v, retained = %v", err, monitor.failure())
+	}
+	select {
+	case <-monitor.failed:
+	default:
+		t.Fatal("short terminal write did not wake the presentation failure monitor")
+	}
+}
+
+func TestRestoreDashboardTerminalReturnsOutputFailure(t *testing.T) {
+	if err := restoreDashboardTerminal(failingStatusWriter{}); err == nil || !strings.Contains(err.Error(), "status output failed") {
+		t.Fatalf("terminal restoration error = %v", err)
+	}
+}
+
+type boundedRecoveryWriter struct {
+	bytes.Buffer
+	limit  int
+	writes int
+}
+
+func (w *boundedRecoveryWriter) Write(content []byte) (int, error) {
+	w.writes++
+	if len(content) > w.limit {
+		content = content[:w.limit]
+	}
+	return w.Buffer.Write(content)
+}
+
+func TestRestoreDashboardTerminalCompletesNilErrorShortWrites(t *testing.T) {
+	output := &boundedRecoveryWriter{limit: 3}
+	if err := restoreDashboardTerminal(output); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != dashboardTerminalRestoration || !strings.HasSuffix(output.String(), "\x1b[?1049l\x1b[?25h") || output.writes <= 1 {
+		t.Fatalf("short-write restoration = %q in %d writes, want complete alternate-screen and cursor restoration in multiple writes", output.String(), output.writes)
+	}
+}
+
+func TestRestoreDashboardTerminalReturnsShortWriteAfterNoProgress(t *testing.T) {
+	output := &boundedRecoveryWriter{}
+	if err := restoreDashboardTerminal(output); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("zero-progress restoration error = %v, want %v", err, io.ErrShortWrite)
+	}
+	if output.writes != 1 || output.Len() != 0 {
+		t.Fatalf("zero-progress restoration made %d writes and produced %q", output.writes, output.String())
+	}
+}
+
+type recoveryInterpretingWriter struct {
+	parser          *ansi.Parser
+	raw             bytes.Buffer
+	visible         strings.Builder
+	hyperlink       bool
+	styled          bool
+	alternateScreen bool
+	cursorVisible   bool
+	report          bool
+	reportLinked    bool
+	reportStyled    bool
+}
+
+func newRecoveryInterpretingWriter() *recoveryInterpretingWriter {
+	output := &recoveryInterpretingWriter{alternateScreen: true}
+	parser := ansi.NewParser()
+	parser.SetHandler(ansi.Handler{
+		Print: func(value rune) {
+			output.visible.WriteRune(value)
+			if output.report {
+				output.reportLinked = output.reportLinked || output.hyperlink
+				output.reportStyled = output.reportStyled || output.styled
+			}
+		},
+		HandleOsc: func(command int, data []byte) {
+			if command != 8 {
+				return
+			}
+			parts := strings.SplitN(string(data), ";", 3)
+			output.hyperlink = len(parts) == 3 && parts[2] != ""
+		},
+		HandleCsi: func(command ansi.Cmd, params ansi.Params) {
+			switch command.Final() {
+			case 'm':
+				if command.Prefix() != 0 {
+					return
+				}
+				if len(params) == 0 {
+					output.styled = false
+					return
+				}
+				params.ForEach(0, func(_ int, parameter int, _ bool) {
+					if parameter == 0 {
+						output.styled = false
+					} else {
+						output.styled = true
+					}
+				})
+			case 'h', 'l':
+				if command.Prefix() != '?' {
+					return
+				}
+				enabled := command.Final() == 'h'
+				params.ForEach(0, func(_ int, parameter int, _ bool) {
+					switch parameter {
+					case 25:
+						output.cursorVisible = enabled
+					case 1049:
+						output.alternateScreen = enabled
+					}
+				})
+			}
+		},
+	})
+	output.parser = parser
+	return output
+}
+
+func (w *recoveryInterpretingWriter) Write(content []byte) (int, error) {
+	_, _ = w.raw.Write(content)
+	w.parser.Parse(content)
+	return len(content), nil
+}
+
+func TestOutputLossRecoveryCancelsPartialHyperlinkAndStyleSequencesBeforeReport(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		interrupted string
+		wantLinked  bool
+		wantStyled  bool
+	}{
+		{
+			name:        "OSC 8 close",
+			interrupted: "\x1b]8;;https://github.com/acme/widgets/issues/73\x1b\\#73\x1b]8;",
+			wantLinked:  true,
+		},
+		{
+			name:        "SGR style",
+			interrupted: "\x1b[31mstyled dashboard\x1b[38;5",
+			wantStyled:  true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output := newRecoveryInterpretingWriter()
+			_, _ = io.WriteString(output, test.interrupted)
+			if output.hyperlink != test.wantLinked || output.styled != test.wantStyled {
+				t.Fatalf("interrupted dashboard state: hyperlink=%t styled=%t, want hyperlink=%t styled=%t", output.hyperlink, output.styled, test.wantLinked, test.wantStyled)
+			}
+
+			if err := restoreDashboardTerminal(output); err != nil {
+				t.Fatal(err)
+			}
+			const report = "Final aggregate summary\nFinal outcome: Error: terminal output lost\n"
+			output.report = true
+			_, _ = io.WriteString(output, report)
+
+			recovery := output.raw.String()[len(test.interrupted):]
+			if !strings.HasPrefix(recovery, "\x18\x1b]8;;\x1b\\\x1b[0m") {
+				t.Fatalf("recovery did not cancel the partial sequence, close OSC 8, and reset SGR first: %q", recovery)
+			}
+			visible := output.visible.String()
+			if output.hyperlink || output.styled || output.alternateScreen || !output.cursorVisible || output.reportLinked || output.reportStyled || !strings.Contains(visible, "Final aggregate summary") || !strings.Contains(visible, "Final outcome: Error: terminal output lost") {
+				t.Fatalf("static report remained captured or formatted after recovery: hyperlink=%t styled=%t alternate=%t cursor=%t report_linked=%t report_styled=%t visible=%q", output.hyperlink, output.styled, output.alternateScreen, output.cursorVisible, output.reportLinked, output.reportStyled, output.visible.String())
+			}
+		})
+	}
+}
+
+type statefulTerminalWriter struct {
+	visible      bytes.Buffer
+	pending      bytes.Buffer
+	synchronized bool
+	unicodeCore  bool
+}
+
+func (w *statefulTerminalWriter) Write(content []byte) (int, error) {
+	rest := string(content)
+	for rest != "" {
+		if w.synchronized {
+			reset := strings.Index(rest, ansi.ResetModeSynchronizedOutput)
+			if reset < 0 {
+				_, _ = w.pending.WriteString(rest)
+				break
+			}
+			_, _ = w.pending.WriteString(rest[:reset])
+			_, _ = w.visible.Write(w.pending.Bytes())
+			w.pending.Reset()
+			_, _ = w.visible.WriteString(ansi.ResetModeSynchronizedOutput)
+			w.synchronized = false
+			rest = rest[reset+len(ansi.ResetModeSynchronizedOutput):]
+			continue
+		}
+
+		control, index := nextTerminalModeControl(rest)
+		if index < 0 {
+			_, _ = w.visible.WriteString(rest)
+			break
+		}
+		_, _ = w.visible.WriteString(rest[:index+len(control)])
+		switch control {
+		case ansi.SetModeSynchronizedOutput:
+			w.synchronized = true
+		case ansi.SetModeUnicodeCore:
+			w.unicodeCore = true
+		case ansi.ResetModeUnicodeCore:
+			w.unicodeCore = false
+		}
+		rest = rest[index+len(control):]
+	}
+	return len(content), nil
+}
+
+func nextTerminalModeControl(content string) (string, int) {
+	control, first := "", -1
+	for _, candidate := range []string{ansi.SetModeSynchronizedOutput, ansi.SetModeUnicodeCore, ansi.ResetModeUnicodeCore} {
+		if index := strings.Index(content, candidate); index >= 0 && (first < 0 || index < first) {
+			control, first = candidate, index
+		}
+	}
+	return control, first
+}
+
+func TestRestoreDashboardTerminalReleasesInterruptedModesBeforeStaticOutput(t *testing.T) {
+	output := &statefulTerminalWriter{}
+	_, _ = io.WriteString(output, ansi.SetModeUnicodeCore+ansi.SetModeSynchronizedOutput+"interrupted dashboard frame")
+	if !output.unicodeCore || !output.synchronized || output.pending.Len() == 0 {
+		t.Fatal("test terminal did not retain the interrupted Unicode Core synchronized frame")
+	}
+	if err := restoreDashboardTerminal(output); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.WriteString(output, "Final aggregate summary")
+
+	visible := output.visible.String()
+	synchronizedReset := strings.Index(visible, ansi.ResetModeSynchronizedOutput)
+	unicodeReset := strings.Index(visible, ansi.ResetModeUnicodeCore)
+	restore := strings.Index(visible, "\x1b[?1049l")
+	summary := strings.Index(visible, "Final aggregate summary")
+	if output.synchronized || output.unicodeCore || output.pending.Len() != 0 || synchronizedReset < 0 || unicodeReset != synchronizedReset+len(ansi.ResetModeSynchronizedOutput) || restore < unicodeReset || summary < restore {
+		t.Fatalf("interrupted terminal modes retained restoration or static output: synchronized=%t unicode_core=%t visible=%q pending=%q", output.synchronized, output.unicodeCore, visible, output.pending.String())
+	}
+}
+
+type initializationFailureTTY struct {
+	*os.File
+	fdCalls atomic.Int32
+}
+
+func (f *initializationFailureTTY) Fd() uintptr {
+	if f.fdCalls.Add(1) == 1 {
+		return f.File.Fd()
+	}
+	return ^uintptr(0)
+}
+
+func TestBubbleDashboardRestoresRawModeAfterBubbleTeaInitializationFailure(t *testing.T) {
+	primary, terminal, err := pty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer primary.Close()
+	defer terminal.Close()
+
+	initialState, err := term.GetState(int(terminal.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := &initializationFailureTTY{File: terminal}
+	session := newBubbleDashboardSession(time.Now)
+	err = session.presentation(context.Background(), PresentationControl{Terminal: PresentationTerminal{
+		Input: terminal, Output: output,
+		Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
+		ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+	}})
+	if err == nil || !strings.Contains(err.Error(), "getting terminal size") {
+		t.Fatalf("Bubble Tea initialization error = %v", err)
+	}
+	if calls := output.fdCalls.Load(); calls < 2 {
+		t.Fatalf("output file descriptor calls = %d, want initialization to fail after TTY detection", calls)
+	}
+	restoredState, stateErr := term.GetState(int(terminal.Fd()))
+	if stateErr != nil {
+		t.Fatal(stateErr)
+	}
+	if !reflect.DeepEqual(restoredState, initialState) {
+		t.Fatalf("terminal remained in raw mode after Bubble Tea initialization failure: got %#v, want %#v", restoredState, initialState)
+	}
+	if startupErr := session.waitForStartup(context.Background()); startupErr == nil || startupErr.Error() != err.Error() {
+		t.Fatalf("Runner startup error = %v, want %v", startupErr, err)
+	}
+}
+
 func TestBubbleDashboardPresentationRejectsDimensionFailureBeforeRunnerStartup(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -2186,6 +2900,79 @@ func TestBubbleDashboardStoreDoesNotPublishFailedSave(t *testing.T) {
 	defer session.mu.Unlock()
 	if len(session.updates) != 0 {
 		t.Fatalf("failed state save published %d dashboard updates", len(session.updates))
+	}
+}
+
+func TestDashboardResultErrorSeparatesParentCancellationFromCommandStatus(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := dashboardResultError(ctx, nil, false); !errors.Is(got, context.Canceled) {
+		t.Fatalf("dashboard cancellation outcome = %v, want context cancellation", got)
+	}
+
+	cleanupErr := errors.New("persist interrupted Runs")
+	if got := dashboardResultError(ctx, cleanupErr, false); got != cleanupErr {
+		t.Fatalf("dashboard cleanup outcome = %v, want %v", got, cleanupErr)
+	}
+	if got := dashboardResultError(ctx, nil, true); got != nil {
+		t.Fatalf("late cancellation replaced natural exhaustion with %v", got)
+	}
+	intervention := &runner.InterventionRequired{Count: 1}
+	if got := dashboardResultError(ctx, intervention, true); got != intervention {
+		t.Fatalf("late cancellation replaced natural exhaustion with attention: %v", got)
+	}
+	if got := dashboardResultError(context.Background(), nil, false); got != nil {
+		t.Fatalf("dashboard result for a clean live context = %v, want nil", got)
+	}
+}
+
+func TestDashboardFinalOutcomeDistinguishesEveryExitPath(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		natural       bool
+		forceStopping bool
+		result        runner.ShutdownResult
+		err           error
+		want          string
+	}{
+		{name: "natural", natural: true, want: "Natural exhaustion"},
+		{name: "natural attention", natural: true, err: &runner.InterventionRequired{Count: 1}, want: "Natural exhaustion with Attention Required"},
+		{name: "Drain", want: "Drain complete"},
+		{name: "bounded suspension", err: &runner.SignalExit{Code: 143}, want: "Suspension complete"},
+		{name: "bounded suspension failure", result: runner.ShutdownResultFailure, err: &runner.SignalExit{Code: 130, Cause: errors.New("boundary failed")}, want: "Suspension finished with errors"},
+		{name: "force stop", forceStopping: true, err: &runner.SignalExit{Code: 130}, want: "Force stop complete"},
+		{name: "force stop failure", forceStopping: true, result: runner.ShutdownResultFailure, err: &runner.SignalExit{Code: 130, Cause: errors.New("kill failed")}, want: "Force stop finished with errors"},
+		{name: "Runner failure", err: errors.New("state unavailable"), want: "Error: state unavailable"},
+		{name: "parent cancellation", err: context.Canceled, want: "Error: context canceled"},
+		{name: "presentation failure", err: &PresentationFailure{Err: errors.New("renderer panic"), RunnerErr: &runner.SignalExit{Code: 143}}, want: "Error: presentation failed: renderer panic; Runner completion: signal shutdown (143)"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := dashboardFinalOutcome(test.natural, test.forceStopping, test.result, test.err); got != test.want {
+				t.Fatalf("final outcome = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestBubbleDashboardReconfigurationPreservesLockedCompletionBaseline(t *testing.T) {
+	session := newBubbleDashboardSession(time.Now)
+	initial := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", MaxConcurrentIssues: 1}
+	source := &dashboardTestSource{current: initial}
+	session.configure(initial, source)
+
+	completed := initial
+	completed.Runs = []scheduler.Run{{Issue: 73, IssueTitle: "Invocation completion", RunID: "run-73", Status: scheduler.StatusMerged}}
+	source.current = completed
+	session.configure(completed, source)
+	if err := session.captureFinalSummary(completed); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := session.printFinalSummary(&output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "Completions produced (1)") || !strings.Contains(output.String(), "#73  Invocation completion") {
+		t.Fatalf("reconfiguration replaced the invocation completion baseline:\n%s", output.String())
 	}
 }
 

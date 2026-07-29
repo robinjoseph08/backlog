@@ -49,9 +49,7 @@ func observeStatusSections(current state.State, source followStateSource, now ti
 	for _, lease := range current.Leases {
 		leasedRuns[lease.RunID] = struct{}{}
 	}
-	sections := map[statusSection][]statusRun{
-		statusActive: {}, statusAttention: {}, statusOutcomes: {}, statusCompletions: {}, statusHistory: {},
-	}
+	sections := newStatusSections()
 	for _, run := range current.Runs {
 		_, leased := leasedRuns[run.RunID]
 		observation := runObservation{run: run, process: observeFollowRun(source, run), observed: now}
@@ -62,6 +60,28 @@ func observeStatusSections(current state.State, source followStateSource, now ti
 		sections[section] = append(sections[section], statusRun{run: run, observation: observation})
 	}
 	return sections
+}
+
+// classifyPersistedStatusSections projects only durable Run and Lease state.
+// Final reports do not need process liveness or Activity telemetry.
+func classifyPersistedStatusSections(current state.State) map[statusSection][]statusRun {
+	leasedRuns := make(map[string]struct{}, len(current.Leases))
+	for _, lease := range current.Leases {
+		leasedRuns[lease.RunID] = struct{}{}
+	}
+	sections := newStatusSections()
+	for _, run := range current.Runs {
+		_, leased := leasedRuns[run.RunID]
+		section := statusSectionFor(run, leased)
+		sections[section] = append(sections[section], statusRun{run: run})
+	}
+	return sections
+}
+
+func newStatusSections() map[statusSection][]statusRun {
+	return map[statusSection][]statusRun{
+		statusActive: {}, statusAttention: {}, statusOutcomes: {}, statusCompletions: {}, statusHistory: {},
+	}
 }
 
 func printPlainStatus(output io.Writer, current state.State, source followStateSource, now time.Time) error {
@@ -123,6 +143,34 @@ func printRunFinalSummary(output io.Writer, current state.State, source followSt
 	printer.header(current)
 	printer.section("Active", sections[statusActive])
 	printer.section("Attention Required", sections[statusAttention])
+	return printer.err
+}
+
+// printRunFinalReport leaves a concise invocation result on the normal screen.
+// Completions are limited to Runs that became merged during this invocation;
+// transient Admission and operational-message history belongs only to the live
+// dashboard and is intentionally omitted.
+func printRunFinalReport(output io.Writer, current state.State, _ followStateSource, _ time.Time, initialCompletions map[string]struct{}, outcome string) error {
+	sections := classifyPersistedStatusSections(current)
+	completions := make([]statusRun, 0)
+	for _, observed := range sections[statusHistory] {
+		if observed.run.Status != scheduler.StatusMerged {
+			continue
+		}
+		if _, existed := initialCompletions[observed.run.RunID]; existed {
+			continue
+		}
+		completions = append(completions, observed)
+	}
+	sortStatusRuns(completions)
+
+	printer := statusPrinter{output: output}
+	printer.printf("\nFinal aggregate summary\n")
+	printer.printf("Final outcome: %s\n", plainStatusValue(outcome))
+	printer.header(current)
+	printer.finalReportSection("Completions produced", completions)
+	printer.finalReportSection("Active", sections[statusActive])
+	printer.finalReportSection("Attention Required", sections[statusAttention])
 	return printer.err
 }
 
@@ -208,6 +256,35 @@ func (p *statusPrinter) section(name string, runs []statusRun) {
 	}
 	for _, observed := range runs {
 		p.run(observed)
+	}
+}
+
+// finalReportSection preserves the Run and issue identities operators need
+// after the TUI exits without copying live observation telemetry to the normal
+// screen.
+func (p *statusPrinter) finalReportSection(name string, runs []statusRun) {
+	p.printf("\n%s (%d)\n", name, len(runs))
+	if len(runs) == 0 {
+		p.printf("  none\n")
+		return
+	}
+	for _, observed := range runs {
+		run := observed.run
+		identity := fmt.Sprintf("#%d", run.Issue)
+		if title := plainStatusValue(run.IssueTitle); title != "" {
+			identity += "  " + title
+		}
+		p.printf("  %s  %s\n", identity, run.Status)
+		if issueURL := plainStatusValue(run.IssueURL); issueURL != "" {
+			p.printf("    Issue: %s\n", issueURL)
+		}
+		p.printf("    Run: %s | State: %s\n", plainStatusValue(run.RunID), run.Status)
+		if run.PullRequest != "" && (run.Status == scheduler.StatusWaitingForMerge || run.Status == scheduler.StatusMerged) {
+			p.printf("    Pull request: %s\n", plainStatusValue(run.PullRequest))
+		}
+		if run.Error != "" && statusSectionFor(run, true) == statusAttention {
+			p.printReason(run)
+		}
 	}
 }
 
