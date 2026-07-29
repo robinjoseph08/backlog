@@ -1158,6 +1158,7 @@ func TestDefaultDashboardCompletesOwnedWorkerShutdownBeforePTYRestorationAndFina
 		wantStatus       scheduler.Status
 		wantBoundary     bool
 		wantLease        bool
+		forceStop        bool
 		wantDashboard    string
 		wantFinalSummary []string
 	}{
@@ -1194,6 +1195,26 @@ while IFS= read -r ignored; do :; done
 			wantDashboard: "Runner stage: Suspension finished",
 			wantFinalSummary: []string{
 				"Final outcome: Suspension complete", "Completions produced (0)", "Active (1)", "#65  Terminal host  suspended", "Attention Required (0)",
+			},
+		},
+		{
+			name: "third SIGINT force stop", signals: []os.Signal{os.Interrupt, os.Interrupt, os.Interrupt},
+			wantExit: 130, wantStatus: scheduler.StatusNeedsHuman, wantLease: true, forceStop: true,
+			workerScript: func(_ string, started string) string {
+				return `#!/bin/sh
+set -eu
+IFS= read -r prompt
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
+touch ` + quote(started) + `
+IFS= read -r abort
+trap '' TERM
+while :; do sleep 1; done
+`
+			},
+			wantDashboard: "Runner stage: Suspension incomplete",
+			wantFinalSummary: []string{
+				"Final outcome: Force stop finished with errors", "Completions produced (0)", "Active (0)",
+				"Attention Required (1)", "#65  Terminal host  needs-human",
 			},
 		},
 	} {
@@ -1249,13 +1270,15 @@ while IFS= read -r ignored; do :; done
 					waitForPseudoTerminalScreen(t, &output.output, 80, 24, "Runner stage: Draining")
 				}
 			}
-			if len(test.signals) > 1 || test.signals[0] == syscall.SIGTERM {
-				waitForFile(t, filepath.Join(fixture.root, "suspension-started"))
-			} else {
-				waitForPseudoTerminalScreen(t, &output.output, 80, 24, "Runner stage: Draining")
-			}
-			if err := os.WriteFile(filepath.Join(fixture.root, "release-worker"), nil, 0o600); err != nil {
-				t.Fatal(err)
+			if !test.forceStop {
+				if len(test.signals) > 1 || test.signals[0] == syscall.SIGTERM {
+					waitForFile(t, filepath.Join(fixture.root, "suspension-started"))
+				} else {
+					waitForPseudoTerminalScreen(t, &output.output, 80, 24, "Runner stage: Draining")
+				}
+				if err := os.WriteFile(filepath.Join(fixture.root, "release-worker"), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
 			}
 			var exit int
 			select {

@@ -978,21 +978,40 @@ func TestTerminalDashboardPreservesDrainAndSuspensionMessages(t *testing.T) {
 	for _, test := range []struct {
 		name       string
 		signal     os.Signal
+		attention  bool
 		wantExit   int
 		wantOutput []string
-		wantFinal  string
+		wantFinal  []string
 	}{
 		{
-			name: "Drain", signal: os.Interrupt, wantExit: 0,
-			wantOutput: []string{"Drain complete", "no effect"}, wantFinal: "Final outcome: Drain complete",
+			name: "Drain with retained Attention Required", signal: os.Interrupt, attention: true, wantExit: 0,
+			wantOutput: []string{"Drain complete", "no effect"},
+			wantFinal: []string{
+				"Final outcome: Drain complete", "Attention Required (1)",
+				"#73  Operator decision  needs-human", "Diagnostic: review retained Worker",
+			},
 		},
 		{
 			name: "suspension", signal: syscall.SIGTERM, wantExit: 143,
-			wantOutput: []string{"Suspension finished", "no effect"}, wantFinal: "Final outcome: Suspension complete",
+			wantOutput: []string{"Suspension finished", "no effect"}, wantFinal: []string{"Final outcome: Suspension complete"},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			repository := initializeFollowRepository(t)
+			stateDir := t.TempDir()
+			if test.attention {
+				run := scheduler.Run{
+					Issue: 73, IssueTitle: "Operator decision", RunID: "retained-attention",
+					Status: scheduler.StatusNeedsHuman, WorkerMode: scheduler.WorkerModePrint, Error: "review retained Worker",
+				}
+				current := state.State{
+					Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
+					Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+				}
+				if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(current); err != nil {
+					t.Fatal(err)
+				}
+			}
 			discovered := filepath.Join(t.TempDir(), "discovered")
 			gh := writeExecutable(t, `#!/bin/sh
 set -eu
@@ -1007,7 +1026,7 @@ esac
 			var stdout, stderr bytes.Buffer
 			go func() {
 				done <- MainWithSignalsAndTerminal(context.Background(), []string{
-					"run", "--watch", "--repo-dir", repository, "--state-dir", t.TempDir(), "--poll", "5ms", "--gh", gh,
+					"run", "--watch", "--repo-dir", repository, "--state-dir", stateDir, "--poll", "5ms", "--gh", gh,
 				}, &stdout, &stderr, signals, func(io.Writer) bool { return true })
 			}()
 			waitForFile(t, discovered)
@@ -1029,8 +1048,13 @@ esac
 			}
 			restore := strings.LastIndex(output, "\x1b[?1049l")
 			summary := strings.Index(output, "Final aggregate summary")
-			if restore < 0 || summary < restore || !strings.Contains(output[summary:], test.wantFinal) {
+			if restore < 0 || summary < restore {
 				t.Fatalf("shutdown normal-screen result was not printed after restoration: %q", output)
+			}
+			for _, want := range test.wantFinal {
+				if !strings.Contains(output[summary:], want) {
+					t.Fatalf("shutdown normal-screen result missing %q: %q", want, output[summary:])
+				}
 			}
 		})
 	}

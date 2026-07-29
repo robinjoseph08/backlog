@@ -658,19 +658,48 @@ func TestPrintRunFinalReportIncludesOnlyInvocationCompletionsAndOutcome(t *testi
 			RunID: "new-completion", Status: scheduler.StatusMerged, PullRequest: "https://example.test/pulls/41", CompletedAt: &completedAt,
 		},
 		{Issue: 12, RunID: "old-retry", Status: scheduler.StatusFailed, Error: "transient retry history"},
+		{
+			Issue: 13, IssueTitle: "Still active", IssueURL: "https://example.test/issues/13",
+			RunID: "active-run", Status: scheduler.StatusRunning,
+		},
+		{
+			Issue: 14, IssueTitle: "Operator decision", IssueURL: "https://example.test/issues/14",
+			RunID: "attention-run", Status: scheduler.StatusNeedsHuman, Error: "review retained work",
+		},
+	}, Leases: []scheduler.Lease{
+		{LeaseID: "active-run", Issue: 13, RunID: "active-run"},
+		{LeaseID: "attention-run", Issue: 14, RunID: "attention-run"},
 	}}
 	var output bytes.Buffer
 	if err := printRunFinalReport(&output, current, &sequenceFollowSource{}, completedAt, map[string]struct{}{"old-completion": {}}, "Drain complete"); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{
-		"Final outcome: Drain complete", "Completions produced (1)", "#11  Completed now",
-		"Issue: https://example.test/issues/11", "Run: new-completion | State: merged",
-		"Pull request: https://example.test/pulls/41", "Attention Required (0)",
-	} {
-		if !strings.Contains(output.String(), want) {
-			t.Fatalf("final report missing %q:\n%s", want, output.String())
-		}
+	want := `
+Final aggregate summary
+Final outcome: Drain complete
+Repository: acme/widgets
+Runs: 5
+Active Leases: 2
+
+Completions produced (1)
+  #11  Completed now  merged
+    Issue: https://example.test/issues/11
+    Run: new-completion | State: merged
+    Pull request: https://example.test/pulls/41
+
+Active (1)
+  #13  Still active  running
+    Issue: https://example.test/issues/13
+    Run: active-run | State: running
+
+Attention Required (1)
+  #14  Operator decision  needs-human
+    Issue: https://example.test/issues/14
+    Run: attention-run | State: needs-human
+    Diagnostic: review retained work
+`
+	if output.String() != want {
+		t.Fatalf("final report ordering or boundaries changed:\ngot:\n%s\nwant:\n%s", output.String(), want)
 	}
 	for _, omitted := range []string{"old-completion", "old-retry", "transient retry history", "Operational messages", "Admission health"} {
 		if strings.Contains(output.String(), omitted) {
