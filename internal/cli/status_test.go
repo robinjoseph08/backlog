@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -651,14 +653,21 @@ func TestPrintRunFinalReportIncludesOnlyInvocationCompletionsAndOutcome(t *testi
 	completedAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets", Runs: []scheduler.Run{
 		{Issue: 10, RunID: "old-completion", Status: scheduler.StatusMerged, CompletedAt: &completedAt},
-		{Issue: 11, IssueTitle: "Completed now", RunID: "new-completion", Status: scheduler.StatusMerged, CompletedAt: &completedAt},
+		{
+			Issue: 11, IssueTitle: "Completed now", IssueURL: "https://example.test/issues/11",
+			RunID: "new-completion", Status: scheduler.StatusMerged, PullRequest: "https://example.test/pulls/41", CompletedAt: &completedAt,
+		},
 		{Issue: 12, RunID: "old-retry", Status: scheduler.StatusFailed, Error: "transient retry history"},
 	}}
 	var output bytes.Buffer
 	if err := printRunFinalReport(&output, current, &sequenceFollowSource{}, completedAt, map[string]struct{}{"old-completion": {}}, "Drain complete"); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Final outcome: Drain complete", "Completions produced (1)", "#11  Completed now", "Attention Required (0)"} {
+	for _, want := range []string{
+		"Final outcome: Drain complete", "Completions produced (1)", "#11  Completed now",
+		"Issue: https://example.test/issues/11", "Run: new-completion | State: merged",
+		"Pull request: https://example.test/pulls/41", "Attention Required (0)",
+	} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("final report missing %q:\n%s", want, output.String())
 		}
@@ -666,6 +675,38 @@ func TestPrintRunFinalReportIncludesOnlyInvocationCompletionsAndOutcome(t *testi
 	for _, omitted := range []string{"old-completion", "old-retry", "transient retry history", "Operational messages", "Admission health"} {
 		if strings.Contains(output.String(), omitted) {
 			t.Fatalf("final report reproduced invocation-external or transient text %q:\n%s", omitted, output.String())
+		}
+	}
+}
+
+func TestClassifyPersistedStatusSectionsPreservesRunOrder(t *testing.T) {
+	current := state.State{
+		Version: state.CurrentVersion,
+		Runs: []scheduler.Run{
+			{RunID: "historical-first", Status: scheduler.StatusMerged},
+			{RunID: "active-first", Status: scheduler.StatusRunning},
+			{RunID: "attention-first", Status: scheduler.StatusFailed},
+			{RunID: "active-second", Status: scheduler.StatusWaitingForMerge},
+			{RunID: "attention-second", Status: scheduler.StatusNeedsHuman},
+			{RunID: "historical-second", Status: scheduler.StatusFailed},
+		},
+		Leases: []scheduler.Lease{
+			{RunID: "active-first"}, {RunID: "attention-first"},
+			{RunID: "active-second"}, {RunID: "attention-second"},
+		},
+	}
+	sections := classifyPersistedStatusSections(current)
+	for section, want := range map[statusSection][]string{
+		statusActive:    {"active-first", "active-second"},
+		statusAttention: {"attention-first", "attention-second"},
+		statusHistory:   {"historical-first", "historical-second"},
+	} {
+		got := make([]string, 0, len(sections[section]))
+		for _, classified := range sections[section] {
+			got = append(got, classified.run.RunID)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("section %d Run order = %v, want %v", section, got, want)
 		}
 	}
 }
@@ -702,12 +743,13 @@ func TestPrintRunFinalReportOmitsLiveObservationTelemetry(t *testing.T) {
 		{LeaseID: "attention-live", Issue: 21, RunID: "attention-live"},
 	}}
 	var output bytes.Buffer
-	if err := printRunFinalReport(&output, current, &dashboardTestSource{current: current}, now, nil, "Error: context canceled"); err != nil {
+	if err := printRunFinalReport(&output, current, finalReportObservationTrap{}, now, nil, "Error: context canceled"); err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
 		"Final outcome: Error: context canceled", "Active (1)", "#20  Still active  running",
-		"Run: active-live | State: running", "Attention Required (1)", "#21  Retained live Worker  needs-human",
+		"Issue: https://example.test/issues/20", "Run: active-live | State: running", "Attention Required (1)",
+		"#21  Retained live Worker  needs-human", "Issue: https://example.test/issues/21",
 		"Run: attention-live | State: needs-human", "Diagnostic: verify retained Worker outcome",
 	} {
 		if !strings.Contains(output.String(), want) {
@@ -718,6 +760,49 @@ func TestPrintRunFinalReportOmitsLiveObservationTelemetry(t *testing.T) {
 		if strings.Contains(output.String(), omitted) {
 			t.Fatalf("final report retained live telemetry %q:\n%s", omitted, output.String())
 		}
+	}
+}
+
+type finalReportObservationTrap struct{}
+
+func (finalReportObservationTrap) Preview() (state.State, bool, error) {
+	panic("final report observed live state")
+}
+
+func (finalReportObservationTrap) RunnerSupervised() (bool, error) {
+	panic("final report observed Runner supervision")
+}
+
+func TestPrintRunFinalReportDoesNotReadRawActivity(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "blocking-worker-log")
+	if err := syscall.Mkfifo(logPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := os.OpenFile(logPath, os.O_RDWR|syscall.O_NONBLOCK, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+
+	run := scheduler.Run{Issue: 22, RunID: "blocking-activity", Status: scheduler.StatusRunning, LogPath: logPath}
+	current := state.State{
+		Version: state.CurrentVersion,
+		Runs:    []scheduler.Run{run},
+		Leases:  []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- printRunFinalReport(io.Discard, current, &sequenceFollowSource{}, time.Now(), nil, "Drain complete")
+	}()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		_ = holder.Close()
+		<-result
+		t.Fatal("final report blocked reading raw Worker Activity")
 	}
 }
 

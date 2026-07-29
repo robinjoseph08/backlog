@@ -49,9 +49,7 @@ func observeStatusSections(current state.State, source followStateSource, now ti
 	for _, lease := range current.Leases {
 		leasedRuns[lease.RunID] = struct{}{}
 	}
-	sections := map[statusSection][]statusRun{
-		statusActive: {}, statusAttention: {}, statusOutcomes: {}, statusCompletions: {}, statusHistory: {},
-	}
+	sections := newStatusSections()
 	for _, run := range current.Runs {
 		_, leased := leasedRuns[run.RunID]
 		observation := runObservation{run: run, process: observeFollowRun(source, run), observed: now}
@@ -62,6 +60,28 @@ func observeStatusSections(current state.State, source followStateSource, now ti
 		sections[section] = append(sections[section], statusRun{run: run, observation: observation})
 	}
 	return sections
+}
+
+// classifyPersistedStatusSections projects only durable Run and Lease state.
+// Final reports do not need process liveness or Activity telemetry.
+func classifyPersistedStatusSections(current state.State) map[statusSection][]statusRun {
+	leasedRuns := make(map[string]struct{}, len(current.Leases))
+	for _, lease := range current.Leases {
+		leasedRuns[lease.RunID] = struct{}{}
+	}
+	sections := newStatusSections()
+	for _, run := range current.Runs {
+		_, leased := leasedRuns[run.RunID]
+		section := statusSectionFor(run, leased)
+		sections[section] = append(sections[section], statusRun{run: run})
+	}
+	return sections
+}
+
+func newStatusSections() map[statusSection][]statusRun {
+	return map[statusSection][]statusRun{
+		statusActive: {}, statusAttention: {}, statusOutcomes: {}, statusCompletions: {}, statusHistory: {},
+	}
 }
 
 func printPlainStatus(output io.Writer, current state.State, source followStateSource, now time.Time) error {
@@ -130,8 +150,8 @@ func printRunFinalSummary(output io.Writer, current state.State, source followSt
 // Completions are limited to Runs that became merged during this invocation;
 // transient Admission and operational-message history belongs only to the live
 // dashboard and is intentionally omitted.
-func printRunFinalReport(output io.Writer, current state.State, source followStateSource, now time.Time, initialCompletions map[string]struct{}, outcome string) error {
-	sections := observeStatusSections(current, source, now)
+func printRunFinalReport(output io.Writer, current state.State, _ followStateSource, _ time.Time, initialCompletions map[string]struct{}, outcome string) error {
+	sections := classifyPersistedStatusSections(current)
 	completions := make([]statusRun, 0)
 	for _, observed := range sections[statusHistory] {
 		if observed.run.Status != scheduler.StatusMerged {

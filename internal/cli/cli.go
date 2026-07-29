@@ -95,7 +95,9 @@ func MainWithTerminal(ctx context.Context, args []string, dependencies TerminalD
 			dashboard.setResult(dashboardResultError(ctx, err))
 			if summaryErr := dashboard.printFinalSummary(stdout); summaryErr != nil {
 				ancillaryOutputErr = summaryErr
-				err = errors.Join(err, summaryErr)
+				if err != nil {
+					err = errors.Join(err, summaryErr)
+				}
 			}
 		}
 	case "status":
@@ -156,6 +158,9 @@ func MainWithTerminal(ctx context.Context, args []string, dependencies TerminalD
 		}
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
+	}
+	if ancillaryOutputErr != nil {
+		fmt.Fprintln(stderr, "error:", ancillaryOutputErr)
 	}
 	return 0
 }

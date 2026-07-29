@@ -466,6 +466,74 @@ exec sleep 30
 	}
 }
 
+func TestTerminalDashboardReportsFinalSummaryFailureWithoutChangingSuccessfulDrainExit(t *testing.T) {
+	root := t.TempDir()
+	setupStarted := filepath.Join(root, "setup-started")
+	git := writeExecutable(t, `#!/bin/sh
+set -eu
+touch `+quote(setupStarted)+`
+exec sleep 30
+`)
+	var stdout finalSummaryFailureWriter
+	var stderr bytes.Buffer
+	externalSignals := make(chan os.Signal)
+	done := make(chan int, 1)
+	go func() {
+		done <- MainWithTerminal(context.Background(), []string{"run", "--git", git}, TerminalDependencies{
+			Input: strings.NewReader(""), Output: &stdout, ErrorOutput: &stderr, Signals: externalSignals,
+			IsTerminal:   func() bool { return true },
+			Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
+			ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+		})
+	}()
+	waitForFile(t, setupStarted)
+	select {
+	case externalSignals <- os.Interrupt:
+	case <-time.After(10 * time.Second):
+		t.Fatal("SIGINT was not accepted during setup")
+	}
+	select {
+	case exit := <-done:
+		if exit != 0 {
+			t.Fatalf("Drain exit = %d, want 0; stderr = %q", exit, stderr.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Drain did not finish")
+	}
+	if !strings.Contains(stdout.output.String(), "Drain complete: 0 Workers remaining; exiting successfully") {
+		t.Fatalf("Drain success output was lost: %q", stdout.output.String())
+	}
+	if !stdout.failed.Load() || !strings.Contains(stderr.String(), "error: final summary output lost") {
+		t.Fatalf("final summary failure was not reported: failed=%t stderr=%q", stdout.failed.Load(), stderr.String())
+	}
+}
+
+func TestTerminalDashboardFinalSummaryFailureDoesNotReplaceOperationalFailure(t *testing.T) {
+	git := writeExecutable(t, `#!/bin/sh
+echo 'operational setup failed' >&2
+exit 23
+`)
+	var stdout finalSummaryFailureWriter
+	var stderr bytes.Buffer
+	exit := MainWithTerminal(context.Background(), []string{"run", "--git", git}, TerminalDependencies{
+		Input: strings.NewReader(""), Output: &stdout, ErrorOutput: &stderr,
+		IsTerminal:   func() bool { return true },
+		Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
+		ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+	})
+	if exit != 1 {
+		t.Fatalf("operational failure exit = %d, want 1; stderr = %q", exit, stderr.String())
+	}
+	for _, want := range []string{"discover Git repository root: operational setup failed", "final summary output lost"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("operational failure stderr omitted %q: %q", want, stderr.String())
+		}
+	}
+	if !stdout.failed.Load() {
+		t.Fatal("final summary output failure was not exercised")
+	}
+}
+
 func TestTerminalDashboardReportsFinalSummaryFailureWithoutChangingInterventionExit(t *testing.T) {
 	repository := initializeFollowRepository(t)
 	stateDir := t.TempDir()
