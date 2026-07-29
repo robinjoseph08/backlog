@@ -2474,6 +2474,124 @@ func TestRestoreDashboardTerminalReturnsShortWriteAfterNoProgress(t *testing.T) 
 	}
 }
 
+type recoveryInterpretingWriter struct {
+	parser          *ansi.Parser
+	raw             bytes.Buffer
+	visible         strings.Builder
+	hyperlink       bool
+	styled          bool
+	alternateScreen bool
+	cursorVisible   bool
+	report          bool
+	reportLinked    bool
+	reportStyled    bool
+}
+
+func newRecoveryInterpretingWriter() *recoveryInterpretingWriter {
+	output := &recoveryInterpretingWriter{alternateScreen: true}
+	parser := ansi.NewParser()
+	parser.SetHandler(ansi.Handler{
+		Print: func(value rune) {
+			output.visible.WriteRune(value)
+			if output.report {
+				output.reportLinked = output.reportLinked || output.hyperlink
+				output.reportStyled = output.reportStyled || output.styled
+			}
+		},
+		HandleOsc: func(command int, data []byte) {
+			if command != 8 {
+				return
+			}
+			parts := strings.SplitN(string(data), ";", 3)
+			output.hyperlink = len(parts) == 3 && parts[2] != ""
+		},
+		HandleCsi: func(command ansi.Cmd, params ansi.Params) {
+			switch command.Final() {
+			case 'm':
+				if command.Prefix() != 0 {
+					return
+				}
+				if len(params) == 0 {
+					output.styled = false
+					return
+				}
+				params.ForEach(0, func(_ int, parameter int, _ bool) {
+					if parameter == 0 {
+						output.styled = false
+					} else {
+						output.styled = true
+					}
+				})
+			case 'h', 'l':
+				if command.Prefix() != '?' {
+					return
+				}
+				enabled := command.Final() == 'h'
+				params.ForEach(0, func(_ int, parameter int, _ bool) {
+					switch parameter {
+					case 25:
+						output.cursorVisible = enabled
+					case 1049:
+						output.alternateScreen = enabled
+					}
+				})
+			}
+		},
+	})
+	output.parser = parser
+	return output
+}
+
+func (w *recoveryInterpretingWriter) Write(content []byte) (int, error) {
+	_, _ = w.raw.Write(content)
+	w.parser.Parse(content)
+	return len(content), nil
+}
+
+func TestOutputLossRecoveryCancelsPartialHyperlinkAndStyleSequencesBeforeReport(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		interrupted string
+		wantLinked  bool
+		wantStyled  bool
+	}{
+		{
+			name:        "OSC 8 close",
+			interrupted: "\x1b]8;;https://github.com/acme/widgets/issues/73\x1b\\#73\x1b]8;",
+			wantLinked:  true,
+		},
+		{
+			name:        "SGR style",
+			interrupted: "\x1b[31mstyled dashboard\x1b[38;5",
+			wantStyled:  true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output := newRecoveryInterpretingWriter()
+			_, _ = io.WriteString(output, test.interrupted)
+			if output.hyperlink != test.wantLinked || output.styled != test.wantStyled {
+				t.Fatalf("interrupted dashboard state: hyperlink=%t styled=%t, want hyperlink=%t styled=%t", output.hyperlink, output.styled, test.wantLinked, test.wantStyled)
+			}
+
+			if err := restoreDashboardTerminal(output); err != nil {
+				t.Fatal(err)
+			}
+			const report = "Final aggregate summary\nFinal outcome: Error: terminal output lost\n"
+			output.report = true
+			_, _ = io.WriteString(output, report)
+
+			recovery := output.raw.String()[len(test.interrupted):]
+			if !strings.HasPrefix(recovery, "\x18\x1b]8;;\x1b\\\x1b[0m") {
+				t.Fatalf("recovery did not cancel the partial sequence, close OSC 8, and reset SGR first: %q", recovery)
+			}
+			visible := output.visible.String()
+			if output.hyperlink || output.styled || output.alternateScreen || !output.cursorVisible || output.reportLinked || output.reportStyled || !strings.Contains(visible, "Final aggregate summary") || !strings.Contains(visible, "Final outcome: Error: terminal output lost") {
+				t.Fatalf("static report remained captured or formatted after recovery: hyperlink=%t styled=%t alternate=%t cursor=%t report_linked=%t report_styled=%t visible=%q", output.hyperlink, output.styled, output.alternateScreen, output.cursorVisible, output.reportLinked, output.reportStyled, output.visible.String())
+			}
+		})
+	}
+}
+
 type statefulTerminalWriter struct {
 	visible      bytes.Buffer
 	pending      bytes.Buffer
@@ -2782,6 +2900,22 @@ func TestBubbleDashboardStoreDoesNotPublishFailedSave(t *testing.T) {
 	defer session.mu.Unlock()
 	if len(session.updates) != 0 {
 		t.Fatalf("failed state save published %d dashboard updates", len(session.updates))
+	}
+}
+
+func TestDashboardResultErrorSeparatesParentCancellationFromCommandStatus(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := dashboardResultError(ctx, nil); !errors.Is(got, context.Canceled) {
+		t.Fatalf("dashboard cancellation outcome = %v, want context cancellation", got)
+	}
+
+	cleanupErr := errors.New("persist interrupted Runs")
+	if got := dashboardResultError(ctx, cleanupErr); got != cleanupErr {
+		t.Fatalf("dashboard cleanup outcome = %v, want %v", got, cleanupErr)
+	}
+	if got := dashboardResultError(context.Background(), nil); got != nil {
+		t.Fatalf("dashboard result for a clean live context = %v, want nil", got)
 	}
 }
 

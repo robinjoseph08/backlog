@@ -115,8 +115,8 @@ func TestRunnerWatchDoesNotExhaustWhenAttentionRemains(t *testing.T) {
 	default:
 	}
 	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("watch cancellation = %v, want context cancellation", err)
+	if err := <-done; err != nil {
+		t.Fatalf("watch cancellation: %v", err)
 	}
 	if summaries != 0 {
 		t.Fatalf("watch printed %d final summaries, want none", summaries)
@@ -1628,8 +1628,8 @@ func TestRunnerWaitsForOwnedWorkerBeforePersistingShutdown(t *testing.T) {
 	cancel()
 	select {
 	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("run cancellation = %v, want context cancellation", err)
+		if err != nil {
+			t.Fatalf("run: %v", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("runner did not wait for and stop its owned worker")
@@ -1639,6 +1639,26 @@ func TestRunnerWaitsForOwnedWorkerBeforePersistingShutdown(t *testing.T) {
 	}
 	if workers.runningCount() != 0 {
 		t.Fatalf("running workers = %d, want zero before shutdown returned", workers.runningCount())
+	}
+}
+
+func TestRunnerCancellationPreservesShutdownFailure(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 40, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	shutdownErr := errors.New("abort unavailable")
+	workers.abortErr = shutdownErr
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	workers.waitForStarts(t, 40)
+	cancel()
+
+	if err := <-done; !errors.Is(err, shutdownErr) {
+		t.Fatalf("canceled Runner shutdown error = %v, want %v", err, shutdownErr)
 	}
 }
 
@@ -1799,8 +1819,8 @@ func TestRunnerRetriesCandidateDiscoveryAfterPollIntervalAndResumesAdmission(t *
 	workers.complete(5, worker.Result{ExitCode: 1, Err: errors.New("failed")})
 	workers.waitForNoRunningWorkers(t)
 	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("run cancellation = %v, want context cancellation", err)
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
 	}
 }
 
@@ -1838,8 +1858,8 @@ func TestRunnerWatchRetriesCandidateDiscoveryWithoutActiveRun(t *testing.T) {
 	workers.complete(7, worker.Result{ExitCode: 1, Err: errors.New("failed")})
 	workers.waitForNoRunningWorkers(t)
 	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("run cancellation = %v, want context cancellation", err)
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
 	}
 }
 
@@ -1969,8 +1989,8 @@ func TestRunnerCancellationInterruptsCandidateDiscoveryRetryWait(t *testing.T) {
 	cancel()
 	select {
 	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("run cancellation = %v, want context cancellation", err)
+		if err != nil {
+			t.Fatalf("run: %v", err)
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("runner did not stop promptly during candidate discovery retry wait")
@@ -2043,8 +2063,8 @@ func TestRunnerSchedulesDependentAfterBlockerCloses(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("run cancellation = %v, want context cancellation", err)
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
 	}
 }
 
@@ -2069,8 +2089,8 @@ func TestRunnerDoesNotDuplicatePersistedLiveWorker(t *testing.T) {
 	go func() { done <- runner.Run(ctx) }()
 	time.Sleep(20 * time.Millisecond)
 	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("run cancellation = %v, want context cancellation", err)
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
 	}
 	if workers.wasStarted(1) {
 		t.Fatal("persisted live issue #1 was launched again")
@@ -2162,8 +2182,8 @@ func TestRunnerOverAgeRecoveredWorkerRetainsCapacity(t *testing.T) {
 	})
 	time.Sleep(20 * time.Millisecond)
 	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("run cancellation = %v, want context cancellation", err)
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 	got := store.LoadValue()
 	if stale := findActiveRun(&got, 1); stale.Status != scheduler.StatusNeedsHuman || stale.PID != 1234 {
@@ -2204,8 +2224,8 @@ func TestRunnerUncertainRecoveredWorkerIdentityRetainsCapacity(t *testing.T) {
 	})
 	time.Sleep(20 * time.Millisecond)
 	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("run cancellation = %v, want context cancellation", err)
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 	got := store.LoadValue()
 	if uncertain := findActiveRun(&got, 3); uncertain.Status != scheduler.StatusNeedsHuman || uncertain.PID != 1235 || !strings.Contains(uncertain.Error, "identity is uncertain") {
@@ -2375,8 +2395,8 @@ func TestRunnerWatchAutomaticallyResolvesClosureDuringPoll(t *testing.T) {
 		cancel()
 		t.Fatal("watch reconciliation did not discover issue closure")
 	}
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("watch shutdown after External Resolution = %v, want context cancellation", err)
+	if err := <-done; err != nil {
+		t.Fatalf("watch shutdown after External Resolution: %v", err)
 	}
 	got := store.LoadValue()
 	if got.Runs[0].Status != scheduler.StatusResolvedExternally || len(got.Leases) != 0 {
@@ -3077,8 +3097,8 @@ func TestRunnerReconcilesDeadWorkerWithArmedAutoMergeAsWaiting(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("run cancellation = %v, want context cancellation", err)
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
 	}
 	if got := store.runStatus(3); got != scheduler.StatusWaitingForMerge {
 		t.Fatalf("issue 3 status = %q, want waiting-for-merge", got)
@@ -3212,12 +3232,8 @@ func TestRunnerRechecksGitHubCompletionImmediatelyBeforeResume(t *testing.T) {
 				time.Sleep(time.Millisecond)
 			}
 			cancel()
-			err := <-done
-			if test.status == scheduler.StatusWaitingForMerge && !errors.Is(err, context.Canceled) {
-				t.Fatalf("run cancellation = %v, want context cancellation", err)
-			}
-			if test.status == scheduler.StatusMerged && err != nil {
-				t.Fatalf("natural exhaustion after merged reconciliation: %v", err)
+			if err := <-done; err != nil {
+				t.Fatal(err)
 			}
 			got := store.LoadValue()
 			if calls < 2 || got.Runs[0].Status != test.status || workers.wasStarted(65) {
@@ -3374,8 +3390,8 @@ func TestRunnerDoesNotResumeBeyondCapacityConsumedByRecoveredLiveWorker(t *testi
 		t.Fatal("Suspended Run resumed despite recovered live Worker consuming all capacity")
 	}
 	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("run cancellation = %v, want context cancellation", err)
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 	got := store.LoadValue()
 	if findActiveRun(&got, 70).Status != scheduler.StatusSuspended || len(got.Leases) != 2 {
@@ -3819,8 +3835,8 @@ func TestRunnerReconcilesSuspendedRunWithArmedAutoMergeAsWaiting(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("run cancellation = %v, want context cancellation", err)
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
 	}
 	got := store.LoadValue()
 	if got.Runs[0].Status != scheduler.StatusWaitingForMerge || got.Runs[0].Error != "" || len(got.Leases) != 1 {

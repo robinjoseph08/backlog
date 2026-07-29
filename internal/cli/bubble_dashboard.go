@@ -151,8 +151,11 @@ func (s *bubbleDashboardSession) presentation(ctx context.Context, control Prese
 
 // Bubble Tea's Kill path invokes normal shutdown, but the output failure that
 // forced it may also prevent teardown controls from being written. Retry those
-// controls directly with this intentionally idempotent sequence.
-const dashboardTerminalRestoration = ansi.ResetModeSynchronizedOutput + ansi.ResetModeUnicodeCore + "\x1b[>4m\x1b[=0;1u\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1049l\x1b[?25h"
+// controls directly with this intentionally idempotent sequence. CAN first
+// returns a terminal parser stranded in an incomplete control string or CSI to
+// ground state. Close any active OSC 8 hyperlink and reset SGR before restoring
+// terminal modes, the normal screen, and the cursor.
+const dashboardTerminalRestoration = "\x18\x1b]8;;\x1b\\\x1b[0m" + ansi.ResetModeSynchronizedOutput + ansi.ResetModeUnicodeCore + "\x1b[>4m\x1b[=0;1u\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1049l\x1b[?25h"
 
 func restoreDashboardTerminal(output io.Writer) error {
 	return writeAll(output, []byte(dashboardTerminalRestoration))
@@ -344,6 +347,13 @@ func (s *bubbleDashboardSession) printFinalSummary(output io.Writer) error {
 	outcome := dashboardFinalOutcome(s.naturalExit, s.forceStopping, s.shutdownResult, s.resultErr)
 	s.finalMu.Unlock()
 	return printRunFinalReport(output, current, source, s.now(), initialCompletions, outcome)
+}
+
+func dashboardResultError(ctx context.Context, err error) error {
+	if err != nil {
+		return err
+	}
+	return context.Cause(ctx)
 }
 
 func dashboardFinalOutcome(natural, forceStopping bool, result runner.ShutdownResult, err error) string {

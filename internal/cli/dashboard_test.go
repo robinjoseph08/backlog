@@ -548,6 +548,64 @@ esac
 	}
 }
 
+func TestAutomaticDashboardParentCancellationKeepsSuccessExitAndReportsCancellation(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	candidateStarted := filepath.Join(t.TempDir(), "candidate-started")
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef") printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url")
+    touch `+quote(candidateStarted)+`
+    exec sleep 30 ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	input, writeInput := io.Pipe()
+	defer input.Close()
+	defer writeInput.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	var stdout synchronizedBuffer
+	var stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- MainWithTerminal(ctx, []string{
+			"run", "--watch", "--repo-dir", repository, "--state-dir", stateDir, "--max-workers", "1", "--gh", gh,
+		}, TerminalDependencies{
+			Input: input, Output: &stdout, ErrorOutput: &stderr,
+			IsTerminal:   func() bool { return true },
+			Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 12}, nil },
+			ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+		})
+	}()
+
+	waitForFile(t, candidateStarted)
+	cancel()
+	select {
+	case exit := <-done:
+		if exit != 0 {
+			t.Fatalf("parent cancellation exit = %d, want 0; stderr = %q", exit, stderr.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("dashboard did not finish parent cancellation")
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("parent cancellation stderr = %q, want none", stderr.String())
+	}
+	output := stdout.String()
+	restore := strings.LastIndex(output, "\x1b[?1049l")
+	summary := strings.Index(output, "Final aggregate summary")
+	if restore < 0 || summary < restore || !strings.Contains(output[summary:], "Final outcome: Error: context canceled\n") || strings.Contains(output[summary:], "Final outcome: Drain complete") {
+		t.Fatalf("parent cancellation report was not printed after restoration: %q", output)
+	}
+}
+
 func TestAutomaticDashboardPresentsCandidateDiscoveryFailureThroughAdmission(t *testing.T) {
 	repository := initializeFollowRepository(t)
 	stateDir := t.TempDir()

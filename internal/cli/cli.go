@@ -92,7 +92,7 @@ func MainWithTerminal(ctx context.Context, args []string, dependencies TerminalD
 			return runCommand(ctx, options, stdout, signals, onOperationalEvent, dashboard, terminal.Now)
 		}, presentation)
 		if dashboard != nil {
-			dashboard.setResult(err)
+			dashboard.setResult(dashboardResultError(ctx, err))
 			if summaryErr := dashboard.printFinalSummary(stdout); summaryErr != nil {
 				ancillaryOutputErr = summaryErr
 				err = errors.Join(err, summaryErr)
@@ -414,7 +414,7 @@ func runCommand(ctx context.Context, options runOptions, stdout io.Writer, signa
 	}
 	runErr := backlogRunner.Run(ctx)
 	backlogRunner.WaitForOperationalEventDelivery()
-	if dashboard != nil {
+	if dashboard != nil && ctx.Err() == nil {
 		if flushErr := dashboard.flush(ctx); flushErr != nil {
 			return errors.Join(runErr, flushErr)
 		}

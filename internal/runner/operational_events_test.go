@@ -208,8 +208,8 @@ func TestRunnerReportsCandidateDiscoveryFailuresAndResetsCountAfterRecovery(t *t
 
 	events := recorder.waitFor(t, func(events []OperationalEvent) bool { return len(events) >= 6 })
 	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("run cancellation = %v, want context cancellation", err)
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
 	}
 	if len(events) != 6 {
 		t.Fatalf("operational events = %#v, want two failure episodes and recoveries", events)
@@ -337,8 +337,8 @@ func TestRunnerCancellationStopsPendingCandidateRetryTimer(t *testing.T) {
 	<-github.candidateChanged
 	<-created
 	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("run cancellation = %v, want context cancellation", err)
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
 	}
 	select {
 	case <-timer.stopped:
@@ -596,8 +596,8 @@ func TestRunnerDoesNotRecoverOrExhaustAfterCanceledCandidateSuccess(t *testing.T
 	go func() { done <- runner.Run(ctx) }()
 	<-retryStarted
 	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("run cancellation = %v, want context cancellation", err)
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
 	}
 	runner.WaitForOperationalEventDelivery()
 
