@@ -574,18 +574,28 @@ func TestAdmissionBackpressureComposesRunnerPresentationAndDashboardBounds(t *te
 	dashboard.mu.Unlock()
 }
 
-func TestPresentationEventQueuePreservesOrderedShutdownAndTerminalDeliveryForSlowConsumer(t *testing.T) {
+func TestPresentationEventQueuePreservesForceStopOutcomeUnderLifecyclePressure(t *testing.T) {
 	queue := newPresentationEventQueue()
 	for failure := 1; failure <= presentationEventLimit*4; failure++ {
 		queue.publish(runner.CandidateDiscoveryFailed{ConsecutiveFailures: failure})
 	}
-	for _, stage := range []runner.ShutdownStage{
-		runner.ShutdownStageDraining,
-		runner.ShutdownStageSuspending,
-		runner.ShutdownStageForceStopping,
-		runner.ShutdownStageSuspensionIncomplete,
-	} {
-		queue.publish(runner.ShutdownEvent{Stage: stage})
+	queue.publish(runner.ShutdownEvent{Stage: runner.ShutdownStageDraining})
+	queue.publish(runner.ShutdownEvent{Stage: runner.ShutdownStageSuspending})
+	queue.publish(runner.ShutdownEvent{Stage: runner.ShutdownStageForceStopping})
+	queue.publish(runner.ShutdownEvent{
+		Stage: runner.ShutdownStageSuspensionIncomplete, Result: runner.ShutdownResultFailure,
+	})
+	for lifecycle := 0; lifecycle < presentationEventLimit*2; lifecycle++ {
+		queue.publish(runner.RunLifecycleEvent{
+			Stage: runner.RunLifecycleCleanupCompleted, Message: fmt.Sprintf("later lifecycle event %d", lifecycle),
+		})
+	}
+
+	queue.mu.Lock()
+	queued := len(queue.events)
+	queue.mu.Unlock()
+	if queued != presentationEventLimit {
+		t.Fatalf("slow-consumer queue length = %d, want bounded %d after %d published events", queued, presentationEventLimit, presentationEventLimit*6+4)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -600,29 +610,34 @@ func TestPresentationEventQueuePreservesOrderedShutdownAndTerminalDeliveryForSlo
 			break
 		}
 		events = append(events, event)
+		queue.complete()
 	}
-	wantEvents := presentationAdmissionFailureLimit + 4
-	if len(events) != wantEvents {
-		t.Fatalf("slow-consumer delivery count = %d, want bounded %d", len(events), wantEvents)
+	if len(events) != presentationEventLimit {
+		t.Fatalf("slow-consumer delivery count = %d, want bounded %d", len(events), presentationEventLimit)
 	}
-	previousFailure := 0
-	for _, event := range events[:len(events)-4] {
-		failure, ok := event.(runner.CandidateDiscoveryFailed)
-		if !ok || failure.ConsecutiveFailures <= previousFailure {
-			t.Fatalf("retained Admission delivery is not ordered: %#v", events)
+	var retainedStages []runner.ShutdownEvent
+	session := &bubbleDashboardSession{}
+	for _, event := range events {
+		shutdown, ok := event.(runner.ShutdownEvent)
+		if !ok {
+			continue
 		}
-		previousFailure = failure.ConsecutiveFailures
+		retainedStages = append(retainedStages, shutdown)
+		session.observeOperationalEvent(shutdown)
 	}
-	for index, stage := range []runner.ShutdownStage{
-		runner.ShutdownStageDraining,
-		runner.ShutdownStageSuspending,
-		runner.ShutdownStageForceStopping,
-		runner.ShutdownStageSuspensionIncomplete,
-	} {
-		shutdown, ok := events[len(events)-4+index].(runner.ShutdownEvent)
-		if !ok || shutdown.Stage != stage {
-			t.Fatalf("shutdown delivery %d = %#v, want stage %s", index, events[len(events)-4+index], stage)
-		}
+	wantStages := []runner.ShutdownEvent{
+		{Stage: runner.ShutdownStageForceStopping},
+		{Stage: runner.ShutdownStageSuspensionIncomplete, Result: runner.ShutdownResultFailure},
+	}
+	if !reflect.DeepEqual(retainedStages, wantStages) {
+		t.Fatalf("retained shutdown classification = %#v, want %#v", retainedStages, wantStages)
+	}
+	session.finalMu.Lock()
+	forceStopping, result := session.forceStopping, session.shutdownResult
+	session.finalMu.Unlock()
+	outcome := dashboardFinalOutcome(false, forceStopping, result, &runner.SignalExit{Code: 130})
+	if outcome != "Force stop finished with errors" {
+		t.Fatalf("retained final outcome = %q, want force-stop failure", outcome)
 	}
 }
 
@@ -1137,7 +1152,7 @@ while :; do sleep 1; done
 func TestDefaultDashboardCompletesOwnedWorkerShutdownBeforePTYRestorationAndFinalSummary(t *testing.T) {
 	for _, test := range []struct {
 		name             string
-		signal           os.Signal
+		signals          []os.Signal
 		workerScript     func(root, started string) string
 		wantExit         int
 		wantStatus       scheduler.Status
@@ -1147,7 +1162,7 @@ func TestDefaultDashboardCompletesOwnedWorkerShutdownBeforePTYRestorationAndFina
 		wantFinalSummary []string
 	}{
 		{
-			name: "Drain", signal: os.Interrupt, wantStatus: scheduler.StatusMerged,
+			name: "Drain", signals: []os.Signal{os.Interrupt}, wantStatus: scheduler.StatusMerged,
 			workerScript: func(root, started string) string {
 				return `#!/bin/sh
 set -eu
@@ -1166,8 +1181,16 @@ while IFS= read -r ignored; do :; done
 			},
 		},
 		{
-			name: "bounded suspension", signal: syscall.SIGTERM, workerScript: presentationSuspendingWorkerScript,
+			name: "direct bounded suspension", signals: []os.Signal{syscall.SIGTERM}, workerScript: presentationSuspendingWorkerScript,
 			wantExit: 143, wantStatus: scheduler.StatusSuspended, wantBoundary: true, wantLease: true,
+			wantDashboard: "Runner stage: Suspension finished",
+			wantFinalSummary: []string{
+				"Final outcome: Suspension complete", "Completions produced (0)", "Active (1)", "#65  Terminal host  suspended", "Attention Required (0)",
+			},
+		},
+		{
+			name: "second SIGINT bounded suspension", signals: []os.Signal{os.Interrupt, os.Interrupt}, workerScript: presentationSuspendingWorkerScript,
+			wantExit: 130, wantStatus: scheduler.StatusSuspended, wantBoundary: true, wantLease: true,
 			wantDashboard: "Runner stage: Suspension finished",
 			wantFinalSummary: []string{
 				"Final outcome: Suspension complete", "Completions produced (0)", "Active (1)", "#65  Terminal host  suspended", "Attention Required (0)",
@@ -1214,14 +1237,19 @@ while IFS= read -r ignored; do :; done
 			if err := finishPTYPresentationInput(inputCtx, primary, input); err != nil {
 				t.Fatal(err)
 			}
-			select {
-			case externalSignals <- test.signal:
-			case exit := <-done:
-				t.Fatalf("default dashboard exited with %d before shutdown signal", exit)
-			case <-time.After(10 * time.Second):
-				t.Fatal("shutdown signal was not accepted")
+			for index, signal := range test.signals {
+				select {
+				case externalSignals <- signal:
+				case exit := <-done:
+					t.Fatalf("default dashboard exited with %d before shutdown signal %d", exit, index+1)
+				case <-time.After(10 * time.Second):
+					t.Fatalf("shutdown signal %d was not accepted", index+1)
+				}
+				if index+1 < len(test.signals) {
+					waitForPseudoTerminalScreen(t, &output.output, 80, 24, "Runner stage: Draining")
+				}
 			}
-			if test.signal == syscall.SIGTERM {
+			if len(test.signals) > 1 || test.signals[0] == syscall.SIGTERM {
 				waitForFile(t, filepath.Join(fixture.root, "suspension-started"))
 			} else {
 				waitForPseudoTerminalScreen(t, &output.output, 80, 24, "Runner stage: Draining")
