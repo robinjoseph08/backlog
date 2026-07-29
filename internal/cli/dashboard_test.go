@@ -427,6 +427,35 @@ func (w *finalSummaryFailureWriter) Write(content []byte) (int, error) {
 	return w.output.Write(content)
 }
 
+func TestTerminalDashboardFinalSummaryFailureAfterNaturalExhaustionIsOperationalFailure(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef") printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url") printf '%s\n' '[]' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+	var stdout finalSummaryFailureWriter
+	var stderr bytes.Buffer
+	exit := MainWithTerminal(context.Background(), []string{
+		"run", "--repo-dir", repository, "--state-dir", stateDir, "--poll", "5ms", "--gh", gh,
+	}, TerminalDependencies{
+		Input: strings.NewReader(""), Output: &stdout, ErrorOutput: &stderr,
+		IsTerminal:   func() bool { return true },
+		Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 80, Height: 24}, nil },
+		ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+	})
+	if exit != 1 {
+		t.Fatalf("natural-exhaustion summary failure exit = %d, want operational failure 1; stderr = %q", exit, stderr.String())
+	}
+	if !stdout.failed.Load() || !strings.Contains(stderr.String(), "error: final summary output lost") {
+		t.Fatalf("natural-exhaustion summary failure was not reported: failed=%t stderr=%q", stdout.failed.Load(), stderr.String())
+	}
+}
+
 func TestTerminalDashboardReportsFinalSummaryFailureWithoutChangingSignalExit(t *testing.T) {
 	root := t.TempDir()
 	setupStarted := filepath.Join(root, "setup-started")

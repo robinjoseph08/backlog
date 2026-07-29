@@ -92,10 +92,10 @@ func MainWithTerminal(ctx context.Context, args []string, dependencies TerminalD
 			return runCommand(ctx, options, stdout, signals, onOperationalEvent, dashboard, terminal.Now)
 		}, presentation)
 		if dashboard != nil {
-			dashboard.setResult(ctx, err)
+			naturalExit := dashboard.setResult(ctx, err)
 			if summaryErr := dashboard.printFinalSummary(stdout); summaryErr != nil {
 				ancillaryOutputErr = summaryErr
-				if err != nil {
+				if err != nil || naturalExit {
 					err = errors.Join(err, summaryErr)
 				}
 			}
