@@ -596,6 +596,29 @@ func TestSelectorRefusesHistoricalRunCleanupWhileNewerRunOwnsIssue(t *testing.T)
 	}
 }
 
+func TestHistoricalCompletionIssueSelectorPrefersPendingThenNewestRun(t *testing.T) {
+	current := state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{
+		{Issue: 7, RunID: "pending-older", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint, CleanupPending: true},
+		{Issue: 7, RunID: "cleaned-newer", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint},
+		{Issue: 7, RunID: "pending-newest", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint, CleanupPending: true},
+	}}
+
+	run, lease, err := Policy("7").SelectRun(current)
+	if err != nil || run.RunID != "pending-newest" || lease.LeaseID != "" {
+		t.Fatalf("newest pending Historical Completion selection = %#v %#v %v", run, lease, err)
+	}
+	current.Runs[2].CleanupPending = false
+	run, lease, err = Policy("7").SelectRun(current)
+	if err != nil || run.RunID != "pending-older" || lease.LeaseID != "" {
+		t.Fatalf("older pending before newer cleaned Historical Completion selection = %#v %#v %v", run, lease, err)
+	}
+	current.Runs[0].CleanupPending = false
+	run, lease, err = Policy("7").SelectRun(current)
+	if err != nil || run.RunID != "pending-newest" || lease.LeaseID != "" {
+		t.Fatalf("newest cleaned Historical Completion selection = %#v %#v %v", run, lease, err)
+	}
+}
+
 func TestSelectorUsesLeaseAndHistoricalRerunPreservesResolutionMetadata(t *testing.T) {
 	resolvedAt := time.Date(2026, 7, 28, 1, 2, 3, 0, time.UTC)
 	current := state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{

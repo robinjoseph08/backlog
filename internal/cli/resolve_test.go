@@ -1078,6 +1078,12 @@ esac
 		t.Fatalf("Historical Completion local branch survived: %s", output)
 	}
 
+	for _, name := range []string{stateDirectoryBindingFile, legacyStateDirectoryBindingFile} {
+		if err := os.Remove(filepath.Join(fixture.repository, ".git", name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+	}
+	assertResolveStateBindingsAbsent(t, fixture.repository)
 	beforeState := fileDigest(t, fixture.store.Path)
 	beforeGitHub := fileDigest(t, fixture.githubState)
 	beforeRefs := gitSnapshot(t, fixture.repository)
@@ -1089,6 +1095,7 @@ esac
 	if fileDigest(t, fixture.store.Path) != beforeState || fileDigest(t, fixture.githubState) != beforeGitHub || gitSnapshot(t, fixture.repository) != beforeRefs || filesystemSnapshot(t, fixture.archiveDir) != beforeArchive {
 		t.Fatal("Historical Completion no-op rerun performed a mutation")
 	}
+	assertResolveStateBindingsAbsent(t, fixture.repository)
 }
 
 func TestHistoricalCompletionCleanupRefusesChangedArtifactWithoutChangingCompletion(t *testing.T) {
