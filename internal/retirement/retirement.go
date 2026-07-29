@@ -482,6 +482,10 @@ func (e Service) revalidateAction(ctx context.Context, current, approved Plan, a
 }
 
 func executablePlansEqual(left, right Plan) bool {
+	if left.TerminalState == scheduler.StatusMerged && right.TerminalState == scheduler.StatusMerged {
+		left.Snapshot.Issue.ClosureReason = ""
+		right.Snapshot.Issue.ClosureReason = ""
+	}
 	if !PlansEqual(left, right) || len(left.Actions) != len(right.Actions) {
 		return false
 	}

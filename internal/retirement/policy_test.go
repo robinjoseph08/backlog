@@ -531,6 +531,36 @@ func TestBuildRefusesWaitingForMergeProgressBeforePlanning(t *testing.T) {
 	}
 }
 
+func TestExecutablePlansEqualAllowsOnlyCompletionClosureReasonDrift(t *testing.T) {
+	base := Plan{
+		Snapshot: Snapshot{
+			Run:   scheduler.Run{Issue: 42},
+			Issue: Issue{ClosureReason: "completed"},
+		},
+		TerminalState: scheduler.StatusResolvedExternally,
+	}
+	changed := base
+	changed.Snapshot.Issue.ClosureReason = "not-planned"
+
+	if PlansEqual(base, changed) {
+		t.Fatal("operator-visible plan equality ignored closure reason drift")
+	}
+	if executablePlansEqual(base, changed) {
+		t.Fatal("External Resolution executable equality ignored closure reason drift")
+	}
+
+	base.TerminalState = scheduler.StatusMerged
+	changed.TerminalState = scheduler.StatusMerged
+	if !executablePlansEqual(base, changed) {
+		t.Fatal("Completion executable equality rejected closure reason-only drift")
+	}
+
+	changed.Snapshot.Issue.URL = "https://github.com/acme/widgets/issues/43"
+	if executablePlansEqual(base, changed) {
+		t.Fatal("Completion executable equality ignored non-reason drift")
+	}
+}
+
 func TestExecutablePlansEqualRejectsRenderedEqualPrivateActionIdentity(t *testing.T) {
 	base := Plan{Actions: []Action{{
 		kind: actionRemoveIssueLabel, description: "same rendered action", label: "owned",

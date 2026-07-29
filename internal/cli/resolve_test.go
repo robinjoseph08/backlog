@@ -1951,6 +1951,99 @@ exec `+quote(gh)+` "$@"
 	}
 }
 
+func TestCompiledResolveAllowsClosureReasonChangeAfterCompletionCleanupStarts(t *testing.T) {
+	binary := buildExecutable(t, t.TempDir())
+	for _, test := range []struct {
+		name       string
+		activation func(githubArtifactResetFixture) string
+	}{
+		{
+			name: "during cleanup revalidation",
+			activation: func(fixture githubArtifactResetFixture) string {
+				return `git --git-dir=` + quote(fixture.remote) + ` show-ref --verify --quiet refs/heads/` + fixture.branch + ` || active=true`
+			},
+		},
+		{
+			name: "immediately before finalization",
+			activation: func(fixture githubArtifactResetFixture) string {
+				return `jq -e '.labels == ["spec"]' ` + quote(fixture.githubState) + ` >/dev/null && active=true || :`
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newGitHubArtifactResetFixture(t, scheduler.StatusWaitingForMerge, false, false, false)
+			gh := githubArtifactResolveGitHub(t, fixture)
+			pullCounter := filepath.Join(t.TempDir(), "pull-request-inspections")
+			driftCounter := filepath.Join(t.TempDir(), "post-cleanup-closure-inspections")
+			for _, counter := range []string{pullCounter, driftCounter} {
+				if err := os.WriteFile(counter, []byte("0\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			racingGitHub := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "issue view 42 --repo acme/widgets --json number,url,state,stateReason")
+    active=false
+    `+test.activation(fixture)+`
+    [ "$active" != true ] || {
+      count=$(cat `+quote(driftCounter)+`)
+      count=$((count + 1))
+      printf '%s\n' "$count" > `+quote(driftCounter)+`
+      case "$count" in
+        1|2) ;;
+        *)
+          printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/issues/42","state":"CLOSED","stateReason":"FUTURE"}'
+          exit 0 ;;
+      esac
+    } ;;
+  "pr list --repo acme/widgets --state all --head `+fixture.branch+` --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository")
+    count=$(cat `+quote(pullCounter)+`)
+    count=$((count + 1))
+    printf '%s\n' "$count" > `+quote(pullCounter)+`
+    [ "$count" -ne 3 ] || {
+      temporary=`+quote(fixture.githubState)+`.tmp
+      jq '.pr="MERGED" | .merged=true | .auto=false' `+quote(fixture.githubState)+` > "$temporary"
+      mv "$temporary" `+quote(fixture.githubState)+`
+    } ;;
+esac
+exec `+quote(gh)+` "$@"
+`)
+
+			command := exec.Command(binary, githubArtifactResolveArgs(fixture, fixture.git, racingGitHub, "--yes")...)
+			output, err := command.CombinedOutput()
+			if err != nil || !strings.Contains(string(output), "Completion recorded for Run run-github") {
+				t.Fatalf("later closure-reason Completion race: %v\n%s", err, output)
+			}
+			current, err := fixture.store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if current.Runs[0].Status != scheduler.StatusMerged || current.Runs[0].CompletedAt == nil || len(current.Leases) != 0 {
+				t.Fatalf("later closure-reason Completion state = %#v", current)
+			}
+			if branch, err := inspectRemoteBranch(context.Background(), fixture.git, fixture.repository, fixture.branch); err != nil || branch.Present {
+				t.Fatalf("later closure-reason Completion remote branch = %#v, %v", branch, err)
+			}
+			var github struct {
+				Labels []string `json:"labels"`
+			}
+			githubData, err := os.ReadFile(fixture.githubState)
+			if err != nil || json.Unmarshal(githubData, &github) != nil {
+				t.Fatalf("read later closure-reason Completion labels: %v", err)
+			}
+			if strings.Join(github.Labels, ",") != "spec" {
+				t.Fatalf("later closure-reason Completion retained labels: %v", github.Labels)
+			}
+			data, err := os.ReadFile(driftCounter)
+			count, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+			if err != nil || parseErr != nil || count < 3 {
+				t.Fatalf("later closure-reason drift was not observed after cleanup began: count=%q, err=%v, parse=%v", data, err, parseErr)
+			}
+		})
+	}
+}
+
 func TestCompiledResolvePreservesRetiredArtifactCommitIdentityAcrossLateMerge(t *testing.T) {
 	fixture := newGitHubArtifactResetFixture(t, scheduler.StatusFailed, false, false, false)
 	current, err := fixture.store.Load()
