@@ -4423,6 +4423,75 @@ while IFS= read -r ignored; do :; done
 	}
 }
 
+func TestRunnerProviderLikeEnglishCannotTriggerAutomaticContinuation(t *testing.T) {
+	for index, test := range []struct {
+		name   string
+		events string
+	}{
+		{
+			name:   "retry error message",
+			events: `'{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"auto_retry_start","attempt":1,"errorMessage":"provider unavailable after exhausting retries"}' '{"type":"auto_retry_end","attempt":1,"success":true}' '{"type":"agent_settled"}'`,
+		},
+		{
+			name:   "assistant text",
+			events: `'{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"message_start"}' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Provider retries exhausted after a transient outage"}]}}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'`,
+		},
+		{
+			name:   "extension error",
+			events: `'{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"extension_error","errorMessage":"Provider unavailable after retries were exhausted"}' '{"type":"agent_settled"}'`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			issue := 120 + index
+			run := resumableRun(t, issue, fmt.Sprintf("provider-english-%d", issue))
+			entry := fmt.Sprintf(`{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"/skill:afk %d"}}`, issue)
+			header := fmt.Sprintf(`{"type":"session","version":3,"id":%q,"cwd":%q}`, run.SessionID, run.Worktree)
+			sessionContent := header + "\n" + entry + "\n"
+			if err := os.WriteFile(run.Continuation.SessionFile, []byte(sessionContent), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			hash := sha256.Sum256([]byte(sessionContent))
+			run.Continuation.LeafID = "leaf"
+			run.Continuation.EntryCount = 1
+			run.Continuation.SHA256 = hex.EncodeToString(hash[:])
+
+			stateData := fmt.Sprintf(`{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":%q,"sessionId":%q}`, run.Continuation.SessionFile, run.SessionID)
+			entriesData := fmt.Sprintf(`{"entries":[%s],"leafId":"leaf"}`, entry)
+			script := filepath.Join(t.TempDir(), "pi")
+			scriptBody := `#!/bin/sh
+set -eu
+IFS= read -r prompt
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+printf '%s\n' ` + test.events + `
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-suspend-state","type":"response","command":"get_state","success":true,"data":` + stateData + `}'
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":` + entriesData + `}'
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-suspend-final-state","type":"response","command":"get_state","success":true,"data":` + stateData + `}'
+IFS= read -r command
+printf '%s\n' '{"id":"backlog-suspend-stable-entries","type":"response","command":"get_entries","success":true,"data":` + entriesData + `}'
+while IFS= read -r ignored; do :; done
+`
+			if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			store := &memoryStore{value: state.State{
+				Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run},
+				Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+			}}
+			realWorkers := &supervisedTestWorkers{supervisor: worker.Supervisor{Executable: script, LogsDir: t.TempDir(), TerminationGrace: time.Second}}
+			runner := testRunner(&fakeGitHub{}, newFakeWorkers(), store, 1)
+			runner.Workers = realWorkers
+			assertInterventionRequired(t, runner.Run(context.Background()), 1)
+			got := store.LoadValue().Runs[0]
+			if got.Status != scheduler.StatusFailed || got.ProviderContinuationAttempts != 0 || got.ResumeAfter != nil || got.FailureClass == scheduler.FailureProviderExhaustion || got.Continuation == nil || realWorkers.startCount() != 1 {
+				t.Fatalf("provider-like English triggered continuation: Run %#v, starts %d", got, realWorkers.startCount())
+			}
+		})
+	}
+}
+
 func TestRunnerRealResumedSettlementNeverFallsBackFromShipItToAFK(t *testing.T) {
 	run := resumableRun(t, 111, "ship-it-monotonic-111")
 	gitDir := filepath.Join(run.Worktree, ".git")
@@ -4784,6 +4853,133 @@ func TestProviderContinuationUsesIndependentOneAttemptBudgetAndCooldown(t *testi
 	got = store.LoadValue().Runs[0]
 	if got.Status != scheduler.StatusNeedsHuman || got.ProviderContinuationAttempts != 1 || !strings.Contains(got.Error, "one bounded Backlog continuation") {
 		t.Fatalf("second provider exhaustion = %#v", got)
+	}
+}
+
+func TestRunnerProviderContinuationMetadataSurvivesRestartThroughCooldownAndRetirement(t *testing.T) {
+	run := resumableRun(t, 109, "provider-restart-109")
+	run.Status = scheduler.StatusFailed
+	run.Error = "provider unavailable after Pi retries"
+	run.SuspendedAt = nil
+	root := t.TempDir()
+	fileStore := state.FileStore{Path: filepath.Join(root, "state.json")}
+	initial := state.State{
+		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
+		Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+	}
+	if err := fileStore.Save(initial); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Date(2026, 7, 29, 2, 0, 0, 0, time.UTC)
+	current, err := fileStore.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRunner := &Runner{Store: fileStore, Now: func() time.Time { return start }}
+	if err := firstRunner.applyProviderContinuation(&current, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded, err := fileStore.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumeAfter := start.Add(30 * time.Second)
+	persisted := reloaded.Runs[0]
+	if persisted.ResumeAfter == nil || !persisted.ResumeAfter.Equal(resumeAfter) || !persisted.RecoveredRetirementRequired {
+		t.Fatalf("reloaded provider continuation metadata = %#v", persisted)
+	}
+
+	workers := newFakeWorkers()
+	github := &fakeGitHub{}
+	freshRunner := &Runner{
+		Config: Config{Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1, PollInterval: time.Hour, SessionsDir: run.SessionDir, Watch: true},
+		GitHub: github, Store: fileStore, Worktrees: &fakeWorktrees{}, Workers: workers, Output: io.Discard,
+		NewRunID: func(issue int) string { return fmt.Sprintf("run-%d", issue) },
+		PIDAlive: func(int) bool { return true }, ProcessGroupAlive: func(int) (bool, error) { return false, nil },
+		PIDIdentity: func(_ context.Context, pid int) (string, error) { return fmt.Sprintf("identity-%d", pid), nil },
+		VerifyResumeGit: func(context.Context, scheduler.Run) (string, bool, string, error) {
+			return strings.Repeat("a", 40), false, "", nil
+		},
+	}
+	var clock atomic.Int64
+	clock.Store(start.UnixNano())
+	freshRunner.Now = func() time.Time { return time.Unix(0, clock.Load()).UTC() }
+	timer := newControlledCandidateRetryTimer()
+	timerCreated := make(chan time.Duration, 1)
+	freshRunner.newResumeWakeTimer = func(delay time.Duration) candidateRetryTimer {
+		timerCreated <- delay
+		return timer
+	}
+	retired := make(chan scheduler.Run, 1)
+	freshRunner.CompletionRetirement = recoveredCompletionRetirerFunc(func(_ context.Context, selected scheduler.Run) (bool, error) {
+		if !selected.RecoveredRetirementRequired {
+			return true, errors.New("reloaded Run bypassed full recovered retirement")
+		}
+		latest, loadErr := fileStore.Load()
+		if loadErr != nil {
+			return true, loadErr
+		}
+		completed := findRun(latest.Runs, selected.RunID)
+		completed.Status = scheduler.StatusMerged
+		completed.PullRequest = mergedOutcome(selected.Issue).PullRequest
+		completed.PID, completed.ProcessIdentity = 0, ""
+		completed.ResumePending = false
+		completed.WorkerLogOpen = false
+		completed.Error = ""
+		completedAt := freshRunner.Now().UTC()
+		completed.CompletedAt = &completedAt
+		completed.UpdatedAt = completedAt
+		replaceRun(&latest, completed)
+		removeLease(&latest, completed.RunID)
+		if saveErr := fileStore.Save(latest); saveErr != nil {
+			return true, saveErr
+		}
+		retired <- selected
+		return true, nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- freshRunner.Run(ctx) }()
+	if delay := <-timerCreated; delay != 30*time.Second {
+		t.Fatalf("reloaded Resume wake delay = %s", delay)
+	}
+	select {
+	case <-workers.startChanged:
+		t.Fatal("fresh Runner resumed before the persisted cooldown")
+	default:
+	}
+	clock.Store(resumeAfter.UnixNano())
+	timer.ticks <- resumeAfter
+	workers.waitForStarts(t, run.Issue)
+	for deadline := time.Now().Add(2 * time.Second); workers.releaseCount() != 1 && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+	if workers.releaseCount() != 1 {
+		t.Fatalf("fresh Runner release count = %d", workers.releaseCount())
+	}
+	github.setCompletion(run.Issue, mergedOutcome(run.Issue))
+	workers.complete(run.Issue, worker.Result{ExitCode: 0})
+	select {
+	case selected := <-retired:
+		if !selected.RecoveredRetirementRequired {
+			t.Fatalf("retirement selected Run without recovered marker: %#v", selected)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("fresh Runner did not perform full recovered retirement")
+	}
+	final, err := fileStore.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Runs[0].Status != scheduler.StatusMerged || len(final.Leases) != 0 {
+		t.Fatalf("restarted recovered Completion = %#v", final)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("fresh Runner shutdown: %v", err)
 	}
 }
 

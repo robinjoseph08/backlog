@@ -1255,6 +1255,53 @@ func TestWorkflowCheckpointRequiresDurableOwnedAFKOrStrictShipItSchema(t *testin
 	}
 }
 
+func TestWorkflowCheckpointPreservesEverySupportedShipItStage(t *testing.T) {
+	worktree := t.TempDir()
+	gitDir := filepath.Join(worktree, ".git")
+	if err := os.Mkdir(gitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	request := ContinuationRequest{
+		Issue: 42, RunID: "run-42", Branch: "agent/issue-42-run-42",
+		SessionID: "session-42", SessionDir: t.TempDir(), Worktree: worktree,
+		ExpectedWorkflow: "ship-it",
+	}
+	checkpoint := filepath.Join(gitDir, "ship-it-checkpoint-v1.md")
+	stages := []struct {
+		stage  string
+		status string
+	}{
+		{stage: "prepare", status: "active"},
+		{stage: "preflight-review", status: "active"},
+		{stage: "preflight-fix", status: "active"},
+		{stage: "normal-review", status: "active"},
+		{stage: "normal-fix", status: "active"},
+		{stage: "final-repair", status: "active"},
+		{stage: "publish", status: "active"},
+		{stage: "pr", status: "active"},
+		{stage: "blocked", status: "blocked"},
+	}
+	if len(stages) != len(supportedShipItStages) {
+		t.Fatalf("stage table has %d entries for %d supported stages", len(stages), len(supportedShipItStages))
+	}
+	for _, test := range stages {
+		t.Run(test.stage, func(t *testing.T) {
+			data := []byte(fmt.Sprintf("# Ship-it checkpoint v1\n\nStatus: %s\nStage: %s\nCoordinator session: %s\nWorking directory: %s\nBranch: %s\n", test.status, test.stage, request.SessionID, request.Worktree, request.Branch))
+			if err := os.WriteFile(checkpoint, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			expectedFile, err := filepath.EvalSymlinks(checkpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			workflow, stage, checkpointFile, checkpointSHA, status, _, err := inspectWorkflowCheckpoint(request, nil)
+			if err != nil || workflow != "ship-it" || stage != test.stage || status != test.status || checkpointFile != expectedFile || checkpointSHA == "" {
+				t.Fatalf("checkpoint stage %q = workflow %q stage %q file %q sha %q status %q, error %v", test.stage, workflow, stage, checkpointFile, checkpointSHA, status, err)
+			}
+		})
+	}
+}
+
 func TestProcessSuspendRejectsTrailingProtocolFailureBeforeFinalBarrier(t *testing.T) {
 	t.Parallel()
 
