@@ -616,7 +616,7 @@ func TestCommandHelpExitsSuccessfully(t *testing.T) {
 		t.Fatalf("resolve help exit = %d, stderr = %q", exit, stderr.String())
 	}
 	resolveHelp := stderr.String()
-	for _, text := range []string{"run-id|positive-issue-number", "--yes", "Safely retire owned unmerged pull requests", "remote", "local branches", "worktrees", "active Pi sessions"} {
+	for _, text := range []string{"run-id|positive-issue-number", "confirm Resolve without an interactive prompt", "Safely retire owned unmerged pull requests", "remote", "local branches", "worktrees", "active Pi sessions"} {
 		if !strings.Contains(resolveHelp, text) {
 			t.Fatalf("resolve help omitted %q: %q", text, resolveHelp)
 		}

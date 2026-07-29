@@ -392,7 +392,7 @@ func TestResolveConfirmationStopsWaitingWhenContextIsCancelled(t *testing.T) {
 func TestResolveRequiresYesNonInteractivelyAndCompiledExecutableRefusesRunnerLock(t *testing.T) {
 	fixture := newResolveFixture(t, []string{"spec"}, "COMPLETED")
 	var stdout, stderr bytes.Buffer
-	if err := resolveCommandWithInput(context.Background(), fixture.args("42"), strings.NewReader(""), false, &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "requires --yes") {
+	if err := resolveCommandWithInput(context.Background(), fixture.args("42"), strings.NewReader(""), false, &stdout, &stderr); err == nil || err.Error() != "non-interactive Resolve requires --yes" {
 		t.Fatalf("non-interactive error = %v", err)
 	}
 	binary := buildExecutable(t, t.TempDir())
@@ -1049,8 +1049,9 @@ esac
 	if err != nil {
 		t.Fatalf("compiled Historical Completion cleanup by issue number: %v\n%s", err, output)
 	}
-	if !strings.Contains(string(output), "Completion cleanup verified for Historical Run run-local") {
-		t.Fatalf("Historical Completion cleanup outcome = %s", output)
+	wantOutcome := "Completion cleanup verified for Historical Run run-local. Existing Completion outcome and pull request " + pullRequest + " were preserved."
+	if !strings.Contains(string(output), wantOutcome) {
+		t.Fatalf("Historical Completion cleanup outcome omitted %q: %s", wantOutcome, output)
 	}
 	persisted, err := fixture.store.Load()
 	if err != nil {
