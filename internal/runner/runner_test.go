@@ -3834,6 +3834,142 @@ func TestRunnerFreshlyVerifiesEveryRecoveryIdentityBeforeStartAndRelease(t *test
 	}
 }
 
+func TestRunnerAbortsGatedReplacementOnFreshIssueLabelWorktreeOrStoppedWorkerDrift(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*fakeGitHub, *fakeWorktrees, *Runner)
+		want   string
+	}{
+		{name: "issue closure", mutate: func(github *fakeGitHub, _ *fakeWorktrees, _ *Runner) {
+			calls := 0
+			github.issueStateFunc = func(int) (ghadapter.IssueState, error) {
+				calls++
+				return ghadapter.IssueState{Open: calls == 1, Labels: []string{"in-progress"}}, nil
+			}
+		}, want: "issue is not open"},
+		{name: "managed label", mutate: func(github *fakeGitHub, _ *fakeWorktrees, _ *Runner) {
+			calls := 0
+			github.issueStateFunc = func(int) (ghadapter.IssueState, error) {
+				calls++
+				labels := []string{"in-progress"}
+				if calls > 1 {
+					labels = []string{"in-progress", "ready-for-agent"}
+				}
+				return ghadapter.IssueState{Open: true, Labels: labels}, nil
+			}
+		}, want: "ready-for-agent"},
+		{name: "human label", mutate: func(github *fakeGitHub, _ *fakeWorktrees, _ *Runner) {
+			calls := 0
+			github.issueStateFunc = func(int) (ghadapter.IssueState, error) {
+				calls++
+				labels := []string{"in-progress"}
+				if calls > 1 {
+					labels = append(labels, "ready-for-human")
+				}
+				return ghadapter.IssueState{Open: true, Labels: labels}, nil
+			}
+		}, want: "ready-for-human"},
+		{name: "worktree reassignment", mutate: func(_ *fakeGitHub, worktrees *fakeWorktrees, _ *Runner) {
+			calls := 0
+			worktrees.verifyFunc = func() error {
+				calls++
+				if calls > 1 {
+					return errors.New("worktree branch reassigned")
+				}
+				return nil
+			}
+		}, want: "branch reassigned"},
+		{name: "stopped process group", mutate: func(_ *fakeGitHub, _ *fakeWorktrees, runner *Runner) {
+			calls := 0
+			runner.ProcessGroupAlive = func(int) (bool, error) {
+				calls++
+				return calls > 1, nil
+			}
+		}, want: "process group"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			run := resumableRun(t, 108, "release-drift-108")
+			run.StoppedWorkerPID = 999999
+			run.StoppedWorkerProcessIdentity = "999999:old-start"
+			workers := newFakeWorkers()
+			store := &memoryStore{value: state.State{Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}}
+			github := &fakeGitHub{}
+			runner := testRunner(github, workers, store, 1)
+			runner.Output = io.Discard
+			runner.PIDAlive = func(int) bool { return false }
+			worktrees := runner.Worktrees.(*fakeWorktrees)
+			test.mutate(github, worktrees, runner)
+			current := store.LoadValue()
+			process, err := runner.resume(context.Background(), context.Background(), &current, run)
+			got := store.LoadValue()
+			if err != nil || process != nil || !workers.wasStarted(run.Issue) || workers.releaseCount() != 0 || got.Runs[0].Status != scheduler.StatusNeedsHuman || len(got.Leases) != 1 || !strings.Contains(got.Runs[0].Error, test.want) {
+				t.Fatalf("gated %s drift = process=%v err=%v state=%#v starts=%v releases=%d", test.name, process, err, got, workers.startedSnapshot(), workers.releaseCount())
+			}
+		})
+	}
+}
+
+func TestRunnerRoutesPostResumeSettlementCompletionAfterStoppedProofToRetirement(t *testing.T) {
+	run := resumableRun(t, 109, "recovered-completion-109")
+	run.RecoveryCount = 1
+	recoveredAt := time.Now().Add(-time.Minute).UTC()
+	run.FirstRecoveredAt, run.LastRecoveredAt = &recoveredAt, &recoveredAt
+	workers := newFakeWorkers()
+	workers.startupCloseResult.GroupExited = true
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}}
+	completionCalls := 0
+	github := &fakeGitHub{completionFunc: func(context.Context, int, string) (ghadapter.CompletionOutcome, error) {
+		completionCalls++
+		if completionCalls >= 4 {
+			return mergedOutcome(run.Issue), nil
+		}
+		return ghadapter.CompletionOutcome{}, nil
+	}}
+	retired := make(chan error, 1)
+	runner := testRunner(github, workers, store, 1)
+	runner.CompletionRetirement = recoveredCompletionRetirerFunc(func(_ context.Context, expected scheduler.Run) (bool, error) {
+		current := store.LoadValue()
+		observed := findRun(current.Runs, expected.RunID)
+		if observed.PID != 0 || observed.ProcessIdentity != "" || observed.StoppedWorkerGeneration != observed.WorkerGeneration || observed.WorkerStoppedAt == nil || observed.Status != scheduler.StatusNeedsHuman || len(current.Leases) != 1 {
+			retired <- fmt.Errorf("retirement observed unsafe preconditions: %#v", current)
+			return true, nil
+		}
+		now := time.Now().UTC()
+		observed.Status, observed.PullRequest, observed.CompletedAt, observed.Error = scheduler.StatusMerged, mergedOutcome(run.Issue).PullRequest, &now, ""
+		replaceRun(&current, observed)
+		removeLease(&current, observed.RunID)
+		retired <- store.Save(current)
+		return true, nil
+	})
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, run.Issue)
+	workers.complete(run.Issue, worker.Result{ExitCode: 0, Settled: true})
+	select {
+	case err := <-retired:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case err := <-done:
+		t.Fatalf("Runner exited before retirement: %v, completion calls=%d, state=%#v", err, completionCalls, store.LoadValue())
+	case <-time.After(2 * time.Second):
+		t.Fatalf("retirement did not run: completion calls=%d, state=%#v", completionCalls, store.LoadValue())
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	got := store.LoadValue()
+	if got.Runs[0].Status != scheduler.StatusMerged || len(got.Leases) != 0 || workers.checkpointCount != 0 {
+		t.Fatalf("post-Resume Completion retirement = %#v, checkpoints=%d", got, workers.checkpointCount)
+	}
+}
+
+type recoveredCompletionRetirerFunc func(context.Context, scheduler.Run) (bool, error)
+
+func (f recoveredCompletionRetirerFunc) RetireRecoveredCompletion(ctx context.Context, run scheduler.Run) (bool, error) {
+	return f(ctx, run)
+}
+
 func TestRunnerSettledCheckpointFailurePersistsUnsafeClassificationBeforeProviderPolicy(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -3872,6 +4008,35 @@ func TestRunnerSettledCheckpointFailurePersistsUnsafeClassificationBeforeProvide
 				t.Fatalf("settled checkpoint failure = %#v, checkpoints=%d", got, workers.checkpointCount)
 			}
 		})
+	}
+}
+
+func TestRunnerSettledCheckpointCopiesStructuredNonProviderFailureClassImmediately(t *testing.T) {
+	run := resumableRun(t, 107, "settled-repair-107")
+	workers := newFakeWorkers()
+	workers.checkpointFunc = func(_ context.Context, _ int, request worker.ContinuationRequest) (worker.Continuation, error) {
+		content, err := os.ReadFile(run.Continuation.SessionFile)
+		if err != nil {
+			return worker.Continuation{}, err
+		}
+		hash := sha256.Sum256(content)
+		return worker.Continuation{
+			SessionID: request.SessionID, SessionFile: run.Continuation.SessionFile, Worktree: request.Worktree,
+			LeafID: "leaf", EntryCount: 1, SHA256: hex.EncodeToString(hash[:]),
+			Workflow: "ship-it", WorkflowStage: "blocked", CheckpointFile: filepath.Join(run.Worktree, "ship-it-checkpoint-v1.md"),
+			CheckpointSHA256: strings.Repeat("b", 64), CheckpointStatus: "blocked", CheckpointFailureClass: string(scheduler.FailureRepairBudgetExhaustion),
+		}, nil
+	}
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}}
+	runner := testRunner(&fakeGitHub{}, workers, store, 1)
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, run.Issue)
+	workers.complete(run.Issue, worker.Result{ExitCode: 1, Settled: true, Err: errors.New("ship-it repair budget exhausted")})
+	assertInterventionRequired(t, <-done, 1)
+	got := store.LoadValue().Runs[0]
+	if got.Status != scheduler.StatusFailed || got.FailureClass != scheduler.FailureRepairBudgetExhaustion || got.WorkflowStage != "blocked" || got.Continuation == nil || got.Continuation.CheckpointFailureClass != string(scheduler.FailureRepairBudgetExhaustion) {
+		t.Fatalf("settled non-provider lifecycle metadata = %#v", got)
 	}
 }
 
@@ -4152,13 +4317,15 @@ func resumableRun(t *testing.T, issue int, runID string) scheduler.Run {
 		t.Fatal(err)
 	}
 	hash := sha256.Sum256([]byte(content))
+	stoppedAt := time.Now().UTC()
 	return scheduler.Run{
 		Issue: issue, RunID: runID, Status: scheduler.StatusSuspended, WorkerMode: scheduler.WorkerModeRPC,
+		WorkerGeneration: 1, StoppedWorkerGeneration: 1, WorkerStoppedAt: &stoppedAt,
 		Branch: fmt.Sprintf("agent/issue-%d-%s", issue, runID), Worktree: worktreePath,
 		SessionName: fmt.Sprintf("afk #%d", issue), SessionID: fmt.Sprintf("session-%d", issue), SessionDir: sessionDir,
 		Continuation: &scheduler.ContinuationBoundary{
 			SessionID: fmt.Sprintf("session-%d", issue), SessionFile: sessionFile, Worktree: worktreePath,
-			LeafID: "leaf", EntryCount: 1, SHA256: hex.EncodeToString(hash[:]), VerifiedAt: time.Now(),
+			LeafID: "leaf", EntryCount: 1, SHA256: hex.EncodeToString(hash[:]), WorkerGeneration: 1, VerifiedAt: time.Now(),
 		},
 		StartedAt: time.Now().Add(-time.Hour), UpdatedAt: time.Now(),
 	}
@@ -5644,9 +5811,10 @@ func mergedOutcome(issue int) ghadapter.CompletionOutcome {
 }
 
 type fakeWorktrees struct {
-	mu        sync.Mutex
-	cleaned   []worktree.Assignment
-	verifyErr error
+	mu         sync.Mutex
+	cleaned    []worktree.Assignment
+	verifyErr  error
+	verifyFunc func() error
 }
 
 type blockingWorktrees struct {
@@ -5724,6 +5892,9 @@ func (*fakeWorktrees) Plan(issue int, runID string) (worktree.Assignment, error)
 }
 func (*fakeWorktrees) Prepare(context.Context, worktree.Assignment) error { return nil }
 func (w *fakeWorktrees) Verify(context.Context, worktree.Assignment) error {
+	if w.verifyFunc != nil {
+		return w.verifyFunc()
+	}
 	return w.verifyErr
 }
 func (w *fakeWorktrees) Cleanup(_ context.Context, assignment worktree.Assignment) error {

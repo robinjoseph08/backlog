@@ -294,7 +294,7 @@ func (p *Process) Release() error {
 			}
 			message = fmt.Sprintf("Recover the existing %s workflow for issue #%d from the verified durable continuation boundary at exact stage %s. Reassess the repository and GitHub state before acting. Freshly inspect the local repository, remote branch, expected-branch pull request, and issue before any push, pull request, merge, issue, or cleanup mutation. Never perform an external mutation when its prior outcome or current identity is uncertain.", workflow, p.events.issue, stage)
 			if p.checkpointFile != "" {
-				message += fmt.Sprintf(" The verified ship-it checkpoint is %s with SHA-256 %s.", p.checkpointFile, p.checkpointSHA256)
+				message += fmt.Sprintf(" The verified %s checkpoint is %s with SHA-256 %s.", workflow, p.checkpointFile, p.checkpointSHA256)
 			}
 		}
 		command := struct {

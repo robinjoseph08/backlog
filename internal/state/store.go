@@ -103,6 +103,9 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 			return State{}, false, fmt.Errorf("decode version %d state: %w", header.Version, err)
 		}
 		value.Version = CurrentVersion
+		if header.Version == previousVersion {
+			migrateV4WorkerProof(&value)
+		}
 		if header.Version == versionWithLeases {
 			for index := range value.Runs {
 				value.Runs[index].AcknowledgedAt = nil
@@ -134,6 +137,44 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 		return value, true, nil
 	default:
 		return State{}, false, fmt.Errorf("unsupported state version %d", header.Version)
+	}
+}
+
+func migrateV4WorkerProof(value *State) {
+	for index := range value.Runs {
+		run := &value.Runs[index]
+		if run.PID > 0 && run.ProcessIdentity != "" && run.Status != scheduler.StatusRunning {
+			if run.WorkerGeneration == 0 {
+				run.WorkerGeneration = 1
+			}
+			run.StoppedWorkerGeneration = run.WorkerGeneration
+			run.StoppedWorkerPID = run.PID
+			run.StoppedWorkerProcessIdentity = run.ProcessIdentity
+			stoppedAt := run.UpdatedAt
+			if stoppedAt.IsZero() {
+				stoppedAt = run.StartedAt
+			}
+			if !stoppedAt.IsZero() {
+				run.WorkerStoppedAt = &stoppedAt
+			}
+		}
+		if run.Status != scheduler.StatusSuspended || run.Continuation == nil {
+			continue
+		}
+		if run.WorkerGeneration == 0 {
+			run.WorkerGeneration = 1
+		}
+		run.StoppedWorkerGeneration = run.WorkerGeneration
+		if run.Continuation.WorkerGeneration == 0 {
+			run.Continuation.WorkerGeneration = run.WorkerGeneration
+		}
+		stoppedAt := run.Continuation.VerifiedAt
+		if stoppedAt.IsZero() && run.SuspendedAt != nil {
+			stoppedAt = *run.SuspendedAt
+		}
+		if !stoppedAt.IsZero() {
+			run.WorkerStoppedAt = &stoppedAt
+		}
 	}
 }
 
@@ -496,7 +537,8 @@ func validateRun(run scheduler.Run, requireWorkerMode, recoverUnsafeContinuation
 		}
 	}
 	if run.WorkerGeneration < 0 || run.StoppedWorkerGeneration < 0 || run.StoppedWorkerGeneration > run.WorkerGeneration ||
-		run.StoppedWorkerGeneration > 0 && (run.WorkerStoppedAt == nil || run.WorkerStoppedAt.IsZero()) || run.WorkerStoppedAt != nil && run.StoppedWorkerGeneration == 0 {
+		run.StoppedWorkerGeneration > 0 && (run.WorkerStoppedAt == nil || run.WorkerStoppedAt.IsZero()) || run.WorkerStoppedAt != nil && run.StoppedWorkerGeneration == 0 ||
+		run.StoppedWorkerPID < 0 || (run.StoppedWorkerPID == 0) != (run.StoppedWorkerProcessIdentity == "") || run.StoppedWorkerPID > 0 && run.StoppedWorkerGeneration == 0 {
 		return fmt.Errorf("state contains Run %q with invalid Worker generation stop proof", run.RunID)
 	}
 	if run.Status == scheduler.StatusSuspended && !unsafeContinuation {

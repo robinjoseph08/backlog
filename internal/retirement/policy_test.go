@@ -152,9 +152,17 @@ esac
 	policy.ProgressStatus = statusResolvingExternally
 	policy.TerminalStatus = statusResolvedExternally
 
+	failAfterLabel := true
 	module, err := New(Config{
 		Store: store, GitHub: ghadapter.Client{Executable: gh, Dir: root}, RepositoryRoot: root,
 		CommonDirectory: root, StateDirectory: stateDir, GitExecutable: git,
+		AfterAction: func(action string) error {
+			if failAfterLabel && strings.Contains(action, "remove issue label ready-for-agent") {
+				failAfterLabel = false
+				return errors.New("deterministic post-label interruption")
+			}
+			return nil
+		},
 	}, policy)
 	if err != nil {
 		t.Fatal(err)
@@ -180,8 +188,25 @@ esac
 		!strings.Contains(output.String(), "Issue: https://github.com/acme/widgets/issues/42 (closed; labels: in-progress, ready-for-agent, unrelated)") {
 		t.Fatalf("External Resolution plan output = %q", output.String())
 	}
-	if err := module.Retire(context.Background(), approved); err != nil {
-		t.Fatalf("External Resolution retirement: %v", err)
+	if err := module.Retire(context.Background(), approved); err == nil || !strings.Contains(err.Error(), "deterministic post-label interruption") {
+		t.Fatalf("partial External Resolution retirement = %v", err)
+	}
+	if len(store.current.Leases) != 1 || store.current.Runs[0].Status != statusResolvingExternally {
+		t.Fatalf("partial retirement released ownership = %#v", store.current)
+	}
+	remaining, err := module.Inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRemaining := []string{
+		"remove issue label in-progress from https://github.com/acme/widgets/issues/42",
+		"mark Run run-42 resolved-externally and release Lease lease-42",
+	}
+	if strings.Join(actionDescriptions(remaining), "\n") != strings.Join(wantRemaining, "\n") {
+		t.Fatalf("partial retirement rerun actions = %q, want only remaining %q", actionDescriptions(remaining), wantRemaining)
+	}
+	if err := module.Retire(context.Background(), remaining); err != nil {
+		t.Fatalf("rerun partial External Resolution retirement: %v", err)
 	}
 	if len(store.saved) != 2 || store.saved[0].Runs[0].Status != statusResolvingExternally || len(store.saved[0].Leases) != 1 {
 		t.Fatalf("External Resolution progress state = %#v", store.saved)

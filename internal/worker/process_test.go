@@ -2065,7 +2065,7 @@ while IFS= read -r ignored; do :; done
 		t.Fatal(err)
 	}
 	message := string(input)
-	for _, want := range []string{"existing ship-it workflow", "exact stage normal-review", "local repository", "remote branch", "expected-branch pull request", "issue", request.CheckpointFile, request.CheckpointSHA256, "Never perform an external mutation"} {
+	for _, want := range []string{"existing ship-it workflow", "exact stage normal-review", "local repository", "remote branch", "expected-branch pull request", "issue", "verified ship-it checkpoint", request.CheckpointFile, request.CheckpointSHA256, "Never perform an external mutation"} {
 		if !strings.Contains(message, want) {
 			t.Fatalf("replacement prompt omitted %q: %q", want, message)
 		}
@@ -2101,6 +2101,8 @@ while IFS= read -r ignored; do :; done
 	request.Resume = true
 	request.ContinuationWorkflow = "afk"
 	request.ContinuationStage = "afk-coordinator"
+	request.CheckpointFile = filepath.Join(sessionDir, "backlog-afk-checkpoint-v1.json")
+	request.CheckpointSHA256 = strings.Repeat("b", 64)
 	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
@@ -2118,10 +2120,13 @@ while IFS= read -r ignored; do :; done
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"existing afk workflow", "exact stage afk-coordinator", "Freshly inspect the local repository", "expected-branch pull request", "Never perform an external mutation"} {
+	for _, want := range []string{"existing afk workflow", "exact stage afk-coordinator", "verified afk checkpoint", request.CheckpointFile, request.CheckpointSHA256, "Freshly inspect the local repository", "expected-branch pull request", "Never perform an external mutation"} {
 		if !strings.Contains(string(message), want) {
 			t.Fatalf("AFK replacement prompt omitted %q: %q", want, message)
 		}
+	}
+	if strings.Contains(string(message), "verified ship-it checkpoint") {
+		t.Fatalf("AFK replacement prompt mislabeled its checkpoint: %q", message)
 	}
 }
 

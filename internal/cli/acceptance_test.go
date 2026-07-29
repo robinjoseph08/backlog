@@ -372,14 +372,16 @@ func TestCompiledExecutableRestartResumesSuspendedRunBeforeNewCandidate(t *testi
 		t.Fatal(err)
 	}
 	hash := sha256.Sum256([]byte(sessionContent))
+	stoppedAt := time.Now().UTC()
 	persisted := state.State{
 		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
 		Runs: []scheduler.Run{{
 			Issue: 91, RunID: "run-91", Status: scheduler.StatusSuspended, WorkerMode: scheduler.WorkerModeRPC,
+			WorkerGeneration: 1, StoppedWorkerGeneration: 1, WorkerStoppedAt: &stoppedAt,
 			Branch: "agent/issue-91-run-91", Worktree: worktreePath, SessionName: "afk #91", SessionID: "session-91", SessionDir: sessionDir,
 			Continuation: &scheduler.ContinuationBoundary{
 				SessionID: "session-91", SessionFile: sessionFile, Worktree: worktreePath, LeafID: "leaf", EntryCount: 1,
-				SHA256: hex.EncodeToString(hash[:]), VerifiedAt: time.Now(),
+				SHA256: hex.EncodeToString(hash[:]), WorkerGeneration: 1, VerifiedAt: time.Now(),
 			},
 			StartedAt: time.Now().Add(-time.Hour), UpdatedAt: time.Now(),
 		}},

@@ -140,8 +140,21 @@ esac
 		return string(output)
 	}
 	output := command()
-	if !strings.Contains(output, "Recovery Plan changed after confirmation") || !strings.Contains(output, "Completion recorded for Run "+run.RunID+" from merged expected pull request "+run.PullRequest) {
-		t.Fatalf("late Completion output:\n%s", output)
+	for _, want := range []string{
+		"Recovery Plan changed after confirmation", "Recovered Completion Plan for issue #42",
+		"delete remote branch " + run.Branch + " at " + head,
+		"remove local worktree " + run.Worktree + " for " + run.Branch + " at " + head,
+		"delete local branch " + run.Branch + " at " + head,
+		"archive Pi session " + run.SessionID + " from " + run.SessionDir + " to " + fixture.archiveDir,
+		"remove issue label in-progress", "record Completion from merged expected pull request #99 (" + run.PullRequest + ") and release Lease lease-local",
+		"Completion recorded for Run " + run.RunID + " from merged expected pull request " + run.PullRequest,
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("late Completion output missing exact action %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "when present") {
+		t.Fatalf("late Completion output used a generic conditional action:\n%s", output)
 	}
 	persisted, err := fixture.store.Load()
 	if err != nil {
@@ -326,7 +339,7 @@ esac
 	if err := recoverCommandWithInput(context.Background(), directArgs, changedInput, true, &directOutput, &directError); err != nil {
 		t.Fatalf("changed-plan interactive Recovery rerun: %v", err)
 	}
-	if !strings.Contains(directOutput.String(), "Recovery Plan changed after confirmation; confirm the current plan again") || strings.Count(directOutput.String(), "Proceed with Recovery? [y/N]") != 2 {
+	if !strings.Contains(directOutput.String(), "Recovery Plan changed after confirmation; confirm the current exact plan again") || strings.Count(directOutput.String(), "Proceed with Recovery? [y/N]") != 2 {
 		t.Fatalf("changed plan was not reconfirmed: %q", directOutput.String())
 	}
 

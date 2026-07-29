@@ -91,6 +91,8 @@ type Run struct {
 	ProcessIdentity              string                `json:"processIdentity,omitempty"`
 	WorkerGeneration             int                   `json:"workerGeneration,omitempty"`
 	StoppedWorkerGeneration      int                   `json:"stoppedWorkerGeneration,omitempty"`
+	StoppedWorkerPID             int                   `json:"stoppedWorkerPid,omitempty"`
+	StoppedWorkerProcessIdentity string                `json:"stoppedWorkerProcessIdentity,omitempty"`
 	WorkerStoppedAt              *time.Time            `json:"workerStoppedAt,omitempty"`
 	Branch                       string                `json:"branch,omitempty"`
 	Worktree                     string                `json:"worktree,omitempty"`

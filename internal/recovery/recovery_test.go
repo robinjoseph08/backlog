@@ -98,7 +98,8 @@ func TestRecoveryDerivesOfflineBoundaryAndSuspendsSameRun(t *testing.T) {
 
 func TestRecoveryAcceptsConclusiveAbsenceFromRetainedProcessIdentity(t *testing.T) {
 	run, store := recoverableFixture(t)
-	run.ProcessIdentity = "456:old worker start"
+	run.StoppedWorkerPID = 456
+	run.StoppedWorkerProcessIdentity = "456:old worker start"
 	store.value.Runs[0] = run
 	var checked []int
 	absent := func(pid int) (bool, error) {
@@ -116,8 +117,8 @@ func TestRecoveryAcceptsConclusiveAbsenceFromRetainedProcessIdentity(t *testing.
 
 func TestRecoveryRefusesLiveOrUncertainWorkerWithoutChangingLease(t *testing.T) {
 	run, store := recoverableFixture(t)
-	run.PID = 123
-	run.ProcessIdentity = "123:started"
+	run.StoppedWorkerPID = 123
+	run.StoppedWorkerProcessIdentity = "123:started"
 	store.value.Runs[0] = run
 	for _, test := range []struct {
 		name  string
@@ -142,8 +143,8 @@ func TestRecoveryRefusesLiveOrUncertainWorkerWithoutChangingLease(t *testing.T) 
 
 func TestRecoveryRefusesUncertainProcessGroupAndAmbiguousOfflineSession(t *testing.T) {
 	run, store := recoverableFixture(t)
-	run.PID = 123
-	run.ProcessIdentity = "123:started"
+	run.StoppedWorkerPID = 123
+	run.StoppedWorkerProcessIdentity = "123:started"
 	store.value.Runs[0] = run
 	module, err := New(Config{
 		Store: store, GitHub: fakeGitHub{issue: openIssue(run.Issue)}, Worktrees: fakeWorktrees{},
@@ -160,7 +161,7 @@ func TestRecoveryRefusesUncertainProcessGroupAndAmbiguousOfflineSession(t *testi
 		t.Fatal("process-group refusal released Lease")
 	}
 
-	run.PID, run.ProcessIdentity = 0, ""
+	run.StoppedWorkerPID, run.StoppedWorkerProcessIdentity = 0, ""
 	store.value.Runs[0] = run
 	if err := os.WriteFile(filepath.Join(run.SessionDir, "ambiguous.jsonl"), []byte("{}\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -261,8 +262,11 @@ func TestRecoveryRefusesNoStoppedGenerationProofAndProcessGroupLookupError(t *te
 	if _, err := module.Inspect(context.Background(), run.RunID); err == nil || !strings.Contains(err.Error(), "no durable proof") {
 		t.Fatalf("no-evidence error = %v", err)
 	}
-	run.WorkerGeneration = 1
-	run.ProcessIdentity = "456:started"
+	run.WorkerGeneration, run.StoppedWorkerGeneration = 1, 1
+	stoppedAt := time.Now().UTC()
+	run.WorkerStoppedAt = &stoppedAt
+	run.StoppedWorkerPID = 456
+	run.StoppedWorkerProcessIdentity = "456:started"
 	store.value.Runs[0] = run
 	module, err := New(Config{
 		Store: store, GitHub: fakeGitHub{issue: openIssue(run.Issue)}, Worktrees: fakeWorktrees{},
@@ -415,7 +419,7 @@ func TestWritePlanRendersOutcomeSpecificActions(t *testing.T) {
 		{OutcomeSuspend, "establish Run as Suspended", "Retirement actions"},
 		{OutcomeAlready, "leave Run already Suspended", "Retirement actions"},
 		{OutcomeWaiting, "transition Run to waiting-for-merge", "Retirement actions"},
-		{OutcomeCompletion, "release exactly this Run's Lease", "Preserve: existing Lease"},
+		{OutcomeCompletion, "exact current owned-artifact actions printed below", "Preserve: existing Lease"},
 	} {
 		var output strings.Builder
 		plan := base

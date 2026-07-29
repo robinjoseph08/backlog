@@ -41,6 +41,7 @@ type Config struct {
 	StateDirectory  string
 	GitExecutable   string
 	SyncPath        func(string) error
+	AfterAction     func(string) error
 }
 
 // Module is the complete owned Run retirement interface used by lifecycle
@@ -59,6 +60,7 @@ type Service struct {
 	stateDirectory  string
 	gitExecutable   string
 	syncPath        func(string) error
+	afterAction     func(string) error
 	policy          Policy
 }
 
@@ -73,7 +75,7 @@ func New(config Config, policy Policy) (Module, error) {
 	return &Service{
 		store: config.Store, github: config.GitHub, repositoryRoot: config.RepositoryRoot,
 		commonDirectory: config.CommonDirectory, stateDirectory: config.StateDirectory,
-		gitExecutable: config.GitExecutable, syncPath: config.SyncPath, policy: policy,
+		gitExecutable: config.GitExecutable, syncPath: config.SyncPath, afterAction: config.AfterAction, policy: policy,
 	}, nil
 }
 
@@ -446,6 +448,11 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			return e.finalizeCompletion(ctx, plan, action.pullRequest)
 		default:
 			return fmt.Errorf("%s Plan contains an unknown action", e.policy.Operation)
+		}
+		if e.afterAction != nil {
+			if err := e.afterAction(action.String()); err != nil {
+				return fmt.Errorf("retirement failpoint after %s: %w", action, err)
+			}
 		}
 	}
 }
@@ -1134,20 +1141,27 @@ func inspectWorkerAbsent(run scheduler.Run) error {
 		return errors.New("replacement Worker launch is pending; Worker absence is uncertain")
 	}
 	if run.ProcessIdentity == "" {
-		if run.PID == 0 {
-			return nil
-		}
-		return fmt.Errorf("Run %s has incomplete Worker identity", run.RunID)
-	}
-	pid, err := processidentity.PID(run.ProcessIdentity)
-	if err != nil {
 		if run.PID != 0 {
-			return fmt.Errorf("Worker PID %d has uncertain identity %q: %w", run.PID, run.ProcessIdentity, err)
+			return fmt.Errorf("Run %s has incomplete Worker identity", run.RunID)
 		}
-		return fmt.Errorf("Run %s has uncertain retained Worker identity: %w", run.RunID, err)
+		if run.StoppedWorkerProcessIdentity == "" {
+			if run.StoppedWorkerPID == 0 {
+				return nil
+			}
+			return fmt.Errorf("Run %s has incomplete stopped Worker identity", run.RunID)
+		}
+		return inspectRecordedWorkerAbsent(run.RunID, run.StoppedWorkerPID, run.StoppedWorkerProcessIdentity, "stopped ")
 	}
-	if run.PID != 0 && run.PID != pid {
-		return fmt.Errorf("Run %s has contradictory Worker identity: recorded PID %d does not match process identity PID %d", run.RunID, run.PID, pid)
+	return inspectRecordedWorkerAbsent(run.RunID, run.PID, run.ProcessIdentity, "")
+}
+
+func inspectRecordedWorkerAbsent(runID string, recordedPID int, expectedIdentity, qualifier string) error {
+	pid, err := processidentity.PID(expectedIdentity)
+	if err != nil {
+		return fmt.Errorf("%sWorker PID %d has uncertain identity %q: %w", qualifier, recordedPID, expectedIdentity, err)
+	}
+	if recordedPID != 0 && recordedPID != pid {
+		return fmt.Errorf("Run %s has contradictory %sWorker identity: recorded PID %d does not match process identity PID %d", runID, qualifier, recordedPID, pid)
 	}
 	processAlive, err := processidentity.Alive(pid)
 	if err != nil {
@@ -1161,16 +1175,16 @@ func inspectWorkerAbsent(run scheduler.Run) error {
 		return nil
 	}
 	if !processAlive || !groupAlive {
-		return fmt.Errorf("Worker PID/process-group liveness is uncertain for Run %s", run.RunID)
+		return fmt.Errorf("%sWorker PID/process-group liveness is uncertain for Run %s", qualifier, runID)
 	}
 	identity, err := processidentity.Start(pid)
 	if err != nil {
 		return fmt.Errorf("verify live Worker identity: %w", err)
 	}
-	if identity != run.ProcessIdentity {
-		return fmt.Errorf("Worker PID %d is live with uncertain identity %q instead of %q", pid, identity, run.ProcessIdentity)
+	if identity != expectedIdentity {
+		return fmt.Errorf("%sWorker PID %d is live with uncertain identity %q instead of %q", qualifier, pid, identity, expectedIdentity)
 	}
-	return fmt.Errorf("Worker for Run %s is live at PID %d", run.RunID, pid)
+	return fmt.Errorf("%sWorker for Run %s is live at PID %d", qualifier, runID, pid)
 }
 
 func absentWorkerSummary(run scheduler.Run) string {

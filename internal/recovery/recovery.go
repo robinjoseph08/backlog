@@ -245,10 +245,10 @@ func (m *Module) Recover(ctx context.Context, expected Plan) (Plan, error) {
 	if err != nil {
 		return Plan{}, err
 	}
+	if fresh.Outcome == OutcomeCompletion {
+		return fresh, nil
+	}
 	if !PlansEqual(expected, fresh) {
-		if fresh.Outcome == OutcomeCompletion {
-			return fresh, nil
-		}
 		if fresh.Outcome != OutcomeWaiting {
 			return Plan{}, errors.New("Recovery Plan changed after confirmation; inspect and confirm the current plan")
 		}
@@ -287,17 +287,6 @@ func (m *Module) Recover(ctx context.Context, expected Plan) (Plan, error) {
 		run.PullRequest = fresh.PullRequest
 		run.PID, run.ProcessIdentity = 0, ""
 		run.UpdatedAt = now
-	case OutcomeCompletion:
-		if err := m.config.Worktrees.Cleanup(ctx, worktree.Assignment{Path: run.Worktree, Branch: run.Branch}); err != nil {
-			return Plan{}, fmt.Errorf("retire completed worktree: %w", err)
-		}
-		run.Status = scheduler.StatusMerged
-		run.ResumeAfter = nil
-		run.PullRequest = fresh.PullRequest
-		run.PID, run.ProcessIdentity = 0, ""
-		run.CompletedAt = &now
-		run.Error = ""
-		removeLease(&current, run.RunID)
 	default:
 		if run.PreservedCause == "" {
 			run.PreservedCause = run.Error
@@ -335,19 +324,19 @@ func (m *Module) Recover(ctx context.Context, expected Plan) (Plan, error) {
 }
 
 func (m *Module) verifyAbsent(run scheduler.Run) error {
-	if run.ProcessIdentity == "" {
-		if run.PID != 0 {
-			return errors.New("recorded Worker PID has no checkable process identity")
-		}
-		if run.WorkerGeneration <= 0 || run.StoppedWorkerGeneration != run.WorkerGeneration || run.WorkerStoppedAt == nil || run.WorkerStoppedAt.IsZero() {
-			return errors.New("Run has no durable proof that its last Worker generation stopped")
+	if run.WorkerGeneration <= 0 || run.StoppedWorkerGeneration != run.WorkerGeneration || run.WorkerStoppedAt == nil || run.WorkerStoppedAt.IsZero() {
+		return errors.New("Run has no durable proof that its last Worker generation stopped")
+	}
+	if run.StoppedWorkerProcessIdentity == "" {
+		if run.StoppedWorkerPID != 0 {
+			return errors.New("stopped Worker PID has no checkable process identity")
 		}
 		return nil
 	}
-	identityPIDText, started, found := strings.Cut(run.ProcessIdentity, ":")
+	identityPIDText, started, found := strings.Cut(run.StoppedWorkerProcessIdentity, ":")
 	identityPID, parseErr := strconv.Atoi(identityPIDText)
-	if !found || parseErr != nil || identityPID <= 0 || strings.TrimSpace(started) == "" || run.PID != 0 && run.PID != identityPID {
-		return errors.New("recorded Worker process identity is malformed or mismatched")
+	if !found || parseErr != nil || identityPID <= 0 || strings.TrimSpace(started) == "" || run.StoppedWorkerPID != identityPID {
+		return errors.New("stopped Worker process identity is malformed or mismatched")
 	}
 	alive, err := m.config.ProcessAlive(identityPID)
 	if err != nil {
@@ -448,15 +437,6 @@ func replaceRun(current *state.State, replacement scheduler.Run) {
 	}
 }
 
-func removeLease(current *state.State, runID string) {
-	for index := range current.Leases {
-		if current.Leases[index].RunID == runID {
-			current.Leases = append(current.Leases[:index], current.Leases[index+1:]...)
-			return
-		}
-	}
-}
-
 func WritePlan(writer interface{ Write([]byte) (int, error) }, plan Plan) error {
 	remote := plan.RemoteCommit
 	if remote == "" {
@@ -492,8 +472,7 @@ func WritePlan(writer interface{ Write([]byte) (int, error) }, plan Plan) error 
 	case OutcomeCompletion:
 		lines = append(lines,
 			fmt.Sprintf("  Completion identity: merged pull request %s at head %s and closed issue #%d", plan.PullRequest, plan.PullRequestHead, plan.Run.Issue),
-			"  Retirement actions: remove Backlog-managed workflow labels; retire the owned remote branch, local worktree and branch, and active Pi session when present; preserve historical logs and diagnostics; record merged Completion and pull request identity; release exactly this Run's Lease",
-			"  State action: complete normal retirement with no replacement Worker launch",
+			"  Retirement: inspect and approve the exact current owned-artifact actions printed below; no replacement Worker will launch",
 		)
 	}
 	if plan.LocalCommit != "" {
