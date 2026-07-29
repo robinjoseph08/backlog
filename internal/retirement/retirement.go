@@ -41,7 +41,6 @@ type Config struct {
 	StateDirectory  string
 	GitExecutable   string
 	SyncPath        func(string) error
-	AfterAction     func(string) error
 }
 
 // Module is the complete owned Run retirement interface used by lifecycle
@@ -60,7 +59,6 @@ type Service struct {
 	stateDirectory  string
 	gitExecutable   string
 	syncPath        func(string) error
-	afterAction     func(string) error
 	policy          Policy
 }
 
@@ -75,7 +73,7 @@ func New(config Config, policy Policy) (Module, error) {
 	return &Service{
 		store: config.Store, github: config.GitHub, repositoryRoot: config.RepositoryRoot,
 		commonDirectory: config.CommonDirectory, stateDirectory: config.StateDirectory,
-		gitExecutable: config.GitExecutable, syncPath: config.SyncPath, afterAction: config.AfterAction, policy: policy,
+		gitExecutable: config.GitExecutable, syncPath: config.SyncPath, policy: policy,
 	}, nil
 }
 
@@ -448,11 +446,6 @@ func (e Service) apply(ctx context.Context, approved Plan) error {
 			return e.finalizeCompletion(ctx, plan, action.pullRequest)
 		default:
 			return fmt.Errorf("%s Plan contains an unknown action", e.policy.Operation)
-		}
-		if e.afterAction != nil {
-			if err := e.afterAction(action.String()); err != nil {
-				return fmt.Errorf("retirement failpoint after %s: %w", action, err)
-			}
 		}
 	}
 }
