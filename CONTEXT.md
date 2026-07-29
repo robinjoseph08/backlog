@@ -60,6 +60,10 @@ _Avoid_: Paused Worker, failed Run
 A fail-closed operator lifecycle operation that verifies durable continuation evidence for an Intervention-required Run and transitions that same leased Run to Suspended.
 _Avoid_: Resume, Retry, Reset
 
+**Recovery Plan**:
+A read-only, current-state-derived description of the verified identities and mutations required to perform Recovery or to retire a late verified Completion discovered during Recovery.
+_Avoid_: Resume plan, Reset Plan, generic cleanup plan
+
 **Resume**:
 Launch of a replacement Worker for a Suspended Run using the same Run identity and retained artifacts after fresh launch checks.
 _Avoid_: Recovery, Retry, restart
@@ -95,3 +99,7 @@ _Avoid_: Attach, control
 **Completion**:
 A GitHub-verified outcome in which the expected pull request is merged and the issue is closed when appropriate.
 _Avoid_: Successful exit, done
+
+**Recovered Completion**:
+A late verified Completion for a Run that crossed a Recovery or structured provider-exhaustion continuation boundary and therefore requires complete owned-artifact retirement before the Run becomes Historical.
+_Avoid_: External Resolution, ordinary post-Worker Completion

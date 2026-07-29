@@ -78,6 +78,8 @@ type ContinuationBoundary struct {
 	CheckpointBlockerCause       string    `json:"checkpointBlockerCause,omitempty"`
 	CheckpointBlockerFingerprint string    `json:"checkpointBlockerFingerprint,omitempty"`
 	VerifiedAt                   time.Time `json:"verifiedAt"`
+	LogPath                      string    `json:"-"`
+	StderrPath                   string    `json:"-"`
 }
 
 type Run struct {

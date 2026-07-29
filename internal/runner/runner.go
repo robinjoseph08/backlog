@@ -1487,18 +1487,15 @@ func (r *Runner) checkpointSettledWorker(ctx context.Context, current *state.Sta
 	}
 	now := r.Now().UTC()
 	run = findRun(current.Runs, run.RunID)
-	run.Continuation = &scheduler.ContinuationBoundary{
-		SessionID: boundary.SessionID, SessionFile: boundary.SessionFile, Worktree: boundary.Worktree,
-		LeafID: boundary.LeafID, EntryCount: boundary.EntryCount, SHA256: boundary.SHA256,
-		Workflow: boundary.Workflow, WorkflowStage: boundary.WorkflowStage,
-		CheckpointFile: boundary.CheckpointFile, CheckpointSHA256: boundary.CheckpointSHA256,
-		CheckpointStatus: boundary.CheckpointStatus, CheckpointFailureClass: boundary.CheckpointFailureClass,
-		CheckpointBlockerKind: boundary.CheckpointBlockerKind, CheckpointBlockerCause: boundary.CheckpointBlockerCause,
-		CheckpointBlockerFingerprint: boundary.CheckpointBlockerFingerprint,
-		WorkerGeneration:             run.WorkerGeneration, LocalCommit: localCommit,
-		RemoteBranchState: remoteBranchState, RemoteCommit: remoteCommit,
-		PullRequest: pullRequest, PullRequestHead: pullRequestHead, VerifiedAt: now,
-	}
+	boundary.WorkerGeneration = run.WorkerGeneration
+	boundary.LocalCommit = localCommit
+	boundary.RemoteBranchState = remoteBranchState
+	boundary.RemoteCommit = remoteCommit
+	boundary.PullRequest = pullRequest
+	boundary.PullRequestHead = pullRequestHead
+	boundary.VerifiedAt = now
+	boundary.LogPath, boundary.StderrPath = "", ""
+	run.Continuation = &boundary
 	run.Workflow = boundary.Workflow
 	run.WorkflowStage = boundary.WorkflowStage
 	if boundary.CheckpointFailureClass != "" {
@@ -1592,15 +1589,7 @@ func verifyBoundaryArtifacts(run scheduler.Run, boundary scheduler.ContinuationB
 	if err := worker.VerifyContinuation(worker.ContinuationRequest{
 		Issue: run.Issue, RunID: run.RunID, Branch: run.Branch,
 		SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree,
-	}, worker.Continuation{
-		SessionID: boundary.SessionID, SessionFile: boundary.SessionFile, Worktree: boundary.Worktree,
-		LeafID: boundary.LeafID, EntryCount: boundary.EntryCount, SHA256: boundary.SHA256,
-		Workflow: boundary.Workflow, WorkflowStage: boundary.WorkflowStage,
-		CheckpointFile: boundary.CheckpointFile, CheckpointSHA256: boundary.CheckpointSHA256,
-		CheckpointStatus: boundary.CheckpointStatus, CheckpointFailureClass: boundary.CheckpointFailureClass,
-		CheckpointBlockerKind: boundary.CheckpointBlockerKind, CheckpointBlockerCause: boundary.CheckpointBlockerCause,
-		CheckpointBlockerFingerprint: boundary.CheckpointBlockerFingerprint,
-	}); err != nil {
+	}, boundary); err != nil {
 		return fmt.Errorf("verify Pi continuation before Resume: %w", err)
 	}
 	return nil
@@ -2687,17 +2676,11 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 		}
 
 		now := r.Now().UTC()
-		run.Continuation = &scheduler.ContinuationBoundary{
-			SessionID: result.boundary.SessionID, SessionFile: result.boundary.SessionFile,
-			Worktree: result.boundary.Worktree, LeafID: result.boundary.LeafID,
-			EntryCount: result.boundary.EntryCount, SHA256: result.boundary.SHA256,
-			Workflow: result.boundary.Workflow, WorkflowStage: result.boundary.WorkflowStage,
-			CheckpointFile: result.boundary.CheckpointFile, CheckpointSHA256: result.boundary.CheckpointSHA256,
-			CheckpointStatus: result.boundary.CheckpointStatus, CheckpointFailureClass: result.boundary.CheckpointFailureClass,
-			CheckpointBlockerKind: result.boundary.CheckpointBlockerKind, CheckpointBlockerCause: result.boundary.CheckpointBlockerCause,
-			CheckpointBlockerFingerprint: result.boundary.CheckpointBlockerFingerprint,
-			WorkerGeneration:             run.WorkerGeneration, VerifiedAt: now,
-		}
+		boundary := result.boundary
+		boundary.WorkerGeneration = run.WorkerGeneration
+		boundary.VerifiedAt = now
+		boundary.LogPath, boundary.StderrPath = "", ""
+		run.Continuation = &boundary
 		run.Workflow = result.boundary.Workflow
 		run.WorkflowStage = result.boundary.WorkflowStage
 		if run.LogPath == "" {

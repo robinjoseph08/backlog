@@ -69,9 +69,6 @@ type Plan struct {
 	DerivedOffline     bool
 	Outcome            Outcome
 	PullRequest        string
-	LocalCommit        string
-	RemotePresent      bool
-	RemoteCommit       string
 	PullRequestHead    string
 	OriginalDiagnostic string
 }
@@ -183,22 +180,13 @@ func (m *Module) Inspect(ctx context.Context, selector string) (Plan, error) {
 		return Plan{}, fmt.Errorf("verify retained branch and worktree: %w", err)
 	}
 
-	var continuation worker.Continuation
+	var continuation scheduler.ContinuationBoundary
 	derived := false
 	if run.Continuation == nil {
 		continuation, err = worker.InspectContinuation(continuationRequest(run))
 		derived = true
 	} else {
-		boundary := run.Continuation
-		continuation = worker.Continuation{
-			SessionID: boundary.SessionID, SessionFile: boundary.SessionFile, Worktree: boundary.Worktree,
-			LeafID: boundary.LeafID, EntryCount: boundary.EntryCount, SHA256: boundary.SHA256,
-			Workflow: boundary.Workflow, WorkflowStage: boundary.WorkflowStage,
-			CheckpointFile: boundary.CheckpointFile, CheckpointSHA256: boundary.CheckpointSHA256,
-			CheckpointStatus: boundary.CheckpointStatus, CheckpointFailureClass: boundary.CheckpointFailureClass,
-			CheckpointBlockerKind: boundary.CheckpointBlockerKind, CheckpointBlockerCause: boundary.CheckpointBlockerCause,
-			CheckpointBlockerFingerprint: boundary.CheckpointBlockerFingerprint,
-		}
+		continuation = *run.Continuation
 		if err = worker.VerifyContinuation(continuationRequest(run), continuation); err != nil {
 			return Plan{}, fmt.Errorf("verify persisted continuation evidence: %w", err)
 		}
@@ -209,18 +197,13 @@ func (m *Module) Inspect(ctx context.Context, selector string) (Plan, error) {
 	if continuation.WorkflowStage == "" || (continuation.Workflow != "afk" && continuation.Workflow != "ship-it") {
 		return Plan{}, errors.New("continuation evidence has an unsupported workflow checkpoint identity")
 	}
-	boundary := scheduler.ContinuationBoundary{
-		SessionID: continuation.SessionID, SessionFile: continuation.SessionFile, Worktree: continuation.Worktree,
-		LeafID: continuation.LeafID, EntryCount: continuation.EntryCount, SHA256: continuation.SHA256,
-		Workflow: continuation.Workflow, WorkflowStage: continuation.WorkflowStage,
-		CheckpointFile: continuation.CheckpointFile, CheckpointSHA256: continuation.CheckpointSHA256,
-		CheckpointStatus: continuation.CheckpointStatus, CheckpointFailureClass: continuation.CheckpointFailureClass,
-		CheckpointBlockerKind: continuation.CheckpointBlockerKind, CheckpointBlockerCause: continuation.CheckpointBlockerCause,
-		CheckpointBlockerFingerprint: continuation.CheckpointBlockerFingerprint,
-		WorkerGeneration:             run.WorkerGeneration, LocalCommit: identity.LocalCommit,
-		RemoteBranchState: map[bool]string{true: "present", false: "absent"}[identity.RemotePresent], RemoteCommit: identity.RemoteCommit,
-		PullRequest: pullRequest, VerifiedAt: m.config.Now().UTC(),
-	}
+	boundary := continuation
+	boundary.WorkerGeneration = run.WorkerGeneration
+	boundary.LocalCommit = identity.LocalCommit
+	boundary.RemoteBranchState = map[bool]string{true: "present", false: "absent"}[identity.RemotePresent]
+	boundary.RemoteCommit = identity.RemoteCommit
+	boundary.PullRequest = pullRequest
+	boundary.VerifiedAt = m.config.Now().UTC()
 	pullHead := ""
 	if len(pulls) == 1 {
 		pullHead = pulls[0].Commit
@@ -234,9 +217,8 @@ func (m *Module) Inspect(ctx context.Context, selector string) (Plan, error) {
 		outcome = OutcomeAlready
 	}
 	return Plan{
-		Run: run, Lease: lease, Boundary: boundary, DerivedOffline: derived, Outcome: outcome, PullRequest: pullRequest,
-		LocalCommit: identity.LocalCommit, RemotePresent: identity.RemotePresent, RemoteCommit: identity.RemoteCommit,
-		PullRequestHead: pullHead, OriginalDiagnostic: run.Error,
+		Run: run, Lease: lease, Boundary: boundary, DerivedOffline: derived, Outcome: outcome,
+		PullRequest: pullRequest, OriginalDiagnostic: run.Error,
 	}, nil
 }
 
@@ -257,16 +239,7 @@ func (m *Module) Recover(ctx context.Context, expected Plan) (Plan, error) {
 		return fresh, nil
 	}
 	if fresh.DerivedOffline && fresh.Outcome == OutcomeSuspend {
-		continuation := worker.Continuation{
-			SessionID: fresh.Boundary.SessionID, SessionFile: fresh.Boundary.SessionFile, Worktree: fresh.Boundary.Worktree,
-			LeafID: fresh.Boundary.LeafID, EntryCount: fresh.Boundary.EntryCount, SHA256: fresh.Boundary.SHA256,
-			Workflow: fresh.Boundary.Workflow, WorkflowStage: fresh.Boundary.WorkflowStage,
-			CheckpointFile: fresh.Boundary.CheckpointFile, CheckpointSHA256: fresh.Boundary.CheckpointSHA256,
-			CheckpointStatus: fresh.Boundary.CheckpointStatus, CheckpointFailureClass: fresh.Boundary.CheckpointFailureClass,
-			CheckpointBlockerKind: fresh.Boundary.CheckpointBlockerKind, CheckpointBlockerCause: fresh.Boundary.CheckpointBlockerCause,
-			CheckpointBlockerFingerprint: fresh.Boundary.CheckpointBlockerFingerprint,
-		}
-		if err := worker.SyncContinuation(continuationRequest(fresh.Run), continuation); err != nil {
+		if err := worker.SyncContinuation(continuationRequest(fresh.Run), fresh.Boundary); err != nil {
 			return Plan{}, fmt.Errorf("synchronize offline continuation evidence: %w", err)
 		}
 	}
@@ -455,7 +428,7 @@ func replaceRun(current *state.State, replacement scheduler.Run) {
 }
 
 func WritePlan(writer interface{ Write([]byte) (int, error) }, plan Plan) error {
-	remote := plan.RemoteCommit
+	remote := plan.Boundary.RemoteCommit
 	if remote == "" {
 		remote = "absent"
 	}
@@ -492,8 +465,8 @@ func WritePlan(writer interface{ Write([]byte) (int, error) }, plan Plan) error 
 			"  Retirement: inspect and approve the exact current owned-artifact actions printed below; no replacement Worker will launch",
 		)
 	}
-	if plan.LocalCommit != "" {
-		lines = append(lines, fmt.Sprintf("  Git identity: local %s; remote %s", plan.LocalCommit, remote))
+	if plan.Boundary.LocalCommit != "" {
+		lines = append(lines, fmt.Sprintf("  Git identity: local %s; remote %s", plan.Boundary.LocalCommit, remote))
 	}
 	if plan.PullRequest != "" && plan.Outcome != OutcomeWaiting && plan.Outcome != OutcomeCompletion {
 		lines = append(lines, "  Expected pull request: "+plan.PullRequest)

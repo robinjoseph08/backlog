@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/robinjoseph08/backlog/internal/activity"
+	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
 
 const promptCommandID = "backlog-afk-prompt"
@@ -50,25 +51,7 @@ type ContinuationRequest struct {
 	ExpectedWorkflow string
 }
 
-type Continuation struct {
-	SessionID                    string
-	SessionFile                  string
-	Worktree                     string
-	LeafID                       string
-	EntryCount                   int
-	SHA256                       string
-	Workflow                     string
-	WorkflowStage                string
-	CheckpointFile               string
-	CheckpointSHA256             string
-	CheckpointStatus             string
-	CheckpointFailureClass       string
-	CheckpointBlockerKind        string
-	CheckpointBlockerCause       string
-	CheckpointBlockerFingerprint string
-	LogPath                      string
-	StderrPath                   string
-}
+type Continuation = scheduler.ContinuationBoundary
 
 type Result struct {
 	ExitCode          int
