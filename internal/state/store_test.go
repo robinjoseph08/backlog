@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/robinjoseph08/backlog/internal/initialprompt"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
 
@@ -971,7 +972,7 @@ func TestFileStoreRoundTripsAndValidatesPromptDigest(t *testing.T) {
 	store := FileStore{Path: filepath.Join(t.TempDir(), "state.json")}
 	run := scheduler.Run{
 		Issue: 7, RunID: "run-7", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModeRPC,
-		SessionID: "session-7", SessionDir: "/sessions/run-7", PromptDigest: strings.Repeat("a", 64),
+		SessionID: "session-7", SessionDir: "/sessions/run-7", PromptDigest: initialprompt.Digest(strings.Repeat("a", 64)),
 	}
 	value := State{Version: CurrentVersion, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}
 	if err := store.Save(value); err != nil {
@@ -985,7 +986,7 @@ func TestFileStoreRoundTripsAndValidatesPromptDigest(t *testing.T) {
 		t.Fatalf("prompt digest = %q, want %q", loaded.Runs[0].PromptDigest, run.PromptDigest)
 	}
 	for _, digest := range []string{"short", strings.Repeat("z", 64), strings.Repeat("a", 66)} {
-		value.Runs[0].PromptDigest = digest
+		value.Runs[0].PromptDigest = initialprompt.Digest(digest)
 		if err := store.Save(value); err == nil || !strings.Contains(err.Error(), "invalid prompt digest") {
 			t.Fatalf("digest %q validation error = %v", digest, err)
 		}

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/robinjoseph08/backlog/internal/activity"
+	"github.com/robinjoseph08/backlog/internal/initialprompt"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
 
@@ -49,7 +50,7 @@ type ContinuationRequest struct {
 	SessionID              string
 	SessionDir             string
 	Worktree               string
-	PromptDigest           string
+	PromptDigest           initialprompt.Digest
 	RequirePromptOwnership bool
 	ExpectedWorkflow       string
 }
@@ -223,7 +224,7 @@ func (s Supervisor) Start(ctx context.Context, request Request) (*Process, error
 	}
 	initialPrompt := request.InitialPrompt
 	if !request.Resume && initialPrompt == "" {
-		initialPrompt = fmt.Sprintf("/skill:afk %d", request.Issue)
+		initialPrompt = initialprompt.DefaultPrompt(request.Issue)
 	}
 	process := &Process{
 		command: command, logPath: logPath, stderrPath: stderrPath, gatePath: gatePath,
@@ -1161,34 +1162,31 @@ func hasOwnedInitialPrompt(entries []json.RawMessage, expected ContinuationReque
 		if json.Unmarshal(raw, &entry) != nil || entry.Type != "message" || entry.Message.Role != "user" {
 			continue
 		}
-		entryMatches := false
 		var text string
 		if json.Unmarshal(entry.Message.Content, &text) == nil {
-			entryMatches = promptContentMatches(text, legacyPrompt, expected.PromptDigest)
-		} else {
-			var content []struct{ Type, Text string }
-			if json.Unmarshal(entry.Message.Content, &content) == nil {
-				for _, item := range content {
-					if item.Type == "text" && promptContentMatches(item.Text, legacyPrompt, expected.PromptDigest) {
-						entryMatches = true
-						break
-					}
-				}
+			if promptContentMatches(text, legacyPrompt, expected.PromptDigest) {
+				matches++
 			}
+			continue
 		}
-		if entryMatches {
-			matches++
+		var content []struct{ Type, Text string }
+		if json.Unmarshal(entry.Message.Content, &content) != nil {
+			continue
+		}
+		for _, item := range content {
+			if item.Type == "text" && promptContentMatches(item.Text, legacyPrompt, expected.PromptDigest) {
+				matches++
+			}
 		}
 	}
 	return matches == 1
 }
 
-func promptContentMatches(content, legacyPrompt, digest string) bool {
+func promptContentMatches(content, legacyPrompt string, digest initialprompt.Digest) bool {
 	if digest == "" {
 		return content == legacyPrompt
 	}
-	hash := sha256.Sum256([]byte(content))
-	return strings.EqualFold(hex.EncodeToString(hash[:]), digest)
+	return digest.Matches(content)
 }
 
 func readSessionRecords(path string) ([]json.RawMessage, string, error) {

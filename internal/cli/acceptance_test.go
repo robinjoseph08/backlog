@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/robinjoseph08/backlog/internal/initialprompt"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 	"golang.org/x/term"
@@ -231,17 +232,22 @@ printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","
 IFS= read -r abort
 while ! test -f `+quote(suspensionRelease)+`; do sleep 0.01; done
 session_file="$session_dir/session.jsonl"
+if [ "$issue" = 31 ]; then
+  entry='{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"custom prompt 31"}}'
+else
+  entry='{"type":"message","id":"leaf","parentId":null,"message":{"role":"assistant","content":[]}}'
+fi
 printf '{"type":"session","version":3,"id":"%s","cwd":"%s"}\n' "$session_id" "$worktree" > "$session_file"
-printf '{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"custom prompt %s"}}\n' "$issue" >> "$session_file"
+printf '%s\n' "$entry" >> "$session_file"
 printf '%s\n' '{"id":"backlog-suspend-abort","type":"response","command":"abort","success":true}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 IFS= read -r state
 printf '{"id":"backlog-suspend-state","type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":"%s","sessionId":"%s"}}\n' "$session_file" "$session_id"
 IFS= read -r entries
-printf '{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"custom prompt %s"}}],"leafId":"leaf"}}\n' "$issue"
+printf '{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[%s],"leafId":"leaf"}}\n' "$entry"
 IFS= read -r final_state
 printf '{"id":"backlog-suspend-final-state","type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":"%s","sessionId":"%s"}}\n' "$session_file" "$session_id"
 IFS= read -r stable_entries
-printf '{"id":"backlog-suspend-stable-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"custom prompt %s"}}],"leafId":"leaf"}}\n' "$issue"
+printf '{"id":"backlog-suspend-stable-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[%s],"leafId":"leaf"}}\n' "$entry"
 while IFS= read -r ignored; do :; done
 `)
 
@@ -340,13 +346,22 @@ while IFS= read -r ignored; do :; done
 	}
 	for _, run := range current.Runs {
 		prompt := fmt.Sprintf("custom prompt %d", run.Issue)
-		digest := sha256.Sum256([]byte(prompt))
-		if run.Status != scheduler.StatusSuspended || run.PID != 0 || run.Continuation == nil || run.SuspendingAt != nil || run.SuspendedAt == nil || run.PromptDigest != hex.EncodeToString(digest[:]) {
+		if run.PID != 0 || run.SuspendingAt != nil || run.PromptDigest != initialprompt.Sum(prompt) {
 			t.Fatalf("persisted custom-prompt Run after second SIGINT = %#v", run)
+		}
+		switch run.Issue {
+		case 31:
+			if run.Status != scheduler.StatusSuspended || run.Continuation == nil || run.SuspendedAt == nil {
+				t.Fatalf("exact custom prompt did not suspend: %#v", run)
+			}
+		case 32:
+			if run.Status != scheduler.StatusNeedsHuman || run.Continuation != nil || !strings.Contains(run.Error, "exact owned initial prompt") {
+				t.Fatalf("missing custom prompt evidence did not fail closed: %#v", run)
+			}
 		}
 	}
 	output := strings.Join(outputLines, "\n")
-	if !strings.Contains(output, "Suspension complete: 0 Workers remaining") {
+	if !strings.Contains(output, "Suspension incomplete: suspension stopped all Workers") {
 		t.Fatalf("suspension output = %q", output)
 	}
 }
@@ -375,7 +390,7 @@ func TestCompiledExecutableRestartResumesSuspendedRunBeforeNewCandidate(t *testi
 		t.Fatal(err)
 	}
 	hash := sha256.Sum256([]byte(sessionContent))
-	promptDigest := sha256.Sum256([]byte(initialPrompt))
+	promptDigest := initialprompt.Sum(initialPrompt)
 	stoppedAt := time.Now().UTC()
 	persisted := state.State{
 		Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", MaxConcurrentIssues: 1,
@@ -383,7 +398,7 @@ func TestCompiledExecutableRestartResumesSuspendedRunBeforeNewCandidate(t *testi
 			Issue: 91, RunID: "run-91", Status: scheduler.StatusSuspended, WorkerMode: scheduler.WorkerModeRPC,
 			WorkerGeneration: 1, StoppedWorkerGeneration: 1, WorkerStoppedAt: &stoppedAt,
 			Branch: "agent/issue-91-run-91", Worktree: worktreePath, SessionName: "afk #91", SessionID: "session-91", SessionDir: sessionDir,
-			PromptDigest: hex.EncodeToString(promptDigest[:]), Continuation: &scheduler.ContinuationBoundary{
+			PromptDigest: promptDigest, Continuation: &scheduler.ContinuationBoundary{
 				SessionID: "session-91", SessionFile: sessionFile, Worktree: worktreePath, LeafID: "leaf", EntryCount: 1,
 				SHA256: hex.EncodeToString(hash[:]), WorkerGeneration: 1, VerifiedAt: time.Now(),
 			},
@@ -572,9 +587,9 @@ while IFS= read -r ignored; do :; done
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest := sha256.Sum256([]byte("custom prompt 33"))
+	digest := initialprompt.Sum("custom prompt 33")
 	if len(current.Runs) != 1 || current.Runs[0].Status != scheduler.StatusNeedsHuman || current.Runs[0].Continuation != nil ||
-		current.Runs[0].PID != 0 || current.Runs[0].PromptDigest != hex.EncodeToString(digest[:]) || !strings.Contains(current.Runs[0].Error, "exact owned initial prompt") || len(current.Leases) != 1 {
+		current.Runs[0].PID != 0 || current.Runs[0].PromptDigest != digest || !strings.Contains(current.Runs[0].Error, "exact owned initial prompt") || len(current.Leases) != 1 {
 		t.Fatalf("changed custom prompt did not fail closed after SIGTERM = %#v", current)
 	}
 	if strings.Contains(output.String(), "Drain:") {
@@ -1165,6 +1180,11 @@ func TestCompiledExecutableRejectsInvalidPromptSourcesBeforeRepositoryInspection
 	if err := os.WriteFile(emptyFile, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	unreadableFile := filepath.Join(root, "unreadable.txt")
+	if err := os.WriteFile(unreadableFile, []byte("prompt"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(unreadableFile, 0o600)
 	touched := filepath.Join(root, "git-touched")
 	git := writeExecutable(t, "#!/bin/sh\ntouch "+quote(touched)+"\nexit 9\n")
 	for _, test := range []struct {
@@ -1176,6 +1196,7 @@ func TestCompiledExecutableRejectsInvalidPromptSourcesBeforeRepositoryInspection
 		{name: "empty inline", args: []string{"--prompt="}, want: "cannot be empty"},
 		{name: "empty file path", args: []string{"--prompt-file="}, want: "path cannot be empty"},
 		{name: "missing file", args: []string{"--prompt-file", filepath.Join(root, "missing.txt")}, want: "read --prompt-file"},
+		{name: "unreadable file", args: []string{"--prompt-file", unreadableFile}, want: "read --prompt-file"},
 		{name: "empty file", args: []string{"--prompt-file", emptyFile}, want: "is empty"},
 		{name: "unknown placeholder", args: []string{"--prompt", "{{unknown}}"}, want: "unknown placeholder"},
 		{name: "empty placeholder", args: []string{"--prompt", "{{}}"}, want: "empty placeholder"},
@@ -1274,9 +1295,9 @@ while IFS= read -r ignored; do :; done
 			if err := json.Unmarshal(captured, &rpcPrompt); err != nil || rpcPrompt.Message != want {
 				t.Fatalf("RPC prompt = %q, %v; want %q", rpcPrompt.Message, err, want)
 			}
-			digest := sha256.Sum256([]byte(want))
-			if run.PromptDigest != hex.EncodeToString(digest[:]) {
-				t.Fatalf("prompt digest = %q, want %x", run.PromptDigest, digest)
+			digest := initialprompt.Sum(want)
+			if run.PromptDigest != digest {
+				t.Fatalf("prompt digest = %q, want %s", run.PromptDigest, digest)
 			}
 			encoded, err := json.Marshal(current)
 			if err != nil || bytes.Contains(encoded, []byte(want)) || bytes.Contains(encoded, []byte(template)) || bytes.Contains(encoded, []byte("prompt.txt")) {
@@ -1381,8 +1402,8 @@ while IFS= read -r ignored; do :; done
 		t.Fatalf("stable prompt-file state = %#v, %v", current, err)
 	}
 	for _, run := range current.Runs {
-		digest := sha256.Sum256([]byte(fmt.Sprintf("stable %d", run.Issue)))
-		if run.PromptDigest != hex.EncodeToString(digest[:]) {
+		digest := initialprompt.Sum(fmt.Sprintf("stable %d", run.Issue))
+		if run.PromptDigest != digest {
 			t.Fatalf("Run #%d prompt digest = %q", run.Issue, run.PromptDigest)
 		}
 	}
@@ -1539,9 +1560,9 @@ rm -f `+quote(piAlive)+`
 	if strings.TrimSpace(string(promptData)) != `{"id":"backlog-afk-prompt","type":"prompt","message":"/skill:afk 5"}` {
 		t.Fatalf("AFK prompt = %q", promptData)
 	}
-	defaultDigest := sha256.Sum256([]byte("/skill:afk 5"))
-	if run.PromptDigest != hex.EncodeToString(defaultDigest[:]) {
-		t.Fatalf("default prompt digest = %q, want %x", run.PromptDigest, defaultDigest)
+	defaultDigest := initialprompt.Sum("/skill:afk 5")
+	if run.PromptDigest != defaultDigest {
+		t.Fatalf("default prompt digest = %q, want %s", run.PromptDigest, defaultDigest)
 	}
 	if _, err := os.Stat(piAlive); !os.IsNotExist(err) {
 		t.Fatalf("Pi process did not shut down after persisted reconciliation: %v", err)

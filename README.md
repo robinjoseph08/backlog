@@ -1,6 +1,6 @@
 # backlog
 
-`backlog` continuously drains a GitHub issue backlog with isolated autonomous Pi Workers. It is a deterministic Go scheduler, not a long-running coordinator conversation.
+`backlog` continuously works through a GitHub issue backlog with isolated autonomous Pi Workers. It is a deterministic Go scheduler, not a long-running coordinator conversation.
 
 Each issue receives its own lease, Git branch, Git worktree, Pi process, named Pi session, context window, and logs. GitHub is always consulted before a run is considered complete.
 

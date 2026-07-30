@@ -8,13 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
 const DefaultTemplate = "/skill:afk {{issue_number}}"
 
 type Values struct {
-	IssueNumber   string
+	IssueNumber   int
 	IssueTitle    string
 	IssueURL      string
 	Repository    string
@@ -22,6 +23,22 @@ type Values struct {
 	RunID         string
 	Branch        string
 	Worktree      string
+}
+
+type Digest string
+
+func Sum(rendered string) Digest {
+	digest := sha256.Sum256([]byte(rendered))
+	return Digest(hex.EncodeToString(digest[:]))
+}
+
+func (digest Digest) Valid() bool {
+	decoded, err := hex.DecodeString(string(digest))
+	return err == nil && len(decoded) == sha256.Size
+}
+
+func (digest Digest) Matches(content string) bool {
+	return strings.EqualFold(string(digest), string(Sum(content)))
 }
 
 type part struct {
@@ -38,7 +55,7 @@ type Template struct {
 var placeholderName = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
 var builtins = map[string]func(Values) string{
-	"issue_number":   func(values Values) string { return values.IssueNumber },
+	"issue_number":   func(values Values) string { return strconv.Itoa(values.IssueNumber) },
 	"issue_title":    func(values Values) string { return values.IssueTitle },
 	"issue_url":      func(values Values) string { return values.IssueURL },
 	"repository":     func(values Values) string { return values.Repository },
@@ -89,6 +106,10 @@ func Compile(source string) (Template, error) {
 	return Template{parts: parts}, nil
 }
 
+func DefaultPrompt(issue int) string {
+	return "/skill:afk " + strconv.Itoa(issue)
+}
+
 func (template Template) Render(values Values) string {
 	var rendered strings.Builder
 	for _, part := range template.parts {
@@ -99,9 +120,4 @@ func (template Template) Render(values Values) string {
 		rendered.WriteString(builtins[part.name](values))
 	}
 	return rendered.String()
-}
-
-func Digest(rendered string) string {
-	digest := sha256.Sum256([]byte(rendered))
-	return hex.EncodeToString(digest[:])
 }

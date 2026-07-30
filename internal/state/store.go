@@ -510,11 +510,8 @@ func validateRun(run scheduler.Run, requireWorkerMode, recoverUnsafeContinuation
 	if run.WorkerLogOpen && run.LogPath == "" {
 		return fmt.Errorf("state contains Run %q with an open Worker log but no log path", run.RunID)
 	}
-	if run.PromptDigest != "" {
-		digest, err := hex.DecodeString(run.PromptDigest)
-		if err != nil || len(digest) != sha256HexLength/2 {
-			return fmt.Errorf("state contains Run %q with an invalid prompt digest", run.RunID)
-		}
+	if run.PromptDigest != "" && !run.PromptDigest.Valid() {
+		return fmt.Errorf("state contains Run %q with an invalid prompt digest", run.RunID)
 	}
 	if run.CleanupPending && run.Status != scheduler.StatusMerged {
 		return fmt.Errorf("state contains non-merged Run %q with pending Completion cleanup", run.RunID)

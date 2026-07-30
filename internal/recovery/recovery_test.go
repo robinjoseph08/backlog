@@ -2,8 +2,6 @@ package recovery
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -13,6 +11,7 @@ import (
 	"time"
 
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
+	"github.com/robinjoseph08/backlog/internal/initialprompt"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 	"github.com/robinjoseph08/backlog/internal/worktree"
@@ -111,8 +110,7 @@ func TestRecoveryRequiresExactPersistedPromptDigestWithoutLegacyFallback(t *test
 		t.Run(test.name, func(t *testing.T) {
 			run, store := recoverableFixture(t)
 			prompt := "custom prompt 世界"
-			digest := sha256.Sum256([]byte(prompt))
-			run.PromptDigest = hex.EncodeToString(digest[:])
+			run.PromptDigest = initialprompt.Sum(prompt)
 			store.value.Runs[0] = run
 			sessionFile := filepath.Join(run.SessionDir, "session.jsonl")
 			session := fmt.Sprintf("{\"type\":\"session\",\"version\":3,\"id\":%q,\"cwd\":%q}\n{\"type\":\"message\",\"id\":\"leaf\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":%s}}\n", run.SessionID, run.Worktree, test.content)

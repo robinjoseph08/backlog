@@ -3,6 +3,8 @@ package scheduler
 import (
 	"sort"
 	"time"
+
+	"github.com/robinjoseph08/backlog/internal/initialprompt"
 )
 
 type Status string
@@ -101,7 +103,7 @@ type Run struct {
 	SessionName                  string                `json:"sessionName,omitempty"`
 	SessionID                    string                `json:"sessionId,omitempty"`
 	SessionDir                   string                `json:"sessionDir,omitempty"`
-	PromptDigest                 string                `json:"promptDigest,omitempty"`
+	PromptDigest                 initialprompt.Digest  `json:"promptDigest,omitempty"`
 	Continuation                 *ContinuationBoundary `json:"continuation,omitempty"`
 	ResumePending                bool                  `json:"resumePending,omitempty"`
 	LogPath                      string                `json:"logPath,omitempty"`

@@ -23,17 +23,6 @@ import (
 	"github.com/robinjoseph08/backlog/internal/worktree"
 )
 
-type PromptContext struct {
-	IssueNumber   int
-	IssueTitle    string
-	IssueURL      string
-	Repository    string
-	DefaultBranch string
-	RunID         string
-	Branch        string
-	Worktree      string
-}
-
 type Config struct {
 	Repo                string
 	DefaultBranch       string
@@ -43,7 +32,7 @@ type Config struct {
 	Watch               bool
 	SessionsDir         string
 	SuspensionTimeout   time.Duration
-	InitialPrompt       func(PromptContext) string
+	InitialPrompt       func(initialprompt.Values) string
 }
 
 type GitHub interface {
@@ -1061,8 +1050,8 @@ func (r *Runner) validate() error {
 		r.Output = io.Discard
 	}
 	if r.Config.InitialPrompt == nil {
-		r.Config.InitialPrompt = func(context PromptContext) string {
-			return fmt.Sprintf("/skill:afk %d", context.IssueNumber)
+		r.Config.InitialPrompt = func(values initialprompt.Values) string {
+			return initialprompt.DefaultPrompt(values.IssueNumber)
 		}
 	}
 	return nil
@@ -1124,12 +1113,12 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 	run = findActiveRun(current, candidate.Number)
 	run.Worktree = assignment.Path
 	run.Branch = assignment.Branch
-	initialPrompt := r.Config.InitialPrompt(PromptContext{
+	initialPrompt := r.Config.InitialPrompt(initialprompt.Values{
 		IssueNumber: candidate.Number, IssueTitle: candidate.Title, IssueURL: candidate.URL,
 		Repository: r.Config.Repo, DefaultBranch: r.Config.DefaultBranch, RunID: runID,
 		Branch: assignment.Branch, Worktree: assignment.Path,
 	})
-	run.PromptDigest = initialprompt.Digest(initialPrompt)
+	run.PromptDigest = initialprompt.Sum(initialPrompt)
 	run.UpdatedAt = r.Now().UTC()
 	replaceRun(current, run)
 	if err := r.Store.Save(*current); err != nil {

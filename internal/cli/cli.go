@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -448,14 +447,8 @@ func runCommand(ctx context.Context, options runOptions, stdout io.Writer, signa
 		Config: runner.Config{
 			Repo: repository.Slug, DefaultBranch: repository.DefaultBranch,
 			MaxConcurrentIssues: options.maxWorkers, PollInterval: options.poll, MaxWorkerAge: options.maxWorkerAge, Watch: options.watch,
-			SessionsDir: filepath.Join(resolvedStateDir, "sessions"),
-			InitialPrompt: func(context runner.PromptContext) string {
-				return promptTemplate.Render(initialprompt.Values{
-					IssueNumber: strconv.Itoa(context.IssueNumber), IssueTitle: context.IssueTitle, IssueURL: context.IssueURL,
-					Repository: context.Repository, DefaultBranch: context.DefaultBranch, RunID: context.RunID,
-					Branch: context.Branch, Worktree: context.Worktree,
-				})
-			},
+			SessionsDir:   filepath.Join(resolvedStateDir, "sessions"),
+			InitialPrompt: promptTemplate.Render,
 		},
 		GitHub:                         github,
 		Store:                          runnerStore,

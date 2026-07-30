@@ -11,12 +11,22 @@ func TestTemplateRendersBuiltinsOnceWithoutChangingPromptBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	values := Values{
-		IssueNumber: "42", IssueTitle: "literal {{run_id}}", IssueURL: "https://example.test/issues/42",
+		IssueNumber: 42, IssueTitle: "literal {{run_id}}", IssueURL: "https://example.test/issues/42",
 		Repository: "acme/widgets", DefaultBranch: "main", RunID: "run-42", Branch: "agent/run-42", Worktree: "/tmp/工作区",
 	}
 	want := strings.Join([]string{"α", "42", "literal {{run_id}}", "https://example.test/issues/42", "acme/widgets", "main", "run-42", values.RunID, "agent/run-42", "/tmp/工作区"}, " ") + "\n第二行"
 	if got := template.Render(values); got != want {
 		t.Fatalf("rendered prompt = %q, want %q", got, want)
+	}
+}
+
+func TestDigestOwnsSHA256ValidationAndExactContentMatching(t *testing.T) {
+	digest := Sum("prompt\n世界")
+	if !digest.Valid() || !digest.Matches("prompt\n世界") || digest.Matches("prompt\n世界 ") {
+		t.Fatalf("digest validation or matching failed for %q", digest)
+	}
+	if Digest("short").Valid() || Digest(strings.Repeat("z", 64)).Valid() {
+		t.Fatal("invalid SHA-256 encoding was accepted")
 	}
 }
 
