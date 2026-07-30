@@ -1150,7 +1150,7 @@ func inspectCheckpointBlockers(checkpointFile string) (kind, cause, fingerprint 
 
 func hasOwnedInitialPrompt(entries []json.RawMessage, expected ContinuationRequest) bool {
 	matches := 0
-	legacyPrompt := fmt.Sprintf("/skill:afk %d", expected.Issue)
+	legacyPrompt := initialprompt.DefaultPrompt(expected.Issue)
 	for _, raw := range entries {
 		var entry struct {
 			Type    string `json:"type"`

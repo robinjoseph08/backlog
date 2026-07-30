@@ -107,7 +107,7 @@ func Compile(source string) (Template, error) {
 }
 
 func DefaultPrompt(issue int) string {
-	return "/skill:afk " + strconv.Itoa(issue)
+	return strings.ReplaceAll(DefaultTemplate, "{{issue_number}}", strconv.Itoa(issue))
 }
 
 func (template Template) Render(values Values) string {
