@@ -17,12 +17,13 @@ import (
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
 
-const CurrentVersion = 5
+const CurrentVersion = 6
 
 const legacyVersion = 1
 const versionWithLeases = 2
 const versionWithAcknowledgments = 3
-const previousVersion = 4
+const versionWithWorkerProof = 4
+const previousVersion = 5
 const sha256HexLength = 64
 
 type State struct {
@@ -98,13 +99,13 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 			return State{}, false, err
 		}
 		return value, false, nil
-	case previousVersion, versionWithAcknowledgments, versionWithLeases:
+	case previousVersion, versionWithWorkerProof, versionWithAcknowledgments, versionWithLeases:
 		value, err := decodeCurrentState(encoded)
 		if err != nil {
 			return State{}, false, fmt.Errorf("decode version %d state: %w", header.Version, err)
 		}
 		value.Version = CurrentVersion
-		if header.Version == previousVersion {
+		if header.Version == versionWithWorkerProof {
 			migrateV4WorkerProof(&value)
 		}
 		if header.Version == versionWithLeases {
@@ -117,7 +118,7 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 		}
 		if persistMigration {
 			if err := s.Save(value); err != nil {
-				return State{}, false, fmt.Errorf("persist version 5 state migration: %w", err)
+				return State{}, false, fmt.Errorf("persist version %d state migration: %w", CurrentVersion, err)
 			}
 		}
 		return value, true, nil
@@ -132,7 +133,7 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 		}
 		if persistMigration {
 			if err := s.Save(value); err != nil {
-				return State{}, false, fmt.Errorf("persist version 5 state migration: %w", err)
+				return State{}, false, fmt.Errorf("persist version %d state migration: %w", CurrentVersion, err)
 			}
 		}
 		return value, true, nil
@@ -508,6 +509,9 @@ func validateRun(run scheduler.Run, requireWorkerMode, recoverUnsafeContinuation
 	}
 	if run.WorkerLogOpen && run.LogPath == "" {
 		return fmt.Errorf("state contains Run %q with an open Worker log but no log path", run.RunID)
+	}
+	if run.PromptDigest != "" && !run.PromptDigest.Valid() {
+		return fmt.Errorf("state contains Run %q with an invalid prompt digest", run.RunID)
 	}
 	if run.CleanupPending && run.Status != scheduler.StatusMerged {
 		return fmt.Errorf("state contains non-merged Run %q with pending Completion cleanup", run.RunID)

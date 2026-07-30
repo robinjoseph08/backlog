@@ -11,6 +11,7 @@ import (
 	"time"
 
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
+	"github.com/robinjoseph08/backlog/internal/initialprompt"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 	"github.com/robinjoseph08/backlog/internal/worktree"
@@ -93,6 +94,44 @@ func TestRecoveryDerivesOfflineBoundaryAndSuspendsSameRun(t *testing.T) {
 	}
 	if store.value.Runs[0].RecoveryCount != 1 {
 		t.Fatalf("Recovery count after idempotence = %d", store.value.Runs[0].RecoveryCount)
+	}
+}
+
+func TestRecoveryRequiresExactPersistedPromptDigestWithoutLegacyFallback(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		content     string
+		wantRefusal bool
+	}{
+		{name: "string content", content: `"custom prompt 世界"`},
+		{name: "structured text content", content: `[{"type":"text","text":"custom prompt 世界"}]`},
+		{name: "changed prompt with legacy fallback present", content: `"/skill:afk 42"`, wantRefusal: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			run, store := recoverableFixture(t)
+			prompt := "custom prompt 世界"
+			run.PromptDigest = initialprompt.Sum(prompt)
+			store.value.Runs[0] = run
+			sessionFile := filepath.Join(run.SessionDir, "session.jsonl")
+			session := fmt.Sprintf("{\"type\":\"session\",\"version\":3,\"id\":%q,\"cwd\":%q}\n{\"type\":\"message\",\"id\":\"leaf\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":%s}}\n", run.SessionID, run.Worktree, test.content)
+			if err := os.WriteFile(sessionFile, []byte(session), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			module := newTestModule(t, store, fakeGitHub{issue: openIssue(run.Issue)}, func(int) (bool, error) { return false, nil }, time.Now())
+			_, err := module.Inspect(context.Background(), run.RunID)
+			if test.wantRefusal {
+				if err == nil || !strings.Contains(err.Error(), "exact owned initial prompt") {
+					t.Fatalf("Recovery ownership refusal = %v", err)
+				}
+				if len(store.value.Leases) != 1 || store.value.Runs[0].Status != scheduler.StatusFailed {
+					t.Fatalf("Recovery refusal changed ownership: %#v", store.value)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Recovery rejected exact custom prompt: %v", err)
+			}
+		})
 	}
 }
 

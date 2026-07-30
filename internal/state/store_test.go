@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/robinjoseph08/backlog/internal/initialprompt"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
 
@@ -87,7 +88,7 @@ func TestFileStoreRoundTripsCompleteRecoverySafetyMetadata(t *testing.T) {
 	}
 }
 
-func TestFileStoreMigratesLiteralV4RunningSuspendedAndFailedRunsToV5(t *testing.T) {
+func TestFileStoreMigratesLiteralV4RunningSuspendedAndFailedRunsToV6(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	fixture := `{
   "version": 4,
@@ -106,7 +107,7 @@ func TestFileStoreMigratesLiteralV4RunningSuspendedAndFailedRunsToV5(t *testing.
   ]
 }`
 	if strings.Contains(fixture, "workerGeneration") || strings.Contains(fixture, "failureClass") || strings.Contains(fixture, "recoveryCount") {
-		t.Fatal("literal V4 fixture contains V5-only fields")
+		t.Fatal("literal V4 fixture contains post-V4 fields")
 	}
 	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
 		t.Fatal(err)
@@ -140,11 +141,11 @@ func TestFileStoreMigratesLiteralV4RunningSuspendedAndFailedRunsToV5(t *testing.
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(got, preview) {
-		t.Fatalf("persisted V5 differs from Preview:\ngot=%#v\npreview=%#v", got, preview)
+		t.Fatalf("persisted V6 differs from Preview:\ngot=%#v\npreview=%#v", got, preview)
 	}
 	persisted, err := os.ReadFile(path)
-	if err != nil || !strings.Contains(string(persisted), `"version": 5`) || !strings.Contains(string(persisted), `"stoppedWorkerPid": 4300`) {
-		t.Fatalf("V5 migration persistence = %s, %v", persisted, err)
+	if err != nil || !strings.Contains(string(persisted), `"version": 6`) || !strings.Contains(string(persisted), `"stoppedWorkerPid": 4300`) {
+		t.Fatalf("V6 migration persistence = %s, %v", persisted, err)
 	}
 }
 
@@ -173,7 +174,7 @@ func TestFileStorePreviewDoesNotPersistV1Migration(t *testing.T) {
 	}
 }
 
-func TestFileStoreReportsV5TargetWhenV1MigrationPersistenceFails(t *testing.T) {
+func TestFileStoreReportsV6TargetWhenV1MigrationPersistenceFails(t *testing.T) {
 	t.Parallel()
 
 	directory := t.TempDir()
@@ -188,7 +189,7 @@ func TestFileStoreReportsV5TargetWhenV1MigrationPersistenceFails(t *testing.T) {
 	defer os.Chmod(directory, 0o700)
 
 	_, err := (FileStore{Path: path}).Load()
-	if err == nil || !strings.Contains(err.Error(), "persist version 5 state migration") {
+	if err == nil || !strings.Contains(err.Error(), "persist version 6 state migration") {
 		t.Fatalf("V1 migration persistence error = %v", err)
 	}
 }
@@ -395,8 +396,8 @@ func TestFileStoreMigratesV2ToV3WithoutAcknowledgingOutcomesOrLosingMetadata(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(persisted), `"version": 5`) {
-		t.Fatalf("V5 migration was not persisted: %s", persisted)
+	if !strings.Contains(string(persisted), `"version": 6`) {
+		t.Fatalf("V6 migration was not persisted: %s", persisted)
 	}
 }
 
@@ -443,10 +444,10 @@ func TestFileStoreRejectsUnsupportedNewerStateVersion(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "state.json")
-	if err := os.WriteFile(path, []byte(`{"version":6,"runs":[],"leases":[]}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"version":7,"runs":[],"leases":[]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := (FileStore{Path: path}).Load(); err == nil || !strings.Contains(err.Error(), "unsupported state version 6") {
+	if _, err := (FileStore{Path: path}).Load(); err == nil || !strings.Contains(err.Error(), "unsupported state version 7") {
 		t.Fatalf("newer state error = %v", err)
 	}
 }
@@ -895,4 +896,99 @@ func TestRepositoryLockAllowsOnlyOneOwner(t *testing.T) {
 		t.Fatalf("acquire after release: %v", err)
 	}
 	defer second.Release()
+}
+
+func TestFileStoreMigratesV5PromptDigestSchemaWithoutChangingLegacyRunEvidence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	fixture := `{
+  "version": 5,
+  "repo": "acme/widgets",
+  "defaultBranch": "main",
+  "maxConcurrentIssues": 1,
+  "runs": [{
+    "issue": 42,
+    "issueTitle": "Legacy Run",
+    "issueUrl": "https://example.test/issues/42",
+    "runId": "legacy-v5",
+    "status": "failed",
+    "workerMode": "rpc",
+    "workerGeneration": 1,
+    "stoppedWorkerGeneration": 1,
+    "workerStoppedAt": "2026-07-29T01:02:03Z",
+    "branch": "agent/issue-42-legacy-v5",
+    "worktree": "/worktrees/legacy-v5",
+    "sessionName": "afk #42",
+    "sessionId": "backlog-legacy-v5",
+    "sessionDir": "/sessions/legacy-v5",
+    "continuation": {
+      "sessionId": "backlog-legacy-v5",
+      "sessionFile": "/sessions/legacy-v5/session.jsonl",
+      "worktree": "/worktrees/legacy-v5",
+      "leafId": "leaf",
+      "entryCount": 2,
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "workflow": "afk",
+      "workflowStage": "afk-coordinator",
+      "checkpointStatus": "active",
+      "verifiedAt": "2026-07-29T01:02:03Z"
+    },
+    "logPath": "/logs/legacy-v5.jsonl",
+    "stderrPath": "/logs/legacy-v5.stderr.log",
+    "error": "retained diagnostic",
+    "startedAt": "2026-07-29T00:00:00Z",
+    "updatedAt": "2026-07-29T01:02:03Z"
+  }],
+  "leases": [{"leaseId":"legacy-v5","issue":42,"runId":"legacy-v5"}]
+}`
+	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := FileStore{Path: path}
+	preview, migrationRequired, err := store.Preview()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !migrationRequired || preview.Version != CurrentVersion || len(preview.Runs) != 1 || len(preview.Leases) != 1 {
+		t.Fatalf("V5 preview = %#v, migration=%t", preview, migrationRequired)
+	}
+	run := preview.Runs[0]
+	if run.PromptDigest != "" || run.Error != "retained diagnostic" || run.Continuation == nil || run.Continuation.LeafID != "leaf" {
+		t.Fatalf("V5 migration changed legacy evidence: %#v", run)
+	}
+	unchanged, err := os.ReadFile(path)
+	if err != nil || string(unchanged) != fixture {
+		t.Fatalf("Preview changed V5 source: %v\n%s", err, unchanged)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(loaded, preview) {
+		t.Fatalf("persisted V6 differs from Preview:\ngot=%#v\nwant=%#v", loaded, preview)
+	}
+}
+
+func TestFileStoreRoundTripsAndValidatesPromptDigest(t *testing.T) {
+	store := FileStore{Path: filepath.Join(t.TempDir(), "state.json")}
+	run := scheduler.Run{
+		Issue: 7, RunID: "run-7", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModeRPC,
+		SessionID: "session-7", SessionDir: "/sessions/run-7", PromptDigest: initialprompt.Digest(strings.Repeat("a", 64)),
+	}
+	value := State{Version: CurrentVersion, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}
+	if err := store.Save(value); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Runs[0].PromptDigest != run.PromptDigest {
+		t.Fatalf("prompt digest = %q, want %q", loaded.Runs[0].PromptDigest, run.PromptDigest)
+	}
+	for _, digest := range []string{"short", strings.Repeat("z", 64), strings.Repeat("a", 66)} {
+		value.Runs[0].PromptDigest = initialprompt.Digest(digest)
+		if err := store.Save(value); err == nil || !strings.Contains(err.Error(), "invalid prompt digest") {
+			t.Fatalf("digest %q validation error = %v", digest, err)
+		}
+	}
 }

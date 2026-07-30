@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/robinjoseph08/backlog/internal/activity"
+	"github.com/robinjoseph08/backlog/internal/initialprompt"
 )
 
 func TestWorkersDoNotInheritHerdrPaneEnvironment(t *testing.T) {
@@ -1252,6 +1253,46 @@ func TestWorkflowCheckpointRequiresDurableOwnedAFKOrStrictShipItSchema(t *testin
 		if err != nil || blockerErr != nil || workflow != "ship-it" || failure != "" || kind != blocker || cause != "hosted evidence did not advance" || fingerprint != "check-123" {
 			t.Fatalf("supported blocker %q = workflow %q failure %q kind/cause/fingerprint %q/%q/%q, errors %v/%v", blocker, workflow, failure, kind, cause, fingerprint, err, blockerErr)
 		}
+	}
+}
+
+func TestWorkflowCheckpointMatchesExactPromptDigestForStringAndStructuredSessionContent(t *testing.T) {
+	worktree := t.TempDir()
+	sessionDir := t.TempDir()
+	request := ContinuationRequest{
+		Issue: 42, RunID: "run-42", Branch: "agent/issue-42-run-42", SessionID: "session-42",
+		SessionDir: sessionDir, Worktree: worktree, RequirePromptOwnership: true,
+	}
+	prompt := "custom workflow\n世界 {{literal}}"
+	request.PromptDigest = initialprompt.Sum(prompt)
+	marker := fmt.Sprintf("{\"version\":1,\"workflow\":\"afk\",\"stage\":\"afk-coordinator\",\"issue\":42,\"runId\":\"run-42\",\"sessionId\":\"session-42\",\"worktree\":%q}\n", worktree)
+	if err := os.WriteFile(filepath.Join(sessionDir, "backlog-afk-checkpoint-v1.json"), []byte(marker), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stringEntry := json.RawMessage(fmt.Sprintf(`{"type":"message","id":"string","parentId":null,"message":{"role":"user","content":%q}}`, prompt))
+	structuredEntry := json.RawMessage(fmt.Sprintf(`{"type":"message","id":"structured","parentId":null,"message":{"role":"user","content":[{"type":"text","text":%q},{"type":"image","text":"ignored"}]}}`, prompt))
+	ambiguousStructuredEntry := json.RawMessage(fmt.Sprintf(`{"type":"message","id":"ambiguous","parentId":null,"message":{"role":"user","content":[{"type":"text","text":%q},{"type":"text","text":%q}]}}`, prompt, prompt))
+	for _, test := range []struct {
+		name    string
+		entries []json.RawMessage
+		wantErr bool
+	}{
+		{name: "string content", entries: []json.RawMessage{stringEntry}},
+		{name: "structured text content", entries: []json.RawMessage{structuredEntry}},
+		{name: "changed prompt", entries: []json.RawMessage{json.RawMessage(fmt.Sprintf(`{"type":"message","id":"changed","parentId":null,"message":{"role":"user","content":%q}}`, prompt+" "))}, wantErr: true},
+		{name: "digest never falls back to legacy invocation", entries: []json.RawMessage{json.RawMessage(`{"type":"message","id":"legacy","parentId":null,"message":{"role":"user","content":"/skill:afk 42"}}`)}, wantErr: true},
+		{name: "ambiguous duplicate entries", entries: []json.RawMessage{stringEntry, structuredEntry}, wantErr: true},
+		{name: "ambiguous duplicate structured text items", entries: []json.RawMessage{ambiguousStructuredEntry}, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, _, _, _, _, _, err := inspectWorkflowCheckpointMode(request, test.entries, false)
+			if test.wantErr && (err == nil || !strings.Contains(err.Error(), "exact owned initial prompt")) {
+				t.Fatalf("ownership error = %v", err)
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("ownership match failed: %v", err)
+			}
+		})
 	}
 }
 

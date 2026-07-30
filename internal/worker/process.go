@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/robinjoseph08/backlog/internal/activity"
+	"github.com/robinjoseph08/backlog/internal/initialprompt"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
 
@@ -34,6 +35,7 @@ type Request struct {
 	SessionID            string
 	SessionDir           string
 	SessionFile          string
+	InitialPrompt        string
 	Resume               bool
 	ContinuationWorkflow string
 	ContinuationStage    string
@@ -42,13 +44,15 @@ type Request struct {
 }
 
 type ContinuationRequest struct {
-	Issue            int
-	RunID            string
-	Branch           string
-	SessionID        string
-	SessionDir       string
-	Worktree         string
-	ExpectedWorkflow string
+	Issue                  int
+	RunID                  string
+	Branch                 string
+	SessionID              string
+	SessionDir             string
+	Worktree               string
+	PromptDigest           initialprompt.Digest
+	RequirePromptOwnership bool
+	ExpectedWorkflow       string
 }
 
 type Continuation = scheduler.ContinuationBoundary
@@ -102,6 +106,7 @@ type Process struct {
 	continuationStage    string
 	checkpointFile       string
 	checkpointSHA256     string
+	initialPrompt        string
 }
 
 var safeRunIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
@@ -217,13 +222,17 @@ func (s Supervisor) Start(ctx context.Context, request Request) (*Process, error
 		}
 		return nil, fmt.Errorf("start Pi gate: %w", err)
 	}
+	initialPrompt := request.InitialPrompt
+	if !request.Resume && initialPrompt == "" {
+		initialPrompt = initialprompt.DefaultPrompt(request.Issue)
+	}
 	process := &Process{
 		command: command, logPath: logPath, stderrPath: stderrPath, gatePath: gatePath,
 		stdin: stdin, stdout: stdoutLog, stderr: stderrLog, activity: activityWriter, events: events, terminate: terminate,
 		terminationStarted: terminationStarted, terminationDone: terminationDone, processGroupGrace: grace, exitDone: make(chan struct{}),
 		resume: request.Resume, continuationWorkflow: request.ContinuationWorkflow,
 		continuationStage: request.ContinuationStage, checkpointFile: request.CheckpointFile,
-		checkpointSHA256: request.CheckpointSHA256,
+		checkpointSHA256: request.CheckpointSHA256, initialPrompt: initialPrompt,
 	}
 	go process.reap()
 	return process, nil
@@ -266,7 +275,7 @@ func (p *Process) Release() error {
 			p.releaseErr = err
 			return
 		}
-		message := fmt.Sprintf("/skill:afk %d", p.events.issue)
+		message := p.initialPrompt
 		if p.resume {
 			stage := strings.TrimSpace(p.continuationStage)
 			if stage == "" {
@@ -292,7 +301,7 @@ func (p *Process) Release() error {
 			_, err = p.stdin.Write(encoded)
 		}
 		if err != nil {
-			p.releaseErr = fmt.Errorf("submit AFK prompt over Pi RPC: %w", err)
+			p.releaseErr = fmt.Errorf("submit Worker prompt over Pi RPC: %w", err)
 		}
 	})
 	return p.releaseErr
@@ -888,6 +897,9 @@ func inspectWorkflowCheckpoint(expected ContinuationRequest, entries []json.RawM
 }
 
 func inspectWorkflowCheckpointMode(expected ContinuationRequest, entries []json.RawMessage, captureAFK bool) (workflow, stage, checkpointFile, checkpointSHA, checkpointStatus, checkpointFailure string, resultErr error) {
+	if expected.RequirePromptOwnership && !hasOwnedInitialPrompt(entries, expected) {
+		return "", "", "", "", "", "", errors.New("Pi session does not contain one exact owned initial prompt")
+	}
 	gitMarker := filepath.Join(expected.Worktree, ".git")
 	info, err := os.Lstat(gitMarker)
 	if errors.Is(err, os.ErrNotExist) {
@@ -998,8 +1010,8 @@ func inspectAFKCheckpoint(expected ContinuationRequest, entries []json.RawMessag
 	checkpointFile = filepath.Join(expected.SessionDir, "backlog-afk-checkpoint-v1.json")
 	info, err := os.Lstat(checkpointFile)
 	if errors.Is(err, os.ErrNotExist) && capture {
-		if !hasOwnedAFKPrompt(entries, expected.Issue) {
-			return "", "", "", "", "", "", errors.New("cannot capture AFK stage checkpoint without the owned AFK invocation")
+		if !hasOwnedInitialPrompt(entries, expected) {
+			return "", "", "", "", "", "", errors.New("cannot capture AFK stage checkpoint without one exact owned initial prompt")
 		}
 		value := afkCheckpoint{Version: 1, Workflow: "afk", Stage: "afk-coordinator", Issue: expected.Issue, RunID: expected.RunID, SessionID: expected.SessionID, Worktree: expected.Worktree}
 		data, marshalErr := json.Marshal(value)
@@ -1136,11 +1148,9 @@ func inspectCheckpointBlockers(checkpointFile string) (kind, cause, fingerprint 
 	return normalize(fields["Blocker kind"]), normalize(fields["Blocker cause"]), normalize(fields["Blocker fingerprint"]), nil
 }
 
-func hasOwnedAFKPrompt(entries []json.RawMessage, issue int) bool {
-	if issue <= 0 {
-		return false
-	}
-	want := fmt.Sprintf("/skill:afk %d", issue)
+func hasOwnedInitialPrompt(entries []json.RawMessage, expected ContinuationRequest) bool {
+	matches := 0
+	legacyPrompt := initialprompt.DefaultPrompt(expected.Issue)
 	for _, raw := range entries {
 		var entry struct {
 			Type    string `json:"type"`
@@ -1153,19 +1163,30 @@ func hasOwnedAFKPrompt(entries []json.RawMessage, issue int) bool {
 			continue
 		}
 		var text string
-		if json.Unmarshal(entry.Message.Content, &text) == nil && strings.TrimSpace(text) == want {
-			return true
+		if json.Unmarshal(entry.Message.Content, &text) == nil {
+			if promptContentMatches(text, legacyPrompt, expected.PromptDigest) {
+				matches++
+			}
+			continue
 		}
 		var content []struct{ Type, Text string }
-		if json.Unmarshal(entry.Message.Content, &content) == nil {
-			for _, item := range content {
-				if item.Type == "text" && strings.TrimSpace(item.Text) == want {
-					return true
-				}
+		if json.Unmarshal(entry.Message.Content, &content) != nil {
+			continue
+		}
+		for _, item := range content {
+			if item.Type == "text" && promptContentMatches(item.Text, legacyPrompt, expected.PromptDigest) {
+				matches++
 			}
 		}
 	}
-	return false
+	return matches == 1
+}
+
+func promptContentMatches(content, legacyPrompt string, digest initialprompt.Digest) bool {
+	if digest == "" {
+		return content == legacyPrompt
+	}
+	return digest.Matches(content)
 }
 
 func readSessionRecords(path string) ([]json.RawMessage, string, error) {

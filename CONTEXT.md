@@ -4,6 +4,10 @@ This context describes how GitHub work moves from an available backlog into isol
 
 ## Language
 
+**AFK workflow**:
+Backlog's autonomous contract for taking an issue through verified Completion without operator interaction. The `afk` Pi skill is one way to initiate this workflow, but a Worker's initial prompt may invoke another skill or no skill.
+_Avoid_: `afk` skill invocation, interactive workflow
+
 **Candidate**:
 An open GitHub issue carrying the `ready-for-agent` label that may be considered for autonomous work.
 _Avoid_: Ticket, job
@@ -25,8 +29,8 @@ A durable reservation preventing more than one run from owning an issue at a tim
 _Avoid_: Claim, lock
 
 **Run**:
-One isolated attempt to take an eligible candidate through the AFK workflow and verify its GitHub outcome.
-_Avoid_: Task, execution
+One isolated attempt to take an eligible candidate through verified issue-to-Completion behavior and verify its GitHub outcome. A Run's identity does not depend on which skill, if any, its initial Worker prompt invokes.
+_Avoid_: Task, execution, skill invocation
 
 **Historical Run**:
 A Run without a Lease that remains available for inspection but no longer reserves its issue.

@@ -4750,7 +4750,7 @@ func resumableRun(t *testing.T, issue int, runID string) scheduler.Run {
 	sessionDir := t.TempDir()
 	worktreePath := t.TempDir()
 	sessionFile := filepath.Join(sessionDir, "session.jsonl")
-	content := fmt.Sprintf("{\"type\":\"session\",\"version\":3,\"id\":\"session-%d\",\"cwd\":%q}\n{\"type\":\"message\",\"id\":\"leaf\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"continue\"}}\n", issue, worktreePath)
+	content := fmt.Sprintf("{\"type\":\"session\",\"version\":3,\"id\":\"session-%d\",\"cwd\":%q}\n{\"type\":\"message\",\"id\":\"leaf\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"/skill:afk %d\"}}\n", issue, worktreePath, issue)
 	if err := os.WriteFile(sessionFile, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
