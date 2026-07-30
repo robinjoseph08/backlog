@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,6 +20,7 @@ import (
 
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
 	"github.com/robinjoseph08/backlog/internal/herdr"
+	"github.com/robinjoseph08/backlog/internal/initialprompt"
 	"github.com/robinjoseph08/backlog/internal/resolution"
 	"github.com/robinjoseph08/backlog/internal/retirement"
 	"github.com/robinjoseph08/backlog/internal/runner"
@@ -191,6 +193,10 @@ type runOptions struct {
 	watch         bool
 	plain         bool
 	approve       bool
+	prompt        string
+	promptFile    string
+	promptSet     bool
+	promptFileSet bool
 	ghExecutable  string
 	gitExecutable string
 	piExecutable  string
@@ -208,6 +214,8 @@ func parseRunOptions(args []string, stderr io.Writer) (runOptions, error) {
 	flags.BoolVar(&options.watch, "watch", false, "keep waiting after the current runnable backlog is exhausted")
 	flags.BoolVar(&options.plain, "plain", false, "disable the full-screen terminal dashboard")
 	flags.BoolVar(&options.approve, "approve", true, "trust project-local Pi resources in worker worktrees")
+	flags.StringVar(&options.prompt, "prompt", "", "initial Worker prompt template")
+	flags.StringVar(&options.promptFile, "prompt-file", "", "file containing the initial Worker prompt template")
 	flags.StringVar(&options.ghExecutable, "gh", "gh", "gh executable")
 	flags.StringVar(&options.gitExecutable, "git", "git", "git executable")
 	flags.StringVar(&options.piExecutable, "pi", "pi", "pi executable")
@@ -217,10 +225,53 @@ func parseRunOptions(args []string, stderr io.Writer) (runOptions, error) {
 	if flags.NArg() != 0 {
 		return runOptions{}, fmt.Errorf("run takes no positional arguments")
 	}
+	flags.Visit(func(flag *flag.Flag) {
+		switch flag.Name {
+		case "prompt":
+			options.promptSet = true
+		case "prompt-file":
+			options.promptFileSet = true
+		}
+	})
+	if options.promptSet && options.promptFileSet {
+		return runOptions{}, errors.New("--prompt and --prompt-file are mutually exclusive")
+	}
+	if options.promptSet && options.prompt == "" {
+		return runOptions{}, errors.New("--prompt cannot be empty")
+	}
+	if options.promptFileSet && options.promptFile == "" {
+		return runOptions{}, errors.New("--prompt-file path cannot be empty")
+	}
 	return options, nil
 }
 
+func loadInitialPrompt(options runOptions) (initialprompt.Template, error) {
+	source := initialprompt.DefaultTemplate
+	if options.promptSet {
+		source = options.prompt
+	}
+	if options.promptFileSet {
+		contents, err := os.ReadFile(options.promptFile)
+		if err != nil {
+			return initialprompt.Template{}, fmt.Errorf("read --prompt-file %q: %w", options.promptFile, err)
+		}
+		if len(contents) == 0 {
+			return initialprompt.Template{}, fmt.Errorf("--prompt-file %q is empty", options.promptFile)
+		}
+		source = string(contents)
+	}
+	template, err := initialprompt.Compile(source)
+	if err != nil {
+		return initialprompt.Template{}, fmt.Errorf("validate initial Worker prompt: %w", err)
+	}
+	return template, nil
+}
+
 func runCommand(ctx context.Context, options runOptions, stdout io.Writer, signals <-chan lifecycleSignal, onOperationalEvent func(runner.OperationalEvent), dashboard *bubbleDashboardSession, now func() time.Time) (resultErr error) {
+	promptTemplate, err := loadInitialPrompt(options)
+	if err != nil {
+		return err
+	}
 	setupCtx := ctx
 	var runnerSignals <-chan os.Signal
 	var cancelSetup context.CancelFunc
@@ -398,6 +449,13 @@ func runCommand(ctx context.Context, options runOptions, stdout io.Writer, signa
 			Repo: repository.Slug, DefaultBranch: repository.DefaultBranch,
 			MaxConcurrentIssues: options.maxWorkers, PollInterval: options.poll, MaxWorkerAge: options.maxWorkerAge, Watch: options.watch,
 			SessionsDir: filepath.Join(resolvedStateDir, "sessions"),
+			InitialPrompt: func(context runner.PromptContext) string {
+				return promptTemplate.Render(initialprompt.Values{
+					IssueNumber: strconv.Itoa(context.IssueNumber), IssueTitle: context.IssueTitle, IssueURL: context.IssueURL,
+					Repository: context.Repository, DefaultBranch: context.DefaultBranch, RunID: context.RunID,
+					Branch: context.Branch, Worktree: context.Worktree,
+				})
+			},
 		},
 		GitHub:                         github,
 		Store:                          runnerStore,
@@ -782,7 +840,7 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "  SIGTERM suspension exits 143, including later force escalation.")
 	fmt.Fprintln(writer, "")
 	fmt.Fprintln(writer, "Upgrade limits:")
-	fmt.Fprintln(writer, "  Runner startup and successful lifecycle mutations migrate versions 1 through 4 state to version 5.")
+	fmt.Fprintln(writer, "  Runner startup and successful lifecycle mutations migrate versions 1 through 5 state to version 6.")
 	fmt.Fprintln(writer, "  Passive inspection previews supported legacy state; legacy print-mode Runs cannot Resume.")
 	fmt.Fprintln(writer, "  State written by a newer unsupported version is refused.")
 }

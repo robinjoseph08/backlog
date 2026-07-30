@@ -16,11 +16,23 @@ import (
 	"time"
 
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
+	"github.com/robinjoseph08/backlog/internal/initialprompt"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 	"github.com/robinjoseph08/backlog/internal/worker"
 	"github.com/robinjoseph08/backlog/internal/worktree"
 )
+
+type PromptContext struct {
+	IssueNumber   int
+	IssueTitle    string
+	IssueURL      string
+	Repository    string
+	DefaultBranch string
+	RunID         string
+	Branch        string
+	Worktree      string
+}
 
 type Config struct {
 	Repo                string
@@ -31,6 +43,7 @@ type Config struct {
 	Watch               bool
 	SessionsDir         string
 	SuspensionTimeout   time.Duration
+	InitialPrompt       func(PromptContext) string
 }
 
 type GitHub interface {
@@ -1047,6 +1060,11 @@ func (r *Runner) validate() error {
 	if r.Output == nil {
 		r.Output = io.Discard
 	}
+	if r.Config.InitialPrompt == nil {
+		r.Config.InitialPrompt = func(context PromptContext) string {
+			return fmt.Sprintf("/skill:afk %d", context.IssueNumber)
+		}
+	}
 	return nil
 }
 
@@ -1106,6 +1124,12 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 	run = findActiveRun(current, candidate.Number)
 	run.Worktree = assignment.Path
 	run.Branch = assignment.Branch
+	initialPrompt := r.Config.InitialPrompt(PromptContext{
+		IssueNumber: candidate.Number, IssueTitle: candidate.Title, IssueURL: candidate.URL,
+		Repository: r.Config.Repo, DefaultBranch: r.Config.DefaultBranch, RunID: runID,
+		Branch: assignment.Branch, Worktree: assignment.Path,
+	})
+	run.PromptDigest = initialprompt.Digest(initialPrompt)
 	run.UpdatedAt = r.Now().UTC()
 	replaceRun(current, run)
 	if err := r.Store.Save(*current); err != nil {
@@ -1130,7 +1154,7 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 
 	process, err := r.Workers.Start(workerCtx, worker.Request{
 		Issue: candidate.Number, RunID: runID, Worktree: assignment.Path, SessionName: run.SessionName,
-		SessionID: run.SessionID, SessionDir: run.SessionDir,
+		SessionID: run.SessionID, SessionDir: run.SessionDir, InitialPrompt: initialPrompt,
 	})
 	if err != nil {
 		r.failRun(current, candidate.Number, fmt.Sprintf("start Pi worker: %v", err))
@@ -1434,8 +1458,8 @@ func (r *Runner) checkpointSettledWorker(ctx context.Context, current *state.Sta
 	defer cancel()
 	boundary, err := checkpointer.CheckpointSettled(checkpointCtx, worker.ContinuationRequest{
 		Issue: run.Issue, RunID: run.RunID, Branch: run.Branch,
-		SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree,
-		ExpectedWorkflow: expectedContinuationWorkflow(run),
+		SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree, PromptDigest: run.PromptDigest,
+		RequirePromptOwnership: true, ExpectedWorkflow: expectedContinuationWorkflow(run),
 	})
 	if err != nil {
 		if errors.Is(err, errSettledCheckpointUnsupported) {
@@ -1588,7 +1612,7 @@ func verifyBoundaryArtifacts(run scheduler.Run, boundary scheduler.ContinuationB
 	}
 	if err := worker.VerifyContinuation(worker.ContinuationRequest{
 		Issue: run.Issue, RunID: run.RunID, Branch: run.Branch,
-		SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree,
+		SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree, PromptDigest: run.PromptDigest,
 	}, boundary); err != nil {
 		return fmt.Errorf("verify Pi continuation before Resume: %w", err)
 	}
@@ -2642,8 +2666,8 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 			}
 			boundary, err := process.Suspend(ctx, worker.ContinuationRequest{
 				Issue: run.Issue, RunID: run.RunID, Branch: run.Branch,
-				SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree,
-				ExpectedWorkflow: expectedContinuationWorkflow(run),
+				SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree, PromptDigest: run.PromptDigest,
+				RequirePromptOwnership: true, ExpectedWorkflow: expectedContinuationWorkflow(run),
 			})
 			boundaries <- suspensionBoundaryResult{issue: issue, boundary: boundary, err: err}
 		}(issue, process, run)
