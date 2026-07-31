@@ -105,11 +105,11 @@ func MainWithTerminal(ctx context.Context, args []string, dependencies TerminalD
 	case "status":
 		commandCtx, stop := cancelContextOnSignal(ctx, terminal.Signals)
 		defer stop()
-		err = statusCommand(commandCtx, args[1:], stdout, stderr)
+		err = statusCommand(commandCtx, args[1:], stdout, stderr, compactPresentationFor(terminal), terminal.Now)
 	case "follow":
 		commandCtx, stop := cancelContextOnSignal(ctx, terminal.Signals)
 		defer stop()
-		err = followCommand(commandCtx, args[1:], stdout, stderr)
+		err = followCommandPresented(commandCtx, args[1:], stdout, stderr, compactPresentationFor(terminal), terminal.Now)
 	case "acknowledge":
 		commandCtx, stop := cancelContextOnSignal(ctx, terminal.Signals)
 		defer stop()
@@ -531,7 +531,7 @@ func (a workerAdapter) Release(runID string) error {
 	return a.supervisor.Release(runID)
 }
 
-func statusCommand(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+func statusCommand(ctx context.Context, args []string, stdout, stderr io.Writer, presentation compactPresentation, now func() time.Time) error {
 	flags := flag.NewFlagSet("status", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	repoDir := flags.String("repo-dir", ".", "Git repository associated with the runner")
@@ -560,7 +560,10 @@ func statusCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return encoder.Encode(current)
 	}
 	source := repositoryFollowSource{followStateSource: store, commonDirectory: commonDirectory}
-	return printPlainStatusProjection(stdout, current, source, time.Now(), *showAll)
+	if presentation.enabled {
+		return printCompactStatusProjection(stdout, current, source, now(), *showAll, presentation)
+	}
+	return printPlainStatusProjection(stdout, current, source, now(), *showAll)
 }
 
 func resolveStateFromFlags(ctx context.Context, repoDir, stateDir, gitExecutable string) (string, string, error) {

@@ -41,10 +41,14 @@ func (s repositoryFollowSource) RunnerSupervised() (bool, error) {
 }
 
 func followCommand(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	return followCommandWithClock(ctx, args, stdout, stderr, time.Now)
+	return followCommandPresented(ctx, args, stdout, stderr, compactPresentation{}, time.Now)
 }
 
 func followCommandWithClock(ctx context.Context, args []string, stdout, stderr io.Writer, now func() time.Time) error {
+	return followCommandPresented(ctx, args, stdout, stderr, compactPresentation{}, now)
+}
+
+func followCommandPresented(ctx context.Context, args []string, stdout, stderr io.Writer, presentation compactPresentation, now func() time.Time) error {
 	flags := flag.NewFlagSet("follow", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() {
@@ -117,7 +121,7 @@ func followCommandWithClock(ctx context.Context, args []string, stdout, stderr i
 			return nil
 		})
 	}
-	return followNormalized(ctx, source, runID, stdout, stderr, followPollInterval, now)
+	return followNormalizedPresented(ctx, source, runID, stdout, stderr, followPollInterval, now, presentation)
 }
 
 func splitFollowArguments(args []string) (string, []string, error) {
@@ -646,34 +650,42 @@ func observeRunOnce(source followStateSource, run scheduler.Run, diagnostics io.
 }
 
 func printNewActivity(output io.Writer, metrics *followMetrics, source *normalizedActivitySource) error {
+	return printNewActivityPresented(newFollowRenderer(output, compactPresentation{}), metrics, source)
+}
+
+func printNewActivityPresented(renderer followRenderer, metrics *followMetrics, source *normalizedActivitySource) error {
 	showSubagentSummary := false
 	for _, entry := range consumeActivity(metrics, source) {
 		if entry.SuppressFeed {
 			continue
 		}
-		if err := printActivityEntry(output, entry); err != nil {
+		if err := renderer.activityEntry(entry); err != nil {
 			return err
 		}
 		showSubagentSummary = showSubagentSummary || entry.Subagent != nil
 	}
-	flushed, err := flushPendingSubagentActivity(output, metrics, source.now())
+	flushed, err := flushPendingSubagentActivityPresented(renderer, metrics, source.now())
 	if err != nil {
 		return err
 	}
 	if showSubagentSummary || flushed {
-		return printActiveSubagentSummary(output, *metrics)
+		return renderer.activeSubagentSummary(*metrics)
 	}
 	return nil
 }
 
 func flushPendingSubagentActivity(output io.Writer, metrics *followMetrics, now time.Time) (bool, error) {
+	return flushPendingSubagentActivityPresented(newFollowRenderer(output, compactPresentation{}), metrics, now)
+}
+
+func flushPendingSubagentActivityPresented(renderer followRenderer, metrics *followMetrics, now time.Time) (bool, error) {
 	flushed := false
 	for _, id := range metrics.subagentOrder {
 		entry, pending := metrics.pendingSubagentFeed[id]
 		if !pending || entry.ObservedAt.IsZero() || now.Sub(entry.ObservedAt) < time.Second {
 			continue
 		}
-		if err := printActivityEntry(output, entry); err != nil {
+		if err := renderer.activityEntry(entry); err != nil {
 			return false, err
 		}
 		entry.SuppressFeed = false
@@ -684,12 +696,6 @@ func flushPendingSubagentActivity(output io.Writer, metrics *followMetrics, now 
 	return flushed, nil
 }
 
-func printActiveSubagentSummary(output io.Writer, metrics followMetrics) error {
-	active, deepest := metrics.activeSubagentSummary()
-	_, err := fmt.Fprintf(output, "  Subagent summary: %d (%d active) | Deepest current operation: %s\n", len(metrics.subagents), active, deepest)
-	return err
-}
-
 func followNormalized(
 	ctx context.Context,
 	source followStateSource,
@@ -698,6 +704,19 @@ func followNormalized(
 	pollInterval time.Duration,
 	now func() time.Time,
 ) error {
+	return followNormalizedPresented(ctx, source, runID, output, diagnostics, pollInterval, now, compactPresentation{})
+}
+
+func followNormalizedPresented(
+	ctx context.Context,
+	source followStateSource,
+	runID string,
+	output, diagnostics io.Writer,
+	pollInterval time.Duration,
+	now func() time.Time,
+	presentation compactPresentation,
+) error {
+	renderer := newFollowRenderer(output, presentation)
 	selected, err := loadFollowRun(source, runID)
 	if err != nil {
 		return err
@@ -706,10 +725,10 @@ func followNormalized(
 	metrics := initial.metrics
 	lastObservation := initial.process
 	nextObservation := initial.observed.Add(followObservationInterval)
-	if err := printFollowSummary(output, selected, metrics, lastObservation, initial.observed); err != nil {
+	if err := renderer.summary(selected, metrics, lastObservation, initial.observed); err != nil {
 		return err
 	}
-	if err := printInitialActivity(output, metrics.entries); err != nil {
+	if err := renderer.initialActivity(metrics.entries); err != nil {
 		return err
 	}
 	metrics.clearPendingSubagentFeed()
@@ -721,7 +740,7 @@ func followNormalized(
 	lastLogPath := selected.LogPath
 	for {
 		if activitySource != nil {
-			if err := printNewActivity(output, &metrics, activitySource); err != nil {
+			if err := printNewActivityPresented(renderer, &metrics, activitySource); err != nil {
 				return err
 			}
 		}
@@ -740,12 +759,12 @@ func followNormalized(
 				lastLogPath = selected.LogPath
 				consumeActivity(&metrics, activitySource)
 				for _, entry := range metrics.entries {
-					if err := printActivityEntry(output, entry); err != nil {
+					if err := renderer.activityEntry(entry); err != nil {
 						return err
 					}
 				}
 				if len(metrics.subagents) > 0 {
-					if err := printActiveSubagentSummary(output, metrics); err != nil {
+					if err := renderer.activeSubagentSummary(metrics); err != nil {
 						return err
 					}
 				}
@@ -758,7 +777,7 @@ func followNormalized(
 				Version: activity.CurrentVersion, ObservedAt: now().UTC(), Kind: "lifecycle",
 				Description: "Run state changed to " + string(selected.Status),
 			}
-			if err := printActivityEntry(output, entry); err != nil {
+			if err := renderer.activityEntry(entry); err != nil {
 				return err
 			}
 			lastStatus = selected.Status
@@ -767,12 +786,12 @@ func followNormalized(
 		if followObservationDue(selected.Status, statusChanged, observationNow, nextObservation) {
 			observation := observeFollowRun(source, selected)
 			if observation.supervision != lastObservation.supervision {
-				if err := printActivityEntry(output, activity.Entry{ObservedAt: observationNow.UTC(), Description: "Runner supervision changed to " + observation.supervision}); err != nil {
+				if err := renderer.activityEntry(activity.Entry{ObservedAt: observationNow.UTC(), Description: "Runner supervision changed to " + observation.supervision}); err != nil {
 					return err
 				}
 			}
 			if observation.workerLiveness != lastObservation.workerLiveness {
-				if err := printActivityEntry(output, activity.Entry{ObservedAt: observationNow.UTC(), Description: "Worker liveness changed to " + observation.workerLiveness}); err != nil {
+				if err := renderer.activityEntry(activity.Entry{ObservedAt: observationNow.UTC(), Description: "Worker liveness changed to " + observation.workerLiveness}); err != nil {
 					return err
 				}
 			}
@@ -781,14 +800,14 @@ func followNormalized(
 		}
 		if scheduler.IsTerminal(selected.Status) && !selected.WorkerLogOpen {
 			if activitySource != nil {
-				if err := printNewActivity(output, &metrics, activitySource); err != nil {
+				if err := printNewActivityPresented(renderer, &metrics, activitySource); err != nil {
 					return err
 				}
 			}
-			if _, err := fmt.Fprintln(output, "\nTerminal Run summary:"); err != nil {
+			if err := renderer.terminalHeading(); err != nil {
 				return err
 			}
-			return printFollowSummary(output, selected, metrics, lastObservation, now())
+			return renderer.finalSummary(selected, metrics, lastObservation, now())
 		}
 		if !waitToFollow(ctx, pollInterval) {
 			return nil
