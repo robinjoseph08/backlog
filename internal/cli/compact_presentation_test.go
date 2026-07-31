@@ -3,11 +3,15 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/x/ansi"
 	"github.com/robinjoseph08/backlog/internal/activity"
@@ -54,7 +58,8 @@ func TestInteractiveStatusUsesCompactColoredRunRows(t *testing.T) {
 		"Backlog Status",
 		"acme/widgets | 2 runs, 2 shown | 1 leases",
 		"Active (1)",
-		"#11 | State: claimed | Elapsed: 2m0s",
+		"#11  Compact active",
+		"State: claimed | Elapsed: 2m0s",
 		"Recent Completions (1)",
 		"#12  Compact completion | Elapsed: 4m0s",
 	} {
@@ -132,9 +137,12 @@ func TestInteractiveFollowUsesCompactColoredSummaryAndActivity(t *testing.T) {
 	plain := ansi.Strip(got)
 	for _, want := range []string{
 		"Backlog Follow",
-		"#21 | State: merged | Elapsed: 1m0s",
+		"#21  Compact follow | State: merged | Elapsed: 1m0s",
 		"Run: follow-compact | Runner: n/a (terminal Run)",
-		"Tokens: n/a | Subagents: 0 (0 active)",
+		"Activity: 5s | Worker operation: test",
+		"Subagents: 0 (0 active) | Deepest: test",
+		"Turns: Worker n/a, Subagent n/a",
+		"Tokens: Worker n/a, Subagent n/a, Total n/a",
 		"Activity (latest 20)",
 		"Tool test started",
 	} {
@@ -179,6 +187,245 @@ func TestInteractiveFollowRawStdoutRemainsVerbatim(t *testing.T) {
 	}
 	if got := output.String(); got != want {
 		t.Fatalf("interactive raw Follow stdout = %q, want %q", got, want)
+	}
+}
+
+func TestCompactStatusRetainsUnavailableElapsedAndRunningTelemetry(t *testing.T) {
+	now := time.Date(2026, 7, 31, 8, 9, 10, 0, time.UTC)
+	turns, tools := 2, 3
+	subagentTokens := int64(50)
+	metrics := followMetrics{}
+	metrics.apply(activity.Entry{ObservedAt: now.Add(-3 * time.Second), Kind: "tool", Operation: "test", OperationChanged: true})
+	metrics.apply(activity.Entry{ObservedAt: now.Add(-2 * time.Second), Kind: "turn", TurnDelta: 1})
+	metrics.apply(activity.Entry{ObservedAt: now.Add(-time.Second), ResponseCompleted: true, TokensKnown: true, TokenDelta: 100})
+	metrics.apply(activity.Entry{ObservedAt: now, Kind: "subagent", Subagent: &activity.SubagentSnapshot{
+		ID: "review", Description: "Review", Activity: "checking", Active: true,
+		Turns: &turns, ToolUses: &tools, ApproxTokens: &subagentTokens,
+	}})
+	observed := statusRun{
+		run: scheduler.Run{Issue: 30, RunID: "running", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint},
+		observation: runObservation{metrics: metrics, observed: now, process: followObservation{
+			workerLiveness: "alive (verified)", workerLivenessState: workerLivenessAlive, supervision: "SUPERVISED",
+		}},
+	}
+	var output bytes.Buffer
+	printer := compactStatusPrinter{
+		output: &output, now: now,
+		presentation: compactPresentation{enabled: true, width: 58, styler: newDashboardStyler(TerminalColorNone, true)},
+	}
+	printer.section(statusActive, "Active", []statusRun{observed})
+	if printer.err != nil {
+		t.Fatal(printer.err)
+	}
+	got := output.String()
+	for _, want := range []string{
+		"State: running | Elapsed: n/a",
+		"Worker: alive (verified)",
+		"Activity: 0s",
+		`Deepest: Subagent "Review": checking`,
+		"Turns: Worker 1, Subagent ~2",
+		"Tokens: ~150",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("compact status telemetry missing %q:\n%s", want, got)
+		}
+	}
+	assertCompactLineWidths(t, got, 58)
+}
+
+func TestInteractiveFollowStreamsCompactFinalSummaryWithOutcomeColor(t *testing.T) {
+	directory := t.TempDir()
+	logPath := filepath.Join(directory, "live-compact.jsonl")
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projectionPath := activity.PathForLog(logPath)
+	observedAt := time.Date(2026, 7, 31, 8, 9, 10, 0, time.Local)
+	writeActivityEntries(t, projectionPath, activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: observedAt, Kind: "lifecycle", Description: "Worker started",
+		Operation: "starting", OperationChanged: true,
+	})
+	identity, err := pidStartIdentity(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := state.FileStore{Path: filepath.Join(directory, "state.json")}
+	run := scheduler.Run{
+		Issue: 31, RunID: "live-compact", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint,
+		PID: os.Getpid(), ProcessIdentity: identity, LogPath: logPath, WorkerLogOpen: true, StartedAt: observedAt.Add(-time.Minute),
+	}
+	if err := store.Save(state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}); err != nil {
+		t.Fatal(err)
+	}
+	presentation := compactPresentation{enabled: true, width: 72, styler: newDashboardStyler(TerminalColorTrueColor, true)}
+	var output synchronizedBuffer
+	done := make(chan error, 1)
+	go func() {
+		done <- followNormalizedPresented(context.Background(), store, run.RunID, &output, io.Discard, 5*time.Millisecond, func() time.Time {
+			return observedAt.Add(10 * time.Second)
+		}, presentation)
+	}()
+	waitForBuffer(t, &output, "Worker started")
+	writeActivityEntries(t, projectionPath, activity.Entry{
+		Version: activity.CurrentVersion, ObservedAt: observedAt.Add(9 * time.Second), Kind: "model",
+		Description: "Assistant response completed", ResponseCompleted: true, TokensKnown: true, TokenDelta: 77,
+	})
+	waitForBuffer(t, &output, "Assistant response completed")
+	run.Status = scheduler.StatusFailed
+	run.WorkerLogOpen = false
+	if err := store.Save(state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{run}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("compact follower did not exit after terminal transition")
+	}
+	got := output.String()
+	plain := ansi.Strip(got)
+	for _, want := range []string{
+		"Run state changed to failed", "Final", "State: failed", "Tokens: Worker 77, Subagent n/a, Total 77",
+	} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("streaming compact Follow missing %q:\n%s", want, plain)
+		}
+	}
+	if strings.Count(plain, "Backlog Follow") != 1 || strings.Count(plain, "Final") != 1 {
+		t.Fatalf("compact final summary duplicated headings:\n%s", plain)
+	}
+	if !strings.Contains(got, presentation.styler.attention.Render("Run state changed to failed")) ||
+		!strings.Contains(got, presentation.styler.attention.Render("Final")) {
+		t.Fatalf("failed lifecycle/final output lost attention color: %q", got)
+	}
+	assertCompactLineWidths(t, got, 72)
+}
+
+func TestInteractiveStatusJSONBypassesCompactPresentation(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	current := state.State{Version: state.CurrentVersion, Repo: "acme/widgets"}
+	store := state.FileStore{Path: filepath.Join(stateDir, "state.json")}
+	if err := store.Save(current); err != nil {
+		t.Fatal(err)
+	}
+	current, _, err := store.Preview()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output, diagnostics bytes.Buffer
+	exit := MainWithTerminal(context.Background(), []string{
+		"status", "--json", "--repo-dir", repository, "--state-dir", stateDir,
+	}, TerminalDependencies{
+		Output: &output, ErrorOutput: &diagnostics,
+		IsTerminal:   func() bool { return true },
+		Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 40, Height: 10}, nil },
+		ColorProfile: func() TerminalColorProfile { return TerminalColorTrueColor },
+	})
+	if exit != 0 {
+		t.Fatalf("terminal status JSON exit = %d, diagnostics = %q", exit, diagnostics.String())
+	}
+	if strings.Contains(output.String(), "\x1b") {
+		t.Fatalf("terminal status JSON contained ANSI: %q", output.String())
+	}
+	var got state.State
+	if err := json.Unmarshal(output.Bytes(), &got); err != nil {
+		t.Fatalf("terminal status JSON: %v\n%s", err, output.String())
+	}
+	if !reflect.DeepEqual(got, current) {
+		t.Fatalf("terminal status JSON = %#v, want %#v", got, current)
+	}
+}
+
+func TestInteractiveStatusAndFollowHonorNoColorEnvironment(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("COLORTERM", "truecolor")
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	run := scheduler.Run{Issue: 32, RunID: "no-color", Status: scheduler.StatusMerged, WorkerMode: scheduler.WorkerModePrint}
+	if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{Version: state.CurrentVersion, Runs: []scheduler.Run{run}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range [][]string{
+		{"status", "--repo-dir", repository, "--state-dir", stateDir},
+		{"follow", run.RunID, "--repo-dir", repository, "--state-dir", stateDir},
+	} {
+		var output, diagnostics bytes.Buffer
+		exit := MainWithTerminal(context.Background(), command, TerminalDependencies{
+			Output: &output, ErrorOutput: &diagnostics,
+			IsTerminal: func() bool { return true },
+			Dimensions: func() (TerminalDimensions, error) {
+				return TerminalDimensions{Width: 60, Height: 20}, nil
+			},
+		})
+		if exit != 0 {
+			t.Fatalf("%v exit = %d, diagnostics = %q", command, exit, diagnostics.String())
+		}
+		if got := output.String(); strings.Contains(got, "\x1b") || !strings.Contains(got, "Backlog ") {
+			t.Fatalf("%v NO_COLOR output = %q", command, got)
+		}
+	}
+}
+
+func TestCompactPresentationHandlesNarrowWideUnicode(t *testing.T) {
+	presentation := compactPresentation{enabled: true, width: 18, styler: newDashboardStyler(TerminalColorTrueColor, true)}
+	var output bytes.Buffer
+	renderer := newFollowRenderer(&output, presentation)
+	if err := renderer.activityEntry(activity.Entry{
+		ObservedAt: time.Date(2026, 7, 31, 8, 9, 10, 0, time.Local),
+		Kind:       "tool", Description: "测试 🧪 e\u0301 activity",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !utf8.ValidString(output.String()) || !strings.Contains(output.String(), "\x1b[") {
+		t.Fatalf("narrow Unicode Activity was invalid or unstyled: %q", output.String())
+	}
+	assertCompactLineWidths(t, output.String(), 18)
+	for _, line := range presentation.fieldLines("  ", "测试字段", "emoji 🧪 value", "e\u0301 combining") {
+		if !utf8.ValidString(line) || ansi.StringWidth(line) > presentation.width {
+			t.Fatalf("packed Unicode field line = %q, width %d", line, ansi.StringWidth(line))
+		}
+	}
+}
+
+func TestCompactPresentationsReturnOutputFailures(t *testing.T) {
+	presentation := compactPresentation{enabled: true, width: 40, styler: newDashboardStyler(TerminalColorTrueColor, true)}
+	if err := printCompactStatusProjection(failingStatusWriter{}, state.State{Version: state.CurrentVersion}, &sequenceFollowSource{}, time.Now(), false, presentation); err == nil || !strings.Contains(err.Error(), "status output failed") {
+		t.Fatalf("compact status output error = %v", err)
+	}
+	renderer := newFollowRenderer(failingStatusWriter{}, presentation)
+	if err := renderer.summary(scheduler.Run{}, followMetrics{}, followObservation{}, time.Now()); err == nil || !strings.Contains(err.Error(), "status output failed") {
+		t.Fatalf("compact Follow output error = %v", err)
+	}
+}
+
+func TestRunLifecycleSemanticCoversEveryStatus(t *testing.T) {
+	for _, test := range []struct {
+		status   scheduler.Status
+		liveness workerLivenessState
+		want     dashboardSemantic
+	}{
+		{scheduler.StatusClaimed, workerLivenessAbsent, dashboardSemanticActive},
+		{scheduler.StatusWorktreeReady, workerLivenessAbsent, dashboardSemanticActive},
+		{scheduler.StatusRunning, workerLivenessAlive, dashboardSemanticActive},
+		{scheduler.StatusRunning, workerLivenessDead, dashboardSemanticWarning},
+		{scheduler.StatusWaitingForMerge, workerLivenessAbsent, dashboardSemanticWarning},
+		{scheduler.StatusSuspended, workerLivenessAbsent, dashboardSemanticWarning},
+		{scheduler.StatusResetting, workerLivenessAbsent, dashboardSemanticWarning},
+		{scheduler.StatusReset, workerLivenessAbsent, dashboardSemanticCompletion},
+		{scheduler.StatusResolvingExternally, workerLivenessAbsent, dashboardSemanticAttention},
+		{scheduler.StatusResolvedExternally, workerLivenessAbsent, dashboardSemanticCompletion},
+		{scheduler.StatusMerged, workerLivenessAbsent, dashboardSemanticCompletion},
+		{scheduler.StatusFailed, workerLivenessAbsent, dashboardSemanticAttention},
+		{scheduler.StatusNeedsHuman, workerLivenessAbsent, dashboardSemanticAttention},
+	} {
+		observed := statusRun{run: scheduler.Run{Status: test.status}, observation: runObservation{process: followObservation{workerLivenessState: test.liveness}}}
+		if got := dashboardRunLifecycleSemantic(observed); got != test.want {
+			t.Fatalf("status %s liveness %d semantic = %d, want %d", test.status, test.liveness, got, test.want)
+		}
 	}
 }
 

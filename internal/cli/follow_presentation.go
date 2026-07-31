@@ -5,6 +5,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/robinjoseph08/backlog/internal/activity"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
@@ -39,17 +40,30 @@ func (r followRenderer) summaryWithHeading(run scheduler.Run, metrics followMetr
 			return err
 		}
 	}
-	row := compactDashboardRun(observed, now, false, r.presentation.width)
+	row := compactRunSummary(observed, now, false, r.presentation.width)
 	if err := r.line(followRunSemantic(observed), row); err != nil {
 		return err
 	}
-	metadata := fmt.Sprintf("Run: %s | Runner: %s | Worker: %s",
-		plainStatusValue(run.RunID), plainStatusValue(observation.supervision), plainStatusValue(observation.workerLiveness))
-	if err := r.line(dashboardSemanticMetadata, metadata); err != nil {
+	if err := r.fields(dashboardSemanticMetadata, "",
+		"Run: "+plainStatusValue(run.RunID),
+		"Runner: "+plainStatusValue(observation.supervision),
+		"Worker: "+plainStatusValue(observation.workerLiveness),
+	); err != nil {
 		return err
 	}
-	usage := fmt.Sprintf("Tokens: %s | Subagents: %d (%d active)", progress.observedTokens, len(metrics.subagents), progress.activeSubagents)
-	if err := r.line(dashboardSemanticMetadata, usage); err != nil {
+	if err := r.fields(dashboardSemanticMetadata, "",
+		"Activity: "+progress.activityAge,
+		"Worker operation: "+plainStatusValue(progress.workerOperation),
+		fmt.Sprintf("Subagents: %d (%d active)", len(metrics.subagents), progress.activeSubagents),
+		"Deepest: "+plainStatusValue(progress.deepestOperation),
+	); err != nil {
+		return err
+	}
+	if err := r.fields(dashboardSemanticMetadata, "",
+		fmt.Sprintf("Turns: Worker %s, Subagent %s", progress.workerTurns, progress.subagentTurns),
+		"Subagent tools: "+progress.subagentToolUses,
+		fmt.Sprintf("Tokens: Worker %s, Subagent %s, Total %s", progress.workerTokens, progress.subagentTokens, progress.observedTokens),
+	); err != nil {
 		return err
 	}
 	if run.Status == scheduler.StatusResolvedExternally {
@@ -72,11 +86,15 @@ func (r followRenderer) summaryWithHeading(run scheduler.Run, metrics followMetr
 	for index, id := range metrics.subagentOrder {
 		observed := metrics.subagents[id]
 		subagent := observed.snapshot
-		line := fmt.Sprintf("  Subagent %d %s | %s | %s | turns %s | tools %s | %s | tokens %s",
-			index+1, valueOr(plainStatusValue(subagent.Description), "n/a"), valueOr(plainStatusValue(subagent.Status), "n/a"),
-			valueOr(plainStatusValue(subagent.Activity), "n/a"), approximateInt(subagent.Turns), approximateInt(subagent.ToolUses),
-			displaySubagentDuration(subagent.DurationMillis, subagent.Active, observed.latest, now), approximateInt64(subagent.ApproxTokens))
-		if err := r.line(followSubagentSemantic(subagent), line); err != nil {
+		if err := r.fields(followSubagentSemantic(subagent), "  ",
+			fmt.Sprintf("Subagent %d: %s", index+1, valueOr(plainStatusValue(subagent.Description), "n/a")),
+			"Status: "+valueOr(plainStatusValue(subagent.Status), "n/a"),
+			"Operation: "+valueOr(plainStatusValue(subagent.Activity), "n/a"),
+			"Turns: "+approximateInt(subagent.Turns),
+			"Tools: "+approximateInt(subagent.ToolUses),
+			"Duration: "+displaySubagentDuration(subagent.DurationMillis, subagent.Active, observed.latest, now),
+			"Tokens: "+approximateInt64(subagent.ApproxTokens),
+		); err != nil {
 			return err
 		}
 	}
@@ -106,6 +124,10 @@ func (r followRenderer) initialActivity(entries []activity.Entry) error {
 }
 
 func (r followRenderer) activityEntry(entry activity.Entry) error {
+	return r.activityEntrySemantic(entry, followActivitySemantic(entry))
+}
+
+func (r followRenderer) activityEntrySemantic(entry activity.Entry, semantic dashboardSemantic) error {
 	if !r.presentation.enabled {
 		return printActivityEntry(r.output, entry)
 	}
@@ -117,10 +139,11 @@ func (r followRenderer) activityEntry(entry activity.Entry) error {
 	if entry.Subagent != nil {
 		description += " | " + displaySubagentDuration(entry.Subagent.DurationMillis, false, time.Time{}, time.Time{})
 	}
-	line := r.presentation.renderSpans(
-		compactSpan{semantic: dashboardSemanticMetadata, text: "  " + observed + "  "},
-		compactSpan{semantic: followActivitySemantic(entry), text: description},
-	)
+	prefix := ansi.Truncate("  "+observed+"  ", r.presentation.width, "")
+	remaining := max(0, r.presentation.width-ansi.StringWidth(prefix))
+	description = ansi.Truncate(description, remaining, "")
+	line := r.presentation.styler.render(dashboardSemanticMetadata, prefix) +
+		r.presentation.styler.render(semantic, description)
 	_, err := fmt.Fprintln(r.output, line)
 	return err
 }
@@ -135,7 +158,16 @@ func (r followRenderer) activeSubagentSummary(metrics followMetrics) error {
 	return r.line(dashboardSemanticActive, line)
 }
 
-func (r followRenderer) terminalHeading() error {
+func (r followRenderer) fields(semantic dashboardSemantic, indent string, fields ...string) error {
+	for _, line := range r.presentation.fieldLines(indent, fields...) {
+		if err := r.line(semantic, line); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r followRenderer) terminalHeading(semantic dashboardSemantic) error {
 	if !r.presentation.enabled {
 		_, err := fmt.Fprintln(r.output, "\nTerminal Run summary:")
 		return err
@@ -143,7 +175,7 @@ func (r followRenderer) terminalHeading() error {
 	if err := r.write("\n"); err != nil {
 		return err
 	}
-	return r.line(dashboardSemanticCompletion, "Final")
+	return r.line(semantic, "Final")
 }
 
 func (r followRenderer) line(semantic dashboardSemantic, text string) error {
@@ -157,19 +189,7 @@ func (r followRenderer) write(text string) error {
 }
 
 func followRunSemantic(observed statusRun) dashboardSemantic {
-	switch observed.run.Status {
-	case scheduler.StatusMerged, scheduler.StatusResolvedExternally, scheduler.StatusReset:
-		return dashboardSemanticCompletion
-	case scheduler.StatusFailed, scheduler.StatusNeedsHuman, scheduler.StatusResolvingExternally:
-		return dashboardSemanticAttention
-	case scheduler.StatusWaitingForMerge, scheduler.StatusSuspended, scheduler.StatusResetting:
-		return dashboardSemanticWarning
-	case scheduler.StatusRunning:
-		if observed.observation.process.workerLivenessState != workerLivenessAlive {
-			return dashboardSemanticWarning
-		}
-	}
-	return dashboardSemanticActive
+	return dashboardRunLifecycleSemantic(observed)
 }
 
 func followSubagentSemantic(snapshot activity.SubagentSnapshot) dashboardSemantic {
@@ -181,6 +201,20 @@ func followSubagentSemantic(snapshot activity.SubagentSnapshot) dashboardSemanti
 	default:
 		return dashboardSemanticMetadata
 	}
+}
+
+func followObservationSemantic(observation followObservation) dashboardSemantic {
+	if observation.supervision != "SUPERVISED" || observation.workerLivenessState == workerLivenessDead || observation.workerLivenessState == workerLivenessUnknown {
+		return dashboardSemanticWarning
+	}
+	return dashboardSemanticActive
+}
+
+func followLivenessSemantic(observation followObservation) dashboardSemantic {
+	if observation.workerLivenessState == workerLivenessDead || observation.workerLivenessState == workerLivenessUnknown || observation.workerLivenessState == workerLivenessAbsent {
+		return dashboardSemanticWarning
+	}
+	return dashboardSemanticActive
 }
 
 func followActivitySemantic(entry activity.Entry) dashboardSemantic {

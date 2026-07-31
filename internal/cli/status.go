@@ -281,8 +281,48 @@ func (p *compactStatusPrinter) section(section statusSection, name string, runs 
 	}
 	for _, observed := range runs {
 		completion := section == statusCompletions || observed.run.Status == scheduler.StatusMerged
-		row := "  " + compactDashboardRun(observed, p.now, completion, p.presentation.width-2)
+		row := "  " + compactRunSummary(observed, p.now, completion, p.presentation.width-2)
 		p.line(compactStatusRunSemantic(observed, section), row)
+		p.details(observed)
+	}
+}
+
+func (p *compactStatusPrinter) details(observed statusRun) {
+	run := observed.run
+	progress := summarizeRunProgress(run, observed.observation.metrics, p.now)
+	var fields []string
+	if run.Status == scheduler.StatusRunning {
+		fields = append(fields,
+			"Runner: "+plainStatusValue(observed.observation.process.supervision),
+			"Worker: "+plainStatusValue(observed.observation.process.workerLiveness),
+			"Activity: "+progress.activityAge,
+			"Worker operation: "+plainStatusValue(progress.workerOperation),
+			"Deepest: "+plainStatusValue(progress.deepestOperation),
+			fmt.Sprintf("Turns: Worker %s, Subagent %s", progress.workerTurns, progress.subagentTurns),
+			"Tokens: "+progress.observedTokens,
+		)
+	}
+	if run.Error != "" {
+		fields = append(fields, "Diagnostic: "+plainStatusValue(strings.TrimSpace(run.Error)))
+	}
+	fields = append(fields, dashboardLifecycleDiagnosticParts(run)...)
+	if run.BlockerKind != "" {
+		fields = append(fields, "Blocker kind: "+plainStatusValue(run.BlockerKind))
+	}
+	if run.BlockerCause != "" {
+		fields = append(fields, "Blocker cause: "+plainStatusValue(run.BlockerCause))
+	}
+	if run.BlockerFingerprint != "" {
+		fields = append(fields, "Blocker fingerprint: "+plainStatusValue(run.BlockerFingerprint))
+	}
+	if run.CleanupPending {
+		fields = append(fields, "Completion cleanup: pending")
+	}
+	if run.AcknowledgedAt != nil && !run.AcknowledgedAt.IsZero() {
+		fields = append(fields, "Acknowledged: "+run.AcknowledgedAt.UTC().Format(time.RFC3339))
+	}
+	for _, line := range p.presentation.fieldLines("    ", fields...) {
+		p.line(dashboardSemanticMetadata, line)
 	}
 }
 
@@ -290,14 +330,11 @@ func compactStatusRunSemantic(observed statusRun, section statusSection) dashboa
 	if section != statusHistory {
 		return dashboardRunSemantic(observed, section)
 	}
-	switch observed.run.Status {
-	case scheduler.StatusMerged, scheduler.StatusResolvedExternally, scheduler.StatusReset:
-		return dashboardSemanticCompletion
-	case scheduler.StatusFailed, scheduler.StatusNeedsHuman:
-		return dashboardSemanticAttention
-	default:
+	semantic := dashboardRunLifecycleSemantic(observed)
+	if semantic == dashboardSemanticActive || semantic == dashboardSemanticWarning {
 		return dashboardSemanticMetadata
 	}
+	return semantic
 }
 
 type statusPrinter struct {

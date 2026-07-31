@@ -38,28 +38,32 @@ func (p compactPresentation) render(semantic dashboardSemantic, text string) str
 	return p.styler.render(semantic, truncateDashboardContent(text, p.width))
 }
 
-func (p compactPresentation) renderSpans(spans ...compactSpan) string {
-	if !p.enabled {
-		var plain strings.Builder
-		for _, span := range spans {
-			plain.WriteString(span.text)
-		}
-		return plain.String()
+func (p compactPresentation) fieldLines(indent string, fields ...string) []string {
+	if len(fields) == 0 {
+		return nil
 	}
-	var rendered strings.Builder
-	remaining := p.width
-	for _, span := range spans {
-		if remaining <= 0 {
-			break
+	width := max(1, p.width)
+	prefix := ansi.Truncate(indent, width, "")
+	available := max(0, width-ansi.StringWidth(prefix))
+	lines := make([]string, 0, len(fields))
+	current := prefix
+	currentWidth := ansi.StringWidth(prefix)
+	for _, field := range fields {
+		field = ansi.Truncate(strings.TrimSpace(field), available, "")
+		separator := ""
+		if currentWidth > ansi.StringWidth(prefix) {
+			separator = " | "
 		}
-		text := ansi.Truncate(span.text, remaining, "")
-		rendered.WriteString(p.styler.render(span.semantic, text))
-		remaining -= ansi.StringWidth(text)
+		fieldWidth := ansi.StringWidth(separator + field)
+		if separator != "" && currentWidth+fieldWidth > width {
+			lines = append(lines, current)
+			current = prefix + field
+			currentWidth = ansi.StringWidth(current)
+			continue
+		}
+		current += separator + field
+		currentWidth += fieldWidth
 	}
-	return rendered.String()
-}
-
-type compactSpan struct {
-	semantic dashboardSemantic
-	text     string
+	lines = append(lines, current)
+	return lines
 }

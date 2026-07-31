@@ -117,11 +117,21 @@ func dashboardRunSemantic(observed statusRun, section statusSection) dashboardSe
 	if semantic := dashboardSectionSemantic(section); semantic != dashboardSemanticActive {
 		return semantic
 	}
+	return dashboardRunLifecycleSemantic(observed)
+}
+
+// dashboardRunLifecycleSemantic classifies a Run independently of the section
+// projecting it so every terminal presentation uses the same lifecycle colors.
+func dashboardRunLifecycleSemantic(observed statusRun) dashboardSemantic {
 	run := observed.run
 	if displayedRunIsSuspending(run, observed.observation.process) {
 		return dashboardSemanticWarning
 	}
 	switch run.Status {
+	case scheduler.StatusMerged, scheduler.StatusResolvedExternally, scheduler.StatusReset:
+		return dashboardSemanticCompletion
+	case scheduler.StatusFailed, scheduler.StatusNeedsHuman, scheduler.StatusResolvingExternally:
+		return dashboardSemanticAttention
 	case scheduler.StatusWaitingForMerge, scheduler.StatusSuspended, scheduler.StatusResetting:
 		return dashboardSemanticWarning
 	case scheduler.StatusRunning:

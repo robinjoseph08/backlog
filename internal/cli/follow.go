@@ -777,7 +777,8 @@ func followNormalizedPresented(
 				Version: activity.CurrentVersion, ObservedAt: now().UTC(), Kind: "lifecycle",
 				Description: "Run state changed to " + string(selected.Status),
 			}
-			if err := renderer.activityEntry(entry); err != nil {
+			semantic := followRunSemantic(statusRun{run: selected, observation: runObservation{process: lastObservation}})
+			if err := renderer.activityEntrySemantic(entry, semantic); err != nil {
 				return err
 			}
 			lastStatus = selected.Status
@@ -786,12 +787,14 @@ func followNormalizedPresented(
 		if followObservationDue(selected.Status, statusChanged, observationNow, nextObservation) {
 			observation := observeFollowRun(source, selected)
 			if observation.supervision != lastObservation.supervision {
-				if err := renderer.activityEntry(activity.Entry{ObservedAt: observationNow.UTC(), Description: "Runner supervision changed to " + observation.supervision}); err != nil {
+				entry := activity.Entry{ObservedAt: observationNow.UTC(), Description: "Runner supervision changed to " + observation.supervision}
+				if err := renderer.activityEntrySemantic(entry, followObservationSemantic(observation)); err != nil {
 					return err
 				}
 			}
 			if observation.workerLiveness != lastObservation.workerLiveness {
-				if err := renderer.activityEntry(activity.Entry{ObservedAt: observationNow.UTC(), Description: "Worker liveness changed to " + observation.workerLiveness}); err != nil {
+				entry := activity.Entry{ObservedAt: observationNow.UTC(), Description: "Worker liveness changed to " + observation.workerLiveness}
+				if err := renderer.activityEntrySemantic(entry, followLivenessSemantic(observation)); err != nil {
 					return err
 				}
 			}
@@ -804,7 +807,8 @@ func followNormalizedPresented(
 					return err
 				}
 			}
-			if err := renderer.terminalHeading(); err != nil {
+			semantic := followRunSemantic(statusRun{run: selected, observation: runObservation{process: lastObservation}})
+			if err := renderer.terminalHeading(semantic); err != nil {
 				return err
 			}
 			return renderer.finalSummary(selected, metrics, lastObservation, now())

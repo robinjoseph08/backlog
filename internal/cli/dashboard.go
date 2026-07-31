@@ -1024,7 +1024,15 @@ func compactDashboardRun(observed statusRun, now time.Time, completion bool, wid
 	return (*dashboardBodyBuilder)(nil).compactDashboardRun(observed, now, completion, width)
 }
 
+func compactRunSummary(observed statusRun, now time.Time, completion bool, width int) string {
+	return (*dashboardBodyBuilder)(nil).compactDashboardRunWithOptions(observed, now, completion, width, true, false)
+}
+
 func (b *dashboardBodyBuilder) compactDashboardRun(observed statusRun, now time.Time, completion bool, width int) string {
+	return b.compactDashboardRunWithOptions(observed, now, completion, width, false, true)
+}
+
+func (b *dashboardBodyBuilder) compactDashboardRunWithOptions(observed statusRun, now time.Time, completion bool, width int, includeUnavailableElapsed, includeDetails bool) string {
 	run := observed.run
 	parts := []string{fmt.Sprintf("#%d", run.Issue)}
 	pullRequest := dashboardPullRequestIdentity(run.PullRequest)
@@ -1037,11 +1045,14 @@ func (b *dashboardBodyBuilder) compactDashboardRun(observed statusRun, now time.
 	progress := summarizeRunProgress(run, observed.observation.metrics, now)
 	if !completion {
 		parts = append(parts, "State: "+displayedRunState(run, observed.observation.process))
-		if progress.elapsed != "n/a" {
+		if progress.elapsed != "n/a" || includeUnavailableElapsed {
 			parts = append(parts, "Elapsed: "+progress.elapsed)
 		}
 	}
-	detailReserve := width / 2
+	detailReserve := 0
+	if includeDetails {
+		detailReserve = width / 2
+	}
 	if completion {
 		detailReserve = width / 3
 	}
@@ -1050,12 +1061,15 @@ func (b *dashboardBodyBuilder) compactDashboardRun(observed statusRun, now time.
 		parts[0] = b.issueIdentity(run, parts[0])
 	}
 	if completion {
-		if progress.elapsed != "n/a" {
+		if progress.elapsed != "n/a" || includeUnavailableElapsed {
 			parts = append(parts, "Elapsed: "+progress.elapsed)
 		}
 		if run.CompletedAt != nil && !run.CompletedAt.IsZero() {
 			parts = append(parts, "Completed: "+displayDuration(now.Sub(*run.CompletedAt))+" ago")
 		}
+		return strings.Join(parts, " | ")
+	}
+	if !includeDetails {
 		return strings.Join(parts, " | ")
 	}
 	parts = append(parts, dashboardLivenessPromotions(observed)...)
