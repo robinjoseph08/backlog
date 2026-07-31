@@ -1044,6 +1044,16 @@ esac
 func TestCompiledResolveFinishesHistoricalCompletionCleanupAndRerunsWithoutMutation(t *testing.T) {
 	fixture := newLocalArtifactResetFixture(t, false)
 	runGit(t, fixture.repository, "push", "origin", fixture.branch)
+	if err := os.WriteFile(filepath.Join(fixture.repository, ".git", "info", "exclude"), []byte("backlog\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ignoredArtifact := filepath.Join(fixture.worktree, "backlog")
+	if err := os.WriteFile(ignoredArtifact, []byte("disposable build output\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("git", "-C", fixture.worktree, "check-ignore", "--quiet", ignoredArtifact).CombinedOutput(); err != nil {
+		t.Fatalf("fixture artifact is not ignored: %v\n%s", err, output)
+	}
 	current, err := fixture.store.Load()
 	if err != nil {
 		t.Fatal(err)

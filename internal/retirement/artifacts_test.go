@@ -296,7 +296,7 @@ func runRetirementGit(t *testing.T, directory string, args ...string) {
 	}
 }
 
-func TestInspectWorktreeChangedDetectsIgnoredFiles(t *testing.T) {
+func TestInspectWorktreeChangedIgnoresIgnoredFiles(t *testing.T) {
 	t.Parallel()
 	worktree := t.TempDir()
 	runRetirementGit(t, worktree, "init")
@@ -314,7 +314,7 @@ func TestInspectWorktreeChangedDetectsIgnoredFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	changed, err = inspectWorktreeChanged(context.Background(), "git", worktree)
-	if err != nil || !changed {
+	if err != nil || changed {
 		t.Fatalf("ignored credentials changed = %t, error = %v", changed, err)
 	}
 }
