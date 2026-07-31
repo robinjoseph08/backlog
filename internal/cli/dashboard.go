@@ -1020,12 +1020,29 @@ func (b *dashboardBodyBuilder) renderResponsiveMessages(messages []dashboardMess
 	}
 }
 
+type compactRunOptions struct {
+	completion                bool
+	width                     int
+	includeUnavailableElapsed bool
+	includeDetails            bool
+}
+
 func compactDashboardRun(observed statusRun, now time.Time, completion bool, width int) string {
-	return (*dashboardBodyBuilder)(nil).compactDashboardRun(observed, now, completion, width)
+	return renderCompactRun(nil, observed, now, compactRunOptions{completion: completion, width: width, includeDetails: true})
+}
+
+func compactRunSummary(observed statusRun, now time.Time, completion bool, width int) string {
+	return renderCompactRun(nil, observed, now, compactRunOptions{completion: completion, width: width, includeUnavailableElapsed: true})
 }
 
 func (b *dashboardBodyBuilder) compactDashboardRun(observed statusRun, now time.Time, completion bool, width int) string {
+	return renderCompactRun(b, observed, now, compactRunOptions{completion: completion, width: width, includeDetails: true})
+}
+
+func renderCompactRun(b *dashboardBodyBuilder, observed statusRun, now time.Time, options compactRunOptions) string {
 	run := observed.run
+	completion, width := options.completion, options.width
+	includeUnavailableElapsed, includeDetails := options.includeUnavailableElapsed, options.includeDetails
 	parts := []string{fmt.Sprintf("#%d", run.Issue)}
 	pullRequest := dashboardPullRequestIdentity(run.PullRequest)
 	if b != nil {
@@ -1037,11 +1054,14 @@ func (b *dashboardBodyBuilder) compactDashboardRun(observed statusRun, now time.
 	progress := summarizeRunProgress(run, observed.observation.metrics, now)
 	if !completion {
 		parts = append(parts, "State: "+displayedRunState(run, observed.observation.process))
-		if progress.elapsed != "n/a" {
+		if progress.elapsed != "n/a" || includeUnavailableElapsed {
 			parts = append(parts, "Elapsed: "+progress.elapsed)
 		}
 	}
-	detailReserve := width / 2
+	detailReserve := 0
+	if includeDetails {
+		detailReserve = width / 2
+	}
 	if completion {
 		detailReserve = width / 3
 	}
@@ -1050,12 +1070,15 @@ func (b *dashboardBodyBuilder) compactDashboardRun(observed statusRun, now time.
 		parts[0] = b.issueIdentity(run, parts[0])
 	}
 	if completion {
-		if progress.elapsed != "n/a" {
+		if progress.elapsed != "n/a" || includeUnavailableElapsed {
 			parts = append(parts, "Elapsed: "+progress.elapsed)
 		}
 		if run.CompletedAt != nil && !run.CompletedAt.IsZero() {
 			parts = append(parts, "Completed: "+displayDuration(now.Sub(*run.CompletedAt))+" ago")
 		}
+		return strings.Join(parts, " | ")
+	}
+	if !includeDetails {
 		return strings.Join(parts, " | ")
 	}
 	parts = append(parts, dashboardLivenessPromotions(observed)...)
@@ -1226,6 +1249,15 @@ func dashboardLifecycleDiagnosticParts(run scheduler.Run) []string {
 	}
 	if run.WorkflowStage != "" {
 		parts = append(parts, "Workflow stage: "+plainStatusValue(run.WorkflowStage))
+	}
+	if run.BlockerKind != "" {
+		parts = append(parts, "Blocker kind: "+plainStatusValue(run.BlockerKind))
+	}
+	if run.BlockerCause != "" {
+		parts = append(parts, "Blocker cause: "+plainStatusValue(run.BlockerCause))
+	}
+	if run.BlockerFingerprint != "" {
+		parts = append(parts, "Blocker fingerprint: "+plainStatusValue(run.BlockerFingerprint))
 	}
 	if run.ResumeAfter != nil && !run.ResumeAfter.IsZero() {
 		parts = append(parts, "Provider cooldown until: "+run.ResumeAfter.UTC().Format(time.RFC3339))

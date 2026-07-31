@@ -88,7 +88,13 @@ func printPlainStatus(output io.Writer, current state.State, source followStateS
 	return printPlainStatusProjection(output, current, source, now, false)
 }
 
-func printPlainStatusProjection(output io.Writer, current state.State, source followStateSource, now time.Time, showAll bool) error {
+type statusProjection struct {
+	sections           map[statusSection][]statusRun
+	displayed          int
+	acknowledgedHidden int
+}
+
+func projectStatus(current state.State, source followStateSource, now time.Time, showAll bool) statusProjection {
 	fullSections := observeStatusSections(current, source, now)
 	sections := map[statusSection][]statusRun{
 		statusActive: fullSections[statusActive], statusAttention: fullSections[statusAttention],
@@ -112,26 +118,50 @@ func printPlainStatusProjection(output io.Writer, current state.State, source fo
 			sections[statusCompletions] = append(sections[statusCompletions], observed)
 		}
 	}
+	displayed := 0
 	for section := range sections {
 		sortStatusRuns(sections[section])
+		displayed += len(sections[section])
 	}
+	return statusProjection{sections: sections, displayed: displayed, acknowledgedHidden: acknowledgedHidden}
+}
 
-	displayed := 0
-	for _, runs := range sections {
-		displayed += len(runs)
-	}
+func printPlainStatusProjection(output io.Writer, current state.State, source followStateSource, now time.Time, showAll bool) error {
+	projection := projectStatus(current, source, now, showAll)
 	printer := statusPrinter{output: output}
 	printer.printf("Repository: %s\n", valueOr(plainStatusValue(current.Repo), "not initialized"))
-	printer.printf("Runs: %d total | %d displayed\n", len(current.Runs), displayed)
-	printer.printf("Acknowledged outcomes hidden by default: %d\n", acknowledgedHidden)
+	printer.printf("Runs: %d total | %d displayed\n", len(current.Runs), projection.displayed)
+	printer.printf("Acknowledged outcomes hidden by default: %d\n", projection.acknowledgedHidden)
 	printer.printf("Active Leases: %d\n", len(current.Leases))
-	printer.section("Active", sections[statusActive])
-	printer.section("Attention Required", sections[statusAttention])
+	printer.section("Active", projection.sections[statusActive])
+	printer.section("Attention Required", projection.sections[statusAttention])
 	if showAll {
-		printer.section("History", sections[statusHistory])
+		printer.section("History", projection.sections[statusHistory])
 	} else {
-		printer.section("Outcomes to Acknowledge", sections[statusOutcomes])
-		printer.section("Recent Completions", sections[statusCompletions])
+		printer.section("Outcomes to Acknowledge", projection.sections[statusOutcomes])
+		printer.section("Recent Completions", projection.sections[statusCompletions])
+	}
+	return printer.err
+}
+
+func printCompactStatusProjection(output io.Writer, current state.State, source followStateSource, now time.Time, showAll bool, presentation compactPresentation) error {
+	projection := projectStatus(current, source, now, showAll)
+	printer := compactStatusPrinter{output: output, presentation: presentation, now: now}
+	printer.line(dashboardSemanticNone, "Backlog Status")
+	summary := fmt.Sprintf("%s | %d runs, %d shown | %d leases",
+		valueOr(plainStatusValue(current.Repo), "not initialized"), len(current.Runs), projection.displayed, len(current.Leases))
+	if projection.acknowledgedHidden > 0 && !showAll {
+		summary += fmt.Sprintf(" | %d acknowledged hidden", projection.acknowledgedHidden)
+	}
+	printer.line(dashboardSemanticMetadata, summary)
+	printer.line(dashboardSemanticNone, "")
+	printer.section(statusActive, "Active", projection.sections[statusActive])
+	printer.section(statusAttention, "Attention Required", projection.sections[statusAttention])
+	if showAll {
+		printer.section(statusHistory, "History", projection.sections[statusHistory])
+	} else {
+		printer.section(statusOutcomes, "Outcomes to Acknowledge", projection.sections[statusOutcomes])
+		printer.section(statusCompletions, "Recent Completions", projection.sections[statusCompletions])
 	}
 	return printer.err
 }
@@ -228,6 +258,84 @@ func lifecycleTime(run scheduler.Run) time.Time {
 		}
 	}
 	return latest
+}
+
+type compactStatusPrinter struct {
+	output       io.Writer
+	presentation compactPresentation
+	now          time.Time
+	err          error
+}
+
+func (p *compactStatusPrinter) line(semantic dashboardSemantic, text string) {
+	if p.err != nil {
+		return
+	}
+	_, p.err = fmt.Fprintln(p.output, p.presentation.render(semantic, text))
+}
+
+func (p *compactStatusPrinter) section(section statusSection, name string, runs []statusRun) {
+	p.line(dashboardSectionSemantic(section), fmt.Sprintf("%s (%d)", name, len(runs)))
+	if len(runs) == 0 {
+		return
+	}
+	for _, observed := range runs {
+		completion := section == statusCompletions
+		row := "  " + compactRunSummary(observed, p.now, completion, p.presentation.width-2)
+		p.line(compactStatusRunSemantic(observed, section), row)
+		p.details(observed)
+	}
+}
+
+func (p *compactStatusPrinter) details(observed statusRun) {
+	run := observed.run
+	progress := summarizeRunProgress(run, observed.observation.metrics, p.now)
+	fields := []string{"Run: " + plainStatusValue(run.RunID)}
+	if run.Status == scheduler.StatusRunning {
+		fields = append(fields,
+			"Runner: "+plainStatusValue(observed.observation.process.supervision),
+			"Worker: "+plainStatusValue(observed.observation.process.workerLiveness),
+			"Activity: "+progress.activityAge,
+			"Worker operation: "+plainStatusValue(progress.workerOperation),
+			"Deepest: "+plainStatusValue(progress.deepestOperation),
+			fmt.Sprintf("Turns: Worker %s, Subagent %s", progress.workerTurns, progress.subagentTurns),
+			"Tokens: "+progress.observedTokens,
+		)
+	}
+	if run.Error != "" {
+		fields = append(fields, "Diagnostic: "+plainStatusValue(strings.TrimSpace(run.Error)))
+	}
+	fields = append(fields, dashboardLifecycleDiagnosticParts(run)...)
+	if run.CleanupPending {
+		fields = append(fields, "Completion cleanup: pending")
+	}
+	if run.AcknowledgedAt != nil && !run.AcknowledgedAt.IsZero() {
+		fields = append(fields, "Acknowledged: "+run.AcknowledgedAt.UTC().Format(time.RFC3339))
+	}
+	if run.Status == scheduler.StatusResolvedExternally {
+		resolvedAt := "n/a"
+		if run.ResolvedExternallyAt != nil && !run.ResolvedExternallyAt.IsZero() {
+			resolvedAt = run.ResolvedExternallyAt.UTC().Format(time.RFC3339)
+		}
+		fields = append(fields, "Resolved externally: "+resolvedAt, "GitHub closure reason: "+valueOr(plainStatusValue(run.ClosureReason), "n/a"))
+	}
+	if run.DiagnosticWarning != "" {
+		fields = append(fields, "Diagnostic warning: "+plainStatusValue(run.DiagnosticWarning))
+	}
+	for _, line := range p.presentation.fieldLines("    ", fields...) {
+		p.line(dashboardSemanticMetadata, line)
+	}
+}
+
+func compactStatusRunSemantic(observed statusRun, section statusSection) dashboardSemantic {
+	if section != statusHistory {
+		return dashboardRunSemantic(observed, section)
+	}
+	semantic := dashboardRunLifecycleSemantic(observed)
+	if semantic == dashboardSemanticActive || semantic == dashboardSemanticWarning {
+		return dashboardSemanticMetadata
+	}
+	return semantic
 }
 
 type statusPrinter struct {
@@ -389,29 +497,8 @@ func (p *statusPrinter) printBranch(run scheduler.Run) {
 
 func (p *statusPrinter) printReason(run scheduler.Run) {
 	p.printf("    Diagnostic: %s\n", valueOr(strings.TrimSpace(plainStatusValue(run.Error)), "n/a"))
-	if run.FailureClass != "" {
-		p.printf("    Failure class: %s\n", plainStatusValue(string(run.FailureClass)))
-	}
-	if run.WorkflowStage != "" {
-		p.printf("    Workflow stage: %s\n", plainStatusValue(run.WorkflowStage))
-	}
-	if run.BlockerKind != "" {
-		p.printf("    Blocker kind: %s\n", plainStatusValue(run.BlockerKind))
-	}
-	if run.BlockerCause != "" {
-		p.printf("    Blocker cause: %s\n", plainStatusValue(run.BlockerCause))
-	}
-	if run.BlockerFingerprint != "" {
-		p.printf("    Blocker fingerprint: %s\n", plainStatusValue(run.BlockerFingerprint))
-	}
-	if run.ResumeAfter != nil {
-		p.printTime("Provider cooldown until", run.ResumeAfter)
-	}
-	if run.ProviderContinuationAttempts > 0 {
-		p.printf("    Provider continuations: %d of 1\n", run.ProviderContinuationAttempts)
-	}
-	if run.RecoveryCount > 0 {
-		p.printf("    Explicit recoveries: %d\n", run.RecoveryCount)
+	for _, diagnostic := range dashboardLifecycleDiagnosticParts(run) {
+		p.printf("    %s\n", diagnostic)
 	}
 }
 
