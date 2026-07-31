@@ -777,7 +777,7 @@ func followNormalizedPresented(
 				Version: activity.CurrentVersion, ObservedAt: now().UTC(), Kind: "lifecycle",
 				Description: "Run state changed to " + string(selected.Status),
 			}
-			semantic := followRunSemantic(statusRun{run: selected, observation: runObservation{process: lastObservation}})
+			semantic := dashboardRunLifecycleSemantic(statusRun{run: selected, observation: runObservation{process: lastObservation}})
 			if err := renderer.activityEntrySemantic(entry, semantic); err != nil {
 				return err
 			}
@@ -806,10 +806,6 @@ func followNormalizedPresented(
 				if err := printNewActivityPresented(renderer, &metrics, activitySource); err != nil {
 					return err
 				}
-			}
-			semantic := followRunSemantic(statusRun{run: selected, observation: runObservation{process: lastObservation}})
-			if err := renderer.terminalHeading(semantic); err != nil {
-				return err
 			}
 			return renderer.finalSummary(selected, metrics, lastObservation, now())
 		}

@@ -70,7 +70,7 @@ func TestInteractiveStatusUsesCompactColoredRunRows(t *testing.T) {
 	if !strings.Contains(got, "\x1b[") {
 		t.Fatalf("interactive status did not use color: %q", got)
 	}
-	for _, verbose := range []string{"    Run:", "    Issue:", "    Progress:", "Acknowledged outcomes hidden by default:"} {
+	for _, verbose := range []string{"    Issue:", "    Progress:", "Acknowledged outcomes hidden by default:"} {
 		if strings.Contains(plain, verbose) {
 			t.Fatalf("compact status retained verbose field %q:\n%s", verbose, plain)
 		}
@@ -88,7 +88,7 @@ func TestInteractiveStatusNoColorRemainsCompactAndPlain(t *testing.T) {
 	if err := printCompactStatusProjection(&output, current, &sequenceFollowSource{}, now, false, presentation); err != nil {
 		t.Fatal(err)
 	}
-	if got := output.String(); strings.Contains(got, "\x1b[") || !strings.Contains(got, "Backlog Status") || strings.Contains(got, "    Run:") {
+	if got := output.String(); strings.Contains(got, "\x1b[") || !strings.Contains(got, "Backlog Status") || !strings.Contains(got, "Run: one") {
 		t.Fatalf("NO_COLOR compact status = %q", got)
 	}
 	assertCompactLineWidths(t, output.String(), 40)
@@ -380,14 +380,143 @@ func TestCompactPresentationHandlesNarrowWideUnicode(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !utf8.ValidString(output.String()) || !strings.Contains(output.String(), "\x1b[") {
-		t.Fatalf("narrow Unicode Activity was invalid or unstyled: %q", output.String())
+	if !utf8.ValidString(output.String()) || !strings.Contains(output.String(), "\x1b[") || !strings.Contains(ansi.Strip(output.String()), "测试") {
+		t.Fatalf("narrow Unicode Activity was invalid, empty, or unstyled: %q", output.String())
 	}
 	assertCompactLineWidths(t, output.String(), 18)
-	for _, line := range presentation.fieldLines("  ", "测试字段", "emoji 🧪 value", "e\u0301 combining") {
+	lines := presentation.fieldLines("  ", "测试字段", "emoji 🧪 value", "e\u0301 combining")
+	if len(lines) == 0 || !strings.Contains(lines[0], "测试") {
+		t.Fatalf("packed Unicode fields lost visible content: %q", lines)
+	}
+	for _, line := range lines {
 		if !utf8.ValidString(line) || ansi.StringWidth(line) > presentation.width {
 			t.Fatalf("packed Unicode field line = %q, width %d", line, ansi.StringWidth(line))
 		}
+	}
+}
+
+func TestInteractiveStatusLoadsRunningTelemetryThroughCommandBoundary(t *testing.T) {
+	repository := initializeFollowRepository(t)
+	stateDir := t.TempDir()
+	now := time.Date(2026, 7, 31, 8, 9, 10, 0, time.UTC)
+	logPath := filepath.Join(stateDir, "status-live.jsonl")
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeActivityEntries(t, activity.PathForLog(logPath),
+		activity.Entry{Version: activity.CurrentVersion, ObservedAt: now.Add(-2 * time.Second), Kind: "tool", Description: "Tool test started", Operation: "test", OperationChanged: true},
+		activity.Entry{Version: activity.CurrentVersion, ObservedAt: now.Add(-time.Second), Kind: "turn", Description: "Turn completed", TurnDelta: 1},
+		activity.Entry{Version: activity.CurrentVersion, ObservedAt: now, Kind: "model", Description: "Response completed", ResponseCompleted: true, TokensKnown: true, TokenDelta: 42},
+	)
+	identity, err := pidStartIdentity(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := scheduler.Run{
+		Issue: 33, RunID: "status-live", Status: scheduler.StatusRunning, WorkerMode: scheduler.WorkerModePrint,
+		PID: os.Getpid(), ProcessIdentity: identity, LogPath: logPath, StartedAt: now.Add(-time.Minute),
+	}
+	if err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Save(state.State{
+		Version: state.CurrentVersion, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var output, diagnostics bytes.Buffer
+	exit := MainWithTerminal(context.Background(), []string{
+		"status", "--repo-dir", repository, "--state-dir", stateDir,
+	}, TerminalDependencies{
+		Output: &output, ErrorOutput: &diagnostics,
+		IsTerminal:   func() bool { return true },
+		Dimensions:   func() (TerminalDimensions, error) { return TerminalDimensions{Width: 72, Height: 20}, nil },
+		ColorProfile: func() TerminalColorProfile { return TerminalColorNone },
+		Now:          func() time.Time { return now },
+	})
+	if exit != 0 {
+		t.Fatalf("live terminal status exit = %d, diagnostics = %q", exit, diagnostics.String())
+	}
+	for _, want := range []string{"Run: status-live", "Worker: alive", "Worker operation: test", "Turns: Worker 1", "Tokens: 42"} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("live terminal status missing %q:\n%s", want, output.String())
+		}
+	}
+}
+
+func TestCompactStatusPreservesDiagnosticsAndHistoricalOutcomeIdentity(t *testing.T) {
+	now := time.Date(2026, 7, 31, 8, 9, 10, 0, time.UTC)
+	resolvedAt := now.Add(-time.Hour)
+	failed := statusRun{run: scheduler.Run{
+		Issue: 40, RunID: "failed-old", Status: scheduler.StatusFailed, Error: "validation failed",
+		FailureClass: scheduler.FailureValidation, WorkflowStage: "validation", BlockerKind: "evidence", BlockerCause: "missing", BlockerFingerprint: "check-1",
+	}}
+	merged := statusRun{run: scheduler.Run{Issue: 41, RunID: "merged-old", Status: scheduler.StatusMerged, CleanupPending: true}}
+	resolved := statusRun{run: scheduler.Run{
+		Issue: 42, RunID: "resolved-old", Status: scheduler.StatusResolvedExternally, ResolvedExternallyAt: &resolvedAt,
+		ClosureReason: "not-planned", DiagnosticWarning: "cleanup uncertain",
+	}}
+	var output bytes.Buffer
+	printer := compactStatusPrinter{output: &output, now: now, presentation: compactPresentation{enabled: true, width: 80, styler: newDashboardStyler(TerminalColorNone, true)}}
+	printer.section(statusHistory, "History", []statusRun{failed, merged, resolved})
+	if printer.err != nil {
+		t.Fatal(printer.err)
+	}
+	for _, want := range []string{
+		"Run: failed-old", "State: failed", "Diagnostic: validation failed", "Failure class: validation-failure", "Workflow stage: validation",
+		"Blocker kind: evidence", "Blocker cause: missing", "Blocker fingerprint: check-1",
+		"Run: merged-old", "State: merged", "Completion cleanup: pending",
+		"Run: resolved-old", "State: resolved-externally", "GitHub closure reason: not-planned", "Diagnostic warning: cleanup uncertain",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("compact History missing %q:\n%s", want, output.String())
+		}
+	}
+}
+
+func TestCompactFollowPreservesExternalResolutionMetadata(t *testing.T) {
+	now := time.Date(2026, 7, 31, 8, 9, 10, 0, time.UTC)
+	resolvedAt := now.Add(-time.Hour)
+	run := scheduler.Run{
+		Issue: 43, RunID: "resolved", Status: scheduler.StatusResolvedExternally, ResolvedExternallyAt: &resolvedAt,
+		ClosureReason: "completed", Error: "retained diagnostic", DiagnosticWarning: "cleanup warning",
+	}
+	var output bytes.Buffer
+	renderer := newFollowRenderer(&output, compactPresentation{enabled: true, width: 80, styler: newDashboardStyler(TerminalColorNone, true)})
+	if err := renderer.summary(run, followMetrics{}, followObservation{supervision: "n/a (terminal Run)", workerLiveness: "absent", workerLivenessState: workerLivenessAbsent}, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"State: resolved-externally", "Resolved: " + resolvedAt.Format(time.RFC3339), "GitHub: completed", "Retained diagnostic: retained diagnostic", "Diagnostic warning: cleanup warning",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("compact resolved Follow missing %q:\n%s", want, output.String())
+		}
+	}
+}
+
+func TestFollowSemanticClassifiersCoverWarningsAndCompletion(t *testing.T) {
+	completed := activity.SubagentSnapshot{Completed: true}
+	active := activity.SubagentSnapshot{Active: true}
+	for name, gotWant := range map[string][2]dashboardSemantic{
+		"completed Subagent": {followSubagentSemantic(completed), dashboardSemanticCompletion},
+		"active Subagent":    {followSubagentSemantic(active), dashboardSemanticActive},
+		"retry":              {followActivitySemantic(activity.Entry{Kind: "retry"}), dashboardSemanticWarning},
+		"compaction":         {followActivitySemantic(activity.Entry{Kind: "compaction"}), dashboardSemanticWarning},
+		"unsupervised":       {followObservationSemantic(followObservation{supervision: "UNSUPERVISED", workerLivenessState: workerLivenessAlive}), dashboardSemanticWarning},
+		"dead Worker":        {followLivenessSemantic(followObservation{workerLivenessState: workerLivenessDead}), dashboardSemanticWarning},
+		"live Worker":        {followLivenessSemantic(followObservation{workerLivenessState: workerLivenessAlive}), dashboardSemanticActive},
+	} {
+		if gotWant[0] != gotWant[1] {
+			t.Fatalf("%s semantic = %d, want %d", name, gotWant[0], gotWant[1])
+		}
+	}
+	styler := newDashboardStyler(TerminalColorTrueColor, true)
+	var output bytes.Buffer
+	renderer := newFollowRenderer(&output, compactPresentation{enabled: true, width: 60, styler: styler})
+	entry := activity.Entry{Kind: "retry", Description: "Worker retry started"}
+	if err := renderer.activityEntry(entry); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), styler.warning.Render(entry.Description)) {
+		t.Fatalf("retry semantic did not reach rendered output: %q", output.String())
 	}
 }
 

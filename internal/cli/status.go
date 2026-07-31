@@ -280,7 +280,7 @@ func (p *compactStatusPrinter) section(section statusSection, name string, runs 
 		return
 	}
 	for _, observed := range runs {
-		completion := section == statusCompletions || observed.run.Status == scheduler.StatusMerged
+		completion := section == statusCompletions
 		row := "  " + compactRunSummary(observed, p.now, completion, p.presentation.width-2)
 		p.line(compactStatusRunSemantic(observed, section), row)
 		p.details(observed)
@@ -290,7 +290,7 @@ func (p *compactStatusPrinter) section(section statusSection, name string, runs 
 func (p *compactStatusPrinter) details(observed statusRun) {
 	run := observed.run
 	progress := summarizeRunProgress(run, observed.observation.metrics, p.now)
-	var fields []string
+	fields := []string{"Run: " + plainStatusValue(run.RunID)}
 	if run.Status == scheduler.StatusRunning {
 		fields = append(fields,
 			"Runner: "+plainStatusValue(observed.observation.process.supervision),
@@ -306,20 +306,21 @@ func (p *compactStatusPrinter) details(observed statusRun) {
 		fields = append(fields, "Diagnostic: "+plainStatusValue(strings.TrimSpace(run.Error)))
 	}
 	fields = append(fields, dashboardLifecycleDiagnosticParts(run)...)
-	if run.BlockerKind != "" {
-		fields = append(fields, "Blocker kind: "+plainStatusValue(run.BlockerKind))
-	}
-	if run.BlockerCause != "" {
-		fields = append(fields, "Blocker cause: "+plainStatusValue(run.BlockerCause))
-	}
-	if run.BlockerFingerprint != "" {
-		fields = append(fields, "Blocker fingerprint: "+plainStatusValue(run.BlockerFingerprint))
-	}
 	if run.CleanupPending {
 		fields = append(fields, "Completion cleanup: pending")
 	}
 	if run.AcknowledgedAt != nil && !run.AcknowledgedAt.IsZero() {
 		fields = append(fields, "Acknowledged: "+run.AcknowledgedAt.UTC().Format(time.RFC3339))
+	}
+	if run.Status == scheduler.StatusResolvedExternally {
+		resolvedAt := "n/a"
+		if run.ResolvedExternallyAt != nil && !run.ResolvedExternallyAt.IsZero() {
+			resolvedAt = run.ResolvedExternallyAt.UTC().Format(time.RFC3339)
+		}
+		fields = append(fields, "Resolved externally: "+resolvedAt, "GitHub closure reason: "+valueOr(plainStatusValue(run.ClosureReason), "n/a"))
+	}
+	if run.DiagnosticWarning != "" {
+		fields = append(fields, "Diagnostic warning: "+plainStatusValue(run.DiagnosticWarning))
 	}
 	for _, line := range p.presentation.fieldLines("    ", fields...) {
 		p.line(dashboardSemanticMetadata, line)
@@ -496,29 +497,8 @@ func (p *statusPrinter) printBranch(run scheduler.Run) {
 
 func (p *statusPrinter) printReason(run scheduler.Run) {
 	p.printf("    Diagnostic: %s\n", valueOr(strings.TrimSpace(plainStatusValue(run.Error)), "n/a"))
-	if run.FailureClass != "" {
-		p.printf("    Failure class: %s\n", plainStatusValue(string(run.FailureClass)))
-	}
-	if run.WorkflowStage != "" {
-		p.printf("    Workflow stage: %s\n", plainStatusValue(run.WorkflowStage))
-	}
-	if run.BlockerKind != "" {
-		p.printf("    Blocker kind: %s\n", plainStatusValue(run.BlockerKind))
-	}
-	if run.BlockerCause != "" {
-		p.printf("    Blocker cause: %s\n", plainStatusValue(run.BlockerCause))
-	}
-	if run.BlockerFingerprint != "" {
-		p.printf("    Blocker fingerprint: %s\n", plainStatusValue(run.BlockerFingerprint))
-	}
-	if run.ResumeAfter != nil {
-		p.printTime("Provider cooldown until", run.ResumeAfter)
-	}
-	if run.ProviderContinuationAttempts > 0 {
-		p.printf("    Provider continuations: %d of 1\n", run.ProviderContinuationAttempts)
-	}
-	if run.RecoveryCount > 0 {
-		p.printf("    Explicit recoveries: %d\n", run.RecoveryCount)
+	for _, diagnostic := range dashboardLifecycleDiagnosticParts(run) {
+		p.printf("    %s\n", diagnostic)
 	}
 }
 

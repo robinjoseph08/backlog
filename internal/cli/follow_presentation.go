@@ -20,28 +20,39 @@ func newFollowRenderer(output io.Writer, presentation compactPresentation) follo
 }
 
 func (r followRenderer) summary(run scheduler.Run, metrics followMetrics, observation followObservation, now time.Time) error {
-	return r.summaryWithHeading(run, metrics, observation, now, true)
-}
-
-func (r followRenderer) finalSummary(run scheduler.Run, metrics followMetrics, observation followObservation, now time.Time) error {
-	return r.summaryWithHeading(run, metrics, observation, now, false)
-}
-
-func (r followRenderer) summaryWithHeading(run scheduler.Run, metrics followMetrics, observation followObservation, now time.Time, heading bool) error {
 	if !r.presentation.enabled {
 		return printFollowSummary(r.output, run, metrics, observation, now)
 	}
+	if err := r.line(dashboardSemanticNone, "Backlog Follow"); err != nil {
+		return err
+	}
+	return r.compactSummary(run, metrics, observation, now)
+}
+
+func (r followRenderer) finalSummary(run scheduler.Run, metrics followMetrics, observation followObservation, now time.Time) error {
+	if !r.presentation.enabled {
+		if _, err := fmt.Fprintln(r.output, "\nTerminal Run summary:"); err != nil {
+			return err
+		}
+		return printFollowSummary(r.output, run, metrics, observation, now)
+	}
+	if err := r.write("\n"); err != nil {
+		return err
+	}
+	observed := statusRun{run: run, observation: runObservation{process: observation}}
+	if err := r.line(dashboardRunLifecycleSemantic(observed), "Final"); err != nil {
+		return err
+	}
+	return r.compactSummary(run, metrics, observation, now)
+}
+
+func (r followRenderer) compactSummary(run scheduler.Run, metrics followMetrics, observation followObservation, now time.Time) error {
 	progress := summarizeRunProgress(run, metrics, now)
 	observed := statusRun{run: run, observation: runObservation{
 		run: run, metrics: metrics, process: observation, observed: now,
 	}}
-	if heading {
-		if err := r.line(dashboardSemanticNone, "Backlog Follow"); err != nil {
-			return err
-		}
-	}
 	row := compactRunSummary(observed, now, false, r.presentation.width)
-	if err := r.line(followRunSemantic(observed), row); err != nil {
+	if err := r.line(dashboardRunLifecycleSemantic(observed), row); err != nil {
 		return err
 	}
 	if err := r.fields(dashboardSemanticMetadata, "",
@@ -75,9 +86,15 @@ func (r followRenderer) summaryWithHeading(run scheduler.Run, metrics followMetr
 		if err := r.line(dashboardSemanticCompletion, resolution); err != nil {
 			return err
 		}
-		for _, diagnostic := range []string{run.Error, run.DiagnosticWarning} {
-			if diagnostic != "" {
-				if err := r.line(dashboardSemanticWarning, "Diagnostic: "+plainStatusValue(diagnostic)); err != nil {
+		for _, diagnostic := range []struct {
+			label string
+			value string
+		}{
+			{label: "Retained diagnostic", value: run.Error},
+			{label: "Diagnostic warning", value: run.DiagnosticWarning},
+		} {
+			if diagnostic.value != "" {
+				if err := r.line(dashboardSemanticWarning, diagnostic.label+": "+plainStatusValue(diagnostic.value)); err != nil {
 					return err
 				}
 			}
@@ -167,17 +184,6 @@ func (r followRenderer) fields(semantic dashboardSemantic, indent string, fields
 	return nil
 }
 
-func (r followRenderer) terminalHeading(semantic dashboardSemantic) error {
-	if !r.presentation.enabled {
-		_, err := fmt.Fprintln(r.output, "\nTerminal Run summary:")
-		return err
-	}
-	if err := r.write("\n"); err != nil {
-		return err
-	}
-	return r.line(semantic, "Final")
-}
-
 func (r followRenderer) line(semantic dashboardSemantic, text string) error {
 	_, err := fmt.Fprintln(r.output, r.presentation.render(semantic, text))
 	return err
@@ -186,10 +192,6 @@ func (r followRenderer) line(semantic dashboardSemantic, text string) error {
 func (r followRenderer) write(text string) error {
 	_, err := io.WriteString(r.output, text)
 	return err
-}
-
-func followRunSemantic(observed statusRun) dashboardSemantic {
-	return dashboardRunLifecycleSemantic(observed)
 }
 
 func followSubagentSemantic(snapshot activity.SubagentSnapshot) dashboardSemantic {

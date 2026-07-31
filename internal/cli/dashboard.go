@@ -1020,20 +1020,29 @@ func (b *dashboardBodyBuilder) renderResponsiveMessages(messages []dashboardMess
 	}
 }
 
+type compactRunOptions struct {
+	completion                bool
+	width                     int
+	includeUnavailableElapsed bool
+	includeDetails            bool
+}
+
 func compactDashboardRun(observed statusRun, now time.Time, completion bool, width int) string {
-	return (*dashboardBodyBuilder)(nil).compactDashboardRun(observed, now, completion, width)
+	return renderCompactRun(nil, observed, now, compactRunOptions{completion: completion, width: width, includeDetails: true})
 }
 
 func compactRunSummary(observed statusRun, now time.Time, completion bool, width int) string {
-	return (*dashboardBodyBuilder)(nil).compactDashboardRunWithOptions(observed, now, completion, width, true, false)
+	return renderCompactRun(nil, observed, now, compactRunOptions{completion: completion, width: width, includeUnavailableElapsed: true})
 }
 
 func (b *dashboardBodyBuilder) compactDashboardRun(observed statusRun, now time.Time, completion bool, width int) string {
-	return b.compactDashboardRunWithOptions(observed, now, completion, width, false, true)
+	return renderCompactRun(b, observed, now, compactRunOptions{completion: completion, width: width, includeDetails: true})
 }
 
-func (b *dashboardBodyBuilder) compactDashboardRunWithOptions(observed statusRun, now time.Time, completion bool, width int, includeUnavailableElapsed, includeDetails bool) string {
+func renderCompactRun(b *dashboardBodyBuilder, observed statusRun, now time.Time, options compactRunOptions) string {
 	run := observed.run
+	completion, width := options.completion, options.width
+	includeUnavailableElapsed, includeDetails := options.includeUnavailableElapsed, options.includeDetails
 	parts := []string{fmt.Sprintf("#%d", run.Issue)}
 	pullRequest := dashboardPullRequestIdentity(run.PullRequest)
 	if b != nil {
@@ -1240,6 +1249,15 @@ func dashboardLifecycleDiagnosticParts(run scheduler.Run) []string {
 	}
 	if run.WorkflowStage != "" {
 		parts = append(parts, "Workflow stage: "+plainStatusValue(run.WorkflowStage))
+	}
+	if run.BlockerKind != "" {
+		parts = append(parts, "Blocker kind: "+plainStatusValue(run.BlockerKind))
+	}
+	if run.BlockerCause != "" {
+		parts = append(parts, "Blocker cause: "+plainStatusValue(run.BlockerCause))
+	}
+	if run.BlockerFingerprint != "" {
+		parts = append(parts, "Blocker fingerprint: "+plainStatusValue(run.BlockerFingerprint))
 	}
 	if run.ResumeAfter != nil && !run.ResumeAfter.IsZero() {
 		parts = append(parts, "Provider cooldown until: "+run.ResumeAfter.UTC().Format(time.RFC3339))
