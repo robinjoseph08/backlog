@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/robinjoseph08/backlog/internal/recovery"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 )
@@ -34,6 +35,119 @@ func TestRecoverHelpDescribesFailClosedLifecycle(t *testing.T) {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("help omitted %q: %q", want, stderr.String())
 		}
+	}
+}
+
+func TestRecoveryGitVerifierTreatsSuccessfulEmptyStdoutWithSSHWarningAsAbsent(t *testing.T) {
+	localCommit := strings.Repeat("a", 40)
+	git := writeExecutable(t, `#!/bin/sh
+case "$*" in
+  *" rev-parse HEAD") printf '%s\n' '`+localCommit+`' ;;
+  *" ls-remote --heads origin refs/heads/agent/issue-111-run-111")
+    echo "Warning: Permanently added 'github.com' (ED25519) to the list of known hosts." >&2 ;;
+  *) echo "unexpected git: $*" >&2; exit 9 ;;
+esac
+`)
+
+	identity, err := (recoveryGitVerifier{executable: git, repositoryRoot: t.TempDir()}).Verify(context.Background(), scheduler.Run{
+		Branch: "agent/issue-111-run-111", Worktree: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("verify absent remote branch with benign stderr: %v", err)
+	}
+	if identity.LocalCommit != localCommit || identity.RemotePresent || identity.RemoteCommit != "" {
+		t.Fatalf("identity = %#v", identity)
+	}
+}
+
+func TestRecoveryGitVerifierRejectsInvalidRemoteCommitIdentity(t *testing.T) {
+	branch := "agent/issue-111-run-111"
+	git := writeExecutable(t, `#!/bin/sh
+case "$*" in
+  *" rev-parse HEAD") printf '%040d\n' 1 ;;
+  *" ls-remote --heads origin refs/heads/`+branch+`") printf '%s\t%s\n' 'not-an-object-id' 'refs/heads/`+branch+`' ;;
+  *) echo "unexpected git: $*" >&2; exit 9 ;;
+esac
+`)
+
+	_, err := (recoveryGitVerifier{executable: git, repositoryRoot: t.TempDir()}).Verify(context.Background(), scheduler.Run{
+		Branch: branch, Worktree: t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "malformed or ambiguous identity") {
+		t.Fatalf("invalid remote commit identity error = %v", err)
+	}
+}
+
+func TestRecoveryGitVerifierAcceptsOnlyUnambiguousIdentityStdout(t *testing.T) {
+	branch := "agent/issue-111-run-111"
+	localCommit := strings.Repeat("a", 40)
+	remoteCommit := strings.Repeat("b", 40)
+	ref := "refs/heads/" + branch
+	tests := []struct {
+		name          string
+		localCommand  string
+		remoteCommand string
+		wantIdentity  recovery.GitIdentity
+		wantError     string
+	}{
+		{
+			name:          "present branch with benign stderr",
+			localCommand:  "printf '%s\\n' '" + localCommit + "'",
+			remoteCommand: "printf '%s\\t%s\\n' '" + remoteCommit + "' '" + ref + "'; echo 'benign SSH diagnostic' >&2",
+			wantIdentity:  recovery.GitIdentity{LocalCommit: localCommit, RemotePresent: true, RemoteCommit: remoteCommit},
+		},
+		{
+			name:          "malformed remote stdout",
+			localCommand:  "printf '%s\\n' '" + localCommit + "'",
+			remoteCommand: "printf '%s\\n' malformed",
+			wantError:     "malformed or ambiguous identity",
+		},
+		{
+			name:          "null remote commit",
+			localCommand:  "printf '%s\\n' '" + localCommit + "'",
+			remoteCommand: "printf '%040d\\t%s\\n' 0 '" + ref + "'",
+			wantError:     "malformed or ambiguous identity",
+		},
+		{
+			name:          "ambiguous remote stdout",
+			localCommand:  "printf '%s\\n' '" + localCommit + "'",
+			remoteCommand: "printf '%s\\t%s\\n%s\\t%s\\n' '" + remoteCommit + "' '" + ref + "' '" + remoteCommit + "' '" + ref + "'",
+			wantError:     "malformed or ambiguous identity",
+		},
+		{
+			name:          "malformed local stdout",
+			localCommand:  "printf '%s\\n' malformed",
+			remoteCommand: "exit 0",
+			wantError:     "malformed or ambiguous identity",
+		},
+		{
+			name:          "unknown remote failure",
+			localCommand:  "printf '%s\\n' '" + localCommit + "'",
+			remoteCommand: "echo 'remote inspection unavailable' >&2; exit 1",
+			wantError:     "remote inspection unavailable",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			git := writeExecutable(t, "#!/bin/sh\ncase \"$*\" in\n"+
+				"  *\" rev-parse HEAD\") "+test.localCommand+" ;;\n"+
+				"  *\" ls-remote --heads origin refs/heads/"+branch+"\") "+test.remoteCommand+" ;;\n"+
+				"  *) echo \"unexpected git: $*\" >&2; exit 9 ;;\n"+
+				"esac\n")
+			identity, err := (recoveryGitVerifier{executable: git, repositoryRoot: t.TempDir()}).Verify(context.Background(), scheduler.Run{
+				Branch: branch, Worktree: t.TempDir(),
+			})
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("error = %v, want containing %q", err, test.wantError)
+				}
+				return
+			}
+			if err != nil || identity != test.wantIdentity {
+				t.Fatalf("identity = %#v, error = %v", identity, err)
+			}
+		})
 	}
 }
 
