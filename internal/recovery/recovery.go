@@ -351,8 +351,10 @@ func continuationRequest(run scheduler.Run) worker.ContinuationRequest {
 	}
 	return worker.ContinuationRequest{
 		Issue: run.Issue, RunID: run.RunID, Branch: run.Branch,
-		SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree, PromptDigest: run.PromptDigest,
-		RequirePromptOwnership: true, ExpectedWorkflow: expectedWorkflow,
+		SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree,
+		PromptDigest: run.PromptDigest, PromptOwnership: run.PromptOwnership,
+		AllowLegacyPromptOwnership: run.LegacyPromptOwnership,
+		RequirePromptOwnership:     true, ExpectedWorkflow: expectedWorkflow,
 	}
 }
 

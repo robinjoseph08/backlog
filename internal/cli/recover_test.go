@@ -203,6 +203,7 @@ func TestCompiledRecoverLateCompletionRetiresArtifactsLabelsAndLeaseIdempotently
 	run.PullRequest = "https://github.com/acme/widgets/pull/99"
 	run.WorkerGeneration = 1
 	run.StoppedWorkerGeneration = 1
+	run.LegacyPromptOwnership = true
 	stopped := time.Now().Add(-time.Minute).UTC()
 	run.WorkerStoppedAt = &stopped
 	run.Error = "retained diagnostic before late Completion"
@@ -397,7 +398,8 @@ func TestCompiledRecoverDryRunAndIdempotentMutationPreserveRunIdentities(t *test
 		Issue: 42, RunID: runID, Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModeRPC,
 		WorkerGeneration: 1, StoppedWorkerGeneration: 1, WorkerStoppedAt: &started,
 		Branch: branch, Worktree: worktreePath, SessionName: "afk #42", SessionID: sessionID, SessionDir: sessionDir,
-		LogPath: filepath.Join(stateDir, "logs", runID+".jsonl"), StderrPath: filepath.Join(stateDir, "logs", runID+".stderr.log"),
+		LegacyPromptOwnership: true,
+		LogPath:               filepath.Join(stateDir, "logs", runID+".jsonl"), StderrPath: filepath.Join(stateDir, "logs", runID+".stderr.log"),
 		Error: "validation failure retained for manual Recovery", FailureClass: scheduler.FailureValidation, StartedAt: started, UpdatedAt: started,
 	}
 	if err := store.Save(state.State{

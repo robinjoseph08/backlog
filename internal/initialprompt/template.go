@@ -14,6 +14,8 @@ import (
 
 const DefaultTemplate = "/skill:afk {{issue_number}}"
 
+const OwnershipVersion = 1
+
 type Values struct {
 	IssueNumber   int
 	IssueTitle    string
@@ -27,9 +29,27 @@ type Values struct {
 
 type Digest string
 
+type OwnershipEvidence struct {
+	Version       int    `json:"version"`
+	EntryID       string `json:"entryId,omitempty"`
+	ContentDigest Digest `json:"contentDigest,omitempty"`
+}
+
 func Sum(rendered string) Digest {
-	digest := sha256.Sum256([]byte(rendered))
+	return SumBytes([]byte(rendered))
+}
+
+func SumBytes(content []byte) Digest {
+	digest := sha256.Sum256(content)
 	return Digest(hex.EncodeToString(digest[:]))
+}
+
+func PendingOwnership() *OwnershipEvidence {
+	return &OwnershipEvidence{Version: OwnershipVersion}
+}
+
+func (e OwnershipEvidence) Complete() bool {
+	return e.Version == OwnershipVersion && strings.TrimSpace(e.EntryID) != "" && e.ContentDigest.Valid()
 }
 
 func (digest Digest) Valid() bool {

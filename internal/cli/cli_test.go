@@ -109,7 +109,10 @@ if [ "$3" = "worktree" ] && [ "$4" = "remove" ]; then rm -rf "$6"; fi
 	pi := writeExecutable(t, `#!/bin/sh
 set -eu
 IFS= read -r command
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+IFS= read -r ownership
+printf '%s\n' '{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":"/skill:afk 42"}}],"leafId":"initial-user"}}'
+printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 while IFS= read -r ignored; do :; done
 `)
 
@@ -384,8 +387,8 @@ func TestStatusRejectsInvalidAndUnsupportedStateWithoutMutation(t *testing.T) {
 		},
 		{
 			name:       "unsupported state version",
-			fixture:    `{"version":7,"runs":[],"leases":[]}`,
-			diagnostic: "unsupported state version 7",
+			fixture:    `{"version":8,"runs":[],"leases":[]}`,
+			diagnostic: "unsupported state version 8",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {

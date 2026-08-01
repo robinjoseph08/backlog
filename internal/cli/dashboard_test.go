@@ -1679,7 +1679,10 @@ exit 0
 	pi := writeExecutable(t, `#!/bin/sh
 set -eu
 IFS= read -r prompt
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"message_start","message":{"role":"assistant"}}' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"working"}],"usage":{"totalTokens":1200}}}' '{"type":"tool_execution_start","toolCallId":"tool-1","toolName":"bash"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+IFS= read -r ownership
+printf '%s\n' '{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":"/skill:afk 45"}}],"leafId":"initial-user"}}'
+printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"message_start","message":{"role":"assistant"}}' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"working"}],"usage":{"totalTokens":1200}}}' '{"type":"tool_execution_start","toolCallId":"tool-1","toolName":"bash"}'
 touch `+quote(activityEmitted)+`
 while ! test -f `+quote(releaseWorker)+`; do sleep 0.01; done
 printf '%s\n' '{"type":"tool_execution_end","toolCallId":"tool-1","toolName":"bash","isError":false}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'

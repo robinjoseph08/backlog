@@ -30,6 +30,7 @@ func TestFileStoreMigratesV3ToV4Losslessly(t *testing.T) {
 	}
 	expected := fixture
 	expected.Version = CurrentVersion
+	markLegacyPromptOwnership(&expected)
 	if !reflect.DeepEqual(preview, expected) {
 		t.Fatalf("migration changed metadata:\ngot %#v\nwant %#v", preview, expected)
 	}

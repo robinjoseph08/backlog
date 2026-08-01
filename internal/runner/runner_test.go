@@ -20,6 +20,7 @@ import (
 	"time"
 
 	ghadapter "github.com/robinjoseph08/backlog/internal/github"
+	"github.com/robinjoseph08/backlog/internal/initialprompt"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 	"github.com/robinjoseph08/backlog/internal/state"
 	"github.com/robinjoseph08/backlog/internal/worker"
@@ -287,6 +288,7 @@ func TestRunnerClosesWorkerAndRetainsLeaseWhenCompletionSaveFails(t *testing.T) 
 	case <-time.After(time.Second):
 		t.Fatal("Worker was not released after its identity became durable")
 	}
+	workers.waitForCompletionWaiters(t, 12)
 	github.setCompletion(12, mergedOutcome(12))
 	store.failNext()
 	workers.complete(12, worker.Result{ExitCode: 0})
@@ -342,7 +344,7 @@ func TestRunnerShutsDownWorkersWhenLogClosureSaveFails(t *testing.T) {
 			// Startup writes once, then each Worker writes its Lease, planned and
 			// prepared worktree, log paths, and process identity. The completed Run
 			// is save 12 and its log closure marker is save 13.
-			store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 13}
+			store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 15}
 			runner := testRunner(github, workers, store, 2)
 			done := make(chan error, 1)
 			go func() { done <- runner.Run(context.Background()) }()
@@ -502,7 +504,9 @@ func TestRunnerPersistsObservableWorkerContextBeforeRelease(t *testing.T) {
 		run := findActiveRun(&current, issue)
 		if run.Status != scheduler.StatusRunning || run.PID != 1000+issue || run.ProcessIdentity == "" || !run.WorkerLogOpen ||
 			run.IssueTitle != "Make Runs observable" || run.IssueURL != "https://github.com/acme/widgets/issues/7" ||
-			run.LogPath != "/logs/run-7.jsonl" || run.StderrPath != "/logs/run-7.stderr.log" {
+			run.LogPath != "/logs/run-7.jsonl" || run.StderrPath != "/logs/run-7.stderr.log" ||
+			run.PromptDigest != initialprompt.Sum("/skill:afk 7") || run.PromptOwnership == nil ||
+			run.PromptOwnership.Version != initialprompt.OwnershipVersion || run.PromptOwnership.Complete() {
 			released <- fmt.Errorf("Run at release = %#v", run)
 			return
 		}
@@ -513,6 +517,11 @@ func TestRunnerPersistsObservableWorkerContextBeforeRelease(t *testing.T) {
 	go func() { done <- runner.Run(context.Background()) }()
 	if err := <-released; err != nil {
 		t.Fatal(err)
+	}
+	workers.waitForCompletionWaiters(t, 7)
+	started := store.LoadValue().Runs[0]
+	if started.PromptOwnership == nil || !started.PromptOwnership.Complete() || started.PromptOwnership.EntryID != "initial-7" {
+		t.Fatalf("Run was supervised before complete prompt ownership became durable: %#v", started)
 	}
 	workers.complete(7, worker.Result{ExitCode: 1, Err: errors.New("failed")})
 	assertInterventionRequired(t, <-done, 1)
@@ -668,6 +677,88 @@ func TestRunnerRetainsLogIdentitiesWhenWorkerReleaseFails(t *testing.T) {
 	}
 	if workers.runningCount() != 0 {
 		t.Fatalf("running Workers = %d, want released Worker stopped", workers.runningCount())
+	}
+}
+
+func TestRunnerFailsClosedWhenInitialPromptOwnershipCaptureFails(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 19, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	workers.captureOwnershipErr = errors.New("correlated get_entries response unavailable")
+	workers.startupCloseResult.GroupExited = true
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	runner := testRunner(github, workers, store, 1)
+
+	assertInterventionRequired(t, runner.Run(context.Background()), 1)
+	run := store.LoadValue().Runs[0]
+	if run.Status != scheduler.StatusFailed || run.FailureClass != scheduler.FailureUnsafeContinuation || run.PromptOwnership == nil || run.PromptOwnership.Complete() ||
+		run.PromptOwnership.Version != initialprompt.OwnershipVersion || len(store.LoadValue().Leases) != 1 || workers.runningCount() != 0 {
+		t.Fatalf("Run after prompt ownership capture failure = %#v", run)
+	}
+}
+
+func TestRunnerSuspensionInterruptsPromptOwnershipCaptureAndRevalidatesBeforeStopping(t *testing.T) {
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 23, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	workers.blockCapture = true
+	workers.startupCloseResult.GroupExited = true
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}}
+	signals := make(chan os.Signal, 1)
+	runner := testRunner(github, workers, store, 1)
+	runner.Signals = signals
+	var identityChecks atomic.Int32
+	runner.PIDIdentity = func(_ context.Context, pid int) (string, error) {
+		identityChecks.Add(1)
+		return fmt.Sprintf("identity-%d", pid), nil
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(context.Background()) }()
+	workers.waitForStarts(t, 23)
+	select {
+	case issue := <-workers.captureStarted:
+		if issue != 23 {
+			t.Fatalf("capture started for issue #%d", issue)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("prompt ownership capture did not start")
+	}
+	started := time.Now()
+	signals <- syscall.SIGTERM
+	select {
+	case err := <-done:
+		if !isSignalExit(err, 143) {
+			t.Fatalf("run = %v, want signal exit 143", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("suspension did not interrupt prompt ownership capture")
+	}
+	if time.Since(started) >= time.Second || identityChecks.Load() != 2 || workers.abortedCount() != 1 {
+		t.Fatalf("capture stop timing/checks = %s/%d/%d", time.Since(started), identityChecks.Load(), workers.abortedCount())
+	}
+	run := store.LoadValue().Runs[0]
+	if run.Status != scheduler.StatusFailed || run.FailureClass != scheduler.FailureUnsafeContinuation || run.PromptOwnership == nil || run.PromptOwnership.Complete() || len(store.LoadValue().Leases) != 1 {
+		t.Fatalf("Run after interrupted prompt ownership capture = %#v", run)
+	}
+}
+
+func TestRunnerKeepsPendingPromptOwnershipWhenCompleteEvidenceSaveFails(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 22, CreatedAt: time.Now()}}}
+	workers := newFakeWorkers()
+	workers.startupCloseResult.GroupExited = true
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 7}
+	runner := testRunner(github, workers, store, 1)
+
+	err := runner.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "persist initial prompt ownership") {
+		t.Fatalf("run error = %v, want prompt ownership persistence failure", err)
+	}
+	run := store.LoadValue().Runs[0]
+	if run.Status != scheduler.StatusFailed || run.FailureClass != scheduler.FailureUnsafeContinuation || run.PromptOwnership == nil || run.PromptOwnership.Complete() || len(store.LoadValue().Leases) != 1 || workers.runningCount() != 0 {
+		t.Fatalf("Run after prompt ownership persistence failure = %#v", run)
 	}
 }
 
@@ -1626,6 +1717,7 @@ func TestRunnerWaitsForOwnedWorkerBeforePersistingShutdown(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(ctx) }()
 	workers.waitForStarts(t, 4)
+	workers.waitForCompletionWaiters(t, 4)
 	cancel()
 	select {
 	case err := <-done:
@@ -2786,7 +2878,7 @@ func TestRunnerReportsUnverifiedSettledExitPersistenceFailureWithoutWaitingTwice
 	// and 2; admission, worktree, logs, identity, and the initial outcome are
 	// saves 3 through 8. The settled continuation boundary is save 9, and
 	// retaining the unverified process group is save 10.
-	store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 10}
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 11}
 	runner := testRunner(github, workers, store, 1)
 	runner.ExternalResolution = externalResolutionFunc(func(context.Context, scheduler.Run) (bool, error) {
 		return true, errors.New("must not inspect an unverified process group")
@@ -4761,6 +4853,7 @@ func resumableRun(t *testing.T, issue int, runID string) scheduler.Run {
 		WorkerGeneration: 1, StoppedWorkerGeneration: 1, WorkerStoppedAt: &stoppedAt,
 		Branch: fmt.Sprintf("agent/issue-%d-%s", issue, runID), Worktree: worktreePath,
 		SessionName: fmt.Sprintf("afk #%d", issue), SessionID: fmt.Sprintf("session-%d", issue), SessionDir: sessionDir,
+		LegacyPromptOwnership: true,
 		Continuation: &scheduler.ContinuationBoundary{
 			SessionID: fmt.Sprintf("session-%d", issue), SessionFile: sessionFile, Worktree: worktreePath,
 			LeafID: "leaf", EntryCount: 1, SHA256: hex.EncodeToString(hash[:]), WorkerGeneration: 1, VerifiedAt: time.Now(),
@@ -5147,6 +5240,7 @@ func TestRunnerSuspendsOnSecondSIGINTAfterPersistingBoundary(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 40)
+	workers.waitForCompletionWaiters(t, 40)
 	signals <- os.Interrupt
 	signals <- os.Interrupt
 	if err := <-done; !isSignalExit(err, 130) {
@@ -5262,6 +5356,7 @@ func TestRunnerMergedCleanupUsesOneSharedSuspensionDeadline(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 81, 82)
+	workers.waitForCompletionWaiters(t, 81, 82)
 	signals <- os.Interrupt
 	signals <- os.Interrupt
 	if err := <-done; !isSignalExit(err, 130) {
@@ -5437,6 +5532,7 @@ func TestRunnerThirdSIGINTAndTimeoutUseTheSameVerifiedForceStopPath(t *testing.T
 			done := make(chan error, 1)
 			go func() { done <- runner.Run(context.Background()) }()
 			workers.waitForStarts(t, issue)
+			workers.waitForCompletionWaiters(t, issue)
 			started := time.Now()
 			test.trigger(signals, workers.closeContextStarted)
 			err := <-done
@@ -5486,6 +5582,7 @@ func TestRunnerForceEscalationPreservesDurableTerminalOutcomes(t *testing.T) {
 			done := make(chan error, 1)
 			go func() { done <- runner.Run(context.Background()) }()
 			workers.waitForStarts(t, issue)
+			workers.waitForCompletionWaiters(t, issue)
 			signals <- os.Interrupt
 			signals <- os.Interrupt
 			<-workers.closeContextStarted
@@ -5545,6 +5642,7 @@ func TestRunnerForceEscalationCleansBeforePersistingNewMergedOutcome(t *testing.
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, issue)
+	workers.waitForCompletionWaiters(t, issue)
 	signals <- os.Interrupt
 	signals <- os.Interrupt
 	<-workers.closeContextStarted
@@ -5564,13 +5662,14 @@ func TestRunnerForceEscalationCleansBeforePersistingNewMergedOutcome(t *testing.
 func TestRunnerDoesNotPersistBoundaryAfterMarkerWriteFails(t *testing.T) {
 	github := &fakeGitHub{candidates: []scheduler.Candidate{{Number: 44, CreatedAt: time.Now()}}}
 	workers := newFakeWorkers()
-	store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 8}
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 9}
 	signals := make(chan os.Signal, 1)
 	runner := testRunner(github, workers, store, 1)
 	runner.Signals = signals
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 44)
+	workers.waitForCompletionWaiters(t, 44)
 	signals <- syscall.SIGTERM
 	if err := <-done; err == nil || !strings.Contains(err.Error(), "require human") {
 		t.Fatalf("run: %v, want failed marker suspension", err)
@@ -5600,7 +5699,7 @@ func TestRunnerRecoversPersistedContinuationAfterFinalSuspensionSaveFails(t *tes
 			LeafID: "leaf", EntryCount: 1, SHA256: hex.EncodeToString(hash[:]),
 		}, nil
 	}
-	store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 9}
+	store := &memoryStore{value: state.State{Version: state.CurrentVersion}, failAtSave: 10}
 	signals := make(chan os.Signal, 1)
 	runner := testRunner(github, workers, store, 1)
 	runner.Signals = signals
@@ -5608,6 +5707,7 @@ func TestRunnerRecoversPersistedContinuationAfterFinalSuspensionSaveFails(t *tes
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, issue)
+	workers.waitForCompletionWaiters(t, issue)
 	signals <- syscall.SIGTERM
 	if err := <-done; !isSignalExit(err, 143) || !strings.Contains(err.Error(), "persist suspended") {
 		t.Fatalf("run: %v, want final suspension persistence failure with signal exit 143", err)
@@ -5715,6 +5815,7 @@ func TestRunnerSuspendsDirectlyOnSIGTERMAndUsesOneDeadline(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 41, 42)
+	workers.waitForCompletionWaiters(t, 41, 42)
 	started := time.Now()
 	signals <- syscall.SIGTERM
 	if err := <-done; err == nil || !strings.Contains(err.Error(), "require human") {
@@ -5774,6 +5875,7 @@ func TestRunnerPipelinesHealthyWorkerWhileAnotherBoundaryTimesOut(t *testing.T) 
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 53, 54)
+	workers.waitForCompletionWaiters(t, 53, 54)
 	signals <- syscall.SIGTERM
 	if err := <-done; err == nil || !strings.Contains(err.Error(), "require human") {
 		t.Fatalf("run: %v, want one failed-closed suspension", err)
@@ -5813,6 +5915,7 @@ func TestRunnerGitHubCompletionWinsOverSuspension(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 45)
+	workers.waitForCompletionWaiters(t, 45)
 	signals <- syscall.SIGTERM
 	if err := <-done; !isSignalExit(err, 143) {
 		t.Fatalf("run: %v, want signal exit 143", err)
@@ -5842,6 +5945,7 @@ func TestRunnerRetainsPIDAndLeaseWhenSuspensionCannotVerifyProcessGroupExit(t *t
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 46)
+	workers.waitForCompletionWaiters(t, 46)
 	signals <- syscall.SIGTERM
 	if err := <-done; err == nil || !strings.Contains(err.Error(), "could not verify or stop 1 Worker") {
 		t.Fatalf("run: %v, want unverified-exit failure", err)
@@ -5876,6 +5980,7 @@ func TestRunnerRechecksWorkerIdentityImmediatelyBeforeTimeoutForceStop(t *testin
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 48)
+	workers.waitForCompletionWaiters(t, 48)
 	signals <- syscall.SIGTERM
 	err := <-done
 	if !isSignalExit(err, 143) || !strings.Contains(err.Error(), "require human") {
@@ -5914,6 +6019,7 @@ func TestRunnerBoundsImmediatePreSignalIdentityRevalidation(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 74)
+	workers.waitForCompletionWaiters(t, 74)
 	started := time.Now()
 	signals <- syscall.SIGTERM
 	err := <-done
@@ -5943,6 +6049,7 @@ func TestRunnerRefusesForceStopWhenDurablePIDChanges(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, issue)
+	workers.waitForCompletionWaiters(t, issue)
 	signals <- os.Interrupt
 	signals <- os.Interrupt
 	<-workers.closeContextStarted
@@ -5977,6 +6084,7 @@ func TestRunnerTreatsCloseErrorAsFailedSuspensionAfterVerifiedExit(t *testing.T)
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 49)
+	workers.waitForCompletionWaiters(t, 49)
 	workers.setCloseResult(49, worker.Result{Err: errors.New("truncated post-settlement RPC output")})
 	signals <- syscall.SIGTERM
 	if err := <-done; err == nil || !strings.Contains(err.Error(), "require human") {
@@ -6014,6 +6122,7 @@ func TestRunnerDoesNotAbortBeforeIdentityAuthorizedCloseAfterBoundaryFailure(t *
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 52)
+	workers.waitForCompletionWaiters(t, 52)
 	signals <- syscall.SIGTERM
 	err := <-done
 	if !isSignalExit(err, 143) || !strings.Contains(err.Error(), "could not verify or stop") {
@@ -6044,6 +6153,7 @@ func TestRunnerGitHubReconciliationErrorPreventsCleanSuspension(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 50)
+	workers.waitForCompletionWaiters(t, 50)
 	signals <- syscall.SIGTERM
 	if err := <-done; err == nil || !strings.Contains(err.Error(), "require human") {
 		t.Fatalf("run: %v, want failed GitHub reconciliation", err)
@@ -6070,6 +6180,7 @@ func TestRunnerMergedOpenIssueWinsOverSuspension(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 51)
+	workers.waitForCompletionWaiters(t, 51)
 	signals <- syscall.SIGTERM
 	if err := <-done; !isSignalExit(err, 143) {
 		t.Fatalf("run: %v, want signal exit 143", err)
@@ -6093,6 +6204,7 @@ func TestRunnerGitHubWaitingOutcomeWinsOverSuspension(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 43)
+	workers.waitForCompletionWaiters(t, 43)
 	signals <- syscall.SIGTERM
 	if err := <-done; !isSignalExit(err, 143) {
 		t.Fatalf("run: %v, want signal exit 143", err)
@@ -6480,6 +6592,7 @@ func (w *fakeWorktrees) cleanupCount() int {
 
 type fakeProcess struct {
 	issue       int
+	resume      bool
 	owner       *fakeWorkers
 	done        chan worker.Result
 	waitStarted chan struct{}
@@ -6503,6 +6616,42 @@ func (p *fakeProcess) Release() error {
 	p.owner.mu.Unlock()
 	p.owner.released(p.issue)
 	return releaseErr
+}
+func (p *fakeProcess) Activate(ctx context.Context) (*initialprompt.OwnershipEvidence, error) {
+	if err := p.Release(); err != nil {
+		return nil, err
+	}
+	if p.resume {
+		return nil, nil
+	}
+	return p.CapturePromptOwnership(ctx)
+}
+func (p *fakeProcess) CapturePromptOwnership(ctx context.Context) (*initialprompt.OwnershipEvidence, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	p.owner.mu.Lock()
+	err := p.owner.captureOwnershipErr
+	evidence := p.owner.captureOwnership
+	block := p.owner.blockCapture
+	captureStarted := p.owner.captureStarted
+	p.owner.mu.Unlock()
+	if block {
+		captureStarted <- p.issue
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		return nil, err
+	}
+	if evidence != nil {
+		cloned := *evidence
+		return &cloned, nil
+	}
+	return &initialprompt.OwnershipEvidence{
+		Version: initialprompt.OwnershipVersion, EntryID: fmt.Sprintf("initial-%d", p.issue),
+		ContentDigest: initialprompt.Sum(fmt.Sprintf("persisted initial %d", p.issue)),
+	}, nil
 }
 func (p *fakeProcess) Abort() error {
 	p.owner.mu.Lock()
@@ -6669,6 +6818,10 @@ type fakeWorkers struct {
 	startErr                error
 	omitLogPaths            bool
 	releaseErr              error
+	captureOwnership        *initialprompt.OwnershipEvidence
+	captureOwnershipErr     error
+	blockCapture            bool
+	captureStarted          chan int
 	abortErr                error
 	startupCloseResult      worker.Result
 	suspendFunc             func(context.Context, int, worker.ContinuationRequest) (worker.Continuation, error)
@@ -6681,7 +6834,7 @@ type fakeWorkers struct {
 
 func newFakeWorkers() *fakeWorkers {
 	return &fakeWorkers{
-		processes: make(map[int]*fakeProcess), startChanged: make(chan struct{}, 20),
+		processes: make(map[int]*fakeProcess), startChanged: make(chan struct{}, 20), captureStarted: make(chan int, 20),
 		closeContextStarted: make(chan int, 20), settledCloseStarted: make(chan int, 20),
 	}
 }
@@ -6695,7 +6848,7 @@ func (w *fakeWorkers) Start(_ context.Context, request worker.Request) (WorkerPr
 		return nil, w.startErr
 	}
 	process := &fakeProcess{
-		issue: request.Issue, owner: w, done: make(chan worker.Result, 1), waitStarted: make(chan struct{}), closeResult: w.startupCloseResult,
+		issue: request.Issue, resume: request.Resume, owner: w, done: make(chan worker.Result, 1), waitStarted: make(chan struct{}), closeResult: w.startupCloseResult,
 	}
 	w.processes[request.Issue] = process
 	w.started = append(w.started, request.Issue)

@@ -88,6 +88,10 @@ _Avoid_: Agent, subagent
 A live Worker whose lifecycle is directly supervised by the current runner invocation.
 _Avoid_: Any live Worker, leased Run
 
+**Prompt ownership evidence**:
+Versioned durable evidence binding a Run's correlated initial RPC prompt to the actual initial user entry Pi persisted, using the entry ID and canonical content digest without storing the prompt body.
+_Avoid_: Submitted prompt digest, workflow-stage checkpoint
+
 **Subagent**:
 A subordinate autonomous executor launched by a Worker to perform part of its Run.
 _Avoid_: Worker, Run

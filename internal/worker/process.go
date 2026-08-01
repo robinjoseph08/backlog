@@ -25,7 +25,10 @@ import (
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
 
-const promptCommandID = "backlog-afk-prompt"
+const (
+	promptCommandID          = "backlog-afk-prompt"
+	promptOwnershipCommandID = "backlog-initial-prompt-entry"
+)
 
 type Request struct {
 	Issue                int
@@ -44,15 +47,17 @@ type Request struct {
 }
 
 type ContinuationRequest struct {
-	Issue                  int
-	RunID                  string
-	Branch                 string
-	SessionID              string
-	SessionDir             string
-	Worktree               string
-	PromptDigest           initialprompt.Digest
-	RequirePromptOwnership bool
-	ExpectedWorkflow       string
+	Issue                      int
+	RunID                      string
+	Branch                     string
+	SessionID                  string
+	SessionDir                 string
+	Worktree                   string
+	PromptDigest               initialprompt.Digest
+	PromptOwnership            *initialprompt.OwnershipEvidence
+	AllowLegacyPromptOwnership bool
+	RequirePromptOwnership     bool
+	ExpectedWorkflow           string
 }
 
 type Continuation = scheduler.ContinuationBoundary
@@ -307,6 +312,75 @@ func (p *Process) Release() error {
 	return p.releaseErr
 }
 
+// CapturePromptOwnership records the actual user entry Pi persisted for the
+// correlated initial prompt. The runner calls this only for a fresh gated Worker.
+func (p *Process) CapturePromptOwnership(ctx context.Context) (*initialprompt.OwnershipEvidence, error) {
+	select {
+	case <-p.events.promptAccepted:
+	case <-p.events.failed:
+		return nil, fmt.Errorf("await correlated initial prompt response: %w", p.events.Err())
+	case <-p.exitDone:
+		return nil, errors.New("Pi RPC process exited before accepting the initial prompt")
+	case <-ctx.Done():
+		return nil, fmt.Errorf("await correlated initial prompt response: %w", ctx.Err())
+	}
+
+	for attempt := 1; ; attempt++ {
+		commandID := promptOwnershipCommandID
+		if attempt > 1 {
+			commandID = fmt.Sprintf("%s-%d", promptOwnershipCommandID, attempt)
+		}
+		response, err := p.rpcCommand(ctx, commandID, "get_entries")
+		if err != nil {
+			return nil, fmt.Errorf("capture persisted initial prompt entry: %w", err)
+		}
+		if !response.Success {
+			return nil, fmt.Errorf("capture persisted initial prompt entry: %s", response.Error)
+		}
+		snapshot, err := decodeRPCEntries(response.Data)
+		if err != nil {
+			return nil, fmt.Errorf("decode persisted initial prompt entry: %w", err)
+		}
+		users, err := promptUserEntries(snapshot.Entries)
+		if err != nil {
+			return nil, fmt.Errorf("capture persisted initial prompt entry: %w", err)
+		}
+		if len(users) > 1 {
+			return nil, fmt.Errorf("capture persisted initial prompt entry: Pi session contains %d user entries; exactly one is required", len(users))
+		}
+		if len(users) == 1 {
+			return &initialprompt.OwnershipEvidence{
+				Version: initialprompt.OwnershipVersion, EntryID: users[0].ID, ContentDigest: users[0].ContentDigest,
+			}, nil
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-timer.C:
+		case <-p.events.failed:
+			timer.Stop()
+			return nil, fmt.Errorf("capture persisted initial prompt entry: %w", p.events.Err())
+		case <-p.exitDone:
+			timer.Stop()
+			return nil, errors.New("Pi RPC process exited before persisting the initial prompt entry")
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("await persisted initial prompt entry: %w", ctx.Err())
+		}
+	}
+}
+
+// Activate releases the gated Worker and completes fresh-session ownership
+// capture before returning. Resume activation preserves the original evidence.
+func (p *Process) Activate(ctx context.Context) (*initialprompt.OwnershipEvidence, error) {
+	if err := p.Release(); err != nil {
+		return nil, err
+	}
+	if p.resume {
+		return nil, nil
+	}
+	return p.CapturePromptOwnership(ctx)
+}
+
 func (p *Process) Abort() error {
 	return p.terminate()
 }
@@ -368,17 +442,8 @@ func (p *Process) CheckpointSettled(ctx context.Context, expected ContinuationRe
 	if !entriesResponse.Success {
 		return Continuation{}, fmt.Errorf("get Pi session entries: %s", entriesResponse.Error)
 	}
-	var rpcEntries struct {
-		Entries []json.RawMessage `json:"entries"`
-		LeafID  string            `json:"leafId"`
-	}
-	if _, err := decodeExactJSON(entriesResponse.Data); err != nil {
-		return Continuation{}, fmt.Errorf("decode Pi session entries: %w", err)
-	}
-	if err := rejectNonCanonicalJSONFields(entriesResponse.Data, "entries", "leafId"); err != nil {
-		return Continuation{}, fmt.Errorf("decode Pi session entries: %w", err)
-	}
-	if err := json.Unmarshal(entriesResponse.Data, &rpcEntries); err != nil {
+	rpcEntries, err := decodeRPCEntries(entriesResponse.Data)
+	if err != nil {
 		return Continuation{}, fmt.Errorf("decode Pi session entries: %w", err)
 	}
 	sha, err := verifyAndSyncSession(rpcState.SessionFile, expected, rpcEntries.Entries, rpcEntries.LeafID, func(file *os.File) error { return file.Sync() })
@@ -406,17 +471,8 @@ func (p *Process) CheckpointSettled(ctx context.Context, expected ContinuationRe
 	if !stableEntriesResponse.Success {
 		return Continuation{}, fmt.Errorf("reread Pi session entries at stability barrier: %s", stableEntriesResponse.Error)
 	}
-	var stableEntries struct {
-		Entries []json.RawMessage `json:"entries"`
-		LeafID  string            `json:"leafId"`
-	}
-	if _, err := decodeExactJSON(stableEntriesResponse.Data); err != nil {
-		return Continuation{}, fmt.Errorf("decode stable Pi session entries: %w", err)
-	}
-	if err := rejectNonCanonicalJSONFields(stableEntriesResponse.Data, "entries", "leafId"); err != nil {
-		return Continuation{}, fmt.Errorf("decode stable Pi session entries: %w", err)
-	}
-	if err := json.Unmarshal(stableEntriesResponse.Data, &stableEntries); err != nil {
+	stableEntries, err := decodeRPCEntries(stableEntriesResponse.Data)
+	if err != nil {
 		return Continuation{}, fmt.Errorf("decode stable Pi session entries: %w", err)
 	}
 	stableSHA, err := verifyAndSyncSession(finalState.SessionFile, expected, stableEntries.Entries, stableEntries.LeafID, func(file *os.File) error { return file.Sync() })
@@ -449,6 +505,28 @@ func (p *Process) CheckpointSettled(ctx context.Context, expected ContinuationRe
 		CheckpointBlockerFingerprint: checkpointBlockerFingerprint,
 		LogPath:                      p.logPath, StderrPath: p.stderrPath,
 	}, nil
+}
+
+type rpcEntriesSnapshot struct {
+	Entries []json.RawMessage `json:"entries"`
+	LeafID  string            `json:"leafId"`
+}
+
+func decodeRPCEntries(raw json.RawMessage) (rpcEntriesSnapshot, error) {
+	if _, err := decodeExactJSON(raw); err != nil {
+		return rpcEntriesSnapshot{}, err
+	}
+	if err := rejectNonCanonicalJSONFields(raw, "entries", "leafId"); err != nil {
+		return rpcEntriesSnapshot{}, err
+	}
+	var snapshot rpcEntriesSnapshot
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		return rpcEntriesSnapshot{}, err
+	}
+	if snapshot.Entries == nil {
+		return rpcEntriesSnapshot{}, errors.New("Pi session entries omitted the entry list")
+	}
+	return snapshot, nil
 }
 
 type rpcSessionState struct {
@@ -897,8 +975,10 @@ func inspectWorkflowCheckpoint(expected ContinuationRequest, entries []json.RawM
 }
 
 func inspectWorkflowCheckpointMode(expected ContinuationRequest, entries []json.RawMessage, captureAFK bool) (workflow, stage, checkpointFile, checkpointSHA, checkpointStatus, checkpointFailure string, resultErr error) {
-	if expected.RequirePromptOwnership && !hasOwnedInitialPrompt(entries, expected) {
-		return "", "", "", "", "", "", errors.New("Pi session does not contain one exact owned initial prompt")
+	if expected.RequirePromptOwnership {
+		if err := verifyOwnedInitialPrompt(entries, expected); err != nil {
+			return "", "", "", "", "", "", err
+		}
 	}
 	gitMarker := filepath.Join(expected.Worktree, ".git")
 	info, err := os.Lstat(gitMarker)
@@ -1010,8 +1090,8 @@ func inspectAFKCheckpoint(expected ContinuationRequest, entries []json.RawMessag
 	checkpointFile = filepath.Join(expected.SessionDir, "backlog-afk-checkpoint-v1.json")
 	info, err := os.Lstat(checkpointFile)
 	if errors.Is(err, os.ErrNotExist) && capture {
-		if !hasOwnedInitialPrompt(entries, expected) {
-			return "", "", "", "", "", "", errors.New("cannot capture AFK stage checkpoint without one exact owned initial prompt")
+		if ownershipErr := verifyOwnedInitialPrompt(entries, expected); ownershipErr != nil {
+			return "", "", "", "", "", "", fmt.Errorf("cannot capture AFK stage checkpoint: %w", ownershipErr)
 		}
 		value := afkCheckpoint{Version: 1, Workflow: "afk", Stage: "afk-coordinator", Issue: expected.Issue, RunID: expected.RunID, SessionID: expected.SessionID, Worktree: expected.Worktree}
 		data, marshalErr := json.Marshal(value)
@@ -1148,7 +1228,145 @@ func inspectCheckpointBlockers(checkpointFile string) (kind, cause, fingerprint 
 	return normalize(fields["Blocker kind"]), normalize(fields["Blocker cause"]), normalize(fields["Blocker fingerprint"]), nil
 }
 
-func hasOwnedInitialPrompt(entries []json.RawMessage, expected ContinuationRequest) bool {
+type promptUserEntry struct {
+	ID            string
+	ContentDigest initialprompt.Digest
+}
+
+func promptUserEntries(entries []json.RawMessage) ([]promptUserEntry, error) {
+	seenIDs := make(map[string]struct{}, len(entries))
+	var users []promptUserEntry
+	for index, raw := range entries {
+		if _, err := decodeExactJSON(raw); err != nil {
+			return nil, fmt.Errorf("decode Pi session entry %d: %w", index+1, err)
+		}
+		if err := rejectNonCanonicalJSONFields(raw, "type", "id", "message"); err != nil {
+			return nil, fmt.Errorf("decode Pi session entry %d: %w", index+1, err)
+		}
+		var entry struct {
+			Type    string          `json:"type"`
+			ID      string          `json:"id"`
+			Message json.RawMessage `json:"message"`
+		}
+		if err := json.Unmarshal(raw, &entry); err != nil || entry.Type == "" || entry.ID == "" {
+			return nil, fmt.Errorf("Pi session entry %d has no durable identity and type", index+1)
+		}
+		if _, duplicate := seenIDs[entry.ID]; duplicate {
+			return nil, fmt.Errorf("Pi session contains duplicate entry %q", entry.ID)
+		}
+		seenIDs[entry.ID] = struct{}{}
+		if entry.Type != "message" {
+			continue
+		}
+		if len(entry.Message) == 0 || string(entry.Message) == "null" {
+			return nil, fmt.Errorf("Pi session message entry %q has no message metadata", entry.ID)
+		}
+		if _, err := decodeExactJSON(entry.Message); err != nil {
+			return nil, fmt.Errorf("decode Pi session message %q: %w", entry.ID, err)
+		}
+		if err := rejectNonCanonicalJSONFields(entry.Message, "role", "content"); err != nil {
+			return nil, fmt.Errorf("decode Pi session message %q: %w", entry.ID, err)
+		}
+		var message struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		}
+		if err := json.Unmarshal(entry.Message, &message); err != nil || message.Role == "" {
+			return nil, fmt.Errorf("Pi session message %q has no role", entry.ID)
+		}
+		if message.Role != "user" {
+			continue
+		}
+		canonical, err := canonicalPromptContent(message.Content)
+		if err != nil {
+			return nil, fmt.Errorf("decode Pi session user content %q: %w", entry.ID, err)
+		}
+		users = append(users, promptUserEntry{ID: entry.ID, ContentDigest: initialprompt.SumBytes(canonical)})
+	}
+	return users, nil
+}
+
+func canonicalPromptContent(raw json.RawMessage) ([]byte, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, errors.New("content is missing")
+	}
+	value, err := decodeExactJSON(raw)
+	if err != nil {
+		return nil, err
+	}
+	switch content := value.(type) {
+	case string:
+		if content == "" {
+			return nil, errors.New("text content is empty")
+		}
+	case []any:
+		if len(content) == 0 {
+			return nil, errors.New("structured content is empty")
+		}
+		for _, item := range content {
+			object, ok := item.(map[string]any)
+			if !ok {
+				return nil, errors.New("structured content item is not an object")
+			}
+			itemType, ok := object["type"].(string)
+			if !ok || itemType != "text" {
+				return nil, errors.New("structured content item is not text")
+			}
+			text, ok := object["text"].(string)
+			if !ok || text == "" {
+				return nil, errors.New("structured text content is missing")
+			}
+		}
+	default:
+		return nil, errors.New("content is not text or structured content")
+	}
+	var canonical bytes.Buffer
+	encoder := json.NewEncoder(&canonical)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(canonical.Bytes(), []byte{'\n'}), nil
+}
+
+func verifyOwnedInitialPrompt(entries []json.RawMessage, expected ContinuationRequest) error {
+	if expected.PromptOwnership == nil {
+		if expected.AllowLegacyPromptOwnership && hasLegacyOwnedInitialPrompt(entries, expected) {
+			return nil
+		}
+		return errors.New("Pi session does not contain one exact owned initial persisted user entry")
+	}
+	ownership := expected.PromptOwnership
+	if ownership.Version != initialprompt.OwnershipVersion || !ownership.Complete() {
+		return errors.New("owned initial persisted user entry evidence is incomplete or unsupported")
+	}
+	users, err := promptUserEntries(entries)
+	if err != nil {
+		return fmt.Errorf("verify owned initial persisted user entry: %w", err)
+	}
+	matchingDigest := 0
+	foundID := false
+	for _, user := range users {
+		if strings.EqualFold(string(user.ContentDigest), string(ownership.ContentDigest)) {
+			matchingDigest++
+		}
+		if user.ID == ownership.EntryID {
+			foundID = true
+			if !strings.EqualFold(string(user.ContentDigest), string(ownership.ContentDigest)) {
+				return errors.New("owned initial persisted user entry content changed")
+			}
+		}
+	}
+	if !foundID {
+		return errors.New("owned initial persisted user entry identity is missing or changed")
+	}
+	if matchingDigest != 1 {
+		return fmt.Errorf("owned initial persisted user entry content has %d matches; exactly one is required", matchingDigest)
+	}
+	return nil
+}
+
+func hasLegacyOwnedInitialPrompt(entries []json.RawMessage, expected ContinuationRequest) bool {
 	matches := 0
 	legacyPrompt := initialprompt.DefaultPrompt(expected.Issue)
 	for _, raw := range entries {
@@ -1753,8 +1971,10 @@ type rpcWriter struct {
 	openTools                 map[string]struct{}
 	responses                 map[string]responseWaiter
 	parseErrors               []error
+	promptAccepted            chan struct{}
 	settled                   chan struct{}
 	failed                    chan struct{}
+	promptAcceptedOnce        sync.Once
 	settledOnce               sync.Once
 	failedOnce                sync.Once
 }
@@ -1763,7 +1983,7 @@ func newRPCWriter(destination io.Writer, observer *activity.Writer, commandID st
 	return &rpcWriter{
 		destination: destination, observer: observer, commandID: commandID, issue: issue,
 		state: rpcAwaitingResponse, openTools: make(map[string]struct{}), responses: make(map[string]responseWaiter),
-		settled: make(chan struct{}), failed: make(chan struct{}),
+		promptAccepted: make(chan struct{}), settled: make(chan struct{}), failed: make(chan struct{}),
 	}
 }
 
@@ -1907,6 +2127,7 @@ func (w *rpcWriter) validate(line []byte) {
 			return
 		}
 		w.state = rpcAwaitingAgentStart
+		w.promptAcceptedOnce.Do(func() { close(w.promptAccepted) })
 		return
 	}
 	if w.state == rpcAgentSettled {

@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -114,7 +115,10 @@ exit 0
 	pi := writeExecutable(t, `#!/bin/sh
 set -eu
 IFS= read -r prompt
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+IFS= read -r ownership
+printf '%s\n' '{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":"/skill:afk 35"}}],"leafId":"initial-user"}}'
+printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}'
 touch `+quote(workerStarted)+`
 while ! test -f `+quote(workerRelease)+`; do sleep 0.01; done
 trap 'exit 0' TERM INT
@@ -228,7 +232,11 @@ case "$worktree" in
 esac
 IFS= read -r prompt
 touch `+quote(workerStarted)+`
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+initial_entry=$(printf '{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"custom prompt %s"}}' "$issue")
+IFS= read -r ownership
+printf '{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[%s],"leafId":"leaf"}}\n' "$initial_entry"
+printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}'
 IFS= read -r abort
 while ! test -f `+quote(suspensionRelease)+`; do sleep 0.01; done
 session_file="$session_dir/session.jsonl"
@@ -274,7 +282,9 @@ while IFS= read -r ignored; do :; done
 	var beforeSignal state.State
 	for deadline := time.Now().Add(2 * time.Second); ; {
 		beforeSignal, err = (state.FileStore{Path: statePath}).Load()
-		if err == nil && len(beforeSignal.Leases) == 2 && len(beforeSignal.Runs) == 2 && beforeSignal.Runs[0].PID != 0 && beforeSignal.Runs[1].PID != 0 {
+		if err == nil && len(beforeSignal.Leases) == 2 && len(beforeSignal.Runs) == 2 && beforeSignal.Runs[0].PID != 0 && beforeSignal.Runs[1].PID != 0 &&
+			beforeSignal.Runs[0].PromptOwnership != nil && beforeSignal.Runs[0].PromptOwnership.Complete() &&
+			beforeSignal.Runs[1].PromptOwnership != nil && beforeSignal.Runs[1].PromptOwnership.Complete() {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -355,7 +365,7 @@ while IFS= read -r ignored; do :; done
 				t.Fatalf("exact custom prompt did not suspend: %#v", run)
 			}
 		case 32:
-			if run.Status != scheduler.StatusNeedsHuman || run.Continuation != nil || !strings.Contains(run.Error, "exact owned initial prompt") {
+			if run.Status != scheduler.StatusNeedsHuman || run.Continuation != nil || !strings.Contains(run.Error, "owned initial persisted user entry") {
 				t.Fatalf("missing custom prompt evidence did not fail closed: %#v", run)
 			}
 		}
@@ -398,7 +408,7 @@ func TestCompiledExecutableRestartResumesSuspendedRunBeforeNewCandidate(t *testi
 			Issue: 91, RunID: "run-91", Status: scheduler.StatusSuspended, WorkerMode: scheduler.WorkerModeRPC,
 			WorkerGeneration: 1, StoppedWorkerGeneration: 1, WorkerStoppedAt: &stoppedAt,
 			Branch: "agent/issue-91-run-91", Worktree: worktreePath, SessionName: "afk #91", SessionID: "session-91", SessionDir: sessionDir,
-			PromptDigest: promptDigest, Continuation: &scheduler.ContinuationBoundary{
+			PromptDigest: promptDigest, LegacyPromptOwnership: true, Continuation: &scheduler.ContinuationBoundary{
 				SessionID: "session-91", SessionFile: sessionFile, Worktree: worktreePath, LeafID: "leaf", EntryCount: 1,
 				SHA256: hex.EncodeToString(hash[:]), WorkerGeneration: 1, VerifiedAt: time.Now(),
 			},
@@ -471,7 +481,12 @@ case "$session_id" in
     printf '%s\n' "$prompt" | grep -q '/skill:afk 92' ;;
   *) exit 9 ;;
 esac
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+if [ "$session_id" != session-91 ]; then
+  IFS= read -r ownership
+  printf '%s\n' '{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":"/skill:afk 92"}}],"leafId":"initial-user"}}'
+fi
+printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 while IFS= read -r ignored; do :; done
 `)
 
@@ -545,7 +560,10 @@ while [ "$#" -gt 0 ]; do
 done
 worktree=$(pwd)
 IFS= read -r prompt
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+IFS= read -r ownership
+printf '%s\n' '{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"custom prompt 33"}}],"leafId":"leaf"}}'
+printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}'
 touch `+quote(workerStarted)+`
 IFS= read -r abort
 session_file="$session_dir/session.jsonl"
@@ -589,7 +607,7 @@ while IFS= read -r ignored; do :; done
 	}
 	digest := initialprompt.Sum("custom prompt 33")
 	if len(current.Runs) != 1 || current.Runs[0].Status != scheduler.StatusNeedsHuman || current.Runs[0].Continuation != nil ||
-		current.Runs[0].PID != 0 || current.Runs[0].PromptDigest != digest || !strings.Contains(current.Runs[0].Error, "exact owned initial prompt") || len(current.Leases) != 1 {
+		current.Runs[0].PID != 0 || current.Runs[0].PromptDigest != digest || !strings.Contains(current.Runs[0].Error, "owned initial persisted user entry") || len(current.Leases) != 1 {
 		t.Fatalf("changed custom prompt did not fail closed after SIGTERM = %#v", current)
 	}
 	if strings.Contains(output.String(), "Drain:") {
@@ -637,8 +655,11 @@ set -eu
 printf '%s\n' "$$" > `+quote(workerPIDPath)+`
 IFS= read -r prompt
 sh -c 'trap "" TERM; while :; do sleep 1; done' &
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+IFS= read -r ownership
+printf '%s\n' '{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":"/skill:afk 33"}}],"leafId":"initial-user"}}'
+printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}'
 touch `+quote(workerStarted)+`
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
 IFS= read -r abort
 touch `+quote(abortReceived)+`
 trap '' TERM
@@ -778,6 +799,8 @@ exit 0
 set -eu
 IFS= read -r prompt
 printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+IFS= read -r ownership
+printf '%s\n' '{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":"/skill:afk 27"}}],"leafId":"initial-user"}}'
 touch `+quote(workerStarted)+`
 while [ ! -f `+quote(emitActivity)+` ]; do sleep 0.01; done
 printf '%s\n' \
@@ -1019,8 +1042,10 @@ exit 0
 set -eu
 trap '' TERM
 IFS= read -r prompt
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+IFS= read -r ownership
+printf '%s\n' '{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":"/skill:afk 73"}}],"leafId":"initial-user"}}'
 printf '%s\n' \
-  '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' \
   '{"type":"agent_start"}' \
   '{"type":"turn_start"}' \
   '{"type":"tool_execution_start","toolCallId":"tool-live","toolName":"bash","args":{"command":"private"}}'
@@ -1262,7 +1287,10 @@ set -eu
 grep -q '"promptDigest": "[0-9a-f]\{64\}"' `+quote(statePath)+`
 IFS= read -r command
 printf '%s\n' "$command" > `+quote(promptCapture)+`
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+IFS= read -r ownership
+printf '%s\n' '{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":"persisted custom prompt"}}],"leafId":"initial-user"}}'
+printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 while IFS= read -r ignored; do :; done
 `)
 			args := []string{"run", "--plain", "--repo-dir", repository, "--state-dir", stateDir, "--max-workers", "1", "--poll", "5ms", "--gh", gh, "--git", git, "--pi", pi}
@@ -1362,11 +1390,14 @@ set -eu
 IFS= read -r command
 printf '%s\n' "$command" >> `+quote(prompts)+`
 case "$PWD" in
-  *issue-21-*) printf '%s\n' 'changed {{issue_number}}' > `+quote(promptFile)+` ;;
-  *issue-22-*) ;;
+  *issue-21-*) issue=21; printf '%s\n' 'changed {{issue_number}}' > `+quote(promptFile)+` ;;
+  *issue-22-*) issue=22 ;;
   *) exit 9 ;;
 esac
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+IFS= read -r ownership
+printf '{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":"stable %s"}}],"leafId":"initial-user"}}\n' "$issue"
+printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 while IFS= read -r ignored; do :; done
 `)
 	command := exec.Command(binary, "run", "--plain", "--repo-dir", repository, "--state-dir", stateDir,
@@ -1406,6 +1437,128 @@ while IFS= read -r ignored; do :; done
 		if run.PromptDigest != digest {
 			t.Fatalf("Run #%d prompt digest = %q", run.Issue, run.PromptDigest)
 		}
+	}
+}
+
+func TestCompiledExecutableBindsTransformedSkillPromptsToPersistedEntries(t *testing.T) {
+	binary := buildExecutable(t, t.TempDir())
+	expandedAFK := `<skill name="afk">expanded AFK body</skill>` + "\n\n110"
+	expandedReview := `<skill name="review">expanded review body</skill>` + "\n\n--strict"
+	entry := func(id string, parent *string, content string) string {
+		parentJSON := "null"
+		if parent != nil {
+			parentJSON = strconv.Quote(*parent)
+		}
+		return fmt.Sprintf(`{"type":"message","id":%q,"parentId":%s,"message":{"role":"user","content":%q}}`, id, parentJSON, content)
+	}
+	for _, test := range []struct {
+		name, prompt, captured, persisted string
+		duplicate                         bool
+		wantBoundary                      bool
+	}{
+		{name: "default expanded skill", captured: expandedAFK, persisted: expandedAFK, wantBoundary: true},
+		{name: "arbitrary expanded skill", prompt: "/skill:review --strict", captured: expandedReview, persisted: expandedReview, wantBoundary: true},
+		{name: "plain prompt", prompt: "plain ownership", captured: "plain ownership", persisted: "plain ownership", wantBoundary: true},
+		{name: "multiline prompt", prompt: "line one\nline two", captured: "line one\nline two", persisted: "line one\nline two", wantBoundary: true},
+		{name: "tampered expansion", captured: expandedAFK, persisted: expandedAFK + " changed"},
+		{name: "duplicate candidate", captured: expandedAFK, persisted: expandedAFK, duplicate: true},
+		{name: "unrelated expansion", captured: expandedAFK, persisted: `<skill name="other">unrelated</skill>`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			repository := filepath.Join(root, "repo")
+			if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
+				t.Fatalf("git init: %v\n%s", err, output)
+			}
+			stateDir := filepath.Join(root, "state")
+			capturedEntry := entry("initial-user", nil, test.captured)
+			persistedEntries := []string{entry("initial-user", nil, test.persisted)}
+			if test.duplicate {
+				parent := "initial-user"
+				persistedEntries = append(persistedEntries, entry("copy", &parent, test.persisted))
+			}
+			entriesJSON := "[" + strings.Join(persistedEntries, ",") + "]"
+			leafID := "initial-user"
+			if test.duplicate {
+				leafID = "copy"
+			}
+			diskEntries := ""
+			for _, persistedEntry := range persistedEntries {
+				diskEntries += "printf '%s\\n' " + quote(persistedEntry) + " >> \"$session_file\"\n"
+			}
+			gh := writeExecutable(t, `#!/bin/sh
+set -eu
+case "$*" in
+  "repo view --json nameWithOwner,defaultBranchRef") printf '%s\n' '{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}' ;;
+  "issue list --repo acme/widgets --state open --label ready-for-agent --limit 1000 --json number,title,createdAt,url") printf '%s\n' '[{"number":110,"title":"Prompt ownership","createdAt":"2026-01-01T00:00:00Z","url":"https://example.test/issues/110"}]' ;;
+  "issue view 110 --repo acme/widgets --json number,title,body,state,url,createdAt") printf '%s\n' '{"number":110,"title":"Prompt ownership","body":"","state":"OPEN","url":"https://example.test/issues/110","createdAt":"2026-01-01T00:00:00Z"}' ;;
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/110/comments?per_page=100 --paginate --slurp"|\
+  "api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/110/dependencies/blocked_by?per_page=100 --paginate --slurp") printf '%s\n' '[[]]' ;;
+  "pr list --repo acme/widgets --state all --head agent/issue-110-"*" --limit 1000 --json number,url,state,mergedAt,autoMergeRequest,isDraft,headRefName,headRefOid,headRepositoryOwner,headRepository") printf '%s\n' '[]' ;;
+  "issue view 110 --repo acme/widgets --json number,state,title,url") printf '%s\n' '{"number":110,"state":"OPEN","title":"Prompt ownership","url":"https://example.test/issues/110"}' ;;
+  *) echo "unexpected gh: $*" >&2; exit 9 ;;
+esac
+`)
+			git := writeExecutable(t, `#!/bin/sh
+set -eu
+if [ "$3" = "rev-parse" ] && [ "$4" = "--show-toplevel" ]; then printf '%s\n' `+quote(repository)+`; exit 0; fi
+if [ "$3" = "rev-parse" ] && [ "$4" = "--git-common-dir" ]; then printf '%s\n' `+quote(filepath.Join(repository, ".git"))+`; exit 0; fi
+if [ "$3" = "worktree" ] && [ "$4" = "add" ]; then mkdir -p "$7"; exit 0; fi
+exit 0
+`)
+			pi := writeExecutable(t, `#!/bin/sh
+set -eu
+session_dir= session_id=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --session-dir) session_dir=$2; shift 2 ;;
+    --session-id) session_id=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+worktree=$(pwd)
+IFS= read -r prompt
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+IFS= read -r ownership
+printf '%s\n' `+quote(`{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[`+capturedEntry+`],"leafId":"initial-user"}}`)+`
+session_file="$session_dir/session.jsonl"
+printf '{"type":"session","version":3,"id":"%s","cwd":"%s"}\n' "$session_id" "$worktree" > "$session_file"
+`+diskEntries+`printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+IFS= read -r state
+printf '{"id":"backlog-suspend-state","type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":"%s","sessionId":"%s"}}\n' "$session_file" "$session_id"
+IFS= read -r entries
+printf '%s\n' `+quote(`{"id":"backlog-suspend-entries","type":"response","command":"get_entries","success":true,"data":{"entries":`+entriesJSON+`,"leafId":"`+leafID+`"}}`)+`
+IFS= read -r final_state
+printf '{"id":"backlog-suspend-final-state","type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":"%s","sessionId":"%s"}}\n' "$session_file" "$session_id"
+IFS= read -r stable_entries
+printf '%s\n' `+quote(`{"id":"backlog-suspend-stable-entries","type":"response","command":"get_entries","success":true,"data":{"entries":`+entriesJSON+`,"leafId":"`+leafID+`"}}`)+`
+while IFS= read -r ignored; do :; done
+`)
+			args := []string{"run", "--plain", "--repo-dir", repository, "--state-dir", stateDir, "--max-workers", "1", "--poll", "5ms", "--gh", gh, "--git", git, "--pi", pi}
+			if test.prompt != "" {
+				args = append(args, "--prompt", test.prompt)
+			}
+			output, err := exec.Command(binary, args...).CombinedOutput()
+			var exitError *exec.ExitError
+			if !errors.As(err, &exitError) || exitError.ExitCode() != 1 {
+				t.Fatalf("compiled transformed-prompt run = %v\n%s", err, output)
+			}
+			current, err := (state.FileStore{Path: filepath.Join(stateDir, "state.json")}).Load()
+			if err != nil || len(current.Runs) != 1 || len(current.Leases) != 1 {
+				t.Fatalf("load transformed-prompt state = %#v, %v", current, err)
+			}
+			run := current.Runs[0]
+			if run.PromptOwnership == nil || !run.PromptOwnership.Complete() {
+				t.Fatalf("prompt ownership was not durable: %#v", run)
+			}
+			if test.wantBoundary {
+				if run.Continuation == nil || run.Continuation.Workflow != "afk" || run.Continuation.WorkflowStage != "afk-coordinator" {
+					t.Fatalf("transformed prompt did not capture a settled boundary: %#v", run)
+				}
+			} else if run.Continuation != nil || run.FailureClass != scheduler.FailureUnsafeContinuation || !strings.Contains(run.Error, "owned initial persisted user entry") {
+				t.Fatalf("changed or ambiguous persisted prompt did not fail closed: %#v", run)
+			}
+		})
 	}
 }
 
@@ -1476,8 +1629,11 @@ grep -q '"stderrPath": ".*\.stderr\.log"' `+quote(statePath)+`
 grep -q '"pid": '"$$" `+quote(statePath)+`
 IFS= read -r command
 printf '%s\n' "$command" > `+quote(prompt)+`
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+IFS= read -r ownership
+printf '%s\n' '{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":"/skill:afk 5"}}],"leafId":"initial-user"}}'
 while [ ! -f `+quote(finishPi)+` ]; do sleep 0.01; done
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
 while IFS= read -r ignored; do :; done
 test -f `+quote(reconciledAlive)+`
 grep -q '"status": "merged"' `+quote(statePath)+`
@@ -1765,7 +1921,7 @@ esac
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(persistedAfterRun), `"version": 6`) || strings.Contains(string(persistedAfterRun), `"paused"`) {
+	if !strings.Contains(string(persistedAfterRun), `"version": 7`) || strings.Contains(string(persistedAfterRun), `"paused"`) {
 		t.Fatalf("Runner did not persist legacy migration:\n%s", persistedAfterRun)
 	}
 	final, err := (state.FileStore{Path: statePath}).Load()

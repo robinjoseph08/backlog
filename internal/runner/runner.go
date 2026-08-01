@@ -59,7 +59,7 @@ type Worktrees interface {
 type WorkerProcess interface {
 	PID() int
 	LogPaths() (string, string)
-	Release() error
+	Activate(context.Context) (*initialprompt.OwnershipEvidence, error)
 	Abort() error
 	Suspend(context.Context, worker.ContinuationRequest) (worker.Continuation, error)
 	Wait() worker.Result
@@ -1119,6 +1119,7 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 		Branch: assignment.Branch, Worktree: assignment.Path,
 	})
 	run.PromptDigest = initialprompt.Sum(initialPrompt)
+	run.PromptOwnership = initialprompt.PendingOwnership()
 	run.UpdatedAt = r.Now().UTC()
 	replaceRun(current, run)
 	if err := r.Store.Save(*current); err != nil {
@@ -1188,9 +1189,29 @@ func (r *Runner) start(workerCtx, operationCtx context.Context, admission *admis
 			failureErr,
 		)
 	}
-	if err := process.Release(); err != nil {
-		return nil, r.failAfterWorkerStart(current, candidate.Number, process, fmt.Sprintf("release Pi worker: %v", err))
+	ownershipCtx, cancelOwnership := context.WithTimeout(operationCtx, 5*time.Second)
+	ownership, err := process.Activate(ownershipCtx)
+	cancelOwnership()
+	if err != nil {
+		if operationCtx.Err() != nil && r.suspensionExit.Load() != 0 {
+			r.suspensionFailed.Store(true)
+		}
+		return nil, r.failAfterActivatedWorkerStart(current, candidate.Number, process, fmt.Sprintf("capture persisted initial prompt ownership: %v", err))
 	}
+	if ownership == nil || !ownership.Complete() {
+		return nil, r.failAfterActivatedWorkerStart(current, candidate.Number, process, "capture persisted initial prompt ownership: Worker returned incomplete evidence")
+	}
+	next := *current
+	next.Runs = append([]scheduler.Run(nil), current.Runs...)
+	run = findActiveRun(&next, candidate.Number)
+	run.PromptOwnership = ownership
+	run.UpdatedAt = r.Now().UTC()
+	replaceRun(&next, run)
+	if err := r.Store.Save(next); err != nil {
+		failureErr := r.failAfterActivatedWorkerStart(current, candidate.Number, process, fmt.Sprintf("persist initial prompt ownership before supervision: %v", err))
+		return nil, errors.Join(fmt.Errorf("persist initial prompt ownership for issue #%d: %w", candidate.Number, err), failureErr)
+	}
+	*current = next
 	r.runLifecycleEvent(RunLifecycleStarted, "started issue #%d in %s (pid %d)", candidate.Number, assignment.Path, process.PID())
 	return process, nil
 }
@@ -1423,7 +1444,7 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 		}
 		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("fresh repository identity changed before replacement Worker release: %v; close: %v", identityErr, closed.Err))
 	}
-	if err := process.Release(); err != nil {
+	if _, err := process.Activate(operationCtx); err != nil {
 		_ = process.Abort()
 		closed := process.Close()
 		run = findActiveRun(current, run.Issue)
@@ -1431,7 +1452,7 @@ func (r *Runner) resume(workerCtx, operationCtx context.Context, current *state.
 			markStoppedRun(&run, r.Now().UTC())
 			replaceRun(current, run)
 		}
-		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("release replacement Pi Worker: %v; close: %v", err, closed.Err))
+		return nil, r.rejectResume(current, run.Issue, fmt.Sprintf("activate replacement Pi Worker: %v; close: %v", err, closed.Err))
 	}
 	r.runLifecycleEvent(RunLifecycleResumed, "resumed issue #%d in %s (pid %d, Run %s)", run.Issue, run.Worktree, process.PID(), run.RunID)
 	return process, nil
@@ -1445,11 +1466,7 @@ func (r *Runner) checkpointSettledWorker(ctx context.Context, current *state.Sta
 	}
 	checkpointCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	boundary, err := checkpointer.CheckpointSettled(checkpointCtx, worker.ContinuationRequest{
-		Issue: run.Issue, RunID: run.RunID, Branch: run.Branch,
-		SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree, PromptDigest: run.PromptDigest,
-		RequirePromptOwnership: true, ExpectedWorkflow: expectedContinuationWorkflow(run),
-	})
+	boundary, err := checkpointer.CheckpointSettled(checkpointCtx, continuationRequest(run, true))
 	if err != nil {
 		if errors.Is(err, errSettledCheckpointUnsupported) {
 			return err
@@ -1582,6 +1599,16 @@ func expectedContinuationWorkflow(run scheduler.Run) string {
 	return ""
 }
 
+func continuationRequest(run scheduler.Run, requirePromptOwnership bool) worker.ContinuationRequest {
+	return worker.ContinuationRequest{
+		Issue: run.Issue, RunID: run.RunID, Branch: run.Branch,
+		SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree,
+		PromptDigest: run.PromptDigest, PromptOwnership: run.PromptOwnership,
+		AllowLegacyPromptOwnership: run.LegacyPromptOwnership,
+		RequirePromptOwnership:     requirePromptOwnership, ExpectedWorkflow: expectedContinuationWorkflow(run),
+	}
+}
+
 func verifyContinuationArtifacts(run scheduler.Run) error {
 	if run.WorkerMode != scheduler.WorkerModeRPC {
 		return errors.New("legacy print-mode Run cannot Resume automatically")
@@ -1599,10 +1626,7 @@ func verifyBoundaryArtifacts(run scheduler.Run, boundary scheduler.ContinuationB
 	if boundary.WorkerGeneration > 0 && boundary.WorkerGeneration != run.WorkerGeneration && boundary.WorkerGeneration != run.WorkerGeneration-1 {
 		return errors.New("continuation boundary does not belong to the replaced Worker generation")
 	}
-	if err := worker.VerifyContinuation(worker.ContinuationRequest{
-		Issue: run.Issue, RunID: run.RunID, Branch: run.Branch,
-		SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree, PromptDigest: run.PromptDigest,
-	}, boundary); err != nil {
+	if err := worker.VerifyContinuation(continuationRequest(run, true), boundary); err != nil {
 		return fmt.Errorf("verify Pi continuation before Resume: %w", err)
 	}
 	return nil
@@ -2414,6 +2438,17 @@ func (r *Runner) retainUnverifiedWorker(current *state.State, original scheduler
 	return nil
 }
 
+func (r *Runner) failAfterActivatedWorkerStart(current *state.State, issue int, process WorkerProcess, message string) error {
+	run := findActiveRun(current, issue)
+	run.FailureClass = scheduler.FailureUnsafeContinuation
+	replaceRun(current, run)
+	if err := r.authorizeSuspensionKill(run.RunID, process)(); err != nil {
+		r.needsHumanWithLiveWorker(current, issue, fmt.Sprintf("%s; Worker identity could not be revalidated before startup stop: %v", message, err))
+		return errors.Join(fmt.Errorf("authorize Worker stop for issue #%d after activation failure: %w", issue, err), r.saveAfterFailure(*current, issue))
+	}
+	return r.failAfterWorkerStart(current, issue, process, message)
+}
+
 func (r *Runner) failAfterWorkerStart(current *state.State, issue int, process WorkerProcess, message string) error {
 	abortErr := process.Abort()
 	closed := process.Close()
@@ -2653,11 +2688,7 @@ func (r *Runner) suspendOwned(current *state.State, local map[int]WorkerProcess,
 				boundaries <- suspensionBoundaryResult{issue: issue, err: fmt.Errorf("recheck Worker process identity: %w", err)}
 				return
 			}
-			boundary, err := process.Suspend(ctx, worker.ContinuationRequest{
-				Issue: run.Issue, RunID: run.RunID, Branch: run.Branch,
-				SessionID: run.SessionID, SessionDir: run.SessionDir, Worktree: run.Worktree, PromptDigest: run.PromptDigest,
-				RequirePromptOwnership: true, ExpectedWorkflow: expectedContinuationWorkflow(run),
-			})
+			boundary, err := process.Suspend(ctx, continuationRequest(run, true))
 			boundaries <- suspensionBoundaryResult{issue: issue, boundary: boundary, err: err}
 		}(issue, process, run)
 	}

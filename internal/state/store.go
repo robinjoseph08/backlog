@@ -14,16 +14,18 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/robinjoseph08/backlog/internal/initialprompt"
 	"github.com/robinjoseph08/backlog/internal/scheduler"
 )
 
-const CurrentVersion = 6
+const CurrentVersion = 7
 
 const legacyVersion = 1
 const versionWithLeases = 2
 const versionWithAcknowledgments = 3
 const versionWithWorkerProof = 4
-const previousVersion = 5
+const versionWithRecovery = 5
+const previousVersion = 6
 const sha256HexLength = 64
 
 type State struct {
@@ -99,12 +101,16 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 			return State{}, false, err
 		}
 		return value, false, nil
-	case previousVersion, versionWithWorkerProof, versionWithAcknowledgments, versionWithLeases:
+	case previousVersion, versionWithRecovery, versionWithWorkerProof, versionWithAcknowledgments, versionWithLeases:
+		if err := rejectPreV7PromptOwnership(encoded); err != nil {
+			return State{}, false, fmt.Errorf("decode version %d state: %w", header.Version, err)
+		}
 		value, err := decodeCurrentState(encoded)
 		if err != nil {
 			return State{}, false, fmt.Errorf("decode version %d state: %w", header.Version, err)
 		}
 		value.Version = CurrentVersion
+		markLegacyPromptOwnership(&value)
 		if header.Version == versionWithWorkerProof {
 			migrateV4WorkerProof(&value)
 		}
@@ -123,6 +129,9 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 		}
 		return value, true, nil
 	case legacyVersion:
+		if err := rejectPreV7PromptOwnership(encoded); err != nil {
+			return State{}, false, fmt.Errorf("decode version 1 state: %w", err)
+		}
 		var legacy legacyState
 		if err := json.Unmarshal(encoded, &legacy); err != nil {
 			return State{}, false, fmt.Errorf("decode version 1 state: %w", err)
@@ -139,6 +148,14 @@ func (s FileStore) load(persistMigration bool) (State, bool, error) {
 		return value, true, nil
 	default:
 		return State{}, false, fmt.Errorf("unsupported state version %d", header.Version)
+	}
+}
+
+func markLegacyPromptOwnership(value *State) {
+	for index := range value.Runs {
+		if value.Runs[index].PromptOwnership == nil {
+			value.Runs[index].LegacyPromptOwnership = true
+		}
 	}
 }
 
@@ -214,6 +231,7 @@ func migrateV1(legacy legacyState) (State, error) {
 	for index := range value.Runs {
 		run := &value.Runs[index]
 		run.WorkerMode = scheduler.WorkerModePrint
+		run.LegacyPromptOwnership = true
 		run.AcknowledgedAt = nil
 		if run.Status != scheduler.StatusMerged && run.Status != scheduler.StatusReset {
 			value.Leases = append(value.Leases, scheduler.Lease{
@@ -281,6 +299,27 @@ func (s FileStore) Save(value State) error {
 	return nil
 }
 
+func rejectPreV7PromptOwnership(encoded json.RawMessage) error {
+	var raw struct {
+		Runs []json.RawMessage `json:"runs"`
+	}
+	if err := json.Unmarshal(encoded, &raw); err != nil {
+		return err
+	}
+	for index, encodedRun := range raw.Runs {
+		for _, field := range []string{"promptOwnership", "legacyPromptOwnership"} {
+			_, present, _, err := inspectRunField(encodedRun, field)
+			if err != nil {
+				return err
+			}
+			if present {
+				return fmt.Errorf("Run %d contains prompt ownership metadata unsupported before version 7", index+1)
+			}
+		}
+	}
+	return nil
+}
+
 func decodeCurrentState(encoded json.RawMessage) (State, error) {
 	var raw struct {
 		Version             int               `json:"version"`
@@ -313,12 +352,26 @@ func decodeRecoverableRun(encoded json.RawMessage) (scheduler.Run, error) {
 	if err != nil {
 		return scheduler.Run{}, err
 	}
+	promptOwnership, hasPromptOwnership, invalidPromptOwnershipKey, err := inspectRunField(encoded, "promptOwnership")
+	if err != nil {
+		return scheduler.Run{}, err
+	}
+	if invalidPromptOwnershipKey {
+		return scheduler.Run{}, errors.New("prompt ownership field is duplicated or noncanonical")
+	}
+	legacyPromptOwnership, hasLegacyPromptOwnership, invalidLegacyPromptOwnershipKey, err := inspectRunField(encoded, "legacyPromptOwnership")
+	if err != nil {
+		return scheduler.Run{}, err
+	}
+	if invalidLegacyPromptOwnershipKey {
+		return scheduler.Run{}, errors.New("legacy prompt ownership field is duplicated or noncanonical")
+	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(encoded, &fields); err != nil {
 		return scheduler.Run{}, err
 	}
 	for field := range fields {
-		if strings.EqualFold(field, "continuation") {
+		if strings.EqualFold(field, "continuation") || strings.EqualFold(field, "promptOwnership") || strings.EqualFold(field, "legacyPromptOwnership") {
 			delete(fields, field)
 		}
 	}
@@ -340,10 +393,22 @@ func decodeRecoverableRun(encoded json.RawMessage) (scheduler.Run, error) {
 	} else if invalidContinuationKey {
 		run.Continuation = &scheduler.ContinuationBoundary{}
 	}
+	if hasPromptOwnership && string(promptOwnership) != "null" {
+		ownership, err := decodePromptOwnership(promptOwnership)
+		if err != nil {
+			return scheduler.Run{}, fmt.Errorf("decode prompt ownership: %w", err)
+		}
+		run.PromptOwnership = &ownership
+	}
+	if hasLegacyPromptOwnership && string(legacyPromptOwnership) != "null" {
+		if err := json.Unmarshal(legacyPromptOwnership, &run.LegacyPromptOwnership); err != nil {
+			return scheduler.Run{}, fmt.Errorf("decode legacy prompt ownership: %w", err)
+		}
+	}
 	return run, nil
 }
 
-func inspectContinuationField(encoded json.RawMessage) (json.RawMessage, bool, bool, error) {
+func inspectRunField(encoded json.RawMessage, canonicalField string) (json.RawMessage, bool, bool, error) {
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
 	opening, err := decoder.Token()
 	if err != nil {
@@ -352,7 +417,7 @@ func inspectContinuationField(encoded json.RawMessage) (json.RawMessage, bool, b
 	if opening != json.Delim('{') {
 		return nil, false, false, errors.New("Run is not a JSON object")
 	}
-	var continuation json.RawMessage
+	var matched json.RawMessage
 	count := 0
 	invalidKey := false
 	for decoder.More() {
@@ -368,16 +433,65 @@ func inspectContinuationField(encoded json.RawMessage) (json.RawMessage, bool, b
 		if err := decoder.Decode(&value); err != nil {
 			return nil, false, false, err
 		}
-		if strings.EqualFold(key, "continuation") {
+		if strings.EqualFold(key, canonicalField) {
 			count++
-			continuation = value
-			invalidKey = invalidKey || key != "continuation"
+			matched = value
+			invalidKey = invalidKey || key != canonicalField
 		}
 	}
 	if _, err := decoder.Token(); err != nil {
 		return nil, false, false, err
 	}
-	return continuation, count > 0, invalidKey || count > 1, nil
+	return matched, count > 0, invalidKey || count > 1, nil
+}
+
+func decodePromptOwnership(encoded json.RawMessage) (initialprompt.OwnershipEvidence, error) {
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return initialprompt.OwnershipEvidence{}, errors.New("prompt ownership must be one JSON object")
+	}
+	allowed := map[string]bool{"version": true, "entryId": true, "contentDigest": true}
+	fields := make(map[string]json.RawMessage, len(allowed))
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		key, ok := keyToken.(string)
+		if err != nil || !ok || !allowed[key] || fields[key] != nil {
+			return initialprompt.OwnershipEvidence{}, errors.New("prompt ownership contains duplicate, unknown, or noncanonical fields")
+		}
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			return initialprompt.OwnershipEvidence{}, err
+		}
+		fields[key] = raw
+	}
+	if _, err := decoder.Token(); err != nil {
+		return initialprompt.OwnershipEvidence{}, err
+	}
+	if err := ensureEOF(decoder); err != nil {
+		return initialprompt.OwnershipEvidence{}, err
+	}
+	var ownership initialprompt.OwnershipEvidence
+	if raw := fields["version"]; raw != nil {
+		if err := json.Unmarshal(raw, &ownership.Version); err != nil {
+			return initialprompt.OwnershipEvidence{}, err
+		}
+	}
+	if raw := fields["entryId"]; raw != nil {
+		if err := json.Unmarshal(raw, &ownership.EntryID); err != nil {
+			return initialprompt.OwnershipEvidence{}, err
+		}
+	}
+	if raw := fields["contentDigest"]; raw != nil {
+		if err := json.Unmarshal(raw, &ownership.ContentDigest); err != nil {
+			return initialprompt.OwnershipEvidence{}, err
+		}
+	}
+	return ownership, nil
+}
+
+func inspectContinuationField(encoded json.RawMessage) (json.RawMessage, bool, bool, error) {
+	return inspectRunField(encoded, "continuation")
 }
 
 func ensureEOF(decoder *json.Decoder) error {
@@ -512,6 +626,29 @@ func validateRun(run scheduler.Run, requireWorkerMode, recoverUnsafeContinuation
 	}
 	if run.PromptDigest != "" && !run.PromptDigest.Valid() {
 		return fmt.Errorf("state contains Run %q with an invalid prompt digest", run.RunID)
+	}
+	if run.PromptOwnership != nil && run.LegacyPromptOwnership {
+		return fmt.Errorf("state contains Run %q with both versioned and legacy prompt ownership modes", run.RunID)
+	}
+	if run.PromptOwnership != nil {
+		ownership := run.PromptOwnership
+		if ownership.Version != initialprompt.OwnershipVersion {
+			return fmt.Errorf("state contains Run %q with unsupported prompt ownership version %d", run.RunID, ownership.Version)
+		}
+		if run.PromptDigest == "" {
+			return fmt.Errorf("state contains Run %q with prompt ownership without a prompt digest", run.RunID)
+		}
+		if ownership.EntryID != "" && strings.TrimSpace(ownership.EntryID) == "" {
+			return fmt.Errorf("state contains Run %q with a malformed prompt ownership entry id", run.RunID)
+		}
+		hasEntry := ownership.EntryID != ""
+		hasDigest := ownership.ContentDigest != ""
+		if hasEntry != hasDigest {
+			return fmt.Errorf("state contains Run %q with incomplete prompt ownership evidence", run.RunID)
+		}
+		if hasDigest && !ownership.ContentDigest.Valid() {
+			return fmt.Errorf("state contains Run %q with an invalid prompt ownership content digest", run.RunID)
+		}
 	}
 	if run.CleanupPending && run.Status != scheduler.StatusMerged {
 		return fmt.Errorf("state contains non-merged Run %q with pending Completion cleanup", run.RunID)
