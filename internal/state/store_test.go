@@ -3,6 +3,7 @@ package state
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -88,7 +89,7 @@ func TestFileStoreRoundTripsCompleteRecoverySafetyMetadata(t *testing.T) {
 	}
 }
 
-func TestFileStoreMigratesLiteralV4RunningSuspendedAndFailedRunsToV6(t *testing.T) {
+func TestFileStoreMigratesLiteralV4RunningSuspendedAndFailedRunsToV7(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	fixture := `{
   "version": 4,
@@ -141,11 +142,11 @@ func TestFileStoreMigratesLiteralV4RunningSuspendedAndFailedRunsToV6(t *testing.
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(got, preview) {
-		t.Fatalf("persisted V6 differs from Preview:\ngot=%#v\npreview=%#v", got, preview)
+		t.Fatalf("persisted V7 differs from Preview:\ngot=%#v\npreview=%#v", got, preview)
 	}
 	persisted, err := os.ReadFile(path)
-	if err != nil || !strings.Contains(string(persisted), `"version": 6`) || !strings.Contains(string(persisted), `"stoppedWorkerPid": 4300`) {
-		t.Fatalf("V6 migration persistence = %s, %v", persisted, err)
+	if err != nil || !strings.Contains(string(persisted), `"version": 7`) || !strings.Contains(string(persisted), `"stoppedWorkerPid": 4300`) {
+		t.Fatalf("V7 migration persistence = %s, %v", persisted, err)
 	}
 }
 
@@ -174,7 +175,7 @@ func TestFileStorePreviewDoesNotPersistV1Migration(t *testing.T) {
 	}
 }
 
-func TestFileStoreReportsV6TargetWhenV1MigrationPersistenceFails(t *testing.T) {
+func TestFileStoreReportsV7TargetWhenV1MigrationPersistenceFails(t *testing.T) {
 	t.Parallel()
 
 	directory := t.TempDir()
@@ -189,7 +190,7 @@ func TestFileStoreReportsV6TargetWhenV1MigrationPersistenceFails(t *testing.T) {
 	defer os.Chmod(directory, 0o700)
 
 	_, err := (FileStore{Path: path}).Load()
-	if err == nil || !strings.Contains(err.Error(), "persist version 6 state migration") {
+	if err == nil || !strings.Contains(err.Error(), "persist version 7 state migration") {
 		t.Fatalf("V1 migration persistence error = %v", err)
 	}
 }
@@ -241,6 +242,7 @@ func TestFileStoreMigratesV1WithoutLosingRunArtifacts(t *testing.T) {
 	}
 	for index := range source.Runs {
 		source.Runs[index].WorkerMode = scheduler.WorkerModePrint
+		source.Runs[index].LegacyPromptOwnership = true
 	}
 	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
 		t.Fatal(err)
@@ -388,6 +390,9 @@ func TestFileStoreMigratesV2ToV3WithoutAcknowledgingOutcomesOrLosingMetadata(t *
 	if err != nil {
 		t.Fatal(err)
 	}
+	for index := range fixture.Runs {
+		fixture.Runs[index].LegacyPromptOwnership = true
+	}
 	if got.Version != CurrentVersion || got.Repo != fixture.Repo || got.DefaultBranch != fixture.DefaultBranch || got.MaxConcurrentIssues != fixture.MaxConcurrentIssues ||
 		!reflect.DeepEqual(got.Runs, fixture.Runs) || len(got.Leases) != 0 {
 		t.Fatalf("V2 migration lost state: got=%#v want=%#v", got, fixture)
@@ -396,8 +401,8 @@ func TestFileStoreMigratesV2ToV3WithoutAcknowledgingOutcomesOrLosingMetadata(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(persisted), `"version": 6`) {
-		t.Fatalf("V6 migration was not persisted: %s", persisted)
+	if !strings.Contains(string(persisted), `"version": 7`) {
+		t.Fatalf("V7 migration was not persisted: %s", persisted)
 	}
 }
 
@@ -444,10 +449,10 @@ func TestFileStoreRejectsUnsupportedNewerStateVersion(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "state.json")
-	if err := os.WriteFile(path, []byte(`{"version":7,"runs":[],"leases":[]}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"version":8,"runs":[],"leases":[]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := (FileStore{Path: path}).Load(); err == nil || !strings.Contains(err.Error(), "unsupported state version 7") {
+	if _, err := (FileStore{Path: path}).Load(); err == nil || !strings.Contains(err.Error(), "unsupported state version 8") {
 		t.Fatalf("newer state error = %v", err)
 	}
 }
@@ -898,10 +903,10 @@ func TestRepositoryLockAllowsOnlyOneOwner(t *testing.T) {
 	defer second.Release()
 }
 
-func TestFileStoreMigratesV5PromptDigestSchemaWithoutChangingLegacyRunEvidence(t *testing.T) {
+func TestFileStoreMigratesV6PromptDigestSchemaWithoutInventingOwnershipEvidence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	fixture := `{
-  "version": 5,
+  "version": 6,
   "repo": "acme/widgets",
   "defaultBranch": "main",
   "maxConcurrentIssues": 1,
@@ -920,6 +925,7 @@ func TestFileStoreMigratesV5PromptDigestSchemaWithoutChangingLegacyRunEvidence(t
     "sessionName": "afk #42",
     "sessionId": "backlog-legacy-v5",
     "sessionDir": "/sessions/legacy-v5",
+    "promptDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     "continuation": {
       "sessionId": "backlog-legacy-v5",
       "sessionFile": "/sessions/legacy-v5/session.jsonl",
@@ -949,30 +955,75 @@ func TestFileStoreMigratesV5PromptDigestSchemaWithoutChangingLegacyRunEvidence(t
 		t.Fatal(err)
 	}
 	if !migrationRequired || preview.Version != CurrentVersion || len(preview.Runs) != 1 || len(preview.Leases) != 1 {
-		t.Fatalf("V5 preview = %#v, migration=%t", preview, migrationRequired)
+		t.Fatalf("V6 preview = %#v, migration=%t", preview, migrationRequired)
 	}
 	run := preview.Runs[0]
-	if run.PromptDigest != "" || run.Error != "retained diagnostic" || run.Continuation == nil || run.Continuation.LeafID != "leaf" {
-		t.Fatalf("V5 migration changed legacy evidence: %#v", run)
+	if run.PromptDigest != initialprompt.Digest(strings.Repeat("c", 64)) || run.PromptOwnership != nil || !run.LegacyPromptOwnership || run.Error != "retained diagnostic" || run.Continuation == nil || run.Continuation.LeafID != "leaf" {
+		t.Fatalf("V6 migration invented or changed legacy evidence: %#v", run)
 	}
 	unchanged, err := os.ReadFile(path)
 	if err != nil || string(unchanged) != fixture {
-		t.Fatalf("Preview changed V5 source: %v\n%s", err, unchanged)
+		t.Fatalf("Preview changed V6 source: %v\n%s", err, unchanged)
 	}
 	loaded, err := store.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(loaded, preview) {
-		t.Fatalf("persisted V6 differs from Preview:\ngot=%#v\nwant=%#v", loaded, preview)
+		t.Fatalf("persisted V7 differs from Preview:\ngot=%#v\nwant=%#v", loaded, preview)
 	}
 }
 
-func TestFileStoreRoundTripsAndValidatesPromptDigest(t *testing.T) {
+func TestFileStoreRejectsNoncanonicalPromptOwnershipEncoding(t *testing.T) {
+	for _, test := range []struct {
+		name, ownership string
+	}{
+		{name: "duplicate Run field", ownership: `"promptOwnership":{"version":1},"promptOwnership":{"version":1}`},
+		{name: "case-variant Run field", ownership: `"PromptOwnership":{"version":1}`},
+		{name: "duplicate evidence field", ownership: `"promptOwnership":{"version":1,"entryId":"initial","entryId":"copy","contentDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}`},
+		{name: "case-variant evidence field", ownership: `"promptOwnership":{"Version":1}`},
+		{name: "unknown evidence field", ownership: `"promptOwnership":{"version":1,"extra":true}`},
+		{name: "duplicate legacy mode", ownership: `"legacyPromptOwnership":true,"legacyPromptOwnership":false`},
+		{name: "case-variant legacy mode", ownership: `"LegacyPromptOwnership":true`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.json")
+			fixture := fmt.Sprintf(`{"version":7,"runs":[{"issue":7,"runId":"run-7","status":"failed","workerMode":"rpc","sessionId":"session-7","sessionDir":"/sessions/run-7","promptDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",%s}],"leases":[{"leaseId":"run-7","issue":7,"runId":"run-7"}]}`, test.ownership)
+			if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := (FileStore{Path: path}).Load(); err == nil || !strings.Contains(err.Error(), "prompt ownership") {
+				t.Fatalf("noncanonical prompt ownership error = %v", err)
+			}
+		})
+	}
+}
+
+func TestFileStoreRejectsPromptOwnershipMetadataBeforeSchemaV7(t *testing.T) {
+	for _, field := range []string{
+		`"promptOwnership":{"version":1}`,
+		`"legacyPromptOwnership":true`,
+		`"PromptOwnership":{"version":1}`,
+	} {
+		path := filepath.Join(t.TempDir(), "state.json")
+		fixture := fmt.Sprintf(`{"version":6,"runs":[{"issue":7,"runId":"run-7","status":"failed","workerMode":"rpc","sessionId":"session-7","sessionDir":"/sessions/run-7",%s}],"leases":[{"leaseId":"run-7","issue":7,"runId":"run-7"}]}`, field)
+		if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := (FileStore{Path: path}).Load(); err == nil || !strings.Contains(err.Error(), "unsupported before version 7") {
+			t.Fatalf("pre-V7 prompt ownership error = %v", err)
+		}
+	}
+}
+
+func TestFileStoreRoundTripsAndValidatesPromptOwnership(t *testing.T) {
 	store := FileStore{Path: filepath.Join(t.TempDir(), "state.json")}
 	run := scheduler.Run{
 		Issue: 7, RunID: "run-7", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModeRPC,
 		SessionID: "session-7", SessionDir: "/sessions/run-7", PromptDigest: initialprompt.Digest(strings.Repeat("a", 64)),
+		PromptOwnership: &initialprompt.OwnershipEvidence{
+			Version: initialprompt.OwnershipVersion, EntryID: "initial-user", ContentDigest: initialprompt.Digest(strings.Repeat("b", 64)),
+		},
 	}
 	value := State{Version: CurrentVersion, Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}
 	if err := store.Save(value); err != nil {
@@ -982,13 +1033,42 @@ func TestFileStoreRoundTripsAndValidatesPromptDigest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Runs[0].PromptDigest != run.PromptDigest {
-		t.Fatalf("prompt digest = %q, want %q", loaded.Runs[0].PromptDigest, run.PromptDigest)
+	if loaded.Runs[0].PromptDigest != run.PromptDigest || !reflect.DeepEqual(loaded.Runs[0].PromptOwnership, run.PromptOwnership) {
+		t.Fatalf("prompt evidence = %#v/%q, want %#v/%q", loaded.Runs[0].PromptOwnership, loaded.Runs[0].PromptDigest, run.PromptOwnership, run.PromptDigest)
 	}
-	for _, digest := range []string{"short", strings.Repeat("z", 64), strings.Repeat("a", 66)} {
-		value.Runs[0].PromptDigest = initialprompt.Digest(digest)
-		if err := store.Save(value); err == nil || !strings.Contains(err.Error(), "invalid prompt digest") {
-			t.Fatalf("digest %q validation error = %v", digest, err)
-		}
+
+	pending := value
+	pending.Runs = append([]scheduler.Run(nil), value.Runs...)
+	pending.Runs[0].PromptOwnership = &initialprompt.OwnershipEvidence{Version: initialprompt.OwnershipVersion}
+	if err := store.Save(pending); err != nil {
+		t.Fatalf("save pending ownership evidence: %v", err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		digest initialprompt.Digest
+		proof  *initialprompt.OwnershipEvidence
+		legacy bool
+		want   string
+	}{
+		{name: "invalid submitted digest", digest: "short", proof: run.PromptOwnership, want: "invalid prompt digest"},
+		{name: "unsupported version", digest: run.PromptDigest, proof: &initialprompt.OwnershipEvidence{Version: 2}, want: "unsupported prompt ownership"},
+		{name: "malformed entry id", digest: run.PromptDigest, proof: &initialprompt.OwnershipEvidence{Version: initialprompt.OwnershipVersion, EntryID: "  "}, want: "malformed prompt ownership entry id"},
+		{name: "entry without digest", digest: run.PromptDigest, proof: &initialprompt.OwnershipEvidence{Version: initialprompt.OwnershipVersion, EntryID: "initial-user"}, want: "incomplete prompt ownership"},
+		{name: "digest without entry", digest: run.PromptDigest, proof: &initialprompt.OwnershipEvidence{Version: initialprompt.OwnershipVersion, ContentDigest: initialprompt.Digest(strings.Repeat("b", 64))}, want: "incomplete prompt ownership"},
+		{name: "invalid content digest", digest: run.PromptDigest, proof: &initialprompt.OwnershipEvidence{Version: initialprompt.OwnershipVersion, EntryID: "initial-user", ContentDigest: "short"}, want: "invalid prompt ownership content digest"},
+		{name: "ownership without submitted digest", proof: run.PromptOwnership, want: "prompt ownership without a prompt digest"},
+		{name: "versioned and legacy modes", digest: run.PromptDigest, proof: run.PromptOwnership, legacy: true, want: "both versioned and legacy prompt ownership modes"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			invalid := value
+			invalid.Runs = append([]scheduler.Run(nil), value.Runs...)
+			invalid.Runs[0].PromptDigest = test.digest
+			invalid.Runs[0].PromptOwnership = test.proof
+			invalid.Runs[0].LegacyPromptOwnership = test.legacy
+			if err := store.Save(invalid); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validation error = %v, want containing %q", err, test.want)
+			}
+		})
 	}
 }

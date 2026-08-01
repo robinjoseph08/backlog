@@ -1060,7 +1060,10 @@ func TestMainWithTerminalRoutesPresentationCtrlCDuringOwnedWorker(t *testing.T) 
 				return `#!/bin/sh
 set -eu
 IFS= read -r prompt
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+IFS= read -r ownership
+printf '%s\n' '{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":"/skill:afk 65"}}],"leafId":"initial-user"}}'
+printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}'
 touch ` + quote(started) + `
 while ! test -f ` + quote(filepath.Join(root, "release-worker")) + `; do sleep 0.01; done
 touch ` + quote(filepath.Join(root, "worker-completed")) + `
@@ -1083,7 +1086,10 @@ while IFS= read -r ignored; do :; done
 				return `#!/bin/sh
 set -eu
 IFS= read -r prompt
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+IFS= read -r ownership
+printf '%s\n' '{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":"/skill:afk 65"}}],"leafId":"initial-user"}}'
+printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}'
 touch ` + quote(started) + `
 IFS= read -r abort
 trap '' TERM
@@ -1168,7 +1174,10 @@ func TestDefaultDashboardCompletesOwnedWorkerShutdownBeforePTYRestorationAndFina
 				return `#!/bin/sh
 set -eu
 IFS= read -r prompt
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+IFS= read -r ownership
+printf '%s\n' '{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":"/skill:afk 65"}}],"leafId":"initial-user"}}'
+printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}'
 touch ` + quote(started) + `
 while ! test -f ` + quote(filepath.Join(root, "release-worker")) + `; do sleep 0.01; done
 touch ` + quote(filepath.Join(root, "worker-completed")) + `
@@ -1204,7 +1213,10 @@ while IFS= read -r ignored; do :; done
 				return `#!/bin/sh
 set -eu
 IFS= read -r prompt
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+IFS= read -r ownership
+printf '%s\n' '{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":"/skill:afk 65"}}],"leafId":"initial-user"}}'
+printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}'
 touch ` + quote(started) + `
 IFS= read -r abort
 trap '' TERM
@@ -1510,7 +1522,10 @@ while [ "$#" -gt 0 ]; do
 done
 worktree=$(pwd)
 IFS= read -r prompt
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+IFS= read -r ownership
+printf '%s\n' '{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"leaf","parentId":null,"message":{"role":"user","content":"/skill:afk 65"}}],"leafId":"leaf"}}'
+printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}'
 touch ` + quote(started) + `
 IFS= read -r abort
 touch ` + quote(filepath.Join(root, "suspension-started")) + `

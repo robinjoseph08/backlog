@@ -832,6 +832,7 @@ func TestRunnerReportsStructuredSuspensionStages(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(context.Background()) }()
 	workers.waitForStarts(t, 40)
+	workers.waitForCompletionWaiters(t, 40)
 	signals <- os.Interrupt
 	signals <- os.Interrupt
 	if err := <-done; !isSignalExit(err, 130) {
@@ -894,6 +895,7 @@ func TestRunnerReportsStructuredForceStopStages(t *testing.T) {
 			done := make(chan error, 1)
 			go func() { done <- runner.Run(context.Background()) }()
 			workers.waitForStarts(t, issue)
+			workers.waitForCompletionWaiters(t, issue)
 			test.trigger(signals, workers.closeContextStarted)
 			if err := <-done; !isSignalExit(err, test.exitCode) {
 				t.Fatalf("run: %v, want signal exit %d", err, test.exitCode)

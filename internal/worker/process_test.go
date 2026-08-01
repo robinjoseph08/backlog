@@ -133,6 +133,135 @@ echo 'diagnostic' >&2
 	}
 }
 
+func TestProcessCapturesTheActualPersistedInitialUserEntry(t *testing.T) {
+	for _, test := range []struct {
+		name, submitted, persisted, wantDigest string
+	}{
+		{
+			name: "expanded default skill", submitted: "/skill:afk 42",
+			persisted:  `<skill name="afk">expanded body</skill>` + "\n\n42",
+			wantDigest: "8a2541608e998cfebbc463d4dc845b1361f2d23f34ec03eefbba1a6ed1edbdd1",
+		},
+		{
+			name: "arbitrary skill", submitted: "/skill:review --strict",
+			persisted:  `<skill name="afk">expanded body</skill>` + "\n\n42",
+			wantDigest: "8a2541608e998cfebbc463d4dc845b1361f2d23f34ec03eefbba1a6ed1edbdd1",
+		},
+		{
+			name: "plain multiline", submitted: "plain prompt\nsecond line",
+			persisted:  "plain prompt\nsecond line",
+			wantDigest: "bca11c7303e41902e4738b126231a2a6449fac22906798a15386b8084095f470",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			entry := fmt.Sprintf(`{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":%q}}`, test.persisted)
+			pi := fakePi(t, `
+IFS= read -r prompt
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+IFS= read -r ownership
+printf '%s\n' `+shellQuote(`{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[`+entry+`],"leafId":"initial-user"}}`)+`
+printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+while IFS= read -r ignored; do :; done
+`)
+			request := request(42, "ownership-42", root, filepath.Join(root, "sessions"))
+			request.InitialPrompt = test.submitted
+			process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(context.Background(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := process.Release(); err != nil {
+				t.Fatal(err)
+			}
+			evidence, err := process.CapturePromptOwnership(context.Background())
+			if err != nil {
+				t.Fatalf("capture prompt ownership: %v", err)
+			}
+			if evidence.Version != initialprompt.OwnershipVersion || evidence.EntryID != "initial-user" || string(evidence.ContentDigest) != test.wantDigest {
+				t.Fatalf("ownership evidence = %#v", evidence)
+			}
+			if result := process.Wait(); !result.Settled || result.Err != nil {
+				t.Fatalf("wait = %#v", result)
+			}
+			if result := process.Close(); result.Err != nil {
+				t.Fatalf("close = %#v", result)
+			}
+		})
+	}
+}
+
+func TestProcessWaitsForTheAcceptedPromptToBecomeDurable(t *testing.T) {
+	root := t.TempDir()
+	entry := `{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":[{"type":"text","text":"expanded prompt"}]}}`
+	pi := fakePi(t, `
+IFS= read -r prompt
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+IFS= read -r first_ownership
+printf '%s\n' '{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[],"leafId":null}}'
+IFS= read -r second_ownership
+printf '%s\n' `+shellQuote(`{"id":"backlog-initial-prompt-entry-2","type":"response","command":"get_entries","success":true,"data":{"entries":[`+entry+`],"leafId":"initial-user"}}`)+`
+printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+while IFS= read -r ignored; do :; done
+`)
+	process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(
+		context.Background(), request(42, "durable-42", root, filepath.Join(root, "sessions")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Release(); err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := process.CapturePromptOwnership(context.Background())
+	if err != nil || evidence.EntryID != "initial-user" || !evidence.Complete() {
+		t.Fatalf("durable ownership evidence = %#v, %v", evidence, err)
+	}
+	if result := process.Wait(); !result.Settled || result.Err != nil {
+		t.Fatalf("wait = %#v", result)
+	}
+	if result := process.Close(); result.Err != nil {
+		t.Fatalf("close = %#v", result)
+	}
+}
+
+func TestProcessPromptOwnershipCaptureFailsClosed(t *testing.T) {
+	valid := `{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":"prompt"}}`
+	for _, test := range []struct {
+		name, response, want string
+	}{
+		{name: "missing entry", response: `{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[],"leafId":null}}`, want: "context deadline exceeded"},
+		{name: "duplicate candidates", response: `{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[` + valid + `,{"type":"message","id":"copy","parentId":"initial-user","message":{"role":"user","content":"prompt"}}],"leafId":"copy"}}`, want: "2 user entries"},
+		{name: "malformed content", response: `{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":[{"type":"text"}]}}],"leafId":"initial-user"}}`, want: "structured text content is missing"},
+		{name: "uncorrelated response", response: `{"id":"unrelated","type":"response","command":"get_entries","success":true,"data":{"entries":[` + valid + `],"leafId":"initial-user"}}`, want: "unexpected or mismatched"},
+		{name: "rejected query", response: `{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":false,"error":"unavailable"}`, want: "unavailable"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			pi := fakePi(t, `
+IFS= read -r prompt
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+IFS= read -r ownership
+printf '%s\n' `+shellQuote(test.response)+`
+while IFS= read -r ignored; do :; done
+`)
+			process, err := (Supervisor{Executable: pi, LogsDir: filepath.Join(root, "logs")}).Start(
+				context.Background(), request(42, "unsafe-42", root, filepath.Join(root, "sessions")),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, err = process.Activate(ctx)
+			cancel()
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("capture error = %v, want containing %q", err, test.want)
+			}
+			_ = process.Abort()
+			_ = process.Close()
+		})
+	}
+}
+
 func TestProcessCannotSubmitPromptUntilReleased(t *testing.T) {
 	t.Parallel()
 
@@ -1045,7 +1174,7 @@ while IFS= read -r ignored; do :; done
 	waitForPath(t, started)
 	boundary, err := process.Suspend(context.Background(), ContinuationRequest{
 		Issue: 50, RunID: "run-50", Branch: "agent/issue-50-run-50",
-		SessionID: "backlog-run-50", SessionDir: sessionDir, Worktree: worktree,
+		SessionID: "backlog-run-50", SessionDir: sessionDir, Worktree: worktree, AllowLegacyPromptOwnership: true,
 	})
 	if err != nil {
 		t.Fatalf("suspend: %v", err)
@@ -1101,7 +1230,7 @@ while IFS= read -r ignored; do :; done
 	if result := process.Wait(); !result.Settled || result.Err != nil {
 		t.Fatalf("wait = %#v", result)
 	}
-	boundary, err := process.CheckpointSettled(context.Background(), ContinuationRequest{Issue: 54, RunID: "run-settled", Branch: "agent/issue-54-run-settled", SessionID: "backlog-run-settled", SessionDir: sessionDir, Worktree: worktree})
+	boundary, err := process.CheckpointSettled(context.Background(), ContinuationRequest{Issue: 54, RunID: "run-settled", Branch: "agent/issue-54-run-settled", SessionID: "backlog-run-settled", SessionDir: sessionDir, Worktree: worktree, AllowLegacyPromptOwnership: true})
 	if err != nil {
 		t.Fatalf("checkpoint settled: %v", err)
 	}
@@ -1261,7 +1390,7 @@ func TestWorkflowCheckpointMatchesExactPromptDigestForStringAndStructuredSession
 	sessionDir := t.TempDir()
 	request := ContinuationRequest{
 		Issue: 42, RunID: "run-42", Branch: "agent/issue-42-run-42", SessionID: "session-42",
-		SessionDir: sessionDir, Worktree: worktree, RequirePromptOwnership: true,
+		SessionDir: sessionDir, Worktree: worktree, RequirePromptOwnership: true, AllowLegacyPromptOwnership: true,
 	}
 	prompt := "custom workflow\n世界 {{literal}}"
 	request.PromptDigest = initialprompt.Sum(prompt)
@@ -1286,7 +1415,61 @@ func TestWorkflowCheckpointMatchesExactPromptDigestForStringAndStructuredSession
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			_, _, _, _, _, _, err := inspectWorkflowCheckpointMode(request, test.entries, false)
-			if test.wantErr && (err == nil || !strings.Contains(err.Error(), "exact owned initial prompt")) {
+			if test.wantErr && (err == nil || !strings.Contains(err.Error(), "owned initial persisted user entry")) {
+				t.Fatalf("ownership error = %v", err)
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("ownership match failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestWorkflowCheckpointVerifiesDurablePersistedEntryOwnership(t *testing.T) {
+	worktree := t.TempDir()
+	sessionDir := t.TempDir()
+	request := ContinuationRequest{
+		Issue: 42, RunID: "run-42", Branch: "agent/issue-42-run-42", SessionID: "session-42",
+		SessionDir: sessionDir, Worktree: worktree, RequirePromptOwnership: true,
+		PromptOwnership: &initialprompt.OwnershipEvidence{
+			Version: initialprompt.OwnershipVersion, EntryID: "initial-user",
+			ContentDigest: "8a2541608e998cfebbc463d4dc845b1361f2d23f34ec03eefbba1a6ed1edbdd1",
+		},
+	}
+	marker := fmt.Sprintf("{\"version\":1,\"workflow\":\"afk\",\"stage\":\"afk-coordinator\",\"issue\":42,\"runId\":\"run-42\",\"sessionId\":\"session-42\",\"worktree\":%q}\n", worktree)
+	if err := os.WriteFile(filepath.Join(sessionDir, "backlog-afk-checkpoint-v1.json"), []byte(marker), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	expanded := `<skill name="afk">expanded body</skill>` + "\n\n42"
+	entry := func(id, content string) json.RawMessage {
+		return json.RawMessage(fmt.Sprintf(`{"type":"message","id":%q,"parentId":null,"message":{"role":"user","content":%q}}`, id, content))
+	}
+	for _, test := range []struct {
+		name       string
+		entries    []json.RawMessage
+		proof      *initialprompt.OwnershipEvidence
+		useMissing bool
+		wantErr    bool
+	}{
+		{name: "exact recorded entry", entries: []json.RawMessage{entry("initial-user", expanded)}},
+		{name: "tampered content", entries: []json.RawMessage{entry("initial-user", expanded+" changed")}, wantErr: true},
+		{name: "duplicate candidate content", entries: []json.RawMessage{entry("initial-user", expanded), entry("copy", expanded)}, wantErr: true},
+		{name: "substituted entry identity", entries: []json.RawMessage{entry("replacement", expanded)}, wantErr: true},
+		{name: "unrelated expanded skill", entries: []json.RawMessage{entry("initial-user", `<skill name="other">unrelated</skill>`)}, wantErr: true},
+		{name: "malformed structured content", entries: []json.RawMessage{json.RawMessage(`{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":[{"type":"text"}]}}`)}, wantErr: true},
+		{name: "missing evidence", entries: []json.RawMessage{entry("initial-user", expanded)}, useMissing: true, wantErr: true},
+		{name: "pending evidence", entries: []json.RawMessage{entry("initial-user", expanded)}, proof: initialprompt.PendingOwnership(), wantErr: true},
+		{name: "unsupported evidence", entries: []json.RawMessage{entry("initial-user", expanded)}, proof: &initialprompt.OwnershipEvidence{Version: 2}, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			proof := test.proof
+			if proof == nil && !test.useMissing {
+				proof = request.PromptOwnership
+			}
+			current := request
+			current.PromptOwnership = proof
+			_, _, _, _, _, _, err := inspectWorkflowCheckpointMode(current, test.entries, false)
+			if test.wantErr && (err == nil || !strings.Contains(err.Error(), "owned initial persisted user entry")) {
 				t.Fatalf("ownership error = %v", err)
 			}
 			if !test.wantErr && err != nil {

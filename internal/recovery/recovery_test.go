@@ -120,7 +120,7 @@ func TestRecoveryRequiresExactPersistedPromptDigestWithoutLegacyFallback(t *test
 			module := newTestModule(t, store, fakeGitHub{issue: openIssue(run.Issue)}, func(int) (bool, error) { return false, nil }, time.Now())
 			_, err := module.Inspect(context.Background(), run.RunID)
 			if test.wantRefusal {
-				if err == nil || !strings.Contains(err.Error(), "exact owned initial prompt") {
+				if err == nil || !strings.Contains(err.Error(), "owned initial persisted user entry") {
 					t.Fatalf("Recovery ownership refusal = %v", err)
 				}
 				if len(store.value.Leases) != 1 || store.value.Runs[0].Status != scheduler.StatusFailed {
@@ -130,6 +130,81 @@ func TestRecoveryRequiresExactPersistedPromptDigestWithoutLegacyFallback(t *test
 			}
 			if err != nil {
 				t.Fatalf("Recovery rejected exact custom prompt: %v", err)
+			}
+		})
+	}
+}
+
+func TestRecoveryVerifiesRecordedExpandedPromptEntryWithoutWeakeningStageEvidence(t *testing.T) {
+	expanded := `<skill name="afk">expanded body</skill>` + "\n\n42"
+	for _, test := range []struct {
+		name       string
+		entries    []string
+		ownership  *initialprompt.OwnershipEvidence
+		useMissing bool
+		wantRefuse bool
+	}{
+		{
+			name:    "recorded expanded entry",
+			entries: []string{fmt.Sprintf(`{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":%q}}`, expanded)},
+		},
+		{
+			name: "tampered expanded content", wantRefuse: true,
+			entries: []string{fmt.Sprintf(`{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":%q}}`, expanded+" changed")},
+		},
+		{
+			name: "duplicate candidate", wantRefuse: true,
+			entries: []string{
+				fmt.Sprintf(`{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":%q}}`, expanded),
+				fmt.Sprintf(`{"type":"message","id":"copy","parentId":"initial-user","message":{"role":"user","content":%q}}`, expanded),
+			},
+		},
+		{
+			name: "unrelated expanded skill", wantRefuse: true,
+			entries: []string{`{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":"<skill name=\"other\">unrelated</skill>"}}`},
+		},
+		{
+			name: "missing versioned evidence", useMissing: true, wantRefuse: true,
+			entries: []string{fmt.Sprintf(`{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":%q}}`, expanded)},
+		},
+		{
+			name: "malformed versioned evidence", wantRefuse: true,
+			entries:   []string{fmt.Sprintf(`{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":%q}}`, expanded)},
+			ownership: &initialprompt.OwnershipEvidence{},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			run, store := recoverableFixture(t)
+			run.PromptDigest = initialprompt.Sum("/skill:afk 42")
+			run.LegacyPromptOwnership = false
+			run.PromptOwnership = &initialprompt.OwnershipEvidence{
+				Version: initialprompt.OwnershipVersion, EntryID: "initial-user",
+				ContentDigest: "8a2541608e998cfebbc463d4dc845b1361f2d23f34ec03eefbba1a6ed1edbdd1",
+			}
+			if test.ownership != nil {
+				run.PromptOwnership = test.ownership
+			}
+			if test.useMissing {
+				run.PromptOwnership = nil
+			}
+			store.value.Runs[0] = run
+			header := fmt.Sprintf(`{"type":"session","version":3,"id":%q,"cwd":%q}`, run.SessionID, run.Worktree)
+			if err := os.WriteFile(filepath.Join(run.SessionDir, "session.jsonl"), []byte(header+"\n"+strings.Join(test.entries, "\n")+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			module := newTestModule(t, store, fakeGitHub{issue: openIssue(run.Issue)}, func(int) (bool, error) { return false, nil }, time.Now())
+			_, err := module.Inspect(context.Background(), run.RunID)
+			if test.wantRefuse {
+				if err == nil || !strings.Contains(err.Error(), "owned initial persisted user entry") {
+					t.Fatalf("Recovery ownership refusal = %v", err)
+				}
+				if len(store.value.Leases) != 1 || store.value.Runs[0].Status != scheduler.StatusFailed {
+					t.Fatalf("Recovery refusal changed ownership: %#v", store.value)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Recovery rejected recorded expanded prompt entry: %v", err)
 			}
 		})
 	}
@@ -587,7 +662,8 @@ func recoverableFixture(t *testing.T) (scheduler.Run, *memoryStore) {
 		Issue: 42, RunID: "run-42", Status: scheduler.StatusFailed, WorkerMode: scheduler.WorkerModeRPC,
 		WorkerGeneration: 1, StoppedWorkerGeneration: 1, WorkerStoppedAt: ptrTime(time.Now().Add(-time.Minute)),
 		Branch: "agent/issue-42-run-42", Worktree: worktreePath, SessionName: "afk #42", SessionID: "session-42", SessionDir: sessionDir,
-		Error: "repair budget exhausted", FailureClass: scheduler.FailureRepairBudgetExhaustion, StartedAt: time.Now().Add(-time.Hour), UpdatedAt: time.Now(),
+		LegacyPromptOwnership: true,
+		Error:                 "repair budget exhausted", FailureClass: scheduler.FailureRepairBudgetExhaustion, StartedAt: time.Now().Add(-time.Hour), UpdatedAt: time.Now(),
 	}
 	return run, &memoryStore{value: state.State{Version: state.CurrentVersion, Repo: "acme/widgets", DefaultBranch: "main", Runs: []scheduler.Run{run}, Leases: []scheduler.Lease{{LeaseID: run.RunID, Issue: run.Issue, RunID: run.RunID}}}}
 }

@@ -279,7 +279,7 @@ func TestResolveDryRunAndCancellationDoNotMigrateBindOrMutate(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			encoded = bytes.Replace(encoded, []byte(`"version": 6`), []byte(`"version": 3`), 1)
+			encoded = bytes.Replace(encoded, []byte(`"version": 7`), []byte(`"version": 3`), 1)
 			if err := os.WriteFile(fixture.store.Path, encoded, 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -786,7 +786,10 @@ while test "$#" -gt 0; do
 done
 printf '{"type":"session","id":"%s","cwd":"%s"}\n' "$session_id" "$PWD" >"$session_dir/session.jsonl"
 IFS= read -r prompt
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}'
+IFS= read -r ownership
+printf '%s\n' '{"id":"backlog-initial-prompt-entry","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"message","id":"initial-user","parentId":null,"message":{"role":"user","content":"/skill:afk 84"}}],"leafId":"initial-user"}}'
+printf '%s\n' '{"type":"agent_start"}' '{"type":"turn_start"}'
 touch `+quote(workerStarted)+`
 while ! test -f `+quote(settleWorker)+`; do sleep 0.01; done
 printf '%s\n' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
@@ -2859,7 +2862,7 @@ func TestCompiledResolveMigratesV3AndStatusAndFollowExposeResolution(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded = bytes.Replace(encoded, []byte(`"version": 6`), []byte(`"version": 3`), 1)
+	encoded = bytes.Replace(encoded, []byte(`"version": 7`), []byte(`"version": 3`), 1)
 	if err := os.WriteFile(fixture.store.Path, encoded, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -2873,7 +2876,7 @@ func TestCompiledResolveMigratesV3AndStatusAndFollowExposeResolution(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(persisted, []byte(`"version": 6`)) {
+	if !bytes.Contains(persisted, []byte(`"version": 7`)) {
 		t.Fatalf("compiled resolve did not persist v3 migration:\n%s", persisted)
 	}
 	migrated, err := fixture.store.Load()
