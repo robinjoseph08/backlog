@@ -2,7 +2,9 @@ package cli
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -285,6 +287,9 @@ func (v recoveryGitVerifier) Verify(ctx context.Context, run scheduler.Run) (rec
 	if err != nil {
 		return recovery.GitIdentity{}, err
 	}
+	if !validCommitIdentity(local) {
+		return recovery.GitIdentity{}, errors.New("local branch lookup returned malformed or ambiguous identity")
+	}
 	remoteOutput, err := commandOutput(ctx, v.executable, "-C", v.repositoryRoot, "ls-remote", "--heads", "origin", "refs/heads/"+run.Branch)
 	if err != nil {
 		return recovery.GitIdentity{}, err
@@ -292,7 +297,7 @@ func (v recoveryGitVerifier) Verify(ctx context.Context, run scheduler.Run) (rec
 	identity := recovery.GitIdentity{LocalCommit: local}
 	if remoteOutput != "" {
 		fields := strings.Fields(remoteOutput)
-		if len(fields) != 2 || fields[1] != "refs/heads/"+run.Branch {
+		if len(fields) != 2 || !validCommitIdentity(fields[0]) || fields[1] != "refs/heads/"+run.Branch {
 			return recovery.GitIdentity{}, errors.New("remote branch lookup returned malformed or ambiguous identity")
 		}
 		identity.RemotePresent = true
@@ -301,14 +306,24 @@ func (v recoveryGitVerifier) Verify(ctx context.Context, run scheduler.Run) (rec
 	return identity, nil
 }
 
+func validCommitIdentity(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil && strings.Trim(value, "0") != ""
+}
+
 func commandOutput(ctx context.Context, executable string, args ...string) (string, error) {
 	command := exec.CommandContext(ctx, executable, args...)
-	output, err := command.CombinedOutput()
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	output, err := command.Output()
 	if err != nil {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
-		message := strings.TrimSpace(string(output))
+		message := strings.TrimSpace(strings.Join([]string{string(output), stderr.String()}, "\n"))
 		if message != "" {
 			return "", errors.New(message)
 		}
