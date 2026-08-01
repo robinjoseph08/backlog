@@ -2130,12 +2130,12 @@ func (w *rpcWriter) validate(line []byte) {
 		w.promptAcceptedOnce.Do(func() { close(w.promptAccepted) })
 		return
 	}
-	if w.state == rpcAgentSettled {
-		w.addError(fmt.Errorf("Pi RPC message %q followed agent_settled on line %d", message.Type, w.lineNumber))
-		return
-	}
 	if message.Type == "extension_ui_request" {
 		w.validateExtensionUIRequest(message.ID, message.Method)
+		return
+	}
+	if w.state == rpcAgentSettled {
+		w.addError(fmt.Errorf("Pi RPC message %q followed agent_settled on line %d", message.Type, w.lineNumber))
 		return
 	}
 	if message.ID != "" {

@@ -693,15 +693,19 @@ while IFS= read -r ignored; do :; done
 	}
 }
 
-func TestCloseReportsProtocolFailuresAfterSettlement(t *testing.T) {
+func TestCloseRejectsUnsupportedActivityAfterSettlement(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name  string
 		event string
+		want  string
 	}{
-		{name: "unknown event", event: `{"type":"surprise"}`},
-		{name: "entry appended", event: `{"type":"entry_appended","entry":{"type":"custom"}}`},
+		{name: "unknown event", event: `{"type":"surprise"}`, want: "followed agent_settled"},
+		{name: "entry appended", event: `{"type":"entry_appended","entry":{"type":"custom"}}`, want: "followed agent_settled"},
+		{name: "interactive UI request", event: `{"type":"extension_ui_request","id":"ui-1","method":"confirm"}`, want: "unsupported interactive Pi RPC request"},
+		{name: "unknown UI method", event: `{"type":"extension_ui_request","id":"ui-1","method":"surprise"}`, want: "unknown Pi RPC extension UI method"},
+		{name: "agent lifecycle event", event: `{"type":"agent_start"}`, want: "followed agent_settled"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -724,8 +728,8 @@ printf '%s\n' '`+test.event+`'
 			if result := process.Wait(); result.Err != nil || !result.Settled {
 				t.Fatalf("wait = %#v", result)
 			}
-			if result := process.Close(); result.Err == nil || !strings.Contains(result.Err.Error(), "followed agent_settled") {
-				t.Fatalf("close error = %v, want post-settlement protocol failure", result.Err)
+			if result := process.Close(); result.Err == nil || !strings.Contains(result.Err.Error(), test.want) {
+				t.Fatalf("close error = %v, want post-settlement protocol failure containing %q", result.Err, test.want)
 			}
 		})
 	}
@@ -1188,7 +1192,7 @@ while IFS= read -r ignored; do :; done
 	}
 }
 
-func TestProcessCheckpointSettledCapturesBoundaryWithoutAbort(t *testing.T) {
+func TestProcessCheckpointSettledAcceptsLifecycleNeutralUIBeforeCorrelatedResponses(t *testing.T) {
 	root := t.TempDir()
 	worktree := filepath.Join(root, "worktree")
 	sessionDir := filepath.Join(root, "sessions")
@@ -1208,7 +1212,7 @@ func TestProcessCheckpointSettledCapturesBoundaryWithoutAbort(t *testing.T) {
 	stateData := `{"isStreaming":false,"isCompacting":false,"pendingMessageCount":0,"sessionFile":` + strconv.Quote(sessionFile) + `,"sessionId":"backlog-run-settled"}`
 	pi := fakePi(t, `
 IFS= read -r prompt
-printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}'
+printf '%s\n' '{"id":"backlog-afk-prompt","type":"response","command":"prompt","success":true}' '{"type":"agent_start"}' '{"type":"turn_start"}' '{"type":"turn_end"}' '{"type":"agent_end"}' '{"type":"agent_settled"}' '{"type":"extension_ui_request","id":"ui-1","method":"setWidget"}'
 IFS= read -r state
 printf '%s' "$state" > `+shellQuote(firstCommand)+`
 printf '%s\n' `+shellQuote(`{"id":"backlog-suspend-state","type":"response","command":"get_state","success":true,"data":`+stateData+`}`)+`
