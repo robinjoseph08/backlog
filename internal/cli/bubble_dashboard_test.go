@@ -576,6 +576,7 @@ func TestBubbleDashboardKeyboardNavigationSelectsCollapsedSectionWhenContentFits
 		model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 80, Height: 23})
 		updated, _ := model.Update(dashboardConfiguredMsg{initial: current, source: &dashboardTestSource{current: current}})
 		model = updated.(bubbleDashboardModel)
+		selectFirstRunForTest(t, &model)
 		if model.viewport.YOffset() != 0 || !model.viewport.AtBottom() {
 			t.Fatalf("test dashboard content did not fit at offset zero: offset=%d bottom=%t", model.viewport.YOffset(), model.viewport.AtBottom())
 		}
@@ -644,6 +645,8 @@ func TestBubbleDashboardMouseWheelScrollsWithoutClickHandling(t *testing.T) {
 	updated, _ := model.Update(dashboardConfiguredMsg{initial: current, source: &dashboardTestSource{current: current}})
 	model = updated.(bubbleDashboardModel)
 	anchor := dashboardRunAnchor(run.RunID)
+	model.selectedAnchor = anchor
+	model.refreshViewport(dashboardSelection{identity: anchor, relative: model.dashboardBodyStart(), valid: true})
 	line, exists := model.anchorVisualLine(anchor)
 	if !exists || !model.visualLineVisible(line) || !strings.Contains(model.View().Content, "\x1b]8;;"+run.IssueURL) {
 		t.Fatalf("linked Run row is not visible for click coverage:\n%q", model.View().Content)
@@ -690,7 +693,7 @@ func TestBubbleDashboardPreservesSelectedRunAcrossLiveProjectionChanges(t *testi
 		Description: "Worker turn completed", TurnDelta: 1,
 	})
 	source := &dashboardTestSource{current: current}
-	model := configuredNavigationTestModel(t, now, current, source)
+	model := configuredNavigationTestModelWithFirstRunSelected(t, now, current, source)
 	selected := dashboardRunAnchor("run-4")
 	line, exists := model.anchorVisualLine(selected)
 	if !exists {
@@ -745,7 +748,7 @@ func TestBubbleDashboardPreservesSelectedRunAcrossLiveProjectionChanges(t *testi
 func TestBubbleDashboardPreservesSelectedRunAcrossAdmissionChanges(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	current := navigationTestState(now, 7)
-	model := configuredNavigationTestModel(t, now, current, &dashboardTestSource{current: current})
+	model := configuredNavigationTestModelWithFirstRunSelected(t, now, current, &dashboardTestSource{current: current})
 	selected := dashboardRunAnchor("run-4")
 	model.selectedAnchor = selected
 	model.refreshViewport(dashboardSelection{identity: selected, relative: model.dashboardBodyStart() + 1, valid: true})
@@ -870,7 +873,7 @@ func TestBubbleDashboardPreservesDownstreamSelectionAcrossStyledDiagnosticsChang
 		t.Run(test.name, func(t *testing.T) {
 			now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 			current := navigationTestState(now, 10)
-			model := configuredNavigationTestModel(t, now, current, &dashboardTestSource{current: current})
+			model := configuredNavigationTestModelWithFirstRunSelected(t, now, current, &dashboardTestSource{current: current})
 			model.styler = newDashboardStyler(test.profile, true)
 			for failure := 1; failure <= dashboardDiagnosticLimit; failure++ {
 				updated, _ := model.Update(dashboardOperationalMsg{event: runner.CandidateDiscoveryFailed{
@@ -1045,7 +1048,7 @@ func TestBubbleDashboardPreservesSelectedSectionAcrossLiveProjectionChanges(t *t
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	current := navigationTestState(now, 5)
 	source := &dashboardTestSource{current: current}
-	model := configuredNavigationTestModel(t, now, current, source)
+	model := configuredNavigationTestModelWithFirstRunSelected(t, now, current, source)
 	selected := dashboardSectionAnchor("Attention Required")
 	line, exists := model.anchorVisualLine(selected)
 	if !exists {
@@ -1091,7 +1094,7 @@ func TestBubbleDashboardMarksAndJumpsToNewOffscreenAttention(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	current := navigationTestState(now, 8)
 	source := &dashboardTestSource{current: current}
-	model := configuredNavigationTestModel(t, now, current, source)
+	model := configuredNavigationTestModelWithFirstRunSelected(t, now, current, source)
 	model.styler = newDashboardStyler(TerminalColorTrueColor, true)
 	selected := model.currentSelection()
 
@@ -1133,7 +1136,7 @@ func TestBubbleDashboardMarksAndJumpsToNewAttentionInCollapsedSection(t *testing
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	current := navigationTestState(now, 4)
 	source := &dashboardTestSource{current: current}
-	model := configuredNavigationTestModel(t, now, current, source)
+	model := configuredNavigationTestModelWithFirstRunSelected(t, now, current, source)
 	section := dashboardSectionAnchor("Attention Required")
 	model.expansionOverrides[section] = false
 	model.refreshViewport(model.currentSelection())
@@ -1174,7 +1177,7 @@ func TestBubbleDashboardClearsPendingAttentionWhenRefreshRevealsRun(t *testing.T
 			now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 			current := navigationTestState(now, 8)
 			source := &dashboardTestSource{current: current}
-			model := configuredNavigationTestModel(t, now, current, source)
+			model := configuredNavigationTestModelWithFirstRunSelected(t, now, current, source)
 			if refresh == "state update" {
 				updated, _ := model.Update(tea.WindowSizeMsg{Width: 64, Height: 17})
 				model = updated.(bubbleDashboardModel)
@@ -1213,7 +1216,7 @@ func TestBubbleDashboardClearsPendingAttentionWhenRefreshRevealsRun(t *testing.T
 func TestBubbleDashboardQIsUnassigned(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	current := navigationTestState(now, 4)
-	model := configuredNavigationTestModel(t, now, current, &dashboardTestSource{current: current})
+	model := configuredNavigationTestModelWithFirstRunSelected(t, now, current, &dashboardTestSource{current: current})
 	before := model.currentSelection()
 	offset := model.viewport.YOffset()
 	stage := model.dashboard.stage
@@ -1237,11 +1240,26 @@ func navigationTestState(now time.Time, count int) state.State {
 	return current
 }
 
-func configuredNavigationTestModel(t *testing.T, now time.Time, current state.State, source *dashboardTestSource) bubbleDashboardModel {
+func configuredNavigationTestModelWithFirstRunSelected(t *testing.T, now time.Time, current state.State, source *dashboardTestSource) bubbleDashboardModel {
 	t.Helper()
 	model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 64, Height: 14})
 	updated, _ := model.Update(dashboardConfiguredMsg{initial: current, source: source})
-	return updated.(bubbleDashboardModel)
+	model = updated.(bubbleDashboardModel)
+	selectFirstRunForTest(t, &model)
+	return model
+}
+
+func selectFirstRunForTest(t *testing.T, model *bubbleDashboardModel) {
+	t.Helper()
+	for _, anchor := range model.layout.anchors {
+		if !strings.HasPrefix(anchor.identity, "run:") {
+			continue
+		}
+		model.selectedAnchor = anchor.identity
+		model.refreshViewport(dashboardSelection{identity: anchor.identity, relative: model.dashboardBodyStart(), valid: true})
+		return
+	}
+	t.Fatal("dashboard has no Run anchor")
 }
 
 func dashboardVisibleLine(t *testing.T, view, content string) int {
@@ -1488,6 +1506,27 @@ func TestBubbleDashboardAdmissionExpansionRemainsUsefulAndResponsive(t *testing.
 	}
 }
 
+func TestBubbleDashboardStartsWithAdmissionHealthSelected(t *testing.T) {
+	now := time.Date(2026, 7, 28, 14, 0, 0, 0, time.UTC)
+	current := navigationTestState(now, 1)
+	admission := dashboardSectionAnchor("Admission health")
+
+	for _, height := range []int{24, 23, 11} {
+		t.Run(fmt.Sprintf("height-%d", height), func(t *testing.T) {
+			model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 160, Height: height})
+			updated, _ := model.Update(dashboardConfiguredMsg{initial: current, source: &dashboardTestSource{current: current}})
+			model = updated.(bubbleDashboardModel)
+
+			if model.selectedAnchor != admission {
+				t.Fatalf("initial selection = %q, want %q", model.selectedAnchor, admission)
+			}
+			if !strings.Contains(ansi.Strip(model.View().Content), "> Admission health") {
+				t.Fatalf("initial view did not select Admission health:\n%s", ansi.Strip(model.View().Content))
+			}
+		})
+	}
+}
+
 func TestBubbleDashboardResponsiveDensityAndSelectedDetails(t *testing.T) {
 	now := time.Date(2026, 7, 28, 14, 0, 0, 0, time.UTC)
 	logPath := t.TempDir() + "/responsive.jsonl"
@@ -1524,7 +1563,11 @@ func TestBubbleDashboardResponsiveDensityAndSelectedDetails(t *testing.T) {
 	newModel := func(height int) bubbleDashboardModel {
 		model := newBubbleDashboardModel(context.Background(), PresentationControl{Terminal: PresentationTerminal{Now: func() time.Time { return now }}}, newBubbleDashboardSession(time.Now), TerminalDimensions{Width: 160, Height: height})
 		updated, _ := model.Update(dashboardConfiguredMsg{initial: current, source: &dashboardTestSource{current: current}})
-		return updated.(bubbleDashboardModel)
+		model = updated.(bubbleDashboardModel)
+		selected := dashboardRunAnchor(active.RunID)
+		model.selectedAnchor = selected
+		model.refreshViewport(dashboardSelection{identity: selected, relative: model.dashboardBodyStart(), valid: true})
+		return model
 	}
 
 	roomy := newModel(24)
@@ -1580,28 +1623,28 @@ func TestBubbleDashboardResponsiveDensityAndSelectedDetails(t *testing.T) {
 	}
 }
 
-func TestBubbleDashboardSelectsRunDetailsWhenResizedFromMediumToRoomy(t *testing.T) {
+func TestBubbleDashboardPreservesSelectedSectionWhenResizedFromMediumToRoomy(t *testing.T) {
 	now := time.Date(2026, 7, 28, 14, 0, 0, 0, time.UTC)
 	current := navigationTestState(now, 2)
-	model := configuredNavigationTestModel(t, now, current, &dashboardTestSource{current: current})
+	model := configuredNavigationTestModelWithFirstRunSelected(t, now, current, &dashboardTestSource{current: current})
 	section := dashboardSectionAnchor("Attention Required")
 	model.selectedAnchor = section
 	model.refreshViewport(dashboardSelection{identity: section, valid: true})
 
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 64, Height: 24})
 	model = updated.(bubbleDashboardModel)
-	if model.selectedAnchor != dashboardRunAnchor("run-0") {
-		t.Fatalf("roomy resize selection = %q, want first Run", model.selectedAnchor)
+	if model.selectedAnchor != section {
+		t.Fatalf("roomy resize selection = %q, want %q", model.selectedAnchor, section)
 	}
-	if !strings.Contains(model.viewport.GetContent(), "Run: run-0") {
-		t.Fatalf("roomy resize did not show selected Run details:\n%s", model.viewport.GetContent())
+	if !strings.Contains(ansi.Strip(model.View().Content), "> Attention Required") {
+		t.Fatalf("roomy resize did not preserve the selected section:\n%s", ansi.Strip(model.View().Content))
 	}
 }
 
 func TestBubbleDashboardPreservesSelectedRunWhenResizedToMinimal(t *testing.T) {
 	now := time.Date(2026, 7, 28, 14, 0, 0, 0, time.UTC)
 	current := navigationTestState(now, 4)
-	model := configuredNavigationTestModel(t, now, current, &dashboardTestSource{current: current})
+	model := configuredNavigationTestModelWithFirstRunSelected(t, now, current, &dashboardTestSource{current: current})
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 64, Height: 24})
 	model = updated.(bubbleDashboardModel)
 

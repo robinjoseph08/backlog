@@ -602,7 +602,6 @@ func dashboardActivityTick() tea.Cmd {
 
 func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	selection := m.currentSelection()
-	previousDensity := dashboardDensityForHeight(m.height)
 	var commands []tea.Cmd
 	trackAttention := false
 	configured := false
@@ -727,10 +726,6 @@ func (m bubbleDashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	m.refreshViewportWithVisibility(selection, keepSelectionVisible)
-	enteredRoomy := previousDensity != dashboardDensityRoomy && dashboardDensityForHeight(m.height) == dashboardDensityRoomy
-	if configured || enteredRoomy {
-		m.ensureRunSelection()
-	}
 	if configured {
 		m.attentionKnown = cloneDashboardIdentities(m.layout.attention)
 		clear(m.attentionPending)
@@ -881,28 +876,6 @@ func (m *bubbleDashboardModel) revealSelectedCompletion(selection dashboardSelec
 		}
 	}
 	return false
-}
-
-func (m *bubbleDashboardModel) ensureRunSelection() {
-	if strings.HasPrefix(m.selectedAnchor, "run:") {
-		for _, anchor := range m.layout.anchors {
-			if anchor.identity == m.selectedAnchor {
-				return
-			}
-		}
-	}
-	for _, anchor := range m.layout.anchors {
-		if !strings.HasPrefix(anchor.identity, "run:") {
-			continue
-		}
-		m.selectedAnchor = anchor.identity
-		m.refreshViewport(dashboardSelection{
-			identity: anchor.identity,
-			relative: m.dashboardBodyStart(),
-			valid:    true,
-		})
-		return
-	}
 }
 
 func (m *bubbleDashboardModel) toggleExpansion() {
